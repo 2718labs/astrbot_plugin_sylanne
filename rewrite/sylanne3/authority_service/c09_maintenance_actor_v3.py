@@ -120,15 +120,35 @@ class InstalledC09MaintenanceActorV3:
         if current['stage'] in {'PREPARED', 'SWITCHED', 'CLEANED'}:
             if current['active_operation_id'] != self.operation_id:
                 raise AuthorityUnavailable('actual resumed actor operation differs from Control')
+            receivers_retired = False
             while True:
                 if current['stage'] == 'PREPARED':
-                    from .c09_writer_peer_originals_v3 import VerifiedPeerRetirementCoverageV3
-                    while True:
-                        peers = m.gate.advance_peer_retirement_coverage_v3(operation_id=self.operation_id)
-                        yield self.snapshot()
-                        if type(peers) is VerifiedPeerRetirementCoverageV3:
-                            break
-                        self._set(peers['phase'])
+                    from ..runtime_storage_v3 import runtime_storage_v3, PhysicalInitialRuntimeHandleV4
+                    from .c09_writer_peer_originals_v3 import (
+                        VerifiedPeerRetirementCoverageV3, VerifiedPreparedPeerRetirementCoverageV3)
+                    initial_prepared = type(runtime_storage_v3(m.core._db)) is PhysicalInitialRuntimeHandleV4
+                    if initial_prepared:
+                        peers = getattr(m.gate, '_peer_retirement_coverage_v3', None)
+                        if peers is None:
+                            with m.control._resource_sql_quantum_v3() as meter:
+                                context = m.control.read_verified_current_storage_v3(meter=meter)
+                                m.gate.restore_prepared_peer_retirement_v3(
+                                    operation_id=self.operation_id, context=context)
+                            peers = m.gate._peer_retirement_coverage_v3
+                        if type(peers) is not VerifiedPreparedPeerRetirementCoverageV3:
+                            raise AuthorityUnavailable('initial PREPARED requires its signed restored EOF coverage')
+                    else:
+                        while True:
+                            peers = m.gate.advance_peer_retirement_coverage_v3(operation_id=self.operation_id)
+                            yield self.snapshot()
+                            if type(peers) is VerifiedPeerRetirementCoverageV3:
+                                break
+                            self._set(peers['phase'])
+                    if not receivers_retired:
+                        with m.gate.hold_final_continuation_v3(operation_id=self.operation_id) as continuation:
+                            yield from self._retire_d13_receivers_v3(peers,
+                                continuation=continuation, prepared_readonly=initial_prepared)
+                        receivers_retired = True
                     progress = m.switch_prepared_storage_v1(operation_id=self.operation_id)
                     if progress['status'] == 'complete':
                         progress = dict(progress, restart_required=True, phase='SWITCHED')
@@ -138,6 +158,11 @@ class InstalledC09MaintenanceActorV3:
                             context = m.control.read_verified_current_storage_v3(meter=meter)
                             m.gate.restore_prepared_peer_retirement_v3(operation_id=self.operation_id, context=context)
                         yield self.snapshot()
+                    if not receivers_retired:
+                        intent = m.control.read_operation_event_v1(self.operation_id, 'INTENT')
+                        yield from self._retire_d13_receivers_v3(m.gate._peer_retirement_coverage_v3,
+                            quiescence=intent['details']['quiescence_original'], recovery=True)
+                        receivers_retired = True
                     progress = m.cleanup_and_release_v1(operation_id=self.operation_id)
                 with self.lock:
                     self.status = dict(progress, operation_id=self.operation_id)
@@ -175,9 +200,36 @@ class InstalledC09MaintenanceActorV3:
         with m.gate.hold_final_continuation_v3(operation_id=self.operation_id) as continuation:
             m._c09_final_continuation_v2 = continuation
             try:
+                yield from self._retire_d13_receivers_v3(peers, continuation=continuation)
+                m._checkpoint(m.graph, close=True)
+                m._checkpoint(m.core)
+                m._checkpoint(m.closure.execution)
+                m._checkpoint(m.closure.deletion)
+                yield self.snapshot()
                 self.result = yield from self._capture(continuation)
             finally:
                 m._c09_final_continuation_v2 = None
+
+    def _retire_d13_receivers_v3(self, coverage, *, quiescence=None, recovery=False, continuation=None, prepared_readonly=False):
+        from .d13_original_owner_v3 import advance_d13_retired_receiver_cleanup_v3
+        m = self.maintenance
+        if quiescence is None:
+            quiescence = m.gate.read_quiescence_original_v1(operation_id=self.operation_id)
+        while True:
+            if prepared_readonly:
+                from .d13_original_owner_v3 import advance_d13_retired_receiver_eof_for_prepared_v4
+                result = advance_d13_retired_receiver_eof_for_prepared_v4(m, retirement_coverage=coverage,
+                    quiescence_original=quiescence, continuation=continuation)
+            else:
+                result = advance_d13_retired_receiver_cleanup_v3(m, retirement_coverage=coverage,
+                    quiescence_original=quiescence, recovery=recovery, continuation=continuation)
+            self._set(result['phase'], retired_receivers=result['closed_receivers'],
+                retirement_after_operation_id=result['after_operation_id'])
+            if result['status'] == 'hold':
+                raise AuthorityUnavailable('D13 retired receiver first failure: ' + result['first_failure'])
+            yield self.snapshot()
+            if result['status'] == 'complete':
+                return
 
     def _prepare_intent(self):
         m = self.maintenance
@@ -199,10 +251,6 @@ class InstalledC09MaintenanceActorV3:
         elif current.stage != 'INTENT':
             raise AuthorityUnavailable('actual C09 capture actor requires its unfinished INTENT')
         self._set('source_freeze')
-        m._checkpoint(m.graph, close=True)
-        m._checkpoint(m.core)
-        m._checkpoint(m.closure.execution)
-        m._checkpoint(m.closure.deletion)
 
     def _capture(self, continuation):
         m = self.maintenance

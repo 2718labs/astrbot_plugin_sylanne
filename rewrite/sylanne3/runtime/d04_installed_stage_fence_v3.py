@@ -8,10 +8,10 @@ from __future__ import annotations
 from contextlib import nullcontext, contextmanager
 from dataclasses import asdict
 import json
-import logging
 import time
 
 from ..authority_service.v2_contract import from_wire, to_wire
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from ..contracts import StaleRead
 from ..graph_types import NamespaceEpoch
@@ -20,13 +20,14 @@ from .first_ingress_v2 import trusted_upper
 from .restore_anchor import RestoreAnchor
 
 TABLE = "graph_d04_installed_stage_attempts_v3"
-STAGES = frozenset({"interpretation", "prepare", "acquire", "seal_call", "settle", "adopt", "drive", "numeric_prepare", "numeric_adopt", "c04_encoding"})
+_SERIES_FREEZE_WRITE_ISSUER=object()
+STAGES = frozenset({"interpretation", "prepare", "acquire", "seal_call", "settle", "adopt", "drive", "numeric_prepare", "numeric_adopt", "c04_encoding", "series_freeze"})
 NEW_STAGE_MODULES_V1 = {
     "interpretation": ("d04", "d11"), "prepare": ("d04", "d11"),
     "acquire": ("d04", "d11"), "seal_call": ("d04", "d11"),
     "adopt": ("d04", "d11"), "drive": ("d04", "d11"),
     "numeric_prepare": ("d04", "d11"), "numeric_adopt": ("d04", "d11"),
-    "c04_encoding": ("d04", "d06", "d11"), "settle": (),
+    "c04_encoding": ("d04", "d06", "d11"), "settle": (), "series_freeze": ("d04","d11"),
 }
 
 _TIMING_PHASES = frozenset({"installed_stage_total", "authority_owner_clock", "sql_transaction", "stage_callback",
@@ -34,7 +35,7 @@ _TIMING_PHASES = frozenset({"installed_stage_total", "authority_owner_clock", "s
     "hot_handoff", "cold_restore_decode_verify", "final_adoption", "post_encoding", "progress_scan",
     "prefix_collection", "prefix_manifest_rpc", "packet_hash", "packet_decode", "prefix_restore",
     "final_derive_numeric_verify", "installed_asset_verify", "authority_gate_validate", "business_transaction"})
-_TIMING_LOG = logging.getLogger(__name__)
+_TIMING_LOG = diagnostic_channel_v1(__name__)
 
 
 class _D04PhaseTimingsV1:
@@ -96,9 +97,20 @@ def install_schema(db):
 
 
 def run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
-        source_ref, operation_id, stage, request_digest, commit, semantic=False, fence_observer=None):
+        source_ref, operation_id, stage, request_digest, commit, semantic=False, fence_observer=None,
+        original_deadline_utc=None):
     timings = _D04PhaseTimingsV1(operation_id)
     with timings.measure("installed_stage_total"):
+        from ..runtime_storage_v3 import runtime_storage_v3
+        if stage != "settle" and runtime_storage_v3(graph._GraphCoordinator__store._db) is not None:
+            from .d04_source_work_v3 import prepare_installed_d04_source_work_v3, require_bound_installed_d04_source_v3
+            current = require_bound_installed_d04_source_v3(graph, graph._GraphCoordinator__store._db,
+                bundle.installation_policy.namespace, c02_operation_id=c02_operation_id, source_ref=source_ref)
+            if current is None:
+                return prepare_installed_d04_source_work_v3(graph, bootstrap, bundle,
+                    c02_operation_id=c02_operation_id, source_ref=source_ref, operation_id=operation_id,
+                    stage=stage, request_digest=request_digest, commit=commit, semantic=semantic,
+                    fence_observer=fence_observer, original_deadline_utc=original_deadline_utc)
         return _run_installed_d04_stage_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id,
             source_ref=source_ref, operation_id=operation_id, stage=stage, request_digest=request_digest,
             commit=commit, semantic=semantic, fence_observer=fence_observer, timings=timings)
@@ -173,6 +185,17 @@ def _run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
         return restored
     if state != "active" or port.validate_fence(scope) != permit:
         raise ValueError("D04 current installed stage write unavailable")
+    from .d04_source_work_v3 import require_bound_installed_d04_source_v3
+    if stage=='series_freeze':
+        from .d04_source_work_v3 import require_bound_installed_d04_series_freeze_v3
+        source_reader=require_bound_installed_d04_series_freeze_v3(graph,store._db,namespace,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,operation_id=operation_id,
+            request_digest=request_digest,commit=commit)
+    else:
+        source_reader = None if stage == 'settle' else require_bound_installed_d04_source_v3(
+            graph,store._db,namespace,c02_operation_id=c02_operation_id,source_ref=source_ref)
+    if stage != 'settle' and source_reader is None:
+        raise ValueError('D04 current content stage requires its own completed Source READ')
     try:
         with timings.measure("authority_owner_clock"):
             from ..authority_service.d12_target_owner_admission_v1 import D12CurrentOwnerAuthorityV1
@@ -186,14 +209,17 @@ def _run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
             clock_reading = port.read_ingress_clock(bundle.ingress_clock)
             timings.bind_clock(clock_reading)
             now = trusted_upper(clock_reading)
+            if source_reader is not None and (guard != source_reader.owner_guard
+                    or now >= source_reader.operation.deadline_utc):
+                raise ValueError('D04 fresh-WRITE Owner or original Source deadline changed')
         semantic_reader = getattr(graph, "_GraphCoordinator__d04_semantic_mapping_reader", None)
         if semantic and semantic_reader is None:
             raise ValueError("current installed D04 semantic reader unavailable")
         if fence_observer is not None:
             fence_observer(scope)
-        if (current_owner.target_admission is not None or current_owner.storage_admission is not None) and semantic_reader is None:
+        if stage != 'settle' and (current_owner.target_admission is not None or current_owner.storage_admission is not None) and semantic_reader is None:
             raise ValueError("D04 migrated background work needs its actual installed location verifier")
-        semantic_context = semantic_reader.current_fence(scope) if (semantic or current_owner.target_admission is not None or current_owner.storage_admission is not None) else nullcontext()
+        semantic_context = semantic_reader.current_fence(scope) if stage != 'settle' and (semantic or current_owner.target_admission is not None or current_owner.storage_admission is not None) else nullcontext()
         with semantic_context, timings.measure("sql_transaction"):
             with store._lock:
                 db = store._db
@@ -203,19 +229,30 @@ def _run_installed_d04_stage_v3(graph, bootstrap, bundle, *, c02_operation_id,
                 try:
                     if graph._v2_graph_stamp(namespace) != (metadata, epoch):
                         raise StaleRead("D04 graph changed before stage adoption")
-                    role, _bindings, role_epoch, _versions = graph._scene_binding_state_locked(namespace, guard)
-                    if (role_epoch != epoch or current_owner.target_admission is None
-                            and guard.installation_id != policy.installation_id):
-                        raise StaleRead("D04 installed Owner scope changed")
-                    if current_owner.target_admission is not None or current_owner.storage_admission is not None:
-                        semantic_reader._require_current_location(db, namespace, scope)
-                    if stage in {"drive", "numeric_prepare", "c04_encoding"}:
-                        from .d04_current_source_context_v3 import read_current_d04_post_appraisal_context_v3
-                        current = read_current_d04_post_appraisal_context_v3(graph, db, namespace,
-                            c02_operation_id, source_ref, now, epoch)
+                    if stage in {'settle','series_freeze'}:
+                        role,current=None,None
+                        if stage=='series_freeze'and(current_owner.target_admission is not None
+                                or current_owner.storage_admission is not None):
+                            semantic_reader._require_current_location(db,namespace,scope)
                     else:
-                        current = graph._current_natural_generation_inputs_locked(namespace, c02_operation_id, source_ref, now, epoch)
-                    with timings.measure("stage_callback"):
+                        role, _bindings, role_epoch, _versions = graph._scene_binding_state_locked(namespace, guard)
+                        if (role_epoch != epoch or current_owner.target_admission is None
+                                and guard.installation_id != policy.installation_id):
+                            raise StaleRead("D04 installed Owner scope changed")
+                        if current_owner.target_admission is not None or current_owner.storage_admission is not None:
+                            semantic_reader._require_current_location(db, namespace, scope)
+                        if stage in {"drive", "numeric_prepare", "c04_encoding"}:
+                            from .d04_current_source_context_v3 import read_current_d04_post_appraisal_context_v3
+                            current = read_current_d04_post_appraisal_context_v3(graph, db, namespace,
+                                c02_operation_id, source_ref, now, epoch)
+                        else:
+                            current = graph._current_natural_generation_inputs_locked(namespace, c02_operation_id, source_ref, now, epoch)
+                    if stage=='series_freeze':
+                        from .d04_source_work_v3 import bind_installed_d04_series_freeze_write_v3
+                        callback_context=bind_installed_d04_series_freeze_write_v3(graph,db,
+                            issuer=_SERIES_FREEZE_WRITE_ISSUER,scope=scope,guard=guard,current_owner=current_owner)
+                    else:callback_context=nullcontext()
+                    with callback_context,timings.measure("stage_callback"):
                         result = commit(db, metadata, epoch, now, guard, role, current)
                     db.execute(f"UPDATE {TABLE} SET receipt_json=? WHERE bot=? AND persona=? AND operation_id=? AND receipt_json IS NULL",
                         (canonical_serialize(result), *namespace.as_tuple, operation_id))

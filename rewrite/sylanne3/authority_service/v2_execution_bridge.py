@@ -204,6 +204,8 @@ class AuthorityV2ExecutionBridge:
             elif stored != (_HANDOFF_RECEIPT_DDL,):
                 raise AuthorityUnavailable("handoff graph receipt schema differs")
             install_natural_final_observation_schema_v4(db)
+            from .observation_refinement_v3 import install_observation_refinement_schema_v3
+            install_observation_refinement_schema_v3(db)
 
     def install_contact_p2_service_v1(self, service):
         from .contact_p2_service_v1 import InstalledContactP2ServiceV1
@@ -472,28 +474,61 @@ class AuthorityV2ExecutionBridge:
             if not row[4].startswith((ENTRY_PREFIX, ROOT_ENTRY_PREFIX_V3, OFFLINE_PREFIX, SERIES_PREFIX, LIFE_PREFIX, b'{"binding":')))
 
     def read_current_observation_receipt_v1(self, *, credential, subject, effect_id):
-        """Independently reread the observed mutation named by the current effect."""
-        observed = self.read_current_effect(credential=credential, subject=subject, effect_id=effect_id)
-        if observed.state != "observed" or observed.mutation_id is None:
-            raise AuthorityUnavailable("actual platform observation is unavailable")
-        with self.deletion.freeze_writes(), self.journal.freeze_writes():
-            head = self.journal.verified_head()
-            if (head.seq, head.digest) != (observed.execution_head_seq, observed.execution_head_digest):
-                raise AuthorityUnavailable("platform observation head changed")
+        from .observation_refinement_v3 import load_observation_receipt_locked_v3
+        from .observation_refinement_contract_v3 import (
+            observation_original_dispatch_permit_v3,observation_platform_observation_v3)
+        observed=self.read_current_effect(credential=credential,subject=subject,effect_id=effect_id)
+        if observed.state!='observed' or observed.mutation_id is None:
+            raise AuthorityUnavailable('actual platform observation is unavailable')
+        with self.deletion.freeze_writes(),self.journal.freeze_writes():
+            head=self.journal.verified_head()
+            if (head.seq,head.digest)!=(observed.execution_head_seq,observed.execution_head_digest):
+                raise AuthorityUnavailable('platform observation head changed')
             with self.core._tx() as db:
-                row = self.fences.mutation_locked(db, observed.mutation_id)
-                if row is None:
-                    raise AuthorityUnavailable("platform observation mutation disappeared")
-                completed = self._completed_result(row)
-                if completed is None:
-                    raise AuthorityUnavailable("platform observation is not committed")
-                receipt, _permit = completed
-                pending = receipt.pending
-                if (pending.phase != "observed" or pending.permit.subject != subject
-                        or pending.permit.effect_id != effect_id
-                        or pending.platform_observation.observation_id != observed.observation_id
-                        or pending.platform_observation.outcome != observed.observation_outcome):
-                    raise AuthorityUnavailable("platform observation original identity differs")
+                receipt=load_observation_receipt_locked_v3(self,db,observed.mutation_id)
+                origin=observation_original_dispatch_permit_v3(receipt)
+                report=observation_platform_observation_v3(receipt)
+                if origin.subject!=subject or origin.effect_id!=effect_id or (report.observation_id,report.outcome)!=(observed.observation_id,observed.observation_outcome):
+                    raise AuthorityUnavailable('platform observation original identity differs')
+                return receipt
+
+    def read_historical_observation_receipt_v3(self, *, credential, subject,
+            effect_id, mutation_id, expected_receipt_digest):
+        from .observation_refinement_contract_v3 import (ENTRY_PREFIX as FACT_PREFIX,
+            decode_fact_row_v3,observation_original_dispatch_permit_v3,
+            observation_platform_observation_v3,observation_receipt_digest_v3)
+        from .observation_refinement_v3 import load_observation_receipt_locked_v3,require_no_pending_fact_v3
+        identifier(subject,'subject');identifier(effect_id,'effect_id');identifier(mutation_id,'mutation_id')
+        if type(expected_receipt_digest) is not str or len(expected_receipt_digest)!=64 or any(c not in '0123456789abcdef' for c in expected_receipt_digest):
+            raise AuthorityUnavailable('historical observation needs exact receipt commitment')
+        self.core._require(credential,'current',self.namespace)
+        with self.deletion.freeze_writes(),self.journal.freeze_writes():
+            dh=self.deletion.verified_head();head,rows=self.journal._scan_locked()
+            with self.core._tx() as db:
+                self._require_v2_mode_locked(db);self.fences._check_schema(db)
+                self._check_deletion_locked(db,dh);self._check_execution_head_locked(db,head)
+                if self.deletion.has_deletion_history(self.namespace):self.core.require_current_content_ready_locked(db,namespace=self.namespace)
+                owner=self.core._row(db,self.namespace)
+                if owner[2]!='active' or owner[0] is None or owner[3] is not None or owner[4] is not None:raise AuthorityUnavailable('historical observation activation is not current')
+                require_no_pending_fact_v3(db,self.namespace)
+                if db.execute("SELECT 1 FROM authority_v2_mutations WHERE namespace=? AND state='pending' LIMIT 1",(self.namespace,)).fetchone():raise AuthorityUnavailable('pending mutation blocks historical observation')
+                current=self._read_current_effect_locked_v4(db,effect_id=effect_id,execution_head=head,execution_rows=rows,owner=owner)
+                if current.state!='observed':raise AuthorityUnavailable('historical observation lacks complete observed effect chain')
+                matches=[]
+                for entry in self._verified_dispatch_rows(rows,head.journal_id):
+                    pending=decode_fact_row_v3(self.journal,entry) if entry[4].startswith(FACT_PREFIX) else decode_bytes(entry[4])
+                    if pending.mutation_id==mutation_id:matches.append((entry,pending))
+                if len(matches)!=1:raise AuthorityUnavailable('historical observation is absent, redacted or ambiguous')
+                entry,pending=matches[0]
+                receipt=load_observation_receipt_locked_v3(self,db,mutation_id)
+                origin=observation_original_dispatch_permit_v3(receipt)
+                observation_platform_observation_v3(receipt)
+                if (receipt.pending!=pending or receipt.durable_state!='committed' or origin.subject!=subject
+                        or origin.effect_id!=effect_id or origin.namespace!=self.namespace
+                        or origin.authority_id!=current.authority_id or origin.generation!=owner[1]
+                        or (receipt.after_anchor.execution_seq,receipt.after_anchor.execution_digest)!=(entry[0],entry[6])
+                        or observation_receipt_digest_v3(receipt)!=expected_receipt_digest):
+                    raise AuthorityUnavailable('historical observation differs from authenticated chain member')
                 return receipt
 
     def read_current_effect(self, *, credential, subject: str,
@@ -528,13 +563,23 @@ class AuthorityV2ExecutionBridge:
                             "WHERE namespace=? AND state='pending' LIMIT 1",
                             (self.namespace,)).fetchone():
                         raise AuthorityUnavailable("pending execution mutation blocks effect read")
+                    from .observation_refinement_v3 import require_no_pending_fact_v3
+                    require_no_pending_fact_v3(db,self.namespace)
                     return self._read_current_effect_locked_v4(db,effect_id=effect_id,execution_head=execution_head,
                         execution_rows=rows,owner=owner)
 
     def _read_current_effect_locked_v4(self,db,*,effect_id,execution_head,execution_rows,owner):
         """Actual target index plus full verified journal join in the caller's Core transaction."""
         matching = []
+        from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_PREFIX,decode_fact_row_v3
+        from .observation_refinement_v3 import read_current_effect_with_facts_locked_v3
         for row in self._verified_dispatch_rows(execution_rows, execution_head.journal_id):
+            if row[4].startswith(FACT_PREFIX):
+                fact=decode_fact_row_v3(self.journal,row)
+                if fact.original_claimed_receipt.pending.permit.effect_id==effect_id:
+                    return read_current_effect_with_facts_locked_v3(self,db,effect_id=effect_id,
+                        execution_head=execution_head,execution_rows=execution_rows,owner=owner)
+                continue
             pending = decode_bytes(row[4])
             if pending.permit.effect_id == effect_id:
                 matching.append((row, pending))
@@ -1475,9 +1520,20 @@ class AuthorityV2ExecutionBridge:
             if state not in {"unresolved", "resolved"}:
                 raise AuthorityUnavailable("Authority effect state is unknown")
             indexed[effect_id] = (state, keys_json, execution_seq)
+        from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_PREFIX,decode_fact_row_v3
+        from .observation_refinement_v3 import TABLE,require_observation_refinement_schema_v3
+        require_observation_refinement_schema_v3(db)
+        if db.execute('SELECT 1 FROM '+TABLE+" WHERE namespace=? AND state='pending' LIMIT 1",(self.namespace,)).fetchone():
+            raise AuthorityUnavailable('pending observation fact blocks P2 admission')
+        fact_entries={}
         by_effect = {}
         journal_mutation_ids = set()
         for entry in self._verified_dispatch_rows(execution_rows, self.journal.journal_id):
+            if entry[4].startswith(FACT_PREFIX):
+                fact=decode_fact_row_v3(self.journal,entry)
+                key=fact.original_claimed_receipt.pending.permit.effect_id
+                fact_entries.setdefault(key,[]).append((entry,fact))
+                continue
             try:
                 pending = decode_bytes(entry[4])
             except (TypeError, ValueError, UnicodeError) as exc:
@@ -1509,6 +1565,23 @@ class AuthorityV2ExecutionBridge:
             (self.namespace,))}
         if committed_ids != journal_mutation_ids:
             raise AuthorityUnavailable("Authority mutations and execution journal differ")
+        fact_ids={p.mutation_id for entries in fact_entries.values() for _,p in entries}
+        saved_fact_ids={row[0] for row in db.execute('SELECT mutation_id FROM '+TABLE+" WHERE namespace=? AND state='committed'",(self.namespace,))}
+        # A surviving historical Fact keeps its original bytes after C09 has
+        # retired the old native journal. Only the exact authenticated archive
+        # arm may classify such a row as historical; current effects and unknown
+        # obligations below keep their original complete-index checks.
+        historical_fact_ids=set()
+        if saved_fact_ids-fact_ids:
+            from .observation_fact_history_v3 import read_runtime_observation_fact_history_v3
+            for fact_id in sorted(saved_fact_ids-fact_ids):
+                historical=read_runtime_observation_fact_history_v3(self,db,fact_id)
+                if (historical is None or historical.pending.mutation_id!=fact_id
+                        or historical.pending.fact_write_permit.namespace!=self.namespace):
+                    raise AuthorityUnavailable('Fact absent from current journal lacks authenticated current-Core history')
+                historical_fact_ids.add(fact_id)
+        if fact_ids!=saved_fact_ids-historical_fact_ids or not set(fact_entries)<=set(by_effect):
+            raise AuthorityUnavailable('observation fact ledger and verified append chain differ')
         effects = []
         for effect_id, entries in by_effect.items():
             indexed_row = indexed.get(effect_id)
@@ -1528,14 +1601,20 @@ class AuthorityV2ExecutionBridge:
                     raise AuthorityUnavailable("unresolved effect phase or footprint differs")
                 previous_phase = pending.phase
             entry, pending, row, _ = entries[-1]
-            if (indexed_row[1:] != (row[5], entry[0])
-                    or tuple(json.loads(row[5])) !=
-                       constraint_keys_from_footprint(footprint)):
-                raise AuthorityUnavailable("effect index and footprint differ")
+            current=None
+            if effect_id in fact_entries:
+                head=JournalHead(self.journal.journal_id,permit.pinned_anchor.execution_seq,permit.pinned_anchor.execution_digest)
+                current=self._read_current_effect_locked_v4(db,effect_id=effect_id,execution_head=head,
+                    execution_rows=execution_rows,owner=self.core._row(db,self.namespace))
+            tail_seq=entry[0] if current is None else current.effect_seq
+            if (indexed_row[1:] != (row[5], tail_seq)
+                    or tuple(json.loads(row[5])) != constraint_keys_from_footprint(footprint)):
+                raise AuthorityUnavailable('effect index and footprint differ')
             effects.append(AuthorityUnresolvedEffectV1(
                 effect_id=effect_id, operation_id=operation_id,
-                mutation_id=pending.mutation_id, phase=pending.phase,
-                execution_seq=entry[0], append_digest=entry[6],
+                mutation_id=pending.mutation_id if current is None else current.mutation_id,
+                phase=pending.phase if current is None else 'observed',
+                execution_seq=tail_seq,append_digest=entry[6] if current is None else current.append_digest,
                 footprint=footprint))
         if {effect_id for effect_id, row in indexed.items()
                 if row[0] == "unresolved"} != set(by_effect):
@@ -1937,6 +2016,27 @@ class AuthorityV2ExecutionBridge:
                               self.namespace, claim_digest, binding_digest,
                               graph_receipt.graph_claim_ref, permit,
                               graph_claim_receipt=graph_receipt)
+
+    def read_observation_refinement_v3(self,*,credential,subject,fact_operation_id):
+        from .observation_refinement_v3 import read_observation_refinement_v3
+        return read_observation_refinement_v3(self,credential=credential,subject=subject,fact_operation_id=fact_operation_id)
+
+    def recover_observation_refinement_v3(self,*,credential,subject,fact_operation_id):
+        from .observation_refinement_v3 import recover_observation_refinement_v3
+        return recover_observation_refinement_v3(self,credential=credential,subject=subject,fact_operation_id=fact_operation_id)
+
+    def current_observation_refinement_operation_v3(self,*,credential,subject):
+        from .observation_refinement_v3 import current_observation_refinement_operation_v3
+        return current_observation_refinement_operation_v3(self,credential=credential,subject=subject)
+
+    def execution_refine_observation_v3(self,*,credential,subject,claimed_receipt,observation):
+        from .observation_refinement_v3 import execution_refine_observation_v3
+        return execution_refine_observation_v3(self,credential=credential,subject=subject,
+            claimed_receipt=claimed_receipt,observation=observation)
+
+    def reconcile_observation_refinement_v3(self,*,credential,subject,pending):
+        from .observation_refinement_v3 import reconcile_observation_refinement_v3
+        return reconcile_observation_refinement_v3(self,credential=credential,subject=subject,pending=pending)
 
     def execution_observe(self, *, credential, subject: str,
                           claimed_receipt: MutationReceiptV2,

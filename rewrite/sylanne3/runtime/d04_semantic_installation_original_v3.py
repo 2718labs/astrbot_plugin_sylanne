@@ -56,32 +56,11 @@ def _operation(value):
         raise ValueError("D04 Owner operation_id must be canonical UUID4")
 
 
-def _read_signed(db, issuer, table, kind, namespace, *, operation_id=None):
+def _read_signed(db, issuer, table, kind, namespace, *, operation_id=None, reader=None):
     if not db.in_transaction:
-        raise ValueError("D04 signed installation original requires a pinned transaction")
-    suffix = " AND operation_id=?" if operation_id is not None else " ORDER BY revision DESC LIMIT 1"
-    args = (*namespace.as_tuple, operation_id) if operation_id is not None else namespace.as_tuple
-    from .domain_background_read_v3 import (_active_v3,background_point_v3,background_json_loads_v3,
-        background_verify_signature_v3,background_json_matches_v3,background_json_digest_v3)
-    from .d11_role_clock_installation_v1 import TABLE as ROLE_CLOCK_TABLE
-    if _active_v3(db)is not None and table in(TABLE,ROLE_CLOCK_TABLE):
-        selected=db.execute(f"SELECT revision FROM {table} WHERE bot=? AND persona=?"+suffix,args).fetchone()
-        row=None if selected is None else background_point_v3(db,table=table,
-            columns=('revision','operation_id','original_json','original_digest','signature'),
-            key_columns=('bot','persona','revision'),key=(*namespace.as_tuple,selected[0]),legacy_reader=lambda:None)
-    else:
-        row = db.execute(f"SELECT revision,operation_id,original_json,original_digest,signature FROM {table} "
-            "WHERE bot=? AND persona=?" + suffix, args).fetchone()
-    if row is None:
-        return None
-    revision, operation, encoded, digest, signature = row
-    background_verify_signature_v3(issuer._signer,kind,encoded,signature)
-    original = background_json_loads_v3(encoded)
-    if (not background_json_matches_v3(encoded,original) or background_json_digest_v3(encoded,original) != digest
-            or original["namespace"] != asdict(namespace) or original["revision"] != revision
-            or original["operation_id"] != operation):
-        raise ValueError("D04 signed installation original identity or content differs")
-    return original, digest
+        raise ValueError('D04 signed installation original requires a pinned transaction')
+    from .role_control_signed_metadata_v4 import read_role_original_metadata_v4
+    return read_role_original_metadata_v4(db,issuer,table,namespace,operation_id=operation_id,reader=reader)
 
 
 def _insert_signed(db, issuer, table, kind, namespace, body):
@@ -108,16 +87,25 @@ def _current_inputs_steps_v3(reader,db,namespace):
     from .domain_background_read_v3 import background_role_clock_call_v3,background_graph_head_v3,background_inventory_v3,background_json_loads_v3
     scope,guard,profile=yield from background_role_clock_call_v3(lambda:reader._current(db,namespace))
     graph=reader.graph
-    role,_bindings,epoch,_versions=yield from background_role_clock_call_v3(lambda:graph._scene_binding_state_locked(namespace,guard))
-    if role.namespace != namespace or role.graph_epoch != epoch.revision:
-        raise ValueError("D04 current role epoch differs")
-    role_rows = []
-    for version in sorted(role.read_versions, key=lambda v: v.key.token):
-        row = yield from background_role_clock_call_v3(lambda:background_graph_head_v3(db,namespace,version.key))
-        if row is None or row[0] != version.revision or row[2] != 1:
-            raise ValueError("D04 current role graph original changed")
-        role_rows.append((version.key.token, row[0], background_json_loads_v3(row[1]), True))
-        yield None
+    from ..runtime_storage_v3 import runtime_storage_v3
+    role_control_rows=None;role_rows=None
+    if runtime_storage_v3(db)is None:
+        role,_bindings,epoch,_versions=yield from background_role_clock_call_v3(lambda:graph._scene_binding_state_locked(namespace,guard))
+        if role.namespace != namespace or role.graph_epoch != epoch.revision:
+            raise ValueError("D04 current role epoch differs")
+        role_rows = []
+        for version in sorted(role.read_versions, key=lambda v: v.key.token):
+            row = yield from background_role_clock_call_v3(lambda:background_graph_head_v3(db,namespace,version.key))
+            if row is None or row[0] != version.revision or row[2] != 1:
+                raise ValueError("D04 current role graph original changed")
+            role_rows.append((version.key.token, row[0], background_json_loads_v3(row[1]), True))
+            yield None
+    else:
+        from .role_control_rows_metadata_v4 import current_role_control_rows_v4
+        role,epoch,role_control_rows=yield from background_role_clock_call_v3(
+            lambda:current_role_control_rows_v4(reader,db,namespace,guard))
+        if role.namespace!=namespace or role.graph_epoch!=epoch.revision:
+            raise ValueError('D04 current role epoch differs')
     from .domain_background_read_v3 import _active_v3
     if _active_v3(db)is not None:
         atoms=[]
@@ -174,9 +162,9 @@ def _current_inputs_steps_v3(reader,db,namespace):
     if len(roots) != 1 or used_templates != set(templates) or len(set(cursors)) != 1:
         raise ValueError("D04 semantic profile requires exact complete synchronized root component coverage")
     return {"guard": guard, "profile": profile, "role": role,
-        "role_rows": role_rows, "member_bindings": members, "block_shares": shares,
+        **({"role_control_rows":role_control_rows}if role_control_rows is not None else {"role_rows":role_rows}), "reader": reader, "db": db, "member_bindings": members, "block_shares": shares,
         "cursor": cursors[0], "role_ref": role.head_id,
-        "persona_version": str(role.plan.version), "scope": scope}
+        "persona_version": str(role.plan_version if role_control_rows is not None else role.plan.version), "scope": scope}
 
 
 def _installation_ref(reader, namespace):
@@ -185,6 +173,8 @@ def _installation_ref(reader, namespace):
 
 
 def _current_matches(original, inputs, reader, namespace):
+    from .role_control_signed_metadata_v4 import require_role_control_rows_match_v4
+    require_role_control_rows_match_v4(original,inputs)
     # Binary64 values are in canonical signed JSON. All accepted shares are
     # explicitly dyadic in this registered profile, so no rounding fallback.
     expected = {
@@ -195,7 +185,6 @@ def _current_matches(original, inputs, reader, namespace):
         "profile_json": inputs["profile"].profile_json,
         "profile_digest": inputs["profile"].profile_digest,
         "owner_guard": asdict(inputs["guard"]),
-        "role_rows": inputs["role_rows"],
         "member_bindings": inputs["member_bindings"],
     }
     if any(canonical_serialize(original.get(k)) != canonical_serialize(v) for k, v in expected.items()):
@@ -204,11 +193,11 @@ def _current_matches(original, inputs, reader, namespace):
 
 def read_current_semantic_mapping_v3(reader, db, namespace):
     inputs = _current_inputs(reader, db, namespace)
-    saved = _read_signed(db, reader.graph._GraphCoordinator__d11_issuer, TABLE, SIGN_KIND, namespace)
+    saved = _read_signed(db, reader.graph._GraphCoordinator__d11_issuer, TABLE, SIGN_KIND, namespace, reader=reader)
     if saved is None:
         raise ValueError("D04 semantic profile requires explicit current Owner acceptance")
     original, digest = saved
-    if original.get("schema") != "d04.owner-semantic-installation-original.v3" or original.get("state") != "active":
+    if original.get("schema") not in {"d04.owner-semantic-installation-original.v3","d04.owner-semantic-installation-original.v4"} or original.get("state") != "active":
         raise ValueError("D04 semantic profile acceptance is absent or revoked")
     _current_matches(original, inputs, reader, namespace)
     asset = inputs["profile"].bind(role_ref=inputs["role_ref"], persona_version=inputs["persona_version"])
@@ -355,6 +344,8 @@ def _owner_write(reader, authority, lease, *, operation_id, request, commit):
                     raise
         return result
     finally:
+        from .role_control_lineage_metadata_v4 import release_installed_role_control_lineages_v4
+        release_installed_role_control_lineages_v4(reader,scope)
         port.finish_fence(scope, request_id="finish:" + attempt,
             request_digest="sha256:" + canonical_digest((attempt, permit.token, request_digest)))
         with store._lock:
@@ -372,24 +363,25 @@ def adopt_current_d04_semantic_mapping_v3(reader, authority, lease, *,
         profile, namespace, issuer = inputs["profile"], authority.namespace, reader.graph._GraphCoordinator__d11_issuer
         if profile.profile_digest != profile_digest:
             raise ValueError("Owner selected semantic profile differs from exact installed profile")
-        prior = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, operation_id=operation_id)
+        prior = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, operation_id=operation_id, reader=reader)
         if prior is not None:
             if prior[0]["owner"]["request_digest"] != owner["request_digest"]:
                 raise ValueError("D04 semantic Owner operation ID reused with different input")
             return _receipt(prior)
-        current = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace)
+        current = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, reader=reader)
         if (0 if current is None else current[0]["revision"]) != expected_revision:
             raise StaleRead("D04 semantic acceptance revision changed")
         asset = profile.bind(role_ref=inputs["role_ref"], persona_version=inputs["persona_version"])
-        body = {"schema": "d04.owner-semantic-installation-original.v3", "namespace": asdict(namespace),
+        body = {"schema": "d04.owner-semantic-installation-original.v4" if "role_control_rows"in inputs else "d04.owner-semantic-installation-original.v3", "namespace": asdict(namespace),
             "operation_id": operation_id, "revision": expected_revision + 1, "state": "active",
             "installation_ref": _installation_ref(reader, namespace), "manifest_sha256": reader.manifest_sha256,
             "profile_json": profile.profile_json, "profile_digest": profile.profile_digest,
-            "owner": owner, "owner_guard": asdict(inputs["guard"]), "role_rows": inputs["role_rows"],
+            "owner": owner, "owner_guard": asdict(inputs["guard"]), **({"role_control_rows":asdict(inputs["role_control_rows"])}if "role_control_rows"in inputs else {"role_rows":inputs["role_rows"]}),
             "member_bindings": inputs["member_bindings"], "bound_asset": asdict(asset),
             "block_shares": inputs["block_shares"], "graph_revision": inputs["scope"].graph_revision,
             "graph_epoch": inputs["scope"].graph_epoch.revision}
-        saved = _insert_signed(db, issuer, TABLE, SIGN_KIND, namespace, body)
+        from .role_control_signed_metadata_v4 import SEMANTIC_SIGN_KIND_V4
+        saved = _insert_signed(db, issuer, TABLE, SEMANTIC_SIGN_KIND_V4 if "role_control_rows"in inputs else SIGN_KIND, namespace, body)
         # Replay the production consumer before transaction commit.
         read_current_semantic_mapping_v3(reader, db, namespace)
         return _receipt(saved)

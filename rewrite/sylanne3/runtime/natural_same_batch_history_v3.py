@@ -13,7 +13,7 @@ from ..authority_service.v2_contract import FencePermitV2, MutationReceiptV2
 from ..domains.d09.natural_reply import natural_semantic_ranges_v3, natural_segment_identity_v3
 from ..graph_types import AtomKey, GraphVersion
 from ..runtime_contracts import NamespaceId, canonical_digest
-from .natural_reply_job_v2 import read_original_preparation
+from .natural_reply_job_v2 import read_original_preparation,natural_semantic_original_version_v3
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,11 +42,12 @@ def same_batch_observation_hints_v3(db, namespace, parent_original_id):
     """Content-free effect hints. They are never proof that a suffix is own."""
     from ..domains.d09.turn_order import turn_order_key, validate_turn_order_v1
     generation = read_original_preparation(db, namespace, parent_original_id, "generation")
-    if generation is None or generation.seal.schema != "sylanne.d09.natural_generation_seal.v5":
-        return None
+    if generation is None or generation.state!='terminal':return None
+    if natural_semantic_original_version_v3(generation)is None:return None
     review = read_original_preparation(db, namespace, parent_original_id, "review")
     if review is None or review.state != "terminal":
         return None
+    natural_semantic_original_version_v3(generation,review)
     data = json.loads(review.frozen.canonical_input)
     output = {"schema": data["generation_output_schema"], "body": data["body"],
               "units": data["units"], "semantic_segments": data["semantic_segments"]}
@@ -202,10 +203,12 @@ def verify_same_batch_history_v3(db, *, issuer, prepared, namespace,
     return tuple(reads[key] for key in sorted(reads))
 
 
-def read_parent_stop_original_v3(db, namespace, generation):
+def read_parent_stop_original_v3(db, namespace, generation, *, prepared_stop=None):
     """Actual Owner control/job-operation join; never trust a bare SQL marker."""
-    from .lifecycle_operations_v1 import ControlCommandV1, OwnerOperationBindingV1, decode_original, digest
-    from .jobs import _job_from_dict
+    if prepared_stop is not None:
+        if type(prepared_stop)is not PreparedNaturalParentStopV3:
+            raise ValueError('actual private parent-stop original required')
+        return prepared_stop.read_v3(db,namespace,generation)
     if not db.in_transaction:
         raise RuntimeError("parent reply stop needs a pinned Graph transaction")
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_d12_backend_operations_v1'").fetchone():
@@ -221,12 +224,20 @@ def read_parent_stop_original_v3(db, namespace, generation):
         "ORDER BY j.operation_id LIMIT 1", (*namespace.as_tuple, generation.seal.job_id)).fetchone()
     if row is None:
         return None
-    original = decode_original(json.loads(row[7]))
-    command = ControlCommandV1.from_wire(json.loads(row[5]))
-    owner_data = json.loads(row[4])
+    return _parent_stop_from_parsed_v3(namespace,generation,row,
+        {'original_json':json.loads(row[7]),'input_json':json.loads(row[5]),
+         'owner_json':json.loads(row[4]),'job_json':json.loads(row[2])})
+
+
+def _parent_stop_from_parsed_v3(namespace,generation,row,values):
+    from .lifecycle_operations_v1 import ControlCommandV1,OwnerOperationBindingV1,decode_original,digest
+    from .jobs import _job_from_dict
+    original=decode_original(values['original_json'])
+    command=ControlCommandV1.from_wire(values['input_json'])
+    owner_data=dict(values['owner_json'])
     owner_data["namespace"] = NamespaceId(**owner_data["namespace"])
     owner = OwnerOperationBindingV1(**owner_data)
-    job = _job_from_dict(json.loads(row[2]))
+    job = _job_from_dict(values['job_json'])
     if (original.namespace != namespace or owner.namespace != namespace
             or original.operation_id != row[0] or original.kind != "control"
             or original.request_digest != row[3] or row[3] != "sha256:" + row[1]
@@ -249,6 +260,13 @@ def read_parent_stop_original_v3(db, namespace, generation):
 
 def read_natural_roster_head_v1(db, namespace, parent_original_id):
     """Only persisted no-content roster; never reconstruct revoked review text."""
+    from .natural_roster_metadata_read_v3 import read_bound_natural_roster_metadata_v3
+    handled,head=read_bound_natural_roster_metadata_v3(db,namespace,parent_original_id)
+    if handled:return head
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from ..authority_service.contract import AuthorityUnavailable
+        raise AuthorityUnavailable("selected Natural roster requires its actual prepared metadata proof before SQL")
     from ..domains.d09.natural_disposition_v1 import TYPE, natural_disposition_from_wire_v1, natural_disposition_key_v1
     rows = db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
         "AND type_name=? AND json_extract(value,'$.parent_original_id')=? LIMIT 2",
@@ -450,3 +468,96 @@ def commit_natural_disposition_maintenance_v1(graph, bootstrap, namespace, paren
     port.confirm_natural_disposition_original_v1(scope=scope,original_ref=observed.original.original_ref)
     port.finish_fence(scope,request_id="finish:"+op,request_digest=finish_digest)
     return {"status":"committed","roster_ref":write.key.token,"operation_id":op}
+
+
+from weakref import WeakKeyDictionary,WeakSet
+_STOP_ISSUER_V3=object()
+_STOP_READERS_V3=WeakSet()
+_STOP_ORIGINALS_V3=WeakKeyDictionary()
+_STOP_JOIN_V3=(" FROM runtime_job_operations j JOIN graph_d12_backend_operations_v1 o "
+    "ON o.bot=j.bot_id AND o.persona=j.persona_id AND o.operation_id=j.operation_id AND o.kind='control' "
+    "JOIN graph_d12_backend_originals_v1 r ON r.bot=o.bot AND r.persona=o.persona "
+    "AND r.original_ref=o.current_original_ref AND r.operation_id=o.operation_id "
+    "WHERE j.bot_id=? AND j.persona_id=? AND j.phase='cancel' AND j.job_id=? ORDER BY j.operation_id LIMIT 1")
+_STOP_HEADERS_V3=('j.operation_id','j.digest','o.request_digest','r.original_digest','o.current_original_ref')
+
+
+def _stop_header_v3(db,namespace,job_id,*,meter=None):
+    if not db.in_transaction:raise RuntimeError('parent-stop metadata requires the actual pinned transaction')
+    if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_d12_backend_operations_v1'").fetchone():
+        return None
+    args=(*namespace.as_tuple,job_id)
+    if meter is not None:
+        lengths=db.execute('SELECT '+','.join('length(CAST('+name+' AS BLOB))'for name in _STOP_HEADERS_V3)+_STOP_JOIN_V3,args).fetchone()
+        if lengths is None:return None
+        size=sum(0 if value is None else value for value in lengths)
+        meter.require_available(size*6+32*len(_STOP_HEADERS_V3));meter.charge_read(size)
+    return db.execute('SELECT '+','.join(_STOP_HEADERS_V3)+_STOP_JOIN_V3,args).fetchone()
+
+
+class DispatchParentStopReadV3:
+    def __init__(self,issuer,owner,generation_original):
+        from .dispatch_initial_source_read_v3 import PreparedNaturalOriginalsV3,_NATURAL_ORIGINALS,_require_dispatch_review_owner_v3
+        if issuer is not _STOP_ISSUER_V3:raise ValueError('actual parent-stop reader issuer required')
+        _require_dispatch_review_owner_v3(owner)
+        if(type(generation_original)is not PreparedNaturalOriginalsV3 or generation_original not in _NATURAL_ORIGINALS
+                or generation_original.owner is not owner or generation_original.saved is None):
+            raise ValueError('parent-stop reader requires actual same-Work generation original')
+        self.owner,self.generation_original=owner,generation_original
+        self.generation=generation_original.saved
+        self.phase='metadata';self.header=None;self.columns={};self.column=None;self.result=None;self.queue=[]
+        _STOP_READERS_V3.add(self)
+    def advance(self,meter):
+        from .dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3,_require_dispatch_review_owner_v3
+        _require_dispatch_review_owner_v3(self.owner)
+        if self.phase=='metadata':
+            self.header=_stop_header_v3(self.owner.db,self.owner.namespace,self.generation.seal.job_id,meter=meter)
+            if self.header is None:self.phase='publish';return False
+            op,_,_,_,original=self.header;ns=self.owner.namespace.as_tuple
+            self.queue=[('job_json','runtime_job_operations',('bot_id','persona_id','operation_id','phase'),(*ns,op,'cancel')),
+                ('owner_json','graph_d12_backend_operations_v1',('bot','persona','operation_id'),(*ns,op)),
+                ('input_json','graph_d12_backend_operations_v1',('bot','persona','operation_id'),(*ns,op)),
+                ('original_json','graph_d12_backend_originals_v1',('bot','persona','original_ref'),(*ns,original))]
+            self.phase='columns';return False
+        if self.phase=='columns':
+            if self.column is not None:
+                if self.column.advance(meter):self.columns[self.column.column]=self.column;self.column=None
+                return False
+            if self.queue:
+                name,table,key_columns,key=self.queue.pop(0)
+                self.column=DispatchOriginalJSONReadV3(self.owner,table=table,column=name,key_columns=key_columns,key=key)
+                return False
+            self.phase='publish';return False
+        if self.phase=='publish':
+            value=None
+            if self.header is not None:
+                op,request_digest,owner_request,original_digest,_=self.header
+                row=(op,request_digest,None,owner_request,None,None,original_digest,None)
+                value=_parent_stop_from_parsed_v3(self.owner.namespace,self.generation,row,
+                    {name:column.require_v3(self.owner)for name,column in self.columns.items()})
+            self.result=PreparedNaturalParentStopV3(_STOP_ISSUER_V3,self,value);self.phase='complete';return True
+        return self.phase=='complete'
+
+
+class PreparedNaturalParentStopV3:
+    """Actual same-job cancellation original or independently current absence."""
+    def __init__(self,issuer,reader,value):
+        if issuer is not _STOP_ISSUER_V3 or reader not in _STOP_READERS_V3 or reader.phase!='publish':
+            raise ValueError('actual complete parent-stop producer required')
+        self.owner,self.generation_original,self.header=reader.owner,reader.generation_original,reader.header
+        self.generation,self.value=reader.generation,value
+        self.columns=tuple(reader.columns.values())
+        _STOP_ORIGINALS_V3[self]=(self.owner,self.generation_original,self.header,self.generation,self.value,self.columns)
+    def read_v3(self,db,namespace,generation):
+        if(_STOP_ORIGINALS_V3.get(self)!=(self.owner,self.generation_original,self.header,self.generation,self.value,self.columns)
+                or self.owner.operation.closed or db is not self.owner.db or namespace!=self.owner.namespace
+                or generation!=self.generation):
+            raise ValueError('actual same-Work parent-stop original required')
+        self.generation_original.require_for_v3(db,namespace,generation.parent_original_id,'generation')
+        if _stop_header_v3(db,namespace,generation.seal.job_id)!=self.header:
+            raise ValueError('natural parent-stop original or absence changed')
+        return self.value
+
+
+def begin_dispatch_parent_stop_read_v3(owner,generation_original):
+    return DispatchParentStopReadV3(_STOP_ISSUER_V3,owner,generation_original)

@@ -7,7 +7,7 @@ from ..domains.d13.derived_block_metadata_v2 import (METADATA_TYPE,
     derived_block_metadata_key_v2,derived_block_metadata_value_v2)
 from ..runtime_contracts import canonical_digest
 from .d11_derived_cache_payload_v1 import (prepare_derived_payload_v1,insert_derived_payload_v1,
-    reclaim_derived_payload_v1)
+    reclaim_derived_payload_v1,derived_payload_capacity_available_v1)
 from .d13_paid_product_v1 import _authorize,_read_original_locked
 from .d13_current_window import read_current_d13_frozen_window_for_authority_v1
 from .d13_paid_coordinator_v1 import (D13PaidStandbyPreparationV1,prepare_paid_d13_standby_in_transaction_v1,
@@ -77,11 +77,17 @@ def complete_d13_paid_derived_graph_v6(graph, authority, lease, *, job_id, selec
                 saved.original, saved.evidence.evidence_digest, saved.settlement,
                 None, "local_module_disabled" if isinstance(refusal, LocalModuleAdmissionDeniedV1)
                 else "paid_current_source_model_or_lifetime_invalid", job)
+        stage = (prepare_derived_payload_v1(prepared, scene_ref=current.scene_ref)
+            if prepared.block is not None else None)
+        if stage is not None and not derived_payload_capacity_available_v1(
+                db, authority.namespace, len(stage.payload_bytes)):
+            # The real paid result remains settled. Capacity refusal creates no
+            # standby cache and never grants a replacement model invocation.
+            prepared = replace(prepared, block=None, reason="derived_cache_capacity_exhausted")
+            stage = None
         completed, writes = finalize_paid_d13_in_transaction_v1(
             db, prepared, holder=authority.actor, fence=saved.call_original.worker_fence)
-        stage=None
-        if prepared.block is not None:
-            stage=prepare_derived_payload_v1(prepared,scene_ref=current.scene_ref)
+        if stage is not None:
             new_key=derived_block_metadata_key_v2(stage.metadata)
             from ..graph_types import Owner
             legacy_key=AtomKey(Owner('persona',*authority.namespace.as_tuple),'d13.derived_block_metadata.v1',stage.metadata.block_ref)

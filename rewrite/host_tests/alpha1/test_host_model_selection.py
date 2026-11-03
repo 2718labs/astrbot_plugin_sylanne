@@ -252,3 +252,86 @@ def test_v4_main_selection_keeps_exact_installation_identity_and_zero_provider_c
     with pytest.raises(ValueError, match='explicit model workflow version 4 required'):
         replace(workflows, version=5)
     assert calls == []
+
+
+def current_host_workflows(base, version, **optional):
+    from dataclasses import fields
+    from sylanne3.host.model_workflows_v8 import AdminModelWorkflowsV8
+    from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+    from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
+    from sylanne3.runtime_contracts import NATURAL_REPLY_REVIEW_WORKFLOW_V2
+    values = {field.name:getattr(base.model_workflows, field.name)
+        for field in fields(base.model_workflows) if field.name != "version"}
+    values.update(natural_generation=replace(base.model_workflows.reply,
+            work_kind="natural_generation", template_version=TEMPLATE_VERSION),
+        natural_review=replace(base.model_workflows.reply, work_kind="natural_review",
+            template_version=NATURAL_REPLY_REVIEW_WORKFLOW_V2), **optional)
+    return {8:AdminModelWorkflowsV8, 9:AdminModelWorkflowsV9}[version](version, **values)
+
+
+@pytest.mark.parametrize("version", (8, 9))
+def test_actual_host_creates_exact_installed_model_port_for_current_workflows(
+        sdk_models, tmp_path, version):
+    from sylanne3.host.installed_model_capability import InstalledModelCapabilityPort
+
+    context, provider, _, calls = sdk_models
+    base = bundle_for(provider, tmp_path)
+    workflows = current_host_workflows(base, version)
+    bundle = replace(base, model_workflows=workflows)
+    policy = bundle.installation_policy
+    grant = InstallationGrantV2(policy.expected_authority_id, "fixture:peer", policy.administrator_holder,
+        policy.installation_id, policy.manifest_digest, "fixture:publisher", "2", "f" * 64)
+    installation = V2InstallationAssembly(policy, grant, b"j" * 32, b"k" * 32,
+        lambda: (_ for _ in ()).throw(AssertionError("port setup must not contact Authority")),
+        tmp_path, tmp_path, admin_bundle=bundle, workbench_origin=ORIGIN)
+    module = host_cases.load_plugin_module()
+    loop = asyncio.new_event_loop()
+    try:
+        port = module._installed_model_port(context, loop, installation)
+        assert type(port) is InstalledModelCapabilityPort
+        assert port._installation_bundle is bundle
+        assert port._installed_namespace == policy.namespace
+        assert port._host_loop is loop
+        assert module._installed_model_port(context, loop,
+            replace(installation, installation_policy=replace(policy))) is None
+        assert module._installed_model_port(context, loop,
+            replace(installation, ingress_encoding=object())) is None
+        assert module._installed_model_port(context, loop, object()) is None
+        raw = profile_cases._workflow_profile_payload()
+        raw["model_workflows"]["version"] = 10
+        with pytest.raises(ValueError):
+            profile_cases.authority_profile._model_workflows_from_payload(raw)
+    finally:
+        loop.close()
+    assert calls == []
+
+
+@pytest.mark.parametrize("slot,broker", (
+    ("d07_relationship_cognition", "d07_cognition_v1"),
+    ("growth_cognition", "d07_cognition_v1"),
+    ("general_growth_cognition", "general_growth_cognition_v1"),
+    ("artifact_observation_cognition", "d07_cognition_v1"),
+))
+def test_actual_host_v9_auxiliary_selection_preserves_installation_match(
+        sdk_models, tmp_path, slot, broker):
+    from importlib import import_module
+    from sylanne3.host.webui_configuration_v1 import default_model_selection_v1
+    context, provider, _, calls = sdk_models
+    base = bundle_for(provider, tmp_path)
+    protocol = import_module("sylanne3.model_broker." + broker)
+    workflow = replace(base.model_workflows.encode, work_kind=protocol.WORK_KIND,
+        purpose=getattr(protocol, "PURPOSE", "proposal"), template_version=protocol.TEMPLATE_VERSION,
+        quote_ceiling={"input_tokens":6000,"output_tokens":1000,"model_tokens":7000,"model_microusd":1000})
+    workflows = current_host_workflows(base, 9, **{slot:workflow})
+    bundle = replace(base, model_workflows=workflows)
+    module = host_cases.load_plugin_module()
+    plugin = module.Sylanne3Plugin.__new__(module.Sylanne3Plugin)
+    plugin._setup_installation = SimpleNamespace(admin_bundle=bundle)
+    plugin._startup_configuration = {"model_selection":default_model_selection_v1()}
+    assert plugin._workflow_selection_ready() is True
+    plugin._startup_configuration["model_selection"]["auxiliary_provider_id"] = provider.meta().id
+    assert plugin._workflow_selection_ready() is True
+    plugin._startup_configuration["model_selection"]["auxiliary_provider_id"] = "other-provider"
+    assert plugin._workflow_selection_ready() is False
+    assert plugin.runtime_health == RuntimeHealth("blocked", ("model_workflow_binding_required",))
+    assert calls == []

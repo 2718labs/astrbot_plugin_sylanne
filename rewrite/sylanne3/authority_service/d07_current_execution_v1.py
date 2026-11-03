@@ -149,7 +149,25 @@ def read_current_d07_execution_graph_v1(db, intent, issuer, now, *, allow_unseal
             request=request, issuer=issuer, installed_bundle=installed_bundle, now=now)
     else:
         from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,require_current_general_growth_prepared_v1
-        if type(prepared)is D07GeneralGrowthPreparedV1:
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import (
+            D07OrdinaryContinuityPreparedV1,require_current_ordinary_continuity_prepared_v1,
+            thaw_current_ordinary_continuity_prepared_request_v1)
+        if type(prepared)is D07OrdinaryContinuityPreparedV1:
+            from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_template_digest_v1
+            frozen=thaw_current_ordinary_continuity_prepared_request_v1(prepared)
+            template_digest=ordinary_continuity_template_digest_v1(prepared.phase)
+            expected_purpose="consolidation"
+            require_current_ordinary_continuity_prepared_v1(db,issuer=issuer,prepared=prepared,
+                installed_bundle=installed_bundle,now=now,frozen=frozen)
+        elif prepared.schema=="d07.single-event-review-prepared.v1":
+            from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1,require_current_single_event_review_prepared_v1
+            if type(prepared)is not D07SingleEventReviewPreparedV1:
+                raise ValueError("single-event review requires its exact actual Prepared type")
+            frozen=thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
+            template_digest=TEMPLATE_DIGEST
+            require_current_single_event_review_prepared_v1(db,issuer=issuer,prepared=prepared,
+                installed_bundle=installed_bundle,now=now,frozen=frozen)
+        elif type(prepared)is D07GeneralGrowthPreparedV1:
             from ..model_broker.general_growth_cognition_v1 import thaw_general_growth_cognition_request_v1,TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST
             frozen=thaw_general_growth_cognition_request_v1(json.loads(prepared.frozen_json))
             template_digest=GENERAL_TEMPLATE_DIGEST
@@ -159,12 +177,19 @@ def read_current_d07_execution_graph_v1(db, intent, issuer, now, *, allow_unseal
         else:
             frozen = thaw_d07_cognition_request_v1(json.loads(prepared.frozen_json))
             template_digest = TEMPLATE_DIGEST
+    from ..runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+    source_wire=(prepared.self_authority_json if type(prepared)is D07IngressRecallPreparedV1
+        else prepared.owner_authority_json)
+    source=decode_typed_production_value_v1(json.loads(source_wire),AuthorityContext)
+    if(source.namespace!=namespace or source.purpose!=prepared.purpose or source.audience!=prepared.audience
+            or source.activation_generation!=prepared.activation_generation):
+        raise ValueError("D07 signed preparation changed its actual Source context")
     if (request.call_id != prepared.call_id or request.prompt_template_digest != template_digest
             or dict(request.payload) != json.loads(frozen.canonical_wire) or request.identity.phase != WORK_KIND
             or request.envelope.authority.namespace != namespace or request.envelope.authority.actor != intent.subject
             or request.envelope.authority.worker_fence != intent.worker_fence or request.identity.operation_id != intent.operation_id
             or request.envelope.parent_budget_lease_ref != intent.budget_lease_id
-            or request.envelope.authority.audience != prepared.audience or request.envelope.authority.purpose != expected_purpose or prepared.purpose!=expected_purpose
+            or request.envelope.authority.audience != prepared.audience or request.envelope.authority.purpose != expected_purpose
             or (intent.provider_id, intent.model_id, intent.provider_config_digest, intent.max_output_tokens) !=
                (frozen.installation.provider_id, frozen.installation.model_id,
                 frozen.installation.provider_config_digest, frozen.installation.max_output_tokens)):

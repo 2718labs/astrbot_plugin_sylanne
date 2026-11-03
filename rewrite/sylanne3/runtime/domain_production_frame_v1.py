@@ -41,6 +41,8 @@ def freeze_domain_production_frame_v1(graph, db, *, envelope, current_owner, sco
     handled, prepared = read_bound_background_frame_inputs_v3(db, graph=graph, scope=scope,
         plan=plan, envelope=envelope, current_owner=current_owner)
     if not handled:
+        from .source_inspection_production_v3 import source_inspection_prepared_plan_v3
+        plan = source_inspection_prepared_plan_v3(db, graph=graph, scope=scope, plan=plan)
         from .current_method_learning_read_v3 import read_bound_method_frame_inputs_v3
         handled, prepared = read_bound_method_frame_inputs_v3(db, graph=graph, scope=scope,
             plan=plan, envelope=envelope, current_owner=current_owner)
@@ -100,6 +102,8 @@ def freeze_foreground_production_frame_v1(graph, db, *, envelope, issued, scope,
     combined = ProductionReadPlanV1(plan.fixed_type_ids,
         tuple(sorted(set((*plan.exact_keys, *(version.key for version in evidence.read_versions))), key=lambda key: key.token)),
         plan.source_roots, plan.required_original_refs)
+    from .source_inspection_production_v3 import source_inspection_prepared_plan_v3
+    plan = source_inspection_prepared_plan_v3(db, graph=graph, scope=scope, plan=plan)
     from .current_method_learning_read_v3 import read_bound_method_issued_frame_inputs_v3
     handled, prepared = read_bound_method_issued_frame_inputs_v3(db, graph=graph, scope=scope,
         plan=combined, issued=issued)
@@ -159,6 +163,8 @@ def freeze_owner_source_note_task_frame_v1(graph, db, *, envelope, issued, scope
     combined = ProductionReadPlanV1(plan.fixed_type_ids,
         tuple(sorted(set((*plan.exact_keys, *(v.key for v in evidence.read_versions))), key=lambda key:key.token)),
         plan.source_roots, plan.required_original_refs)
+    from .source_inspection_production_v3 import source_inspection_prepared_plan_v3
+    plan = source_inspection_prepared_plan_v3(db, graph=graph, scope=scope, plan=plan)
     from .current_method_learning_read_v3 import read_bound_method_issued_frame_inputs_v3
     handled, prepared = read_bound_method_issued_frame_inputs_v3(db, graph=graph, scope=scope,
         plan=combined, issued=issued)
@@ -226,7 +232,9 @@ def _materialize_current_domain_frame_v1(graph, db, **kwargs):
     from .current_habit_source_read_v3 import register_current_habit_source_frame_v3
     frame=register_current_habit_source_frame_v3(db,frame,kwargs["scope"])
     from .artifact_frame_control_reads_v3 import register_artifact_model_source_frame_v3
-    return register_artifact_model_source_frame_v3(db,frame,kwargs["scope"],kwargs.get("prepared_inputs"))
+    frame=register_artifact_model_source_frame_v3(db,frame,kwargs["scope"],kwargs.get("prepared_inputs"))
+    from .persona_growth_review_frame_v1 import register_growth_review_frame_v1
+    return register_growth_review_frame_v1(db,frame,kwargs["scope"])
 
 
 def freeze_owner_stop_projection_frame_v1(graph, db, *, envelope, issued, scope, plan, now_utc):
@@ -281,22 +289,36 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
         if general_growth_background_parent_v1(prepared_inputs.owner) is not None:
             require_general_growth_background_sources_v1(prepared_inputs.owner,plan.source_roots,
                 prepared_inputs.envelope.authority)
-    from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3,_GENERAL_OWNER_OPERATIONS_V1,_NUMERIC_OWNER_OPERATIONS_V1
+    from .current_method_learning_read_v3 import (PreparedMethodDomainInputsV3,
+        _general_owner_metadata_mode_v1,_NUMERIC_OWNER_OPERATIONS_V1,
+        require_current_method_recipe_sources_v1)
     if (type(prepared_inputs)is PreparedMethodDomainInputsV3
-            and prepared_inputs.owner.operation_kind in _GENERAL_OWNER_OPERATIONS_V1):
-        from .current_method_learning_read_v3 import require_current_general_method_sources_v1
-        require_current_general_method_sources_v1(prepared_inputs.owner,plan.source_roots)
+            and _general_owner_metadata_mode_v1(prepared_inputs.owner)):
+        require_current_method_recipe_sources_v1(prepared_inputs.owner,plan.source_roots)
     if (type(prepared_inputs)is PreparedMethodDomainInputsV3
             and prepared_inputs.owner.operation_kind in _NUMERIC_OWNER_OPERATIONS_V1):
         from .current_life_numeric_metadata_v1 import require_numeric_method_sources_v1
         require_numeric_method_sources_v1(prepared_inputs.owner)
     if type(prepared_inputs)is PreparedMethodDomainInputsV3:
-        from .current_beta1_source_read_v3 import beta1_source_operation_v3
-        if beta1_source_operation_v3(prepared_inputs.owner.operation_kind):
+        from .current_beta1_source_read_v3 import beta1_source_reader_operation_v3
+        if beta1_source_reader_operation_v3(prepared_inputs.owner):
             from .current_beta1_source_read_v3 import require_beta1_source_groups_v3
             require_beta1_source_groups_v3(prepared_inputs.owner,plan.source_roots)
+    from .current_commitment_input_source_v3 import (
+        current_commitment_applicability_metadata_inventory_v3,
+        current_commitment_policy_metadata_source_v3,
+    )
     _, epoch = graph._v2_graph_stamp(ns)
     atoms = {}
+    def policy_source(key):
+        if key.type_name != 'memory.source':
+            return None
+        return current_commitment_policy_metadata_source_v3(prepared_inputs,key.token)
+    def require_metadata_revision(key,revision):
+        row=read_graph_row_v3(db,('revision',),where='token=? AND bot=? AND persona=?',
+            parameters=(key.token,*ns.as_tuple),history=False)
+        if row is None or row[0]!=revision:
+            raise ValueError('production qualified policy Source metadata changed in the held transaction')
     def load(key):
         if type(key) is not AtomKey or NamespaceId.from_key(key) != ns:
             raise ValueError("production read plan crossed the actual namespace")
@@ -322,11 +344,20 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
     for type_id in plan.fixed_type_ids:
         graph._GraphCoordinator__store._registry.spec(type_id)
         general_inventory_metadata=False
-        from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3,_GENERAL_OWNER_OPERATIONS_V1,\
+        from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3,_general_owner_metadata_mode_v1,\
             _GENERAL_OWNER_METADATA_TYPES_V1
         from .current_d07_simulation_source_read_v3 import SIMULATION_METADATA_INVENTORY_TYPES_V3,current_d07_simulation_inventory_metadata_v3
         from .current_habit_source_read_v3 import is_habit_prepared_inputs_v3,habit_metadata_inventory_v3
-        if is_habit_prepared_inputs_v3(prepared_inputs):
+        commitment_metadata=current_commitment_applicability_metadata_inventory_v3(prepared_inputs,type_id)
+        from .current_relationship_source_read_v3 import current_relationship_metadata_inventory_v3
+        relationship_metadata=current_relationship_metadata_inventory_v3(prepared_inputs,type_id)
+        if commitment_metadata is not None:
+            rows=tuple((item.key.token,item.revision)for item in commitment_metadata)
+            general_inventory_metadata=True
+        elif relationship_metadata is not None:
+            rows=tuple((item.key.token,item.revision)for item in relationship_metadata)
+            general_inventory_metadata=True
+        elif is_habit_prepared_inputs_v3(prepared_inputs):
             metadata_rows=habit_metadata_inventory_v3(prepared_inputs,type_id)
             rows=tuple((item.key.token,item.revision)for item in metadata_rows)
             general_inventory_metadata=True
@@ -336,7 +367,7 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
             rows=tuple((item.key.token,item.revision)for item in metadata_rows)
             general_inventory_metadata=True
         elif (type(prepared_inputs)is PreparedMethodDomainInputsV3
-                and prepared_inputs.owner.operation_kind in _GENERAL_OWNER_OPERATIONS_V1
+                and _general_owner_metadata_mode_v1(prepared_inputs.owner)
                 and type_id in _GENERAL_OWNER_METADATA_TYPES_V1):
             from .current_method_learning_read_v3 import require_current_general_owner_metadata_coverage_v1
             metadata_rows=require_current_general_owner_metadata_coverage_v1(prepared_inputs,type_id)
@@ -359,13 +390,14 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
         selected, complete = rows[:limits.max_query_rows], len(rows) <= limits.max_query_rows
         versions = tuple(GraphVersion(AtomKey.from_token(ref), revision) for ref, revision in selected)
         for version in versions:
-            if not general_inventory_metadata or version.key in plan.exact_keys:
+            if (not general_inventory_metadata or version.key in plan.exact_keys) and policy_source(version.key) is None:
                 load(version.key)
         continuation = None if complete else "production-query:" + canonical_digest(
             (ns, type_id, epoch.revision, selected[-1][0]))[:48]
         pages.append(ProductionQueryCoverageV1(query_epoch, type_id, versions, complete, continuation))
     for key in plan.exact_keys:
-        load(key)
+        if policy_source(key) is None:
+            load(key)
     active, seen = set(), set()
     def source_closure(ref):
         key = AtomKey.from_token(ref)
@@ -376,22 +408,48 @@ def _materialize_current_domain_read_set_v3(graph, db, *, namespace, plan,
         if ref in seen:
             return
         active.add(ref)
-        source = load(key)
-        load(access_key(*ns.as_tuple, key.owner.subject))
-        load(source_correction_head_key(ns, key.owner.subject))
-        if source.valid and source.revision > 0:
-            value = SourceRecord.from_dict(source.value)
-            if value.source_id != key.owner.subject:
-                raise ValueError("production source record and key identity differ")
-            for parent in value.parent_source_ids:
-                source_closure(source_key(*ns.as_tuple, parent).token)
+        metadata=policy_source(key)
+        if metadata is not None:
+            if metadata.source_id != key.owner.subject:
+                raise ValueError('production qualified policy Source metadata and key identity differ')
+            for parent in metadata.parent_source_ids:
+                source_closure(source_key(*ns.as_tuple,parent).token)
+        else:
+            source = load(key)
+            load(access_key(*ns.as_tuple, key.owner.subject))
+            load(source_correction_head_key(ns, key.owner.subject))
+            if source.valid and source.revision > 0:
+                value = SourceRecord.from_dict(source.value)
+                if value.source_id != key.owner.subject:
+                    raise ValueError("production source record and key identity differ")
+                for parent in value.parent_source_ids:
+                    source_closure(source_key(*ns.as_tuple, parent).token)
         active.remove(ref)
         seen.add(ref)
-    for ref in plan.source_roots:
+    body_source_roots=plan.source_roots
+    copy_metadata_versions={}
+    if type(prepared_inputs)is PreparedMethodDomainInputsV3:
+        from .current_full_persona_writer_v1 import (
+            current_full_persona_writer_base_source_roots_v1,
+            compose_current_full_persona_writer_metadata_cas_v1)
+        base=current_full_persona_writer_base_source_roots_v1(prepared_inputs.owner)
+        if base is not None:
+            if not set(base)<=set(plan.source_roots):
+                raise ValueError('full writer Body roots left its actual frozen Source union')
+            body_source_roots=base
+            copy_metadata_versions={v.key:v.revision for v in
+                compose_current_full_persona_writer_metadata_cas_v1(prepared_inputs,(),limits)}
+    for ref in body_source_roots:
         source_closure(ref)
     for original in observed_originals:
         for version in original.read_versions:
-            if load(version.key).revision != version.revision:
+            if version.key in copy_metadata_versions:
+                if copy_metadata_versions[version.key]!=version.revision:
+                    raise ValueError('independent original changed its actual full writer metadata guard')
+                require_metadata_revision(version.key,version.revision)
+            elif policy_source(version.key) is not None:
+                require_metadata_revision(version.key,version.revision)
+            elif load(version.key).revision != version.revision:
                 raise ValueError("production independently read original changed in the held transaction")
     rights = db.execute("SELECT access_epoch,delete_epoch FROM graph_authority_epochs WHERE bot=? AND persona=?", ns.as_tuple).fetchone()
     if rights != expected_rights:
@@ -426,6 +484,16 @@ def _materialize_current_domain_frame_fields_v1(graph, db, *, envelope, scope, p
     snapshot,pages,artifact_read_versions=compose_artifact_model_frame_fields_v3(prepared_inputs,snapshot,pages)
     if artifact_read_versions is not None:
         read_versions=artifact_read_versions
+    from .persona_growth_review_frame_v1 import compose_growth_review_metadata_cas_v1
+    read_versions=compose_growth_review_metadata_cas_v1(db,snapshot=snapshot,read_versions=read_versions,limits=limits)
+    from .d06_ordinary_readout_v3 import compose_life_ordinary_metadata_cas_v3
+    read_versions=compose_life_ordinary_metadata_cas_v3(db,prepared_inputs,read_versions,limits)
+    from .current_commitment_input_source_v3 import compose_current_commitment_applicability_cas_v3
+    read_versions=compose_current_commitment_applicability_cas_v3(db,read_versions,limits)
+    from .current_relationship_source_read_v3 import compose_relationship_metadata_cas_v3
+    read_versions=compose_relationship_metadata_cas_v3(db,read_versions,limits)
+    from .current_full_persona_writer_v1 import compose_current_full_persona_writer_metadata_cas_v1
+    read_versions=compose_current_full_persona_writer_metadata_cas_v1(prepared_inputs,read_versions,limits)
     inputs = tuple(sorted(set(plan.source_roots + plan.required_original_refs)))
     from .artifact_frame_control_reads_v3 import artifact_model_frame_deadline_v3,artifact_model_frame_monotonic_deadline_v3
     actual_deadline=artifact_model_frame_deadline_v3(prepared_inputs,envelope.deadline_utc)

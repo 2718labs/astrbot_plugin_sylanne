@@ -89,12 +89,19 @@ def prepare_post_c02_reply_bundle_candidate_v2(
     This function cannot establish that provenance and intentionally exposes no
     send or admission capability.
     """
+    from .d08_commitment_communication_v1 import CommitmentLiteralExpressionV1, require_live_commitment_literal_v1
+    from ..domains.d08.commitment_communication_v1 import promise_use_key_v1
+    named = type(expression) is CommitmentLiteralExpressionV1
+    named_scope = require_live_commitment_literal_v1(expression, envelope.identity) if named else None
+    from ..domains.d08.commitment_communication_v1 import CommitmentTermsCommunicationIntentV2
+    expected_sources = (named_scope.source_refs if type(named_scope) is CommitmentTermsCommunicationIntentV2
+        else (route.source_ref,))
     if (type(envelope) is not CommandEnvelope
             or type(action) is not PostC02ReplyActionCandidateV2
             or type(staged_d08) is not DomainProposal
             or type(checks) is not tuple
             or any(type(check) is not CheckReceipt for check in checks)
-            or type(expression) is not SourceReplyExpressionV1
+            or type(expression) not in (SourceReplyExpressionV1, CommitmentLiteralExpressionV1)
             or type(route) is not CurrentReplyRouteManifestV2
             or type(route_binding) is not CurrentReplyEntityRouteBindingV2
             or type(pre_frozen_grant) is not CommunicationIntentGrant
@@ -112,7 +119,7 @@ def prepare_post_c02_reply_bundle_candidate_v2(
             or identity.effect_id is None or not now_utc < envelope.deadline_utc
             or route.namespace != namespace
             or route.c02_operation_id not in envelope.causation
-            or envelope.source_qualification.source_refs != (route.source_ref,)
+            or envelope.source_qualification.source_refs != expected_sources
             or route.source_ref not in envelope.input_refs
             or envelope.authority.audience != (route.conversation_ref,)
             or envelope.authority.purpose != "expression"
@@ -124,7 +131,7 @@ def prepare_post_c02_reply_bundle_candidate_v2(
             or action.intent.identity != identity
             or action.intent.goal_ref != action.goal.goal_id
             or action.intent.schema_id != action.schema.schema_id
-            or action.intent.source_refs != (route.source_ref,)
+            or action.intent.source_refs != expected_sources
             or (route_binding.namespace, route_binding.c02_operation_id,
                 route_binding.source_ref, route_binding.platform_ref,
                 route_binding.conversation_ref, route_binding.scene_ref) != (
@@ -138,9 +145,14 @@ def prepare_post_c02_reply_bundle_candidate_v2(
             or action.communication.cancellation_epoch != 0):
         raise ValueError("staged passive reply identity or route differs")
     staged_types = [write.key.type_name for write in staged_d08.typed_writes]
-    if (len(staged_types) != 4 or set(staged_types) != {
-            "d08.goal.v1", "d08.action_intent.v1",
-            "d08.action_schema.v1", "d08.action_cancellation.v1"}):
+    expected_types = {"d08.goal.v1", "d08.action_intent.v1", "d08.action_schema.v1", "d08.action_cancellation.v1"}
+    if named:
+        from ..domains.d08.commitment_communication_v1 import USE_TYPES
+        uses = tuple(kind for kind in staged_types if kind in USE_TYPES)
+        if len(uses) != 1:
+            raise ValueError("named reply requires its one actual scoped PromiseUse")
+        expected_types.add(uses[0])
+    if len(staged_types) != len(expected_types) or set(staged_types) != expected_types:
         raise ValueError("staged D08 goal/action/schema/cancellation must be complete")
     if (type(expression.segments) is not tuple or len(expression.segments) != 1
             or not expression.claims):
@@ -154,8 +166,8 @@ def prepare_post_c02_reply_bundle_candidate_v2(
             or action.communication.segment_specs[0].segment_id != segment.segment_id
             or action.communication.segment_specs[0].effect_id != segment.effect_id
             or action.communication.segment_specs[0].payload_digest != expression.payload_digest
-            or any(claim.kind is not ClaimKind.REPORTED_CLAIM
-                   or claim.source_refs != (route.source_ref,)
+            or any(claim.kind is not (ClaimKind.INTERNAL_ACTIVITY if named else ClaimKind.REPORTED_CLAIM)
+                   or claim.source_refs != expected_sources
                    or claim.allowed_audiences != (route.conversation_ref,)
                    or claim.disclosure_ref != route.source_ref
                    for claim in expression.claims)):
@@ -249,6 +261,20 @@ def prepare_post_c02_reply_bundle_candidate_v2(
             raise ValueError("candidate graph head is already present")
     extra = tuple(GraphVersion(key, 0) for key in
                   (grant_key, batch_key, job_key, outbox_key) if key not in reads)
+    promise_write = ()
+    if named:
+        use_key = promise_use_key_v1(namespace, identity.activity_id, expression.promise_use)
+        if reads.get(use_key, 0) != 0:
+            raise ValueError("promise use requires its actual absent same-commit head")
+        if use_key not in reads:
+            extra = (*extra, GraphVersion(use_key, 0))
+        from ..domains.d01.production_operations_v1 import plain_v1
+        expected_use = GraphWrite(use_key, plain_v1(expression.promise_use),
+            (expression.scope_version.key, expression.scope.commitment.key))
+        existing_use = tuple(write for write in staged_d08.typed_writes if write.key == use_key)
+        if existing_use and existing_use != (expected_use,):
+            raise ValueError("actual provisional PromiseUse differs from final sealed literal")
+        promise_write = () if existing_use else (expected_use,)
     bundle_envelope = replace(envelope, version_guard=replace(
         envelope.version_guard,
         read_versions=envelope.version_guard.read_versions + extra))
@@ -256,7 +282,7 @@ def prepare_post_c02_reply_bundle_candidate_v2(
     d08_proposal = d08.validate(replace(
         staged_d08, envelope=bundle_envelope,
         typed_writes=staged_d08.typed_writes + (GraphWrite(
-            grant_key, json.loads(canonical_serialize(asdict(grant))),),)))
+            grant_key, json.loads(canonical_serialize(asdict(grant))),),) + promise_write))
     d09_proposal = d09.validate(DomainProposal(
         "d09", "d09.proposal.v1", d09.descriptor.request_schema_hash,
         bundle_envelope, (GraphWrite(batch_key, batch),),

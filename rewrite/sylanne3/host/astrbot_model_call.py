@@ -12,8 +12,9 @@ from .model_workflows_v4 import AdminModelWorkflowsV4
 from .model_workflows_v5 import AdminModelWorkflowsV5, is_installed_relationship_cognition_slot_v2
 from .model_workflows_v6 import AdminModelWorkflowsV6, is_installed_growth_cognition_slot_v2
 from .model_workflows_v7 import AdminModelWorkflowsV7, is_installed_growth_cognition_slot_v3, is_installed_relationship_cognition_slot_v3
-from .model_workflows_v8 import AdminModelWorkflowsV8, is_installed_growth_cognition_slot_v4, is_installed_relationship_cognition_slot_v4
-from .model_workflows_v9 import AdminModelWorkflowsV9
+from .model_workflows_v8 import AdminModelWorkflowsV8, is_installed_growth_cognition_slot_v4, is_installed_relationship_cognition_slot_v4, is_installed_general_growth_cognition_slot_v1
+from .model_workflows_v9 import AdminModelWorkflowsV9,is_installed_artifact_observation_cognition_slot_v1
+from .model_workflows_v10 import AdminModelWorkflowsV10,is_installed_ordinary_continuity_cognition_slot_v1
 from ..runtime.d11_artifact_draft_model_v1 import is_installed_artifact_draft_slot_v1
 from .authority_profile import is_installed_artifact_draft_phase_slot_v2
 
@@ -534,7 +535,7 @@ class AstrBotModelProvider:
                            or (is_installed_growth_cognition_slot_v2(installation_bundle, admin_model) or (is_installed_growth_cognition_slot_v3(installation_bundle, admin_model) or is_installed_growth_cognition_slot_v4(installation_bundle, admin_model)))
                            or is_installed_artifact_draft_slot_v1(installation_bundle,admin_model)
                            or is_installed_artifact_draft_phase_slot_v2(installation_bundle,admin_model)
-                           or (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+                           or (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                               and (admin_model is workflows.life_content
                                    or admin_model is workflows.life_numeric))))
         if not installed:
@@ -709,7 +710,7 @@ class AstrBotModelProvider:
             entry.stage = "handle_issued"
             _admissions[admission.admission_id] = admission.call_id
         d13_binding=None
-        if (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        if (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 and self._admin_model is self._installation_bundle.model_workflows.natural_generation):
             from .model_egress_executor import _bound_model_admission_v1
             current=executor._verified_start_binding_v1
@@ -790,7 +791,7 @@ class AstrBotModelProvider:
             model.provider_config_digest, model.provider_id, model.model_id, model.max_output_tokens)
         try:
             from .model_workflows_v3 import AdminModelWorkflowsV3
-            if type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+            if type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
                 from ..model_broker.contact_expression_v2 import contact_provider_messages_v2
                 return contact_provider_messages_v2(request, installation)
             return contact_provider_messages_v1(request, installation)
@@ -823,11 +824,15 @@ class AstrBotModelProvider:
                         and model is not workflows.contact_review
                         and model is not workflows.appraisal
                         and model is not workflows.d07_cognition
+                        and not is_installed_artifact_observation_cognition_slot_v1(bundle,model)
+                        and not is_installed_general_growth_cognition_slot_v1(bundle,model)
+                        and not any(is_installed_ordinary_continuity_cognition_slot_v1(bundle,model,phase)
+                            for phase in("ordinary_screen","deep_review"))
                         and not (is_installed_relationship_cognition_slot_v2(bundle, model) or (is_installed_relationship_cognition_slot_v3(bundle, model) or is_installed_relationship_cognition_slot_v4(bundle, model)))
                         and not (is_installed_growth_cognition_slot_v2(bundle, model) or (is_installed_growth_cognition_slot_v3(bundle, model) or is_installed_growth_cognition_slot_v4(bundle, model)))
                         and not is_installed_artifact_draft_slot_v1(bundle,model)
                         and not is_installed_artifact_draft_phase_slot_v2(bundle,model)
-                        and not (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+                        and not (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                                  and (model is workflows.life_content
                                       or model is workflows.life_numeric)))
                     or type(policy) is not AdminInstallationPolicy
@@ -883,10 +888,30 @@ class AstrBotModelProvider:
                         or type(authority.worker_fence) is not int or authority.worker_fence<1):return False
                 artifact_draft_provider_messages_v1(request)
                 return True
-            if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and model is workflows.life_numeric:
+            if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and model is workflows.life_numeric:
                 return self._life_numeric_messages(request) is not None
-            if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and model is workflows.life_content:
+            if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and model is workflows.life_content:
                 return self._life_messages(request) is not None
+            if is_installed_general_growth_cognition_slot_v1(bundle,model):
+                from ..model_broker.general_growth_cognition_v1 import (
+                    TEMPLATE_VERSION as GENERAL_TEMPLATE_VERSION,TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST,
+                    general_growth_cognition_messages_v1)
+                return(request.identity.phase=="d07.cognition"and type(authority.worker_fence)is int
+                    and authority.worker_fence>=1 and model.template_version==GENERAL_TEMPLATE_VERSION
+                    and request.prompt_template_digest==GENERAL_TEMPLATE_DIGEST
+                    and general_growth_cognition_messages_v1(request)is not None)
+            ordinary_phases=tuple(phase for phase in("ordinary_screen","deep_review")
+                if is_installed_ordinary_continuity_cognition_slot_v1(bundle,model,phase))
+            if ordinary_phases:
+                from ..model_broker.ordinary_continuity_cognition_v1 import (
+                    ordinary_continuity_template_v1,ordinary_continuity_template_digest_v1,
+                    ordinary_continuity_cognition_messages_v1)
+                phase=ordinary_phases[0]
+                return(len(ordinary_phases)==1 and request.identity.phase=="d07.cognition"
+                    and type(authority.worker_fence)is int and authority.worker_fence>=1
+                    and model.template_version==ordinary_continuity_template_v1(phase)[0]
+                    and request.prompt_template_digest==ordinary_continuity_template_digest_v1(phase)
+                    and ordinary_continuity_cognition_messages_v1(request)is not None)
             if model is workflows.encode:
                 from ..model_broker.first_ingress_encoding import encoding_template_digest_v1, ENCODING_TEMPLATE_VERSIONS
                 return (type(encoding) is AdminIngressEncodingPolicy
@@ -946,7 +971,7 @@ class AstrBotModelProvider:
                     GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                     REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                     REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
-                if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+                if type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
                     from ..model_broker.contact_expression_v2 import (
                         GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                         REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
@@ -964,7 +989,7 @@ class AstrBotModelProvider:
                         and model.template_version == APPRAISAL_TEMPLATE_VERSION
                         and request.prompt_template_digest == APPRAISAL_TEMPLATE_DIGEST
                         and _appraisal_messages(request) is not None)
-            if (model is workflows.d07_cognition or (is_installed_relationship_cognition_slot_v2(bundle, model) or (is_installed_relationship_cognition_slot_v3(bundle, model) or is_installed_relationship_cognition_slot_v4(bundle, model)))
+            if (model is workflows.d07_cognition or is_installed_artifact_observation_cognition_slot_v1(bundle,model) or (is_installed_relationship_cognition_slot_v2(bundle, model) or (is_installed_relationship_cognition_slot_v3(bundle, model) or is_installed_relationship_cognition_slot_v4(bundle, model)))
                     or (is_installed_growth_cognition_slot_v2(bundle, model) or (is_installed_growth_cognition_slot_v3(bundle, model) or is_installed_growth_cognition_slot_v4(bundle, model)))):
                 return (request.identity.phase == "d07.cognition"
                         and type(authority.worker_fence) is int and authority.worker_fence >= 1
@@ -1034,10 +1059,10 @@ class AstrBotModelProvider:
             return self._context.get_provider_by_id(self._descriptor.provider_id)
         if is_installed_artifact_draft_slot_v1(self._installation_bundle,self._admin_model):
             return self._context.get_provider_by_id(self._descriptor.provider_id)
-        if (type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        if (type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 and any(self._admin_model is getattr(workflows, slot, None)
                         for slot in ("encode", "appraisal", "d07_cognition", "d07_relationship_cognition", "growth_cognition",
-                                     "general_growth_cognition", "artifact_observation_cognition", "life_content", "life_numeric"))):
+                                     "general_growth_cognition", "artifact_observation_cognition", "ordinary_continuity_screen", "ordinary_continuity_deep", "life_content", "life_numeric"))):
             return self._context.get_provider_by_id(self._descriptor.provider_id)
         async_selector = getattr(self._context, "get_using_provider_async", None)
         if callable(async_selector):
@@ -1115,10 +1140,10 @@ class AstrBotModelProvider:
         elif is_installed_artifact_draft_slot_v1(self._installation_bundle,self._admin_model):
             from ..model_broker.artifact_draft_v1 import artifact_draft_provider_messages_v1
             messages=artifact_draft_provider_messages_v1(request)
-        elif (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        elif (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 and self._admin_model is self._installation_bundle.model_workflows.life_content):
             messages = self._life_messages(request)
-        elif (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        elif (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 and self._admin_model is self._installation_bundle.model_workflows.life_numeric):
             messages = self._life_numeric_messages(request)
         elif (type(self._admin_model) is AdminModelWorkflowV2
@@ -1137,8 +1162,16 @@ class AstrBotModelProvider:
         elif (type(self._admin_model) is AdminModelWorkflowV2
               and self._admin_model is self._installation_bundle.model_workflows.appraisal):
             messages = _appraisal_messages(request)
+        elif is_installed_general_growth_cognition_slot_v1(self._installation_bundle,self._admin_model):
+            from ..model_broker.general_growth_cognition_v1 import general_growth_cognition_messages_v1
+            messages=general_growth_cognition_messages_v1(request)
+        elif any(is_installed_ordinary_continuity_cognition_slot_v1(self._installation_bundle,self._admin_model,phase)
+                for phase in("ordinary_screen","deep_review")):
+            from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_cognition_messages_v1
+            messages=ordinary_continuity_cognition_messages_v1(request)
         elif (type(self._admin_model) is AdminModelWorkflowV2
               and (self._admin_model is self._installation_bundle.model_workflows.d07_cognition
+                   or is_installed_artifact_observation_cognition_slot_v1(self._installation_bundle,self._admin_model)
                    or (is_installed_relationship_cognition_slot_v2(self._installation_bundle, self._admin_model) or (is_installed_relationship_cognition_slot_v3(self._installation_bundle, self._admin_model) or is_installed_relationship_cognition_slot_v4(self._installation_bundle, self._admin_model)))
                    or (is_installed_growth_cognition_slot_v2(self._installation_bundle, self._admin_model) or (is_installed_growth_cognition_slot_v3(self._installation_bundle, self._admin_model) or is_installed_growth_cognition_slot_v4(self._installation_bundle, self._admin_model))))):
             messages = d07_cognition_messages_v1(request)
@@ -1159,7 +1192,7 @@ class AstrBotModelProvider:
             client = selected_client.with_options(
                 max_retries=0, timeout=request.timeout_seconds,
             )
-            if (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+            if (type(self._installation_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                     and self._admin_model is self._installation_bundle.model_workflows.natural_generation):
                 from ..model_broker.d13_provider_http_template_v1 import D13ProviderHTTPTemplateV1
                 policy=self._installation_bundle.d13_wire_policy

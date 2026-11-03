@@ -13,7 +13,7 @@ import math
 from typing import Mapping
 
 from ..domains.d13.precompression import (
-    COMPILER_VERSION, D13CurrentPaidModelVerifierV2, PrecompressionPlan,
+    COMPILER_VERSION, D13CurrentMainPressureV2, D13CurrentPaidModelVerifierV2, PrecompressionPlan,
     accept_verified_model_candidate_v2, adopt_candidate,
     decide_activation, plan_precompression,
 )
@@ -159,14 +159,27 @@ def prepare_paid_precompression_intent_v1(
     parent_budget_lease_ref: str, resource_ref: str,
     ceiling: Mapping[str, int], deadline_utc: float,
     exact_count: D13ExactTokenCountV1 | None = None,
+    pressure: D13CurrentMainPressureV2 | None = None,
+    _prepared_deterministic_v3=None,
 ) -> D13PaidPrecompressionIntentV1 | None:
     """Plan the main-model call under a separate paid lease and model ceiling."""
     if type(selected_main) is not D13PrecompressionInstallationV1:
         raise TypeError("installed selected main model required")
-    plan = plan_precompression(
-        window, history_token_budget, background_capacity=background_capacity,
-        outstanding_candidate=outstanding_candidate,
-        attempted_input_digests=attempted_input_digests)
+    if _prepared_deterministic_v3 is None:
+        plan = plan_precompression(
+            window, history_token_budget, background_capacity=background_capacity,
+            outstanding_candidate=outstanding_candidate,
+            attempted_input_digests=attempted_input_digests, pressure=pressure)
+    else:
+        from .d13_deterministic_applicability_v3 import require_d13_deterministic_compiler_applicability_v3
+        actual = require_d13_deterministic_compiler_applicability_v3(
+            _prepared_deterministic_v3, window, _prepared_deterministic_v3.plan)
+        if history_token_budget != actual.policy.history_token_budget:
+            raise ValueError("D13 paid history policy differs from the exact deterministic prefix")
+        plan = actual.plan
+        if (not background_capacity or outstanding_candidate or plan is None
+                or plan.input_digest in attempted_input_digests):
+            return None
     if plan is None:
         return None
     if (type(deadline_utc) not in (int, float) or
@@ -316,17 +329,32 @@ def prepare_precompression_intent_v1(
     background_capacity: bool, outstanding_candidate: bool,
     attempted_input_digests: frozenset[str], parent_budget_lease_ref: str,
     resource_ref: str, ceiling: Mapping[str, int], deadline_utc: float,
+    pressure: D13CurrentMainPressureV2 | None = None,
+    _prepared_deterministic_v3=None,
 ) -> D13PrecompressionIntentV1 | None:
     """Pure plan. D11 must supply current quota, attempts and signed profile.
 
     No reservation or job exists until an installed coordinator accepts this
     exact identity in its graph transaction.
     """
-    plan = plan_precompression(
-        window, history_token_budget, background_capacity=background_capacity,
-        outstanding_candidate=outstanding_candidate,
-        attempted_input_digests=attempted_input_digests,
-    )
+    if _prepared_deterministic_v3 is None:
+        plan = plan_precompression(
+            window, history_token_budget, background_capacity=background_capacity,
+            outstanding_candidate=outstanding_candidate,
+            attempted_input_digests=attempted_input_digests, pressure=pressure,
+        )
+    else:
+        from .d13_deterministic_applicability_v3 import (
+            require_d13_deterministic_compiler_applicability_v3,
+        )
+        actual = require_d13_deterministic_compiler_applicability_v3(
+            _prepared_deterministic_v3, window, _prepared_deterministic_v3.plan)
+        if history_token_budget != actual.policy.history_token_budget:
+            raise ValueError("deterministic prepared plan changed its installed history budget")
+        plan = actual.plan
+        if (not background_capacity or outstanding_candidate or plan is None
+                or plan.input_digest in attempted_input_digests):
+            return None
     if plan is None:
         return None
     if (type(deadline_utc) not in (int, float) or
@@ -413,12 +441,14 @@ def prepare_standby_v1(
     job: PersistentJob, *, holder: str, fence: int, now_utc: float,
     plan: PrecompressionPlan, candidate: CompressedTurnBlockV2,
     current_window: ConversationWindowProjectionV1,
+    _prepared_deterministic_v3=None,
 ) -> CompressedTurnBlockV2:
     """Pure worker result check. D11 must atomically CAS/save the returned block."""
     _require_live_worker_v1(job, holder=holder, fence=fence,
                             now_utc=now_utc, plan=plan,
                             current_window=current_window)
-    return adopt_candidate(candidate, plan, current_window, job_fence_valid=True)
+    return adopt_candidate(candidate, plan, current_window, job_fence_valid=True,
+        _prepared_deterministic_v3=_prepared_deterministic_v3)
 
 
 def _require_live_worker_v1(
@@ -651,10 +681,12 @@ def prepare_adoption_intent_v1(
     job: PersistentJob, *, holder: str, fence: int, now_utc: float,
     plan: PrecompressionPlan, candidate: CompressedTurnBlockV2,
     current_window: ConversationWindowProjectionV1,
+    _prepared_deterministic_v3=None,
 ) -> D13CacheTransitionIntentV1:
     standby = prepare_standby_v1(
         job, holder=holder, fence=fence, now_utc=now_utc,
-        plan=plan, candidate=candidate, current_window=current_window)
+        plan=plan, candidate=candidate, current_window=current_window,
+        _prepared_deterministic_v3=_prepared_deterministic_v3)
     return _transition_intent("adopt", current_window, standby,
                               expected_cache_revision=None,
                               worker_fence=fence, reason="candidate_validated")
@@ -748,51 +780,7 @@ def submit_cache_transition_v1(
     return receipt
 
 
-@dataclass(frozen=True, slots=True)
-class D13CallUsageV1:
-    """One trusted D11 receipt's measured dimensions; unknown stays unknown."""
 
-    input_tokens: int
-    output_tokens: int
-    cached_input_tokens: int | None
-    billed_microusd: int | None
-
-    def __post_init__(self) -> None:
-        if (type(self.input_tokens) is not int or self.input_tokens < 0 or
-                type(self.output_tokens) is not int or self.output_tokens < 0 or
-                self.cached_input_tokens is not None and
-                (type(self.cached_input_tokens) is not int or
-                 not 0 <= self.cached_input_tokens <= self.input_tokens) or
-                self.billed_microusd is not None and
-                (type(self.billed_microusd) is not int or self.billed_microusd < 0)):
-            raise ValueError("invalid D13 measured usage")
-
-
-@dataclass(frozen=True, slots=True)
-class D13DualLedgerV1:
-    foreground_window_tokens: int
-    foreground_cached_tokens: int | None
-    total_billed_microusd: int | None
-    unused_candidate_cost_microusd: int | None
-
-
-def combine_usage_v1(
-    foreground: D13CallUsageV1, background: D13CallUsageV1 | None,
-    *, candidate_used: bool,
-) -> D13DualLedgerV1:
-    """Cached tokens occupy the window and are never added to input twice."""
-    if type(foreground) is not D13CallUsageV1 or (
-            background is not None and type(background) is not D13CallUsageV1) or (
-            type(candidate_used) is not bool):
-        raise TypeError("trusted typed call usage required")
-    total = (foreground.billed_microusd + background.billed_microusd
-             if background is not None and foreground.billed_microusd is not None
-             and background.billed_microusd is not None else
-             foreground.billed_microusd if background is None else None)
-    unused = (background.billed_microusd if background is not None and
-              not candidate_used else None)
-    return D13DualLedgerV1(foreground.input_tokens,
-                           foreground.cached_input_tokens, total, unused)
 
 
 @dataclass(frozen=True, slots=True)
@@ -892,7 +880,7 @@ __all__ = (
     "prepare_precompression_intent_v1", "submit_precompression_intent_v1",
     "prepare_standby_v1", "D13ActivationCheckV1", "check_activation_v1",
     "prepare_model_standby_candidate_v2",
-    "retirement_due_v1", "D13CallUsageV1", "D13DualLedgerV1", "combine_usage_v1",
+    "retirement_due_v1",
     "D13CacheTransitionIntentV1", "D13CacheCommitReceiptV1",
     "prepare_adoption_intent_v1", "prepare_activation_intent_v1",
     "prepare_model_adoption_intent_v2",

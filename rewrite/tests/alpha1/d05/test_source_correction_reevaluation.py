@@ -8,6 +8,7 @@ import pytest
 from sylanne3.domains.d05 import (
     BoundaryRule, RelationshipContribution, compile_d05_source_reevaluation,
 )
+from sylanne3.domains.d05.relationship import CONTRIBUTION_KINDS_V2
 from sylanne3.domains.d06 import source_correction_head_key
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner
 from sylanne3.memory_types import SourceRecord, interpretation_key, source_key
@@ -39,9 +40,12 @@ def _snapshot(effect="deny"):
         None, effect, "counterparty_explicit", (OLD.token,), (), (), 1.0,
         None, 1, "entity:bob", (), "active",
     )
+    # Stored contributions are written only in the explicit v2 wire shape (the
+    # v1 dataclass defaults are transient key-derivation material, not a wire).
     item = RelationshipContribution(
         "persona:alice", "event:one", "entity:bob", "trust", "external_observation",
-        1, (OLD.token,),
+        1, (OLD.token,), schema_version=2,
+        kind=CONTRIBUTION_KINDS_V2["external_observation"], identity_status="resolved",
     )
     relation = Owner("relation", "bot", "alice", "entity:bob")
     rows = [

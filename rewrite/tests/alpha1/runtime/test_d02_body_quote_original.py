@@ -71,8 +71,7 @@ def test_fixed_body_quote_requires_installed_policy_and_reads_original():
     with pytest.raises(BodyQuoteUnavailable, match="absent"):
         body_authority.issue_fixed_quote_and_reservation(
             db, resource_issuer, envelope, quote, policy.policy_id,
-            policy.version, state, (), "reservation", "effect",
-        )
+            policy.version, state, (), "reservation", "effect", now_utc=100.0)
     body_authority.install_policy(db, policy)
     profile_write, state_write = body_authority.initial_writes(
         db, namespace, policy.policy_id, policy.version,
@@ -86,8 +85,7 @@ def test_fixed_body_quote_requires_installed_policy_and_reads_original():
         )
     issued = body_authority.issue_fixed_quote_and_reservation(
         db, resource_issuer, envelope, quote, policy.policy_id,
-        policy.version, state, (), "reservation", "effect",
-    )
+        policy.version, state, (), "reservation", "effect", now_utc=100.0)
     assert issued.reservation.quote_id == issued.body_quote.quote_id
     assert issued.body_quote_version == 1
     assert issued.replayed is False
@@ -104,16 +102,14 @@ def test_fixed_body_quote_requires_installed_policy_and_reads_original():
         )
     replay = body_authority.issue_fixed_quote_and_reservation(
         db, resource_issuer, envelope, quote, policy.policy_id,
-        policy.version, state, (issued.reservation,), "reservation", "effect",
-    )
+        policy.version, state, (issued.reservation,), "reservation", "effect", now_utc=100.0)
     assert replay.replayed is True
     assert replay.body_quote == issued.body_quote
     assert replay.reservation == issued.reservation
     with pytest.raises(BodyQuoteUnavailable, match="replay differs"):
         body_authority.issue_fixed_quote_and_reservation(
             db, resource_issuer, envelope, quote, policy.policy_id,
-            policy.version, state, (issued.reservation,), "reservation", "other",
-        )
+            policy.version, state, (issued.reservation,), "reservation", "other", now_utc=100.0)
     with pytest.raises(BodyQuoteUnavailable, match="binding differs"):
         body_authority.original_body_quote(
             db, issued.body_quote.quote_id,

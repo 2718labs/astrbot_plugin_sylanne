@@ -68,6 +68,91 @@ class LocalCreationCatalogue:
         self._models = model_checker
         self._budgets = budget_checker
 
+    def _current_presets(self):
+        """Read only the manifest-bound shipped catalogue; this grants no Source rights."""
+        asset = (self._root / Path(*_PRESET_PATH.split("/"))).read_bytes()
+        manifest_bytes = (self._root / "release-manifest.json").read_bytes()
+        if not hmac.compare_digest(sha256(manifest_bytes).hexdigest(), self._expected_manifest_digest):
+            return None
+        manifest = _read_json(manifest_bytes)
+        if (type(manifest) is not dict or manifest.get("schema_version") != 1
+                or manifest.get("build_mode") not in {"formal-alpha1", "snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}
+                or type(manifest.get("files")) is not list):
+            return None
+        if manifest["build_mode"] in {"snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}:
+            from ..host.installed_package import verify_installed_backend_runtime_v1
+            qualified = verify_installed_backend_runtime_v1(self._root, self._expected_manifest_digest)
+            if not qualified.verified or qualified.runtime_scope not in {"backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
+                return None
+        entries = [entry for entry in manifest["files"]
+                   if type(entry) is dict and entry.get("path") == _PRESET_PATH]
+        if (len(entries) != 1 or type(entries[0].get("bytes")) is not int
+                or entries[0]["bytes"] != len(asset)
+                or type(entries[0].get("sha256")) is not str
+                or not hmac.compare_digest(entries[0]["sha256"], sha256(asset).hexdigest())):
+            return None
+        data = _read_json(asset)
+        if (type(data) is not dict or set(data) != {"schema", "blueprints"}
+                or data["schema"] != _PRESET_SCHEMA or type(data["blueprints"]) is not list):
+            return None
+        return data["blueprints"], sha256(asset).hexdigest()
+
+
+    def _resources_from_preset(self, *, preset, namespace, blueprint_ref,
+                               model_capability_ref, budget_ref, model, budget, asset_digest):
+        """Pure assembly from this call's verified catalogue and resource metadata."""
+        if (not isinstance(model, VerifiedModelCapability)
+                or model.namespace != namespace or model.capability_ref != model_capability_ref
+                or not isinstance(budget, VerifiedBudgetLease)
+                or budget.namespace != namespace or budget.budget_ref != budget_ref):
+            return None
+        if set(preset) != {"blueprint_ref", "version", "label", "description", "blocks", "values"}:
+            return None
+        if (type(preset["version"]) is not int or preset["version"] < 1
+                or not isinstance(preset["blocks"], list) or not isinstance(preset["values"], list)):
+            return None
+        blocks = tuple(PersonaBlock(**item) for item in preset["blocks"])
+        values = tuple(ValueRule(
+            **{**item, "applies_to": tuple(item["applies_to"]),
+               "supports_candidates": tuple(item["supports_candidates"]),
+               "rejects_candidates": tuple(item["rejects_candidates"])}
+        ) for item in preset["values"])
+        return VerifiedCreationResources(
+            namespace, blueprint_ref, model_capability_ref, budget_ref,
+            preset["version"], "sha256:" + asset_digest,
+            blocks, values, model, budget)
+
+    def read_current_creation_choices(self, *, namespace, budget_ref, session, principal):
+        """Qualify once per call; never cache or move permission across requests."""
+        catalogue = self._current_presets()
+        if catalogue is None:
+            return {"choices": [], "reason_code": "creation_catalogue_unavailable"}
+        presets, asset_digest = catalogue
+        if (not 1 <= len(presets) <= 16 or any(type(row) is not dict for row in presets)
+                or len({row.get("blueprint_ref") for row in presets}) != len(presets)):
+            raise ValueError("creation catalogue is outside the finite selector contract")
+        model_reader = getattr(self._models, "read_current_creation_model_capability", None)
+        model = model_reader(namespace=namespace) if callable(model_reader) else None
+        if type(model) is not VerifiedModelCapability:
+            return {"choices": [], "reason_code": "installed_creation_model_unavailable"}
+        budget = self._budgets.resolve_current_budget_lease(
+            namespace=namespace, budget_ref=budget_ref, session=session, principal=principal)
+        choices = []
+        for row in presets:
+            if (type(row.get("label")) is not str or not 1 <= len(row["label"]) <= 80
+                    or type(row.get("description")) is not str or len(row["description"]) > 1024):
+                raise ValueError("creation catalogue metadata is invalid")
+            resources = self._resources_from_preset(
+                preset=row, namespace=namespace, blueprint_ref=row["blueprint_ref"],
+                model_capability_ref=model.capability_ref, budget_ref=budget_ref, model=model, budget=budget, asset_digest=asset_digest)
+            if resources is None:
+                return {"choices": [], "reason_code": "creation_resources_currently_unavailable"}
+            choices.append({"blueprint": resources.blueprint_ref, "label": row["label"],
+                            "description": row["description"],
+                            "model_capability_ref": resources.model_capability_ref,
+                            "budget_ref": resources.budget_ref})
+        return {"choices": choices, "reason_code": None}
+
     def resolve_current_resources(
         self,
         *,
@@ -79,33 +164,11 @@ class LocalCreationCatalogue:
         principal: OwnerPrincipalV1,
     ) -> VerifiedCreationResources | None:
         try:
-            asset = (self._root / Path(*_PRESET_PATH.split("/"))).read_bytes()
-            manifest_bytes = (self._root / "release-manifest.json").read_bytes()
-            if not hmac.compare_digest(sha256(manifest_bytes).hexdigest(), self._expected_manifest_digest):
+            catalogue = self._current_presets()
+            if catalogue is None:
                 return None
-            manifest = _read_json(manifest_bytes)
-            if (type(manifest) is not dict or manifest.get("schema_version") != 1
-                    or manifest.get("build_mode") not in {"formal-alpha1", "snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}
-                    or type(manifest.get("files")) is not list):
-                return None
-            if manifest["build_mode"] in {"snapshot-alpha1-test", "alpha2-candidate", "beta1-candidate"}:
-                from ..host.installed_package import verify_installed_backend_runtime_v1
-                qualified = verify_installed_backend_runtime_v1(self._root, self._expected_manifest_digest)
-                if not qualified.verified or qualified.runtime_scope not in {"backend-production-acceptance", "backend-local-alpha2-acceptance", "backend-beta1-server-test"}:
-                    return None
-            entries = [entry for entry in manifest["files"]
-                       if type(entry) is dict and entry.get("path") == _PRESET_PATH]
-            if (len(entries) != 1 or type(entries[0].get("bytes")) is not int
-                    or entries[0]["bytes"] != len(asset)
-                    or type(entries[0].get("sha256")) is not str
-                    or not hmac.compare_digest(entries[0]["sha256"], sha256(asset).hexdigest())):
-                return None
-            data = _read_json(asset)
-            if (not isinstance(data, dict) or set(data) != {"schema", "blueprints"}
-                    or data["schema"] != _PRESET_SCHEMA
-                    or not isinstance(data["blueprints"], list)):
-                return None
-            selected = [item for item in data["blueprints"]
+            presets, asset_digest = catalogue
+            selected = [item for item in presets
                         if isinstance(item, dict) and item.get("blueprint_ref") == blueprint_ref]
             if len(selected) != 1:
                 return None
@@ -114,31 +177,10 @@ class LocalCreationCatalogue:
             budget = self._budgets.resolve_current_budget_lease(
                 namespace=namespace, budget_ref=budget_ref,
                 session=session, principal=principal)
-            if (not isinstance(model, VerifiedModelCapability)
-                    or model.namespace != namespace
-                    or model.capability_ref != model_capability_ref
-                    or not isinstance(budget, VerifiedBudgetLease)
-                    or budget.namespace != namespace
-                    or budget.budget_ref != budget_ref):
-                return None
-            preset = selected[0]
-            if set(preset) != {"blueprint_ref", "version", "label", "description", "blocks", "values"}:
-                return None
-            if (type(preset["version"]) is not int or preset["version"] < 1
-                    or not isinstance(preset["blocks"], list)
-                    or not isinstance(preset["values"], list)):
-                return None
-            blocks = tuple(PersonaBlock(**item) for item in preset["blocks"])
-            values = tuple(ValueRule(
-                **{**item, "applies_to": tuple(item["applies_to"]),
-                   "supports_candidates": tuple(item["supports_candidates"]),
-                   "rejects_candidates": tuple(item["rejects_candidates"])}
-            ) for item in preset["values"])
-            return VerifiedCreationResources(
-                namespace, blueprint_ref, model_capability_ref, budget_ref,
-                preset["version"], "sha256:" + sha256(asset).hexdigest(),
-                blocks, values, model, budget,
-            )
+            return self._resources_from_preset(
+                preset=selected[0], namespace=namespace, blueprint_ref=blueprint_ref,
+                model_capability_ref=model_capability_ref, budget_ref=budget_ref,
+                model=model, budget=budget, asset_digest=asset_digest)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError,
                 TypeError, KeyError, AttributeError):
             return None

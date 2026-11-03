@@ -18,6 +18,7 @@ from .c09_storage_control_v1 import C09StorageControlV1,SURFACES,ROLES,canonical
 from .c09_recovery_resolver_v4 import InstalledSanitizedRecoveryResolverV4,read_recovery_bindings_v1_locked
 
 
+_HOST_GRAPH_GATES_V4=WeakSet()
 _PEER_REGISTRY_ACTIVATIONS_V3=WeakSet()
 _PEER_REGISTRY_ACTIVATION_ISSUER_V3=object()
 
@@ -73,6 +74,7 @@ class InstalledC09WriterGateV1:
         self._active = 0
         self._operation = None
         self._epoch = 0
+        self._host_graph_custodies_v4=set()
         self._workers = {}
         self._peers = {}
         self._retired_peers = []
@@ -80,6 +82,23 @@ class InstalledC09WriterGateV1:
         self._closing_continuation=None
         self._peer_registry_activation_hold_v3=None
         self._controlled_sdk_activation_v3=None
+        _HOST_GRAPH_GATES_V4.add(self)
+
+    def register_host_graph_custody_v4(self,custody):
+        from .linux_host_supervisor_v1 import _InstalledHostGraphCustodyV4
+        from ..host.c09_storage_admission_v1 import _ControlledSDKHostGraphCustodyV4
+        with self._condition:
+            if (type(custody)not in (_InstalledHostGraphCustodyV4,_ControlledSDKHostGraphCustodyV4)
+                    or custody.gate is not self or custody.closed or self._operation is not None
+                    or custody.epoch!=self._epoch):
+                raise AuthorityUnavailable('actual current Host Graph custody required')
+            self.control.lease.require_held()
+            self._host_graph_custodies_v4.add(custody)
+    def unregister_host_graph_custody_v4(self,custody):
+        with self._condition:self._host_graph_custodies_v4.discard(custody)
+    def _revoke_host_graph_custodies_v4(self):
+        for custody in tuple(self._host_graph_custodies_v4):custody.revoke_v4()
+        self._host_graph_custodies_v4.clear()
 
     @contextmanager
     def hold_peer_registry_activation_v3(self):
@@ -130,11 +149,31 @@ class InstalledC09WriterGateV1:
         self._pending_start_supervisor_v3=supervisor
 
     def require_pending_start_bootstrap_scope_v3(self,*,meter):
-        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3,RootPeerRegistryGenesisHoldV3
         from ..host.c09_controlled_sdk_bootstrap_v3 import VerifiedControlledSDKProcessCensusV3
         hold=self._pending_start_bootstrap_hold_v3
         if type(hold) is RootPeerStartCoverageHoldV3:
             hold.require_current(control=self.control,gate=self,meter=meter)
+        elif type(hold)is RootPeerRegistryGenesisHoldV3:
+            from .c09_writer_peer_activation_v3 import InstalledPeerRegistryCensusV3
+            from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+            from .c09_selected_history_v3 import _bounded
+            factory=self._installed_config_v3.c09_maintenance_factory
+            census=factory._peer_registry_census_v3;state=factory._peer_registry_preparations_v3.get(self.control)
+            if (type(census)is not InstalledPeerRegistryCensusV3 or state is None or state['gate']is not self
+                    or state['fresh']is None or census.hold is not hold or state['activation'].qualification is not census):
+                raise AuthorityUnavailable('fresh pending EOF requires its actual same-census Root genesis owner')
+            request=_require_fresh_d13_request_v3(state['fresh'],config=self._installed_config_v3)
+            if (request.consumer_mode!='production_root' or request.selected_composition.control is not self.control
+                    or census.context is not request.selected_composition.context
+                    or (census.context.stage,census.context.pointer_version,census.context.storage_generation)!=('READY',0,0)):
+                raise AuthorityUnavailable('fresh pending EOF cannot migrate historical storage or another process profile')
+            self.require_peer_registry_activation_hold_v3(state['activation_token'])
+            census.require_current(control=self.control,gate=self,meter=meter)
+            hold.require_authority_birth_observation_v4()
+            with self.control._db()as db:
+                if _bounded(db,meter).execute('SELECT admission_digest FROM c09_writer_peer_admissions_v3 LIMIT 1').fetchone()is not None:
+                    raise AuthorityUnavailable('fresh production pending EOF has actual historical business admission; migration HOLD')
         elif type(hold) is VerifiedControlledSDKProcessCensusV3:
             hold.require_current()
             scope=hold.original['selection_scope']
@@ -145,9 +184,12 @@ class InstalledC09WriterGateV1:
         return hold
 
     def resolve_pending_start_coverage_v3(self,pending):
-        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+        from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3,RootPeerRegistryGenesisHoldV3
         from .c09_process_identity_v1 import read_process_identity_v1
         hold=getattr(self,'_pending_start_bootstrap_hold_v3',None)
+        if type(hold)is RootPeerRegistryGenesisHoldV3:
+            hold.require_authority_birth_observation_v4()
+            raise AuthorityUnavailable('fresh production genesis cannot resolve historical pending starts; explicit migration HOLD')
         if pending['root_process_original']!=read_process_identity_v1(1):
             from .installed_root_lifetime_observer_v3 import (read_installed_old_root_retirement_v3,
                 VerifiedInstalledRootCohortRetirementV3)
@@ -309,6 +351,7 @@ class InstalledC09WriterGateV1:
             if self._operation not in {None,operation_id}:
                 raise AuthorityUnavailable("another actual maintenance gate is active")
             if self._operation is None:
+                self._revoke_host_graph_custodies_v4()
                 self._epoch+=1
                 self._operation=operation_id
         result=self.control.advance_writer_peer_retirement_coverage_v3(self,operation_id=operation_id)
@@ -338,6 +381,7 @@ class InstalledC09WriterGateV1:
             if self._operation not in {None,operation_id} or self._active or self._peers:
                 raise AuthorityUnavailable("prepared peer retirement cannot replace current live admission")
             if self._operation is None:
+                self._revoke_host_graph_custodies_v4()
                 self._epoch+=1
                 self._operation=operation_id
             self._peer_retirement_coverage_v3=proof
@@ -350,6 +394,7 @@ class InstalledC09WriterGateV1:
             if self._operation not in {None, operation_id}:
                 raise AuthorityUnavailable("C09 other maintenance gate active")
             if self._operation is None:
+                self._revoke_host_graph_custodies_v4()
                 self._epoch += 1
                 self._operation = operation_id
             peers = tuple(admission[4] for admission in self._peers.values())
@@ -1020,3 +1065,13 @@ def read_recovery_bindings_connection_v1(*, control, core_db, execution_reader, 
         execution_bindings=tuple(item for _,item in sorted(prior.items())),facts_digest=bundle["facts"].facts_digest)
     committed = canonical_digest(tuple(body[f.name] for f in fields(C09RecoveryBindingsV1) if f.name != "bindings_digest"))
     return C09RecoveryBindingsV1(**body,bindings_digest=committed)
+
+
+def revoke_actual_host_graph_custodies_for_instance_lease_v4(lease):
+    """Called before the exact instance lease releases its OS lock."""
+    from .c09_storage_control_v1 import InstalledC09InstanceLeaseV1
+    if type(lease)is not InstalledC09InstanceLeaseV1:
+        raise AuthorityUnavailable('actual C09 instance lease required for Host custody close')
+    for gate in tuple(_HOST_GRAPH_GATES_V4):
+        if gate.control.lease is lease:
+            with gate._condition:gate._revoke_host_graph_custodies_v4()

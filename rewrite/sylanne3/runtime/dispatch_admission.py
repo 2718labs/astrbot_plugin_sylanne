@@ -280,8 +280,7 @@ def _request_matches(admission: DispatchAdmissionV1,
     )
 
 
-def _decode_request(raw: str) -> DispatchRequest:
-    data = json.loads(raw)
+def _request_from_parsed_v3(data) -> DispatchRequest:
     if type(data) is not dict or set(data) != {field.name for field in fields(DispatchRequest)}:
         raise ValueError("invalid stored dispatch request")
     footprint = data["footprint"]
@@ -304,15 +303,22 @@ def _decode_request(raw: str) -> DispatchRequest:
     if type(data["required_check_refs"]) is not list:
         raise ValueError("invalid stored dispatch request")
     data["required_check_refs"] = tuple(data["required_check_refs"])
-    request = DispatchRequest(**data)
+    return DispatchRequest(**data)
+
+def _decode_request(raw: str) -> DispatchRequest:
+    request = _request_from_parsed_v3(json.loads(raw))
     if _stored_json(request) != raw:
         raise ValueError("stored dispatch request is not canonical")
     return request
 
 
 def load_request(db, namespace: NamespaceId,
-                 admission_ref: str) -> tuple[DispatchAdmissionReceiptV1, DispatchRequest] | None:
+                 admission_ref: str, *, prepared_admission=None) -> tuple[DispatchAdmissionReceiptV1, DispatchRequest] | None:
     """Read historical command evidence; this grants no current send authority."""
+    if prepared_admission is not None:
+        from .dispatch_admission_read_v3 import require_prepared_dispatch_admission_v3
+        proof = require_prepared_dispatch_admission_v3(prepared_admission, db, namespace, admission_ref)
+        return proof.receipt_v3(), proof.request_v3()
     receipt = load_admission(db, namespace, admission_ref)
     if receipt is None:
         return None
@@ -347,7 +353,10 @@ def _decode_check(data: object) -> CheckReceipt:
 
 
 def load_admission(db, namespace: NamespaceId,
-                   admission_ref: str) -> DispatchAdmissionReceiptV1 | None:
+                   admission_ref: str, *, prepared_admission=None) -> DispatchAdmissionReceiptV1 | None:
+    if prepared_admission is not None:
+        from .dispatch_admission_read_v3 import require_prepared_dispatch_admission_v3
+        return require_prepared_dispatch_admission_v3(prepared_admission, db, namespace, admission_ref).receipt_v3()
     if db.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_dispatch_admissions'"
     ).fetchone() is None:
@@ -360,7 +369,9 @@ def load_admission(db, namespace: NamespaceId,
     ).fetchone()
     if row is None:
         return None
-    data = json.loads(row[3])
+    return _admission_from_parsed_v3(namespace, admission_ref, row, json.loads(row[3]))
+
+def _admission_value_from_parsed_v3(data):
     if type(data) is not dict or type(data.get("check_receipts")) is not list:
         raise ValueError("invalid stored dispatch admission")
     data["check_receipts"] = tuple(_decode_check(item)
@@ -370,7 +381,11 @@ def load_admission(db, namespace: NamespaceId,
             raise ValueError("invalid stored dispatch admission read set")
         data[field] = tuple(tuple(item) if field == "graph_reads" else item
                             for item in data[field])
-    admission = DispatchAdmissionV1(**data)
+    return DispatchAdmissionV1(**data)
+
+
+def _admission_from_parsed_v3(namespace, admission_ref, row, data):
+    admission = _admission_value_from_parsed_v3(data)
     if (admission.operation_id != row[0] or admission.effect_id != row[1]
             or admission.digest != row[2]
             or namespace_of(admission) != namespace

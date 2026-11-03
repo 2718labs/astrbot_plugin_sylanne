@@ -9,6 +9,7 @@ from sylanne3.domains.d06 import (
     CandidateSet,
     CorrectionRequest,
     D06DomainAdapter,
+    D06DomainProvider,
     EncodingContext,
     ErasureRequest,
     RecallIntent,
@@ -22,7 +23,10 @@ from sylanne3.domains.d06 import (
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import GraphCandidate, GraphVersion, NamespaceEpoch, TypeRegistry
 from sylanne3.memory_retrieval import MemoryBatch, MemoryHit
-from sylanne3.memory_types import SourceRecord, access_key, register_memory_types, source_key
+from sylanne3.memory_types import SourceRecord, access_key, source_key
+from sylanne3.domains.d06.inspection_metadata_v1 import (
+    SOURCE_TYPE, inspection_key_v1,
+)
 from sylanne3.runtime_contracts import (
     AuthorityContext,
     CommandEnvelope,
@@ -313,6 +317,7 @@ class D06DomainAdapterTests(unittest.TestCase):
         admitted = self.domain.admit_source(request)
         source = source_key("bot", "persona", "source-ingress")
         access = access_key("bot", "persona", "source-ingress")
+        source_metadata = inspection_key_v1(source, 1)
         input_refs = (source.token,)
         envelope = CommandEnvelope(
             RUNTIME_SCHEMA,
@@ -326,10 +331,11 @@ class D06DomainAdapterTests(unittest.TestCase):
             ),
             AuthorityContext(
                 "host", "d06", "capability-d06", NamespaceId("bot", "persona"),
-                ("persona",), "context", ("owner",), "provider-policy-1", 1,
+                ("event",), "context", ("owner",), "provider-policy-1", 1,
             ),
             VersionGuard(
-                (GraphVersion(source, 0), GraphVersion(access, 0)),
+                (GraphVersion(source, 0), GraphVersion(access, 0),
+                 GraphVersion(source_metadata, 0)),
                 (), 4, 7, "catalogue-1", "scheme-1", "operator-1", "d06.policy.v1", (), (), (),
             ),
             admitted.qualification,
@@ -343,8 +349,12 @@ class D06DomainAdapterTests(unittest.TestCase):
 
         proposal = self.domain.compile_source_ingress(envelope, request)
 
-        self.assertEqual(tuple(write.key for write in proposal.typed_writes), (source, access))
+        self.assertEqual(tuple(write.key for write in proposal.typed_writes),
+                         (source, access, source_metadata))
         self.assertEqual(proposal.typed_writes[1].dependencies, (source,))
+        self.assertEqual(proposal.typed_writes[2].key.type_name, SOURCE_TYPE)
+        self.assertEqual(proposal.typed_writes[2].dependencies, (source,))
+        self.assertEqual(proposal.typed_writes[2].value["target_ref"], source.token)
         self.assertEqual(
             proposal.dependencies.current_invalidation,
             (GraphVersion(source, 0),),
@@ -352,7 +362,8 @@ class D06DomainAdapterTests(unittest.TestCase):
         self.assertEqual(proposal.typed_writes[1].value["status"], "active")
         self.assertEqual(proposal.required_bundle_parts, ("persistent_job", "outbox"))
         registry = TypeRegistry()
-        register_memory_types(registry)
+        for spec in D06DomainProvider.type_specs():
+            registry.register(spec)
         with tempfile.TemporaryDirectory() as directory:
             store = GraphStore(Path(directory) / "ingress.db", registry)
             try:
@@ -362,7 +373,7 @@ class D06DomainAdapterTests(unittest.TestCase):
                     proposal.typed_writes,
                 ))
                 self.assertEqual(receipt.status, "committed")
-                snapshot = store.graph_snapshot((source, access))
+                snapshot = store.graph_snapshot((source, access, source_metadata))
                 self.assertTrue(all(atom.valid for atom in snapshot.atoms))
             finally:
                 store.close()

@@ -6,6 +6,7 @@ import codecs
 import hashlib
 import json
 import math
+import sys
 from typing import Callable
 
 
@@ -660,3 +661,76 @@ class C09CanonicalJSONStreamV2:
         except Exception:
             self._failed = True
             raise
+
+
+class _CanonicalJSONValueBuilderV3:
+    """Shared retained JSON value builder; SQL/signature issuers remain separate."""
+    def _initialize_json_value_v3(self,*,incremental_retention,frozen_object_type,frozen_array_type):
+        self.nodes={};self.scalar=bytearray();self.value=None;self.source_members=[]
+        self._frozen_object_type,self._frozen_array_type=frozen_object_type,frozen_array_type
+        self._incremental_retention=incremental_retention
+        self._payload_bytes=sys.getsizeof(self.nodes)
+        self._detached_container_bytes=0
+        self.fragment=b'';self.reserved=0
+    def _json_extra_retained_bytes_v3(self):return 0
+    def _reserve(self,extra=0):
+        size=self._payload_bytes+sys.getsizeof(self.scalar)+sys.getsizeof(self.fragment)+extra+65536
+        size+=self._json_extra_retained_bytes_v3()
+        if size>self.reserved:self.operation.retain(size-self.reserved);self.reserved=size
+    def _put(self,path,value):
+        if not path:self.value=value
+        else:
+            parent=self.nodes[path[:-1]]
+            if self._incremental_retention:
+                self._reserve(2*sys.getsizeof(parent)+512)
+                before=sys.getsizeof(parent)
+            if type(parent)is list:parent.append(value)
+            else:parent[path[-1]]=value
+            if self._incremental_retention:
+                self._payload_bytes+=max(0,sys.getsizeof(parent)-before)
+                self._detached_container_bytes+=16 if type(parent)is list else 72
+    def _close_container_v3(self,path):
+        value=self.nodes[path]
+        pairs=type(value)is dict
+        # Hold the mutable storage, tuple/pairs and new immutable wrapper at once.
+        self._reserve(2*sys.getsizeof(value)+len(value)*(80 if pairs else 16)+1024)
+        items=tuple(value.items())if pairs else tuple(value)
+        frozen=self._frozen_object_type(items)if pairs else self._frozen_array_type(items)
+        self._payload_bytes+=sys.getsizeof(frozen)+sys.getsizeof(frozen.__dict__)+sys.getsizeof(items)
+        if pairs:self._payload_bytes+=len(items)*sys.getsizeof((None,None))
+        if path:
+            parent=self.nodes[path[:-1]]
+            parent[path[-1]]=frozen
+        else:self.value=frozen
+        del self.nodes[path]
+        self._payload_bytes-=sys.getsizeof(value)+sys.getsizeof(path)+(sys.getsizeof(path[-1])if path and type(path[-1])is int else 0)
+    def _emit(self,event):
+        if event.kind=='key' and self._incremental_retention:
+            # Canonical object keys are emitted once and retained by their parent.
+            self._reserve(sys.getsizeof(event.key))
+            self._payload_bytes+=sys.getsizeof(event.key)
+        elif event.kind in ('object_start','array_start'):
+            if self._incremental_retention:
+                path_bytes=sys.getsizeof(event.path)+(sys.getsizeof(event.path[-1])if event.path and type(event.path[-1])is int else 0)
+                # Reserve both the node-map resize and the new path/container
+                # before insertion. Parent growth is reserved independently.
+                self._reserve(2*sys.getsizeof(self.nodes)+path_bytes+1024)
+                before=sys.getsizeof(self.nodes)
+            else:self._reserve(1024)
+            value={}if event.kind=='object_start'else[]
+            self.nodes[event.path]=value
+            if self._incremental_retention:
+                self._payload_bytes+=path_bytes+sys.getsizeof(value)+max(0,sys.getsizeof(self.nodes)-before)
+                self._detached_container_bytes+=256 if type(value)is dict else 64
+            self._put(event.path,value)
+        elif event.kind in ('object_end','array_end')and self._incremental_retention:
+            self._close_container_v3(event.path)
+        elif event.kind=='scalar_start':self.scalar=bytearray()
+        elif event.kind=='scalar_chunk':
+            self._reserve(len(event.raw)*4+1024+(2*sys.getsizeof(self.scalar)if self._incremental_retention else 0))
+            self.scalar.extend(event.raw)
+        elif event.kind=='scalar_end':
+            self._reserve(len(self.scalar)*4+1024)
+            value=json.loads(self.scalar)
+            if self._incremental_retention:self._payload_bytes+=sys.getsizeof(value)
+            self.scalar=bytearray();self._put(event.path,value)

@@ -208,3 +208,178 @@ def test_constructed_life_bridge_has_no_private_issuance(tmp_path):
         assert store._db.total_changes == changes
     finally:
         store.close()
+
+
+def _life_job_serialization_case_v1(tmp_path):
+    """Unsigned data-only vector; no Source permission, job admission or native run."""
+    from types import SimpleNamespace
+    from sylanne3.graph_types import GraphAtom, GraphSnapshot, NamespaceEpoch
+    from sylanne3.runtime_contracts import (AuthorityContext, CommandEnvelope, OperationIdentity,
+        VersionGuard, SourceQualification, RUNTIME_SCHEMA, canonical_digest)
+    from sylanne3.runtime.jobs import PersistentJob
+    from sylanne3.runtime.d11_types import job_graph_write
+    from sylanne3.runtime.d04_current_joint_replay_input_v2 import D04CurrentJointReplayInputV2
+    from sylanne3.runtime.d04_joint_product_assembly_v3 import D04JointProductPreparationV3
+    from sylanne3.runtime.d04_semantic_mapping_v3 import D04JointEvidenceInputsV3, joint_evidence_field_v3
+    from sylanne3.runtime.d04_appraisal_driver_v3 import graph_read_rows_v3
+    store, ns, scheme, root, _, _ = _component(tmp_path)
+    try:
+        component = _read(store, ns, scheme, root)
+        atoms = []
+        for version in component.read_versions:
+            row = store._db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',
+                (version.key.token,)).fetchone()
+            if version.revision == 0:
+                assert row is None
+                atoms.append(GraphAtom(version.key, 0, {}, False))
+            else:
+                assert row[0] == version.revision
+                atoms.append(GraphAtom(version.key, row[0], json.loads(row[1]), bool(row[2])))
+    finally:
+        store.close()
+    job = PersistentJob('serial-job', 'serial-op', 'serial-activity', None, *ns.as_tuple,
+        'serial-input', 'running', 'd04.joint_numeric', {}, None, '2030-01-01T00:00:00Z',
+        'serial-budget', 'serial-cpu', {}, 'serial-worker', '2030-01-01T00:00:00Z', 1, 0, {}, None)
+    key = job_graph_write(job).key
+    snapshot = GraphSnapshot(tuple(sorted((*atoms, GraphAtom(key, 0, {}, False)), key=lambda a:a.key.token)),
+        (NamespaceEpoch(*ns.as_tuple, 1),))
+    identity = OperationIdentity(job.activity_id, None, job.operation_id, 'joint_advance',
+        job.operation_id, canonical_digest({'input_refs': []}))
+    envelope = CommandEnvelope(RUNTIME_SCHEMA, identity,
+        AuthorityContext('serial-actor', 'd04', 'serial-capability', ns, ('persona',),
+            'context', ('owner',), 'serial-policy', 1, 1),
+        VersionGuard(snapshot.versions, (component.query_epoch,), 0, 0, component.catalogue_hash,
+            'serial-scheme', 'serial-operator', 'serial-policy', (), (), ()),
+        SourceQualification((), 'derived', None, 0.0, 'inference', 'ineligible', None, 'not_applicable'),
+        (), job.budget_ref, 1000.0, 250.0, 'serial-interval', ())
+    preparation = D04JointProductPreparationV3(envelope,
+        D04CurrentJointReplayInputV2(component, (), (), ()), None, snapshot)
+    rows = graph_read_rows_v3(snapshot, snapshot.versions)
+    stamp = {'namespace': asdict(ns), 'graph_revision': component.graph_revision,
+        'query_epoch': asdict(component.query_epoch), 'graph_incarnation': component.graph_incarnation}
+    fields = {'read_versions_digest': {'versions': [{'ref':r.ref,'revision':r.revision} for r in rows]},
+        'snapshot_stamp_digest': stamp,
+        'closure_digest': {'snapshot_stamp': stamp, 'numeric_scan_rows': ['unchanged-current-numeric']},
+        'absent_reads_digest': {'absent_rows': [asdict(r) for r in rows if r.revision == 0],
+            'negative_numeric_inventory': {'complete': True}},
+        'source_closure_digest': {'unmodified_binary64': 0.1}}
+    evidence = D04JointEvidenceInputsV3(ns, component.candidate_digest, component.checkpoint_refs,
+        tuple((name, canonical_json(joint_evidence_field_v3(name, value)[0]))
+            for name, value in sorted(fields.items())), rows, None)
+    return preparation, evidence, job, SimpleNamespace(graph_revision=2), NamespaceEpoch(*ns.as_tuple, 2)
+
+
+@pytest.mark.parametrize('job_is_component_dependency', (False, True))
+def test_life_job_rebinding_changes_only_actual_job_and_stamp_data(tmp_path, job_is_component_dependency):
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import _rebase_life_joint_job_input_v1
+    from sylanne3.runtime.d11_types import job_graph_write
+    from sylanne3.runtime_contracts import canonical_digest
+    preparation, evidence, job, metadata, epoch = _life_job_serialization_case_v1(tmp_path)
+    key = job_graph_write(job).key
+    if job_is_component_dependency:
+        from sylanne3.runtime.joint_numeric_component import joint_numeric_component_digest_v1
+        prior = preparation.current.component
+        versions = tuple(sorted((*prior.read_versions, GraphVersion(key, 0)), key=lambda v:v.key.token))
+        prior = replace(prior, read_versions=versions, read_values_digest=canonical_digest(tuple(sorted(
+            (atom.key.token, atom.revision, canonical_digest(atom.value), atom.valid)
+            for atom in preparation.snapshot.atoms))))
+        prior = replace(prior, candidate_digest=joint_numeric_component_digest_v1(prior))
+        preparation = replace(preparation, current=replace(preparation.current, component=prior))
+        evidence = replace(evidence, component_digest=prior.candidate_digest)
+    before = canonical_digest((preparation, evidence))
+    updated, output = _rebase_life_joint_job_input_v1(preparation, evidence, job, metadata, epoch)
+    if job_is_component_dependency:
+        assert GraphVersion(key, 1) in updated.current.component.read_versions
+        assert GraphVersion(key, 0) not in updated.current.component.read_versions
+        assert updated.current.component.read_values_digest == canonical_digest(tuple(sorted(
+            (atom.key.token, atom.revision, canonical_digest(atom.value), atom.valid)
+            for atom in updated.snapshot.atoms)))
+    else:
+        assert updated.current.component.read_versions == preparation.current.component.read_versions
+        assert updated.current.component.read_values_digest == preparation.current.component.read_values_digest
+    key = job_graph_write(job).key
+    assert updated.snapshot.get(key).revision == 1
+    assert updated.snapshot.get(key).value == job_graph_write(job).value
+    assert all(updated.snapshot.get(atom.key) == atom for atom in preparation.snapshot.atoms if atom.key != key)
+    assert updated.current.component.query_epoch.revision == 2
+    assert updated.current.component.graph_revision == 2
+    assert updated.current.component.candidate_digest != preparation.current.component.candidate_digest
+    assert updated.envelope.version_guard.read_versions == updated.snapshot.versions
+    assert updated.envelope.version_guard.query_epochs == (updated.current.component.query_epoch,)
+    assert (updated.envelope.deadline_utc, updated.envelope.monotonic_deadline,
+        updated.envelope.parent_budget_lease_ref, updated.envelope.authority) == (
+        preparation.envelope.deadline_utc, preparation.envelope.monotonic_deadline,
+        preparation.envelope.parent_budget_lease_ref, preparation.envelope.authority)
+    assert dict(output.field_payloads)['source_closure_digest'] == dict(evidence.field_payloads)['source_closure_digest']
+    expected_absent = [asdict(row) for row in evidence.read_rows if row.revision == 0 and row.ref != key.token]
+    assert json.loads(dict(output.field_payloads)['absent_reads_digest'])['payload']['absent_rows'] == expected_absent
+    assert canonical_digest((preparation, evidence)) == before
+
+
+@pytest.mark.parametrize('invalid', ('occupied_job', 'different_read_rows'))
+def test_life_job_data_rebinding_refuses_non_original_negative_input(tmp_path, invalid):
+    from sylanne3.graph_types import GraphAtom, GraphSnapshot
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import _rebase_life_joint_job_input_v1
+    from sylanne3.runtime.d11_types import job_graph_write
+    preparation, evidence, job, metadata, epoch = _life_job_serialization_case_v1(tmp_path)
+    if invalid == 'occupied_job':
+        key = job_graph_write(job).key
+        preparation = replace(preparation, snapshot=GraphSnapshot(tuple(
+            GraphAtom(key, 1, job_graph_write(job).value, True) if atom.key == key else atom
+            for atom in preparation.snapshot.atoms), preparation.snapshot.epochs))
+    else:
+        evidence = replace(evidence, read_rows=evidence.read_rows[:-1])
+    with pytest.raises(ValueError, match='actual frozen negative read'):
+        _rebase_life_joint_job_input_v1(preparation, evidence, job, metadata, epoch)
+
+
+def test_original_reader_keeps_normal_route_without_life_write_proof():
+    """Explicit unselected SQL fixture; this is no production Source admission."""
+    import sqlite3
+    from sylanne3.runtime_contracts import NamespaceId, canonical_digest
+    from sylanne3.runtime.d04_appraisal_driver_v3 import (
+        install_d04_appraisal_schema_v3, read_d04_original_v3, record_d04_original_in_transaction_v3)
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import read_bound_life_joint_new_original_v1
+    db = sqlite3.connect(':memory:')
+    ns = NamespaceId('original-bot', 'original-persona')
+    try:
+        db.execute('BEGIN')
+        install_d04_appraisal_schema_v3(db)
+        selected = dict(table='graph_d04_originals_v3', columns=('payload_json', 'payload_digest'),
+            key_columns=('bot', 'persona', 'kind', 'original_ref'),
+            key=(*ns.as_tuple, 'numeric_prepared', 'original-operation'))
+        assert read_bound_life_joint_new_original_v1(db, **selected) == (False, None)
+        assert read_d04_original_v3(db, ns, 'numeric_prepared', 'original-operation') is None
+        payload = {'schema': 'test-only-original', 'value': 'retained'}
+        digest = record_d04_original_in_transaction_v3(db, ns, 'numeric_prepared', 'original-operation', payload)
+        assert digest == canonical_digest(payload)
+        assert read_d04_original_v3(db, ns, 'numeric_prepared', 'original-operation') == (payload, digest)
+        assert record_d04_original_in_transaction_v3(db, ns, 'numeric_prepared', 'original-operation', payload) == digest
+        with pytest.raises(ValueError, match='reused with changed payload'):
+            record_d04_original_in_transaction_v3(db, ns, 'numeric_prepared', 'original-operation', {'value': 'changed'})
+        assert read_bound_life_joint_new_original_v1(db, **selected) == (False, None)
+    finally:
+        db.rollback()
+        db.close()
+
+
+def test_life_bridge_typed_getter_rejects_unissued_bridge(tmp_path):
+    """Typed Life Source reads exist only through the private live issuance."""
+    from sylanne3.runtime.d06_life_numeric_joint_v1 import _LifeJointSourceBridgeV1
+    from sylanne3.runtime.life_numeric_source_bridge_v1 import (
+        life_joint_bridge_reader_v1, read_life_joint_bridge_atom_v1,
+        read_life_joint_bridge_rows_v1)
+    store, _namespace, _scheme, _assets, _source, root = _fixture(tmp_path)
+    unissued = _LifeJointSourceBridgeV1(object(), object(), None, None)
+    store._db.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(ValueError, match="live private issuance"):
+            life_joint_bridge_reader_v1(store._db, unissued)
+        with pytest.raises(TypeError, match="exact atom key"):
+            read_life_joint_bridge_atom_v1(store._db, unissued, root.token)
+        with pytest.raises(ValueError, match="live private issuance"):
+            read_life_joint_bridge_rows_v1(store._db, unissued, ("d04.numeric_coupling.v1",))
+        with pytest.raises(TypeError, match="exact type names"):
+            read_life_joint_bridge_rows_v1(store._db, unissued, ())
+    finally:
+        store._db.execute("ROLLBACK")

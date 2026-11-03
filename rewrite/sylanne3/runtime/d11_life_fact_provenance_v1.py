@@ -127,12 +127,21 @@ def life_fact_auxiliary_type_specs_v1():
         for kind in (PROVENANCE_TYPE,ELIGIBILITY_TYPE))
 
 
-def life_fact_provenance_v1(prepared,claim,terminal,fact):
+def life_fact_provenance_v1(prepared,claim,terminal,fact,*,adoption_inputs=None):
     from .d11_life_preparation_v1 import life_read_digest_v1
     rows=tuple(sorted((LifeFactReadCommitmentV1(row.ref,row.revision,
         life_read_digest_v1(row),row.valid) for row in prepared.read_rows),key=lambda row:row.ref))
+    if adoption_inputs is None:
+        prepared_digest=prepared.digest
+    else:
+        from .current_character_labor_adoption_v1 import (
+            PreparedCharacterLaborAdoptionV1,require_character_labor_adoption_prepared_digest_v1)
+        if type(adoption_inputs)is not PreparedCharacterLaborAdoptionV1 or adoption_inputs.prepared is not prepared:
+            raise TypeError("labor fact digest requires its actual sealed Prepared and inputs")
+        adoption_inputs._actual_v1()
+        prepared_digest=require_character_labor_adoption_prepared_digest_v1(prepared)
     return LifeFactProvenanceV1(prepared.binding,fact.key.token,1,canonical_digest(fact.value),
-        life_adoption_operation_id_v1(prepared.binding),prepared.digest,claim.original_ref,claim.claim_digest,
+        life_adoption_operation_id_v1(prepared.binding),prepared_digest,claim.original_ref,claim.claim_digest,
         terminal.original_ref,terminal.terminal_digest,rows,
         tuple(row.ref for row in rows if AtomKey.from_token(row.ref).type_name=='memory.source'))
 
@@ -179,12 +188,12 @@ def life_current_fact_reads_v1(prepared):
     return selected
 
 
-def life_fact_qualified_writes_v1(prepared,claim,terminal,facts):
+def life_fact_qualified_writes_v1(prepared,claim,terminal,facts,*,adoption_inputs=None):
     from ..domains.d01.production_operations_v1 import plain_v1
     result=[]
     for fact in facts:
         if fact.dependencies:raise ValueError('immutable Life facts retain invalidating edges')
-        proof=life_fact_provenance_v1(prepared,claim,terminal,fact)
+        proof=life_fact_provenance_v1(prepared,claim,terminal,fact,adoption_inputs=adoption_inputs)
         key=life_fact_auxiliary_key_v1(fact.key,PROVENANCE_TYPE)
         eligibility_key=life_fact_auxiliary_key_v1(fact.key,ELIGIBILITY_TYPE)
         eligibility=LifeFactEligibilityV1(fact.key.token,1,proof.fact_digest,key.token,1,

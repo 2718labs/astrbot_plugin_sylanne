@@ -343,38 +343,163 @@ async def _run_actual_current_producers_v3(case):
 
 
 def _accept_actual_current_barrier_v3(case):
+    from dataclasses import asdict, replace
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    from sylanne3.authority_service.current_erasure_service import GraphBarrierAttestationV2
+    from sylanne3.authority_service.current_accepted_erasure_wire import accepted_from_wire, accepted_to_wire
     from sylanne3.authority_service.erasure_closure_inventory import SurfaceTargetV1
     from sylanne3.authority_service.c09_storage_control_v1 import SURFACES
-    daemon=case['c09_daemon'];graph=case['graph'];control=daemon.c09_control;maintenance=daemon.c09_maintenance
+    from sylanne3.graph_coordinator import UnavailableGuard
+    from sylanne3.runtime.c09_source_plan_barrier_v2 import C09SourcePlanCaptureV2, C09GraphBarrierReceiptV2
+    from sylanne3.runtime_contracts import canonical_digest
+
+    daemon = case['c09_daemon']
+    graph, control, maintenance = case['graph'], daemon.c09_control, daemon.c09_maintenance
     assert daemon.server is case['server'] and daemon.core is case['core']
     assert maintenance._installed_deployment_config_v2 is daemon.config
-    graph.install_current_c09_source_plan_resources_v2(case['bootstrap'],maintenance._paged_capture_control_v2)
-    namespace=case['authority_namespace'];policy=case['policy'];peer=case['peer'];subject=case['client_grant'].subject
-    erasure=daemon.server._current_erasure_prepares[(namespace,policy.installation_id)]
-    operation=str(uuid4())
-    authority,lease,_=graph.grant_current_owner(case['bootstrap'],actor='owner-actor-reply',namespace=case['namespace'],
-        domains=('d06',),purpose='context',audience=case['life_audience'],activation_generation=1,
-        owner_session_token=case['owner_session_token'],owner_session_request=case['owner_session_request'])
+    capture_control = maintenance._paged_capture_control_v2
+    graph.install_current_c09_source_plan_resources_v2(case['bootstrap'], capture_control)
+    namespace, policy = case['authority_namespace'], case['policy']
+    peer, subject = case['peer'], case['client_grant'].subject
+    erasure = daemon.server._current_erasure_prepares[(namespace, policy.installation_id)]
+    # The actual installed factory owns both bindings; the test supplies neither
+    # a synthetic plan table nor an alternative verifier or storage selection.
+    assert erasure._plan_graph_verifier._source_plan_control_v2 is capture_control
+    accepted_reader = daemon.server._current_accepted_erasure_reads[(namespace, policy.installation_id)]
+    operation = str(uuid4())
+    authority, lease, _ = graph.grant_current_owner(
+        case['bootstrap'], actor='owner-actor-reply', namespace=case['namespace'],
+        domains=('d06',), purpose='context', audience=case['life_audience'],
+        activation_generation=1, owner_session_token=case['owner_session_token'],
+        owner_session_request=case['owner_session_request'])
+    plan_quanta = barrier_quanta = 0
     try:
-        plan=graph.issue_current_c09_erasure_plan_v1(authority,lease,operation_id=operation,source_ref=case['source_ref'])
-        receipt,permit=erasure.prepare_request(credential=peer,subject=subject,holder=policy.administrator_holder,
-            installation_id=policy.installation_id,owner_actor_id='owner-actor-reply',owner_session_token=case['owner_session_token'],
-            owner_session_request=case['owner_session_request'],deletion_operation_id=operation,source_id=plan.source_id)
-        graph.commit_current_c09_source_barrier_v1(case['bootstrap'],namespace=case['namespace'],deletion_operation_id=operation,permit=permit)
-        accepted,_=erasure.accept_verified_graph_barrier(credential=peer,subject=subject,pending_mutation_id=receipt.pending.mutation_id)
-    finally:graph.release_current_owner_lease(case['bootstrap'],lease)
-    current=control.read_verified_current_storage_v1();files={row['role']:Path(row['resolved_path']) for row in current.manifest['members']}
-    targets=tuple(SurfaceTargetV1(name,'sqlite_execution_journal' if name=='execution_journal_payloads' else 'installed_current_four_store',
-        str(files['execution']) if name=='execution_journal_payloads' else str(files['graph'].parent),'c09.installed.v1',
-        maintenance.closure.execution.journal_id if name=='execution_journal_payloads' else 'generation:0','installed') for name in sorted(SURFACES))
-    maintenance.closure.install_registry(credential=peer,targets=targets)
-    maintenance.closure.begin_run(credential=peer,subject=subject,accepted_mutation_id=accepted.pending.mutation_id)
-    # This process is the admitted real business peer. It cannot prepare INTENT;
-    # the next OS process must consume its signed admission and observed retirement.
-    return dict(operation_id=operation,accepted_mutation_id=accepted.pending.mutation_id,
-        cold_fixture=case['c09_cold_fixture'],source_execution_id=case['content_source_execution_id'],
-        source_execution_commitment=hashlib.sha256(case['content_source_execution_id'].encode()).hexdigest())
-
+        while True:
+            plan = graph.issue_current_c09_erasure_plan_v2(
+                authority, lease, operation_id=operation, source_ref=case['source_ref'])
+            plan_quanta += 1
+            if type(plan) is C09SourcePlanCaptureV2:
+                break
+            assert type(plan) is dict and plan['schema'] == 'sylanne3.graph.c09_source_plan_progress.v2'
+            assert plan['operation_id'] == operation
+        assert graph.read_current_c09_erasure_plan_v2(
+            authority, lease, operation_id=operation) == plan
+        assert plan.source_ref == case['source_ref'] and plan.source_page_count > 0
+        args = dict(
+            credential=peer, subject=subject, holder=policy.administrator_holder,
+            installation_id=policy.installation_id, owner_actor_id='owner-actor-reply',
+            owner_session_token=case['owner_session_token'],
+            owner_session_request=case['owner_session_request'],
+            deletion_operation_id=operation, source_id=plan.source_id)
+        with pytest.raises(AuthorityUnavailable, match='Graph plan unavailable'):
+            erasure.prepare_request(**{**args, 'source_id': 'different-source'})
+        with erasure._recovery.deletion.freeze_writes():
+            assert erasure._recovery.deletion.latest_phases().get((namespace, operation)) is None
+        receipt, permit = erasure.prepare_request(**args)
+        assert receipt.pending.request_digest != 'sha256:' + plan.request_digest
+        assert receipt.pending.evidence.issuer_id == 'authority-owner-graph-plan-v2'
+        assert receipt.pending.closure_roots == plan.root_source_ids
+        assert permit.pinned_anchor == receipt.after_anchor
+        assert erasure.prepare_request(**args) == (receipt, permit)
+        # A second real login proves replay with a current same-principal
+        # session; arbitrary strings are not described as credentials.
+        renewed_token = None
+        try:
+            challenge = case['owner_sessions'].begin_login(
+                transport_credential=peer, request=case['owner_session_request'])
+            renewed_token = case['owner_sessions'].accept_login(
+                transport_credential=peer, challenge=challenge,
+                signature=case['owner_key'].sign(challenge.signed_bytes()))
+            assert renewed_token != case['owner_session_token']
+            assert erasure.prepare_request(
+                **{**args, 'owner_session_token': renewed_token}) == (receipt, permit)
+        finally:
+            challenge = renewed_token = None
+        with pytest.raises(AuthorityUnavailable, match='replay differs'):
+            erasure.prepare_request(**{**args, 'source_id': 'different-source'})
+        read_args = dict(
+            credential=peer, subject=subject, installation_id=policy.installation_id,
+            deletion_operation_id=operation, scope_digest=receipt.pending.evidence.scope_digest)
+        with pytest.raises(AuthorityUnavailable, match='accepted'):
+            accepted_reader.read_current_accepted_erasure_v1(**read_args, permit=permit)
+        with pytest.raises(UnavailableGuard, match='current C09 Authority pending differs'):
+            erasure.accept_verified_graph_barrier(
+                credential=peer, subject=subject, pending_mutation_id=receipt.pending.mutation_id)
+        while True:
+            barrier = graph.commit_current_c09_source_barrier_v2(
+                case['bootstrap'], namespace=case['namespace'],
+                deletion_operation_id=operation, permit=permit)
+            barrier_quanta += 1
+            if type(barrier) is C09GraphBarrierReceiptV2:
+                break
+            assert type(barrier) is dict and barrier['schema'] == 'sylanne3.graph.c09_source_barrier_progress.v2'
+            assert barrier['operation_id'] == operation
+        assert barrier.plan_digest == plan.digest and barrier.affected_count == barrier.withdrawn_count
+        assert graph.read_current_c09_graph_barrier_v2(
+            case['bootstrap'], namespace=case['namespace'],
+            deletion_operation_id=operation, permit=permit) == barrier
+        assert erasure.read_graph_barrier_candidate(
+            credential=peer, subject=subject,
+            pending_mutation_id=receipt.pending.mutation_id) == GraphBarrierAttestationV2(receipt, barrier)
+        wrong_body = asdict(barrier)
+        wrong_body['request_digest'] = 'f' * 64
+        wrong_body.pop('receipt_digest')
+        wrong_barrier = replace(
+            barrier, request_digest=wrong_body['request_digest'],
+            receipt_digest=canonical_digest(wrong_body))
+        with pytest.raises(ValueError, match='complete paged Source barrier differs'):
+            GraphBarrierAttestationV2(receipt, wrong_barrier)
+        accepted, accepted_permit = erasure.accept_verified_graph_barrier(
+            credential=peer, subject=subject, pending_mutation_id=receipt.pending.mutation_id)
+        assert (accepted.pending.source_phase, accepted.pending.target_phase) == ('pending', 'accepted')
+        assert accepted.pending.evidence.issuer_id == 'authority-pinned-graph-barrier-v2'
+        assert accepted.pending.evidence.proof_digest == 'sha256:' + canonical_digest(barrier)
+        assert accepted_permit.pinned_anchor == accepted.after_anchor
+        original = accepted_reader.read_current_accepted_erasure_v1(**read_args, permit=accepted_permit)
+        assert original.pending_receipt == receipt and original.accepted_receipt == accepted
+        assert accepted_from_wire(accepted_to_wire(original)) == original
+        assert erasure.accept_verified_graph_barrier(
+            credential=peer, subject=subject,
+            pending_mutation_id=receipt.pending.mutation_id) == (accepted, accepted_permit)
+        with pytest.raises(AuthorityUnavailable):
+            accepted_reader.read_current_accepted_erasure_v1(**read_args, permit=permit)
+        for changed in (
+                {'scope_digest': 'sha256:' + '0' * 64},
+                {'deletion_operation_id': str(uuid4())},
+                {'installation_id': 'wrong-installation'}):
+            with pytest.raises(AuthorityUnavailable):
+                accepted_reader.read_current_accepted_erasure_v1(
+                    **{**read_args, **changed}, permit=accepted_permit)
+        with erasure._recovery.deletion.freeze_writes():
+            assert erasure._recovery.deletion.latest_phases()[(namespace, operation)] == 'accepted'
+    finally:
+        graph.release_current_owner_lease(case['bootstrap'], lease)
+    current = control.read_verified_current_storage_v1()
+    files = {row['role']: Path(row['resolved_path']) for row in current.manifest['members']}
+    targets = tuple(SurfaceTargetV1(
+        name, 'sqlite_execution_journal' if name == 'execution_journal_payloads' else 'installed_current_four_store',
+        str(files['execution']) if name == 'execution_journal_payloads' else str(files['graph'].parent),
+        'c09.installed.v1', maintenance.closure.execution.journal_id if name == 'execution_journal_payloads' else 'generation:0',
+        'installed') for name in sorted(SURFACES))
+    with pytest.raises(AuthorityUnavailable):
+        maintenance.closure.install_registry(credential=object(), targets=targets)
+    registry = maintenance.closure.install_registry(credential=peer, targets=targets)
+    assert registry.surfaces == tuple(sorted(SURFACES))
+    run = maintenance.closure.begin_run(
+        credential=peer, subject=subject, accepted_mutation_id=accepted.pending.mutation_id)
+    assert run.graph_barrier_receipt_digest == canonical_digest(barrier)
+    assert run.status == 'inventory_open_hold'
+    # This process is the admitted business peer. The independent next process
+    # consumes the real retirement/admission and completes current capture.
+    packet = dict(
+        operation_id=operation, accepted_mutation_id=accepted.pending.mutation_id,
+        cold_fixture=case['c09_cold_fixture'], source_execution_id=case['content_source_execution_id'],
+        source_execution_commitment=hashlib.sha256(case['content_source_execution_id'].encode()).hexdigest(),
+        source_plan_quanta=plan_quanta, source_barrier_quanta=barrier_quanta,
+        source_plan_digest=plan.digest, source_barrier_digest=canonical_digest(barrier),
+        source_barrier_page_count=barrier.page_count, source_barrier_affected_count=barrier.affected_count,
+        source_plan_schema=plan.schema, source_barrier_schema=barrier.schema)
+    return packet, original, accepted_permit
 
 async def _run_current_business_v3(root,installed_root,setup_file):
     from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
@@ -385,7 +510,21 @@ async def _run_current_business_v3(root,installed_root,setup_file):
     async def completed(case):
         nonlocal result
         producers=await _run_actual_current_producers_v3(case)
-        accepted=await asyncio.to_thread(_accept_actual_current_barrier_v3,case)
+        accepted, original, permit = await asyncio.to_thread(_accept_actual_current_barrier_v3, case)
+        try:
+            client = case['authority_client']
+            read_args = dict(deletion_operation_id=accepted['operation_id'],
+                scope_digest=original.scope_digest, permit=permit)
+            current = await client.current_accepted_erasure_v1(
+                case['installed_bundle'], case['client_grant'], **read_args)
+            assert current == original
+            with pytest.raises(RuntimeError, match='unavailable'):
+                await client.current_accepted_erasure_v1(
+                    case['installed_bundle'], case['client_grant'],
+                    **{**read_args, 'scope_digest': 'sha256:' + '0' * 64})
+            accepted['accepted_rpc_original_verified'] = True
+        finally:
+            current = original = permit = None
         result=dict(phase='business_current_v3',pid=os.getpid(),producers=producers,**accepted)
     await run_installed_life_content_fullchain_v1(installation.data_dir,installed_root,after_completed=completed,
         enable_c09_maintenance=True,terminal_after_completed=True,c09_protected_root=Path(root)/'protected',
@@ -463,6 +602,11 @@ def test_installed_completed_life_segmented_four_role_current_v3(tmp_path,instal
         assert result['operation_id']==operation
         outcomes.append(result);receipts.append(receipt)
     business,switched,released,cold=outcomes
+    assert business['source_plan_schema'] == 'sylanne3.graph.c09_source_plan_capture.v2'
+    assert business['source_barrier_schema'] == 'sylanne3.graph.c09_erasure_barrier.v2'
+    assert business['source_plan_quanta'] > 0 and business['source_barrier_quanta'] > 0
+    assert business['source_barrier_page_count'] > 0 and business['source_barrier_affected_count'] > 0
+    assert business['accepted_rpc_original_verified'] is True
     assert len({item['pid'] for item in outcomes})==4
     assert switched['restart_required'] is True and switched['execution_count']>0 and switched['model_count']>0
     assert switched['prepared_digest']==released['prepared_digest']==cold['prepared_digest']

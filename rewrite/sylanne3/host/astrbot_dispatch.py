@@ -92,6 +92,47 @@ class GraphTextPayloadResolver:
         )
 
 
+def resolved_natural_text_payload_v3(request, result, *, operation=None):
+    """Validate and encode the actual already-qualified Natural segment once."""
+    if (type(result) is not tuple or len(result) != 2
+            or type(result[0]) is not GraphDispatchTextSegmentV1
+            or type(result[1]) is not NaturalDispatchCandidateEvidenceV2):
+        raise DispatchBlocked("committed natural dispatch evidence is unavailable")
+    segment, evidence = result
+    try:
+        payload_ref = natural_dispatch_segment_payload_ref_v2(
+            evidence.batch_ref, request.segment_index)
+    except (TypeError, ValueError) as exc:
+        raise DispatchBlocked("natural batch reference is invalid") from exc
+    if (evidence.operation_id != request.operation_id
+            or evidence.effect_id != request.effect_id
+            or evidence.payload_digest != request.payload_digest
+            or request.payload_ref != payload_ref
+            or request.segment_index != 0 or request.segment_count != 1
+            or request.footprint.segment_id != evidence.segment_id
+            or not evidence.paid_review_digest
+            or evidence.generation_original_operation_id
+               == evidence.review_original_operation_id
+            or not evidence.current_read_versions
+            or segment.media_refs
+            or segment_payload_digest(
+                segment.body, segment.media_refs, segment.claim_uses,
+            ) != evidence.payload_digest):
+        raise DispatchBlocked("natural text differs from paid final candidate")
+    if operation is not None:
+        # Reserve the outgoing UTF-8 copy before allocating it. The same
+        # actual inventory lease remains held until the sender ends.
+        operation.retain(
+            4096 + 4 * len(segment.body) + 96 * len(segment.claim_uses))
+    return ResolvedTextPayload(
+        segment.body.encode("utf-8"), segment.media_refs,
+        segment.claim_uses, request.namespace,
+        segment.platform_id, segment.platform_name, segment.self_id,
+        segment.umo, segment.conversation_id, segment.scene_ref,
+    )
+
+
+
 class NaturalGraphTextPayloadResolver:
     """Adapt W01's committed V2 batch read to the existing one-shot sender.
 
@@ -99,47 +140,22 @@ class NaturalGraphTextPayloadResolver:
     decides whether this exact original effect may reach the platform.
     """
 
-    def __init__(self, coordinator, authority, lease: object) -> None:
+    def __init__(self, coordinator, authority, lease: object, *, prepared_inventory=None) -> None:
         self._coordinator = coordinator
         self._authority = authority
         self._lease = lease
+        self._prepared_inventory = prepared_inventory
 
     def resolve(self, request: DispatchRequest) -> ResolvedTextPayload:
         read = getattr(self._coordinator, "get_natural_dispatch_text_segment_v2", None)
         if not callable(read):
             raise DispatchBlocked("committed natural dispatch read is unavailable")
-        result = read(self._authority, self._lease, request)
-        if (type(result) is not tuple or len(result) != 2
-                or type(result[0]) is not GraphDispatchTextSegmentV1
-                or type(result[1]) is not NaturalDispatchCandidateEvidenceV2):
-            raise DispatchBlocked("committed natural dispatch evidence is unavailable")
-        segment, evidence = result
-        try:
-            payload_ref = natural_dispatch_segment_payload_ref_v2(
-                evidence.batch_ref, request.segment_index)
-        except (TypeError, ValueError) as exc:
-            raise DispatchBlocked("natural batch reference is invalid") from exc
-        if (evidence.operation_id != request.operation_id
-                or evidence.effect_id != request.effect_id
-                or evidence.payload_digest != request.payload_digest
-                or request.payload_ref != payload_ref
-                or request.segment_index != 0 or request.segment_count != 1
-                or request.footprint.segment_id != evidence.segment_id
-                or not evidence.paid_review_digest
-                or evidence.generation_original_operation_id
-                   == evidence.review_original_operation_id
-                or not evidence.current_read_versions
-                or segment.media_refs
-                or segment_payload_digest(
-                    segment.body, segment.media_refs, segment.claim_uses,
-                ) != evidence.payload_digest):
-            raise DispatchBlocked("natural text differs from paid final candidate")
-        return ResolvedTextPayload(
-            segment.body.encode("utf-8"), segment.media_refs,
-            segment.claim_uses, request.namespace,
-            segment.platform_id, segment.platform_name, segment.self_id,
-            segment.umo, segment.conversation_id, segment.scene_ref,
-        )
+        result = (read(self._authority, self._lease, request)
+                  if self._prepared_inventory is None else
+                  read(self._authority, self._lease, request,
+                       prepared_inventory=self._prepared_inventory))
+        operation = None if self._prepared_inventory is None else self._prepared_inventory.operation
+        return resolved_natural_text_payload_v3(request, result, operation=operation)
 
 
 class AstrBotTextPlatformCapability:

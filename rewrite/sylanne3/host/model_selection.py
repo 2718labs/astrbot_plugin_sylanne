@@ -26,6 +26,7 @@ from .model_workflows_v6 import AdminModelWorkflowsV6
 from .model_workflows_v7 import AdminModelWorkflowsV7
 from .model_workflows_v8 import AdminModelWorkflowsV8
 from .model_workflows_v9 import AdminModelWorkflowsV9
+from .model_workflows_v10 import AdminModelWorkflowsV10
 from .mtls_transport import AuthorityTlsProfile
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime_contracts import canonical_digest
@@ -93,7 +94,7 @@ def _installed_reason(plan, bundle):
             or bundle.tls_profile.profile_id != plan.authority_profile):
         return "model_awaiting_installation"
     workflows = bundle.model_workflows
-    if type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+    if type(workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
         # The installed reply slot defines the main model. Optional generation,
         # review, cognition and Life slots retain their independent identities.
         selected = [workflows.reply]

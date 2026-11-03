@@ -17,7 +17,8 @@ from .contract import AuthorityUnavailable, identifier
 from . import c09_authority_storage_rebase as legacy
 from .c09_originals_archive_v1 import SINGLETONS, ARCHIVE_DDL, CONTINUATION_DDL
 from .c09_d13_source_retirement_v3 import TABLE as D13_RETIREMENT_TABLE,DDL as D13_RETIREMENT_DDL,TRIGGERS as D13_RETIREMENT_TRIGGERS
-from ..runtime_contracts import canonical_digest, canonical_serialize
+from ..runtime_contracts import canonical_digest, canonical_serialize, NamespaceId
+from ..graph_types import AtomKey
 from ..runtime.c09_paged_capture_contract_v2 import C09StreamIdentityV2
 from ..runtime.c09_paged_sql_v2 import (
     C09PagedCaptureHold, C09RowTransformResultV2, C09TableShapeV2,
@@ -201,7 +202,7 @@ def scope_role(pair):
 
 class _AuthorityRowTransformV2:
     """One actual source row; all cross-row state remains indexed on disk."""
-    __slots__ = ('pair','scope','basis','facts','completion','role','origin','probe','probe_seen','source_physical_census_v3','habit_current_v1')
+    __slots__ = ('pair','scope','basis','facts','completion','role','origin','probe','probe_seen','source_physical_census_v3','habit_current_v1','fact_disposition_v3','labor_core_owner_v1')
 
     def __init__(self,pair,scope,basis):
         self.pair,self.scope,self.basis = pair,scope,basis
@@ -213,7 +214,7 @@ class _AuthorityRowTransformV2:
             scope_digest=scope.scope_digest,facts_pin_digest=basis.pin_digest,
             graph_issue_digest=basis.graph_issue_digest)
         self.role = scope_role(pair)
-        self.origin=None;self.probe=None;self.probe_seen=False;self.source_physical_census_v3=None;self.habit_current_v1=None
+        self.origin=None;self.probe=None;self.probe_seen=False;self.source_physical_census_v3=None;self.habit_current_v1=None;self.fact_disposition_v3=None;self.labor_core_owner_v1=None
 
     def _consume(self,kind,item,operation,commitment,meter):
         if self.probe==(kind,item,operation,commitment): self.probe_seen=True
@@ -309,6 +310,37 @@ class _AuthorityRowTransformV2:
         if table=='sqlite_sequence': return old,'preserved_exact'
         ns = old[columns.index('namespace')] if 'namespace' in columns else None
         commitment=lambda: legacy._row_commitment(table,columns,old)
+        if table=='authority_c09_originals_archive_v1' and old[2]=='character_labor_execution_history_v1':
+            from .c09_character_labor_execution_v1 import verify_character_labor_archive_row_v1
+            if self.labor_core_owner_v1 is None:raise C09PagedCaptureHold("actual labor archive owner missing")
+            verify_character_labor_archive_row_v1(self.labor_core_owner_v1,columns,old,source=True,meter=meter.parent)
+            return old,'preserved_exact'
+        if table=='authority_c09_originals_archive_v1' and old[2]=='observation_fact_history_v3':
+            return _fact_archive_disposition_v3(self,columns,old,meter)
+        if table=='authority_source_inspection_migrations_v1':
+            from .source_inspection_migration_v1 import COLUMNS as INSPECTION_COLUMNS,validate_source_inspection_migration_core_row_v1
+            if columns!=INSPECTION_COLUMNS:
+                raise C09PagedCaptureHold('Source inspection migration Core columns differ')
+            value=validate_source_inspection_migration_core_row_v1(columns,old,authority_namespace=namespace)
+            from .c09_platform_observation_lineage_v3 import require_inspection_core_graph_join_v3
+            require_inspection_core_graph_join_v3(self,columns,old,meter=meter)
+            if value['state']!='completed':
+                resolution=self._terminal_inspection_resolution(table,columns,old,meter)
+                if resolution is None or resolution['replaced_operation_id']!=value['operation_id']:
+                    raise C09PagedCaptureHold('pending Source inspection migration lacks its exact signed terminal replacement')
+                self._consume('source_inspection_migration_operation',value['operation_id'],value['operation_id'],commitment(),meter)
+                return None,'payload_erased_retained_facts'
+        if table=='authority_source_inspection_workflows_v1':
+            from .source_inspection_workflow_v1 import COLUMNS as WORKFLOW_COLUMNS,validate_inspection_workflow_core_row_v1
+            if columns!=WORKFLOW_COLUMNS:
+                raise C09PagedCaptureHold('Source inspection workflow Core columns differ')
+            value=validate_inspection_workflow_core_row_v1(columns,old,authority_namespace=namespace)
+            if value['state']=='held':
+                resolution=self._terminal_inspection_resolution(table,columns,old,meter)
+                if resolution is None or resolution['replaced_operation_id']!=value['operation_id']:
+                    raise C09PagedCaptureHold('held Source inspection workflow lacks its exact signed terminal replacement')
+                self._consume('source_inspection_workflow_operation',value['operation_id'],value['operation_id'],commitment(),meter)
+                return None,'payload_erased_retained_facts'
         if table=='authority_natural_disposition_originals_v1':
             from .natural_disposition_maintenance_v1 import ORIGINAL_COLUMNS,core_original_from_wire_v1
             if columns!=ORIGINAL_COLUMNS: raise C09PagedCaptureHold('natural disposition columns differ')
@@ -349,6 +381,15 @@ class _AuthorityRowTransformV2:
             from .d12_c09_core_rows_v1 import validate_d12_core_row_v1
             actual_ns,kind,item,operation=validate_d12_core_row_v1(table,columns,old)
             if actual_ns!=namespace: return old,'preserved_exact'
+            if table=='authority_d12_lifecycle_operations_v1' and old[4].startswith('d12inspectioncontrol:'):
+                from .source_inspection_workflow_v1 import validate_inspection_control_original_v1
+                control= self.basis.session._control.maintenance.control
+                native=validate_inspection_control_original_v1(old[5],authority_namespace=namespace)
+                if (old[4]!='d12inspectioncontrol:'+native['original_digest']
+                        or native['operation_id']!=old[1] or native['action']!=old[3]
+                        or old[13] not in {'paused','active'} or old[15] is not None):
+                    raise C09PagedCaptureHold('inspection native control is not its exact terminal D12 operation')
+                control.verify_original_v1(native,'original_digest')
             if table=='authority_d12_operation_originals_v1':
                 from .owner_stop_reply_v1 import PLAN_SCHEMA
                 if json.loads(old[7]).get('schema')==PLAN_SCHEMA:
@@ -476,6 +517,15 @@ class _AuthorityRowTransformV2:
         for settlement in settlements:
             if self.facts.lookup_d11(settlement,meter=meter) is None:
                 raise C09PagedCaptureHold('model settlement original absent')
+        from ..runtime.c09_life_numeric_originals_v1 import verify_numeric_life_model_fact_v1
+        verify_numeric_life_model_fact_v1(self,original,meter)
+
+    def _terminal_inspection_resolution(self,table,columns,row,meter):
+        from .c09_platform_observation_lineage_v3 import read_frozen_terminal_inspection_resolution_v3
+        actual=meter.read_one(self.pair.source,table,columns,'namespace=? AND operation_id=?',(row[0],row[1]))
+        if actual!=tuple(row):
+            raise C09PagedCaptureHold('inspection original differs from its actual frozen Core source row')
+        return read_frozen_terminal_inspection_resolution_v3(self,row[1],meter=meter)
 
     def _execution(self,shape,old,meter):
         if shape.table in {'authority_v2_execution_entries','authority_v2_execution_redacted_prefix_v4'}:
@@ -542,20 +592,34 @@ def _has_table(db,name,meter):
 
 
 def _validate_preserved_core_row(transform,table,columns,row,meter,*,shape):
+    from .d13_cache_use_control_v2 import CACHE_USE_DDLS_V2,validate_d13_cache_use_core_row_v2
+    if table in CACHE_USE_DDLS_V2:
+        return validate_d13_cache_use_core_row_v2(table,columns,row)
     if table=='authority_migration_snapshot_certificate_members_v1':
         from .migration_snapshot_certificate_members_v1 import validate_snapshot_certificate_member_row_v1
         if shape.primary_key_columns!=('namespace','transfer_id','member_key') or shape.primary_key_types!=('text','text','text'):
             raise C09PagedCaptureHold('actual migration certificate member exact PK differs')
         return validate_snapshot_certificate_member_row_v1(transform.basis.session._control.maintenance.core,columns,row)
     elif table==D13_RETIREMENT_TABLE:
-        from .c09_d13_source_retirement_v3 import COLUMNS,validate_retirement_original_v3
+        from .c09_d13_source_retirement_v3 import COLUMNS,validate_retirement_row_v3
         if columns!=COLUMNS:raise C09PagedCaptureHold('actual bodyless D13 retirement row columns differ')
-        original=validate_retirement_original_v3(transform.basis.session._control.maintenance.control,json.loads(row[7]))
-        if (row[:7]!=(original['namespace'],original['kind'],original['item_id'],original['phase'],original['counter_operation_id'],
-                original['generation_call_id'],original['retirement_digest']) or row[8:]!=(original['key_id'],original['signature'])
-                or canonical_serialize(original)!=row[7]):
-            raise C09PagedCaptureHold('actual D13 retirement row and immutable signed original differ')
-        return original
+        return validate_retirement_row_v3(transform.basis.session._control.maintenance.control,tuple(row))
+    elif table=='authority_source_inspection_migrations_v1':
+        from .source_inspection_migration_v1 import COLUMNS,DDL,validate_source_inspection_migration_core_row_v1
+        actual=meter.read_one(transform.pair.source,'sqlite_master',('sql',),'type=? AND name=?',('table',table))
+        if (tuple(columns)!=COLUMNS or shape.primary_key_columns!=('namespace','operation_id')
+                or shape.primary_key_types!=('text','text') or actual!=(DDL,)):
+            raise C09PagedCaptureHold('Source inspection migration exact Core schema differs')
+        validate_source_inspection_migration_core_row_v1(columns,row,authority_namespace=transform.scope.authority_namespace)
+    elif table=='authority_source_inspection_workflows_v1':
+        from .source_inspection_workflow_v1 import COLUMNS,DDL,validate_inspection_workflow_core_row_v1
+        actual=meter.read_one(transform.pair.source,'sqlite_master',('sql',),'type=? AND name=?',('table',table))
+        if (tuple(columns)!=COLUMNS or shape.primary_key_columns!=('namespace','operation_id')
+                or shape.primary_key_types!=('text','text') or actual!=(DDL,)):
+            raise C09PagedCaptureHold('Source inspection workflow exact Core schema differs')
+        validate_inspection_workflow_core_row_v1(columns,row,authority_namespace=transform.scope.authority_namespace)
+    elif table=='authority_platform_observation_facts_v3':
+        raise C09PagedCaptureHold('Fact requires its registered complete frozen Source/disposition path')
     elif table=='authority_natural_final_observations_v4':
         from .v2_contract import (decode_bytes,canonical_bytes,AuthorityNaturalFinalEffectObservationV4)
         expected_columns=('authority_namespace','operation_id','observation_kind','permit_digest','original_bytes','original_digest')
@@ -709,6 +773,10 @@ def _verify_schema(transform,original,meter):
         from .d13_core_counter_service_v1 import _SCHEMA as COUNTER_DDL
         from .d13_provider_http_admission_v1 import SCHEMA as HTTP_DDL
         originals={'authority_d13_counter_originals_v1':COUNTER_DDL,'authority_d13_provider_http_bindings_v1':HTTP_DDL}
+        from .d13_cache_use_control_v2 import CACHE_USE_DDLS_V2,validate_d13_cache_use_core_schema_v2
+        if table in CACHE_USE_DDLS_V2:
+            validate_d13_cache_use_core_schema_v2(original.object_type,original.name,original.sql)
+            return
         if table=='authority_natural_final_observations_v4':
             from .v2_execution_bridge import NATURAL_FINAL_OBSERVATION_DDL_MAP_V4
             expected=NATURAL_FINAL_OBSERVATION_DDL_MAP_V4.get(original.name)
@@ -792,6 +860,10 @@ def _verify_schema(transform,original,meter):
 def _target_schema_sql(transform,original):
     if transform.role=='core' and original.object_type=='table':
         from ..segmented_sql_cell_v1 import CORE_REF_DDLS_V2
+        from .c09_platform_observation_fact_storage_v3 import TABLE as FACT_TABLE,NATIVE_DDL,PHYSICAL_DDL
+        if original.name==FACT_TABLE:
+            if original.sql not in(NATIVE_DDL,PHYSICAL_DDL):raise C09PagedCaptureHold('Fact Source physical schema differs')
+            return PHYSICAL_DDL
         if original.name in CORE_REF_DDLS_V2:
             from .d13_core_counter_service_v1 import _SCHEMA as COUNTER_SOURCE_DDL
             from .d13_provider_http_admission_v1 import SCHEMA as HTTP_SOURCE_DDL
@@ -5236,9 +5308,9 @@ class _D13OutboundAdoptionReadV3(_D13PaidRowStreamV3):
         self.row_where='bot=? AND persona=? AND final_operation_id=? AND observation_digest=?';self.row_key=None
         self.source_hash=sha256();self.target_hash=sha256();self.column=0;self.offset=0;self.total=None
         self.parser=None;self.buffer=bytearray();self.values={};self.json_source_bytes={};self.original=None;self.permit=None;self.complete=False
-        self.original_hash=None;self.observed=None;self.observation_digest=None;self.operation_id=None;self.finish_digest=None;self.adoption_fence=None;self.dispatch_mutation=None;self.dispatch_stage=0;self.predecessor=None;self.handoff=None;self.graph_claim=None;self.outbox_original=None;self.batch_original=None;self.batch_payload=None;self.batch_claims=None;self.batch_manifest=None;self.batch_semantic=None;self.part_claims=None;self.paid_review_original=None;self.natural_preparation=None;self.natural_stage=0;self.natural_parent=None;self.natural_preparations={};self.natural_seal=None;self.natural_seals={};self.seal_stage=0;self.natural_frozen=None;self.natural_frozens={};self.frozen_stage=0;self.natural_message_wire=None;self.natural_message_wires={};self.message_stage=0;self.natural_prefix=None;self.natural_projection=None;self.natural_reference_facts=None;self.natural_context_parts=None;self.natural_raw_turns=None;self.natural_detail_parts=None;self.natural_stable_turns=None;self.natural_units=None;self.natural_review_basis=None;self.natural_output_conformance=None;self.natural_installed_authority=None;self.natural_plan_budget=None;self.natural_request=None;self.natural_requests={};self.natural_request_stage=0;self.natural_job=None;self.natural_jobs={};self.natural_job_stage=0;self.natural_acquire=None;self.natural_acquires={};self.natural_acquire_stage=0;self.natural_acquire_fence=None;self.natural_acquire_fences={};self.natural_model=None;self.natural_models={};self.natural_model_stage=0;self.natural_paid_output=None;self.natural_paid_outputs={};self.natural_paid_output_stage=0;self.natural_source_original=None;self.natural_qualification_original=None;self.natural_final_original=None;self.natural_final_authority_original=None;self.natural_producer_original=None;self.natural_final_historical_original=None;self.natural_source_qualified=False
+        self.original_hash=None;self.observed=None;self.observation_digest_value=None;self.refined_observation=None;self.observation_fact=None;self.observation_digest=None;self.operation_id=None;self.finish_digest=None;self.adoption_fence=None;self.dispatch_mutation=None;self.dispatch_stage=0;self.predecessor=None;self.handoff=None;self.graph_claim=None;self.outbox_original=None;self.batch_original=None;self.batch_payload=None;self.batch_claims=None;self.batch_manifest=None;self.batch_semantic=None;self.part_claims=None;self.paid_review_original=None;self.natural_preparation=None;self.natural_stage=0;self.natural_parent=None;self.natural_preparations={};self.natural_seal=None;self.natural_seals={};self.seal_stage=0;self.natural_frozen=None;self.natural_frozens={};self.frozen_stage=0;self.natural_message_wire=None;self.natural_message_wires={};self.message_stage=0;self.natural_prefix=None;self.natural_projection=None;self.natural_reference_facts=None;self.natural_context_parts=None;self.natural_raw_turns=None;self.natural_detail_parts=None;self.natural_stable_turns=None;self.natural_units=None;self.natural_review_basis=None;self.natural_output_conformance=None;self.natural_installed_authority=None;self.natural_plan_budget=None;self.natural_request=None;self.natural_requests={};self.natural_request_stage=0;self.natural_job=None;self.natural_jobs={};self.natural_job_stage=0;self.natural_acquire=None;self.natural_acquires={};self.natural_acquire_stage=0;self.natural_acquire_fence=None;self.natural_acquire_fences={};self.natural_model=None;self.natural_models={};self.natural_model_stage=0;self.natural_paid_output=None;self.natural_paid_outputs={};self.natural_paid_output_stage=0;self.natural_source_original=None;self.natural_qualification_original=None;self.natural_final_original=None;self.natural_final_authority_original=None;self.natural_producer_original=None;self.natural_final_historical_original=None;self.natural_source_qualified=False
         self.capture.parser._source_arena.add(self);self.capture.parser._require_arena()
-    def owned_values(self):return (self.turn,self.completion,self.outbox_ref,self.event,self.original,self.permit,self.observed,self.context_inventory,self.natural_preparations,self.natural_seals,self.natural_frozens,self.natural_message_wires)
+    def owned_values(self):return (self.turn,self.completion,self.outbox_ref,self.event,self.original,self.permit,self.observed,self.observation_digest_value,self.refined_observation,self.observation_fact,self.context_inventory,self.natural_preparations,self.natural_seals,self.natural_frozens,self.natural_message_wires)
     def copy(self):
         result=super().copy();result.natural_preparations=dict(self.natural_preparations);result.natural_seals=dict(self.natural_seals);result.natural_frozens=dict(self.natural_frozens);result.natural_message_wires=dict(self.natural_message_wires);result.natural_requests=dict(self.natural_requests);result.natural_jobs=dict(self.natural_jobs);result.natural_acquires=dict(self.natural_acquires);result.natural_acquire_fences=dict(self.natural_acquire_fences);result.natural_models=dict(self.natural_models);result.natural_paid_outputs=dict(self.natural_paid_outputs);return result
     def _source_json_complete(self,name,parser,eof):
@@ -5246,15 +5318,25 @@ class _D13OutboundAdoptionReadV3(_D13PaidRowStreamV3):
     def _identity(self):
         from .v2_contract import from_wire,FencePermitV2
         value=self.values['original_json'];small=self.small
-        expected={'schema','operation_id','source_ref','slot_ref','batch_ref','pre_epoch','pre_revision','permit',
+        legacy_fields={'schema','operation_id','source_ref','slot_ref','batch_ref','pre_epoch','pre_revision','permit',
             'finish_digest','graph_receipt_digest','observation_digest'}
-        if (type(value) is not dict or set(value)!=expected or value['schema']!='d13.outbound_adoption.v1'
+        latest_fields=legacy_fields|{'trusted_latest_utc','trusted_clock_digest'}
+        actual_fields=frozenset(value) if type(value) is dict else frozenset()
+        if (type(value) is not dict or actual_fields not in {frozenset(legacy_fields),frozenset(latest_fields)}
+                or value['schema']!='d13.outbound_adoption.v1'
                 or self.original_hash!=small['original_digest'] or value['source_ref']!=small['source_ref']
                 or value['slot_ref']!=small['slot_ref'] or value['batch_ref']!=small['batch_ref']
                 or value['observation_digest']!=small['observation_digest'] or value['operation_id']!=self.event[3]
                 or type(value['pre_epoch']) is not int or value['pre_epoch']+1!=self.birth_epoch
                 or type(value['pre_revision']) is not int or value['pre_revision']<0):
             raise C09PagedCaptureHold('actual outbound adoption original differs from complete row/turn/event')
+        if actual_fields==frozenset(latest_fields):
+            import math
+            clock_digest=value['trusted_clock_digest'];latest=value['trusted_latest_utc']
+            if (type(latest) not in (int,float) or not math.isfinite(latest) or latest<0
+                    or type(clock_digest) is not str or len(clock_digest)!=64
+                    or any(char not in '0123456789abcdef' for char in clock_digest)):
+                raise C09PagedCaptureHold('actual outbound adoption trusted time/clock commitment differs')
         permit=from_wire(value['permit'])
         if type(permit) is not FencePermitV2 or permit.operation!='write' or permit.operation_id!=value['operation_id']:
             raise C09PagedCaptureHold('outbound adoption original is not its actual Graph write permit')
@@ -5291,27 +5373,90 @@ class _D13OutboundAdoptionReadV3(_D13PaidRowStreamV3):
                 for item in value:visit(item)
         visit(raw);return fee
     def _observation_identity(self,meter):
-        from .v2_contract import from_wire,MutationReceiptV2,PlatformObservationV2
+        from .v2_contract import (MutationReceiptV2,PlatformObservationV1,PlatformObservationV2,
+            PendingMutationV2,decode_bytes,AuthorityV2FenceStore)
+        from .observation_refinement_contract_v3 import (from_wire,PlatformObservationRefinementReceiptV3,
+            observation_claimed_receipt_v3,observation_platform_observation_v3)
         raw=self.values['observation_json'];fee=self._constructor_encoding_bound(raw)
         meter.require_available(fee);self.capture.parser._require_arena(self.json_source_bytes['observation_json']*24+16384)
-        observed=from_wire(raw);meter.charge_encode(self._constructor_encoding_bound(raw,exact=True))
-        if (type(observed) is not MutationReceiptV2 or observed.durable_state!='committed'
-                or observed.pending.phase!='observed'
-                or type(observed.pending.platform_observation) is not PlatformObservationV2
-                or observed.pending.platform_observation.outcome!='delivered'):
-            raise C09PagedCaptureHold('actual outbound completion lacks committed V2 delivered observation')
-        observation=observed.pending.platform_observation;origin=observation.binding.origin
+        saved=from_wire(raw);meter.charge_encode(self._constructor_encoding_bound(raw,exact=True))
+        if type(saved) is MutationReceiptV2:
+            if saved.durable_state!='committed' or saved.pending.phase!='observed' or type(saved.pending.platform_observation) is not PlatformObservationV2:
+                raise C09PagedCaptureHold('actual outbound completion lacks committed V2 dispatch observation')
+            observed=saved;refined=saved.pending.platform_observation
+        elif type(saved) is PlatformObservationRefinementReceiptV3:
+            if saved.durable_state!='committed':raise C09PagedCaptureHold('actual outbound V3 observation fact is not committed')
+            effect_id=saved.pending.original_claimed_receipt.pending.permit.effect_id
+            transform=self.capture.builder.transform;core=transform.basis.session._control.maintenance.core
+            port=core._execution_recovery_facts_ports_v4.get('/'.join(self.namespace.as_tuple))
+            if port is None:raise C09PagedCaptureHold('actual C09 fact reader is absent for V3 outbound observation')
+            try:
+                port._originals(transform.scope.authority_namespace,transform.scope.operation_id)
+                entry=port.observation_refinement_fact_for_effect_v3(effect_id)
+            except AuthorityUnavailable as exc:
+                raise C09PagedCaptureHold('actual V3 outbound observation lineage is unavailable') from exc
+            if entry is None or entry[1]!=saved or entry[0]!=saved.pending or entry[2] is None:
+                raise C09PagedCaptureHold('D13 V3 observation has no exact current C09 fact-table lineage')
+            _,_,_,source_fact,predecessor_row,_=entry
+            fact_row=source_fact
+            if fact_row is None or tuple(fact_row[0:5])!=(saved.pending.fact_write_permit.namespace,
+                    saved.pending.fact_write_permit.operation_id,saved.pending.mutation_id,
+                    saved.pending.fact_write_permit.subject,saved.pending.request_digest):
+                raise C09PagedCaptureHold('D13 V3 observation fact row identity differs')
+            actual_pending=decode_bytes(predecessor_row[4])
+            if type(actual_pending) is not PendingMutationV2 or actual_pending.phase!='observed':
+                raise C09PagedCaptureHold('V3 outbound fact lacks its actual V2 observed dispatch phase')
+            actual_row=AuthorityV2FenceStore.mutation_locked(port._originals(transform.scope.authority_namespace,
+                transform.scope.operation_id)[-1],actual_pending.mutation_id)
+            kind,actual_pending_row,actual_receipt,_=AuthorityV2FenceStore._decode_mutation_row(actual_row)
+            if (kind!='execution' or actual_pending_row!=actual_pending or actual_receipt is None
+                    or actual_pending.permit.effect_id!=effect_id
+                    or actual_pending.claimed_receipt!=saved.pending.original_claimed_receipt):
+                raise C09PagedCaptureHold('V3 outbound fact lost its true V2 dispatch receipt')
+            observed=actual_receipt;refined=observation_platform_observation_v3(saved)
+            self.observation_fact=(saved.pending.fact_write_permit.operation_id,saved.receipt_digest)
+        else:
+            raise C09PagedCaptureHold('actual outbound observation has another closed original type')
+        if type(refined) not in (PlatformObservationV1,PlatformObservationV2):
+            raise C09PagedCaptureHold('actual outbound observation platform type differs')
+        claimed=observation_claimed_receipt_v3(saved) if type(saved) is PlatformObservationRefinementReceiptV3 else observed.pending.claimed_receipt
+        effect_id=claimed.pending.permit.effect_id
+        if (observed.durable_state!='committed' or observed.pending.phase!='observed'
+                or type(observed.pending.platform_observation) not in (PlatformObservationV1,PlatformObservationV2)
+                or claimed!=observed.pending.claimed_receipt):
+            raise C09PagedCaptureHold('D13 outbound adoption lost its actual V2 observed dispatch/claim phase')
+        dispatch_observation=observed.pending.platform_observation
+        if effect_id is not None:
+            transform=self.capture.builder.transform;core=transform.basis.session._control.maintenance.core
+            port=core._execution_recovery_facts_ports_v4.get('/'.join(self.namespace.as_tuple))
+            if port is not None:
+                try:
+                    port._originals(transform.scope.authority_namespace,transform.scope.operation_id)
+                    entry=port.observation_refinement_fact_for_effect_v3(effect_id)
+                except AuthorityUnavailable as exc:
+                    raise C09PagedCaptureHold('actual outbound observation fact lineage is unavailable') from exc
+                if entry is not None:
+                    from .observation_refinement_contract_v3 import observation_platform_observation_v3
+                    fact,receipt,updated,source_fact=entry[:4]
+                    if (receipt is None or receipt.pending!=fact or updated is None
+                            or source_fact is None or fact.original_claimed_receipt!=claimed):
+                        raise C09PagedCaptureHold('actual outbound observation fact differs from its dispatch claim')
+                    refined=observation_platform_observation_v3(receipt)
+                    self.observation_fact=(fact.fact_write_permit.operation_id,receipt.receipt_digest)
+        if refined.outcome!='delivered' or refined.binding!=dispatch_observation.binding:
+            raise C09PagedCaptureHold('actual outbound completion lacks its separate delivered observation fact')
+        self.observed=observed;self.observation_digest_value=saved;self.refined_observation=refined;origin=refined.binding.origin
         from datetime import datetime
         if (origin.operation_id!=self.small['final_operation_id']
                 or origin.namespace!=self.permit.namespace
-                or observation.binding.graph_namespace!='/'.join(self.namespace.as_tuple)
-                or datetime.fromisoformat(observation.observed_at_utc.replace('Z','+00:00')).timestamp()!=self.completion['trusted_utc']):
+                or refined.binding.graph_namespace!='/'.join(self.namespace.as_tuple)
+                or datetime.fromisoformat(refined.observed_at_utc.replace('Z','+00:00')).timestamp()!=self.completion['trusted_utc']):
             raise C09PagedCaptureHold('actual outbound delivered operation/namespace/observation time differs')
-        self.observed=observed;self.phase='observation_digest'
+        self.phase='observation_digest'
     def _typed_observation_digest(self,meter):
-        upper=self._json_size(self.observed,typed=True)
+        upper=self._json_size(self.observation_digest_value,typed=True)
         meter.require_available(upper*2);self.capture.parser._require_arena(upper*16+16384)
-        text=canonical_serialize(self.observed);raw=text.encode('ascii');meter.charge_encode(len(raw)*2)
+        text=canonical_serialize(self.observation_digest_value);raw=text.encode('ascii');meter.charge_encode(len(raw)*2)
         digest=sha256(raw).hexdigest()
         if digest!=self.small['observation_digest']:
             raise C09PagedCaptureHold('actual typed outbound MutationReceipt digest differs from stored observation')
@@ -6485,8 +6630,10 @@ class _D13OutboundMutationReadV3:
             if predecessor.phase!='mutation' or predecessor.receipt is None:
                 raise C09PagedCaptureHold('predecessor mutation needs actual decoded receipt identity')
             parent=predecessor.parent
-        if (type(parent) is not _D13OutboundAdoptionReadV3 or parent.phase not in {'dispatch_originals','dispatch_predecessors'}
-                or parent.adoption_fence is None or not parent.adoption_fence.complete):
+        if not ((type(parent)is _D13OutboundAdoptionReadV3 and parent.phase in {'dispatch_originals','dispatch_predecessors'}
+                and parent.adoption_fence is not None and parent.adoption_fence.complete)
+                or(type(parent)is _PlatformObservationFactDispositionReadV3 and parent.phase in {'dispatch_originals','dispatch_predecessors'}
+                and parent.fact_fence is not None and parent.fact_fence.complete)):
             raise C09PagedCaptureHold('actual dispatch mutation needs proved delivered adoption/Core source')
         self.parent=parent;self.capture=parent.capture;self.builder=self.capture.builder;self.pair=self.builder.pair
         if parent.phase=='dispatch_originals' and not 0<=parent.dispatch_stage<3:raise C09PagedCaptureHold('unknown actual dispatch mutation stage')
@@ -6532,7 +6679,7 @@ class _D13OutboundMutationReadV3:
     def advance(self,meter):
         from ..runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_c09_table_shape_v2,read_legacy_sql_cell_fragment_v2
         self.builder.require_current();self.capture.require_complete(self.builder,self.capture.shape,self.capture.key)
-        if self.pair is not self.builder.pair or self.pair.source_original!=self.parent.adoption_fence.source_original:
+        if self.pair is not self.builder.pair or self.pair.source_original!=require_dispatch_lineage_parent_source_v3(self.parent,meter):
             raise C09PagedCaptureHold('dispatch mutation lost proved same-scope frozen Core source')
         result=self.copy();pending=result.receipt.pending;permit=pending.permit;db=result.pair.source
         if result.phase=='identity':
@@ -6690,7 +6837,8 @@ class _D13OutboundJournalReadV3:
 class _D13OutboundPredecessorReadV3:
     """Actual previous observed or claimed receipt, never inferred from phase."""
     def __init__(self,parent):
-        if type(parent) is not _D13OutboundAdoptionReadV3 or parent.phase!='dispatch_predecessors' or parent.dispatch_stage!=3:
+        if (type(parent)not in(_D13OutboundAdoptionReadV3,_PlatformObservationFactDispositionReadV3)
+                or parent.phase!='dispatch_predecessors' or parent.dispatch_stage!=3):
             raise C09PagedCaptureHold('actual predecessor needs all three Core/journal originals')
         self.parent=parent;self.capture=parent.capture;self.builder=self.capture.builder;self.pair=self.builder.pair
         self.phase='length';self.buffer=bytearray();self.total=None;self.offset=0
@@ -6772,11 +6920,11 @@ class _D13OutboundHandoffReadV3:
     _start_columns=('handoff_id','operation_id','namespace','subject','claim_digest','binding_digest','graph_claim_ref','permit')
     _receipt_columns=('handoff_id','context_digest','receipt')
     def __init__(self,parent):
-        if (type(parent) is not _D13OutboundAdoptionReadV3 or parent.phase!='handoff_originals'
+        if (type(parent)not in(_D13OutboundAdoptionReadV3,_PlatformObservationFactDispositionReadV3) or parent.phase!='handoff_originals'
                 or parent.predecessor is None or not parent.predecessor.complete):
             raise C09PagedCaptureHold('actual handoff needs complete Core/journal/predecessor provenance')
         self.parent=parent;self.capture=parent.capture;self.builder=self.capture.builder;self.pair=self.builder.pair
-        self.observation=parent.observed.pending.platform_observation
+        self.observation=parent.refined_observation
         self.claim=parent.observed.pending.claimed_receipt
         self.claim_wire=parent.values['observation_json']['pending']['claimed_receipt']
         self.binding_wire=self.claim_wire['pending']['binding']
@@ -6809,7 +6957,7 @@ class _D13OutboundHandoffReadV3:
     def advance(self,meter):
         from ..runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_c09_table_shape_v2,read_legacy_sql_cell_fragment_v2
         self.builder.require_current();self.capture.require_complete(self.builder,self.capture.shape,self.capture.key)
-        if self.pair is not self.builder.pair or self.pair.source_original!=self.parent.adoption_fence.source_original:
+        if self.pair is not self.builder.pair or self.pair.source_original!=require_dispatch_lineage_parent_source_v3(self.parent,meter):
             raise C09PagedCaptureHold('handoff lost signed frozen Core role original')
         result=self.copy();db=result.pair.source;obs=result.observation;origin=obs.binding.origin
         if result.phase=='claim_digest':
@@ -6904,7 +7052,8 @@ class _D13OutboundHandoffReadV3:
 class _D13OutboundGraphClaimReadV3:
     """Formal immutable Graph claim at actual handoff epoch, full row proofs."""
     def __init__(self,parent):
-        if (type(parent) is not _D13OutboundAdoptionReadV3 or parent.phase!='batch_originals'
+        if (not ((type(parent)is _D13OutboundAdoptionReadV3 and parent.phase=='batch_originals')
+                or(type(parent)is _PlatformObservationFactDispositionReadV3 and parent.phase=='graph_claim_original'))
                 or parent.handoff is None or not parent.handoff.complete):
             raise C09PagedCaptureHold('historical Graph claim needs actual Core handoff/installed issuer')
         self.parent=parent;self.capture=parent.capture;self.graph=parent.graph
@@ -6945,7 +7094,7 @@ class _D13OutboundGraphClaimReadV3:
             expected=(*self.parent.namespace.as_tuple,origin.activity_id,'dispatch-claim:'+origin.effect_id)
             actual=tuple(result.locator.history_metadata[name] for name in ('event_bot','event_persona','event_session','event_id'))
             if (actual!=expected or receipt.graph_claim_ref!=expected[3] or receipt.graph_version!='graph:1'
-                    or result.locator.birth_epoch!=receipt.graph_epoch or receipt.graph_epoch>=self.parent.birth_epoch
+                    or result.locator.birth_epoch!=receipt.graph_epoch or not _dispatch_claim_epoch_bound_v3(self.parent,receipt.graph_epoch,meter)
                     or result.locator.head_revision!=1):
                 raise C09PagedCaptureHold('actual immutable dispatch claim birth event/version/epoch differs from receipt')
             result.phase='rows'
@@ -11538,7 +11687,8 @@ class _D13CoreRowCaptureV3:
         expected=CORE_REF_DDLS_V2.get(shape.table) if mapped else schemas.get(shape.table)
         if expected is None or actual!=(expected,):
             raise C09PagedCaptureHold('Core source original has another registered exact physical schema')
-        phases={'draft','header','evidence'} if shape.table=='authority_d13_counter_originals_v1' else {'expected','observed_before_send'}
+        from .d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+        phases={'draft','header','evidence','pressure_mapping_v1'} if shape.table=='authority_d13_counter_originals_v1' else {'expected','observed_before_send'}|D13_ACCOUNTING_PHASES_V3
         if type(key) is not tuple or len(key)!=3 or any(type(value) is not str or not value for value in key) or key[2] not in phases:
             raise C09PagedCaptureHold('Core source original has another registered actual primary key/phase')
         if key[0]!=builder.scope.authority_namespace:raise C09PagedCaptureHold('Core source row crosses actual authority namespace')
@@ -11656,13 +11806,20 @@ class _InstalledAuthorityRoleBuilderV2:
                '_pending_natural_core_required_v4','_pending_natural_core_obligations_v4',
                'paid_owner_final_retention_v3','_pending_paid_owner_final_retention_v3','paid_owner_final_retention_proof_v3',
                'graph_imported_wire_census_v3','_pending_graph_imported_wire_census_v3','_pending_graph_imported_wire_cold_v3',
-               '_pending_habit_read_v1','owner_stop_read_v3','_pending_owner_stop_read_v3')
+               '_pending_habit_read_v1','owner_stop_read_v3','_pending_owner_stop_read_v3',
+               'numeric_core_reverse_v1','_pending_numeric_core_reverse_v1',
+               'labor_core_production_v1','_pending_labor_core_production_v1',
+               'labor_core_reverse_v1','_pending_labor_core_reverse_v1',
+
+               'inspection_core_reverse_v3','_pending_inspection_core_reverse_v3','fact_source_capture_v3','fact_disposition_v3',
+               '_pending_fact_capture_v3','_pending_fact_disposition_v3','fact_target_state_v3')
 
     def __init__(self,token,session,pair,basis):
         if token is not _BUILDER_TOKEN: raise AuthorityUnavailable('installed authority role builder required')
         self._issuer=token;self.session=session;self.pair=pair;self.basis=basis
         self.scope=session.require_current()
         self.transform=_AuthorityRowTransformV2(pair,self.scope,basis)
+        self.transform.labor_core_owner_v1=self
         plan=pair.build_plan;completion=self.transform.completion
         if (plan['scope_digest'],plan['facts_pin_digest'],plan['graph_issue_digest'],
             plan['old_execution_journal_id'],plan['old_execution_seq'],plan['old_execution_digest'])!=(
@@ -11671,6 +11828,11 @@ class _InstalledAuthorityRoleBuilderV2:
             raise C09PagedCaptureHold('stable build plan differs from current sealed originals')
         self.execution_pair=None;self.cold=None;self._pending_habit_read_v1=None
         self.owner_stop_read_v3=None;self._pending_owner_stop_read_v3=None
+        self.inspection_core_reverse_v3=None;self._pending_inspection_core_reverse_v3=None
+        self.numeric_core_reverse_v1=None;self._pending_numeric_core_reverse_v1=None
+        self.labor_core_production_v1=None;self._pending_labor_core_production_v1=None
+        self.labor_core_reverse_v1=None;self._pending_labor_core_reverse_v1=None
+        self.fact_source_capture_v3=None;self.fact_disposition_v3=None;self._pending_fact_capture_v3=None;self._pending_fact_disposition_v3=None;self.fact_target_state_v3=None
         self.segmented_target_v3=None;self.segmented_census_v3=None;self.segmented_sweep_v3=None;self.segmented_finish_pending_v3=False;self.d13_source_capture_v3=None
         self.cold_position_v3=None;self._pending_cold_position_v3=None;self._pending_d13_capture_v3=None
         self.d13_projection_v3=None;self._pending_d13_projection_v3=None
@@ -11729,7 +11891,8 @@ def _table_shape(source,table):
 
 def _core_source_shape_v3(builder,physical,meter):
     from ..segmented_sql_cell_v1 import CORE_REF_DDLS_V2
-    if builder.transform.role!='core' or physical.table not in CORE_REF_DDLS_V2 or 'payload_cell_id' not in physical.columns:
+    fact=physical.table=='authority_platform_observation_facts_v3' and 'pending_cell_id'in physical.columns
+    if builder.transform.role!='core' or not(fact or physical.table in CORE_REF_DDLS_V2 and 'payload_cell_id'in physical.columns):
         return physical
     from ..runtime.c09_logical_source_v3 import read_c09_logical_source_shape_v3
     original=builder.core_logical_shapes_v3.get(physical.table)
@@ -11847,6 +12010,7 @@ class _D13CoreDispositionReadV3:
         self.cpu_prepared=None;self.cpu_fact=None;self.cpu_binding=None;self.model=None
         self.facts_refs=();self.facts_index=0;self.pending_obligations=[];self.pending_stage=0;self.complete=False;self.quantum_completed=False
         self.graph_imported_evidence=None
+        self.pressure_mapping=None
         self.builder.session._source_parser_arena_v3.add(self)
     def _source_heap_bytes(self):
         import sys
@@ -11860,7 +12024,7 @@ class _D13CoreDispositionReadV3:
             elif is_dataclass(value) and not isinstance(value,type):total+=sum(size(getattr(value,field.name)) for field in fields(value))
             return total
         return sys.getsizeof(self.__dict__)+sum(size(value) for key,value in self.__dict__.items()
-            if key not in {'capture','builder','family_capture'})
+            if key not in {'capture','builder','family_capture','pressure_mapping'})
     def _require_arena(self,extra=0):
         from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
         meter=current_c09_sql_meter_v2()
@@ -11903,7 +12067,7 @@ class _D13CoreDispositionReadV3:
                 result.generation_call_id=meta['generation_call_id'];result.execution_id=meta['execution_id'];result.frame_intent_digest=meta['frame_intent_digest']
                 refs=builder.d13_graph_refs_v3
                 refs.require_complete();result.references=tuple(reference for reference in refs.references if reference[1]>0)
-                result.phase='graph_dispositions'
+                result.phase='pressure_mapping'
         elif result.phase=='graph_dispositions':
             if result.reference_index<len(result.references):
                 token,revision=result.references[result.reference_index]
@@ -12055,6 +12219,15 @@ class _D13CoreDispositionReadV3:
                 result.graph_imported_evidence=result.graph_imported_evidence.advance(meter)
             else:
                 result._remember('graph_imported_evidence',result.graph_imported_evidence.proof);result.phase='accounting_refs'
+        elif result.phase=='pressure_mapping':
+            from .c09_d13_pressure_mapping_v3 import _D13PressureMappingReadV3
+            if result.pressure_mapping is None:
+                result.pressure_mapping=_D13PressureMappingReadV3(result)
+            result.pressure_mapping=result.pressure_mapping.advance(result,budget,meter)
+            if result.pressure_mapping.complete:
+                result._remember('pressure_mapping_v1',result.pressure_mapping.proof)
+                result.references=tuple(sorted(set(result.references)|set(result.pressure_mapping.references)))
+                result.phase='graph_dispositions'
         elif result.phase=='accounting_refs':
             if result.facts_index<len(result.facts_refs):
                 family,key=result.facts_refs[result.facts_index]
@@ -12125,7 +12298,8 @@ def _append_d13_source_member_v3(builder,qualified,stream,commitment,meter,*,log
     from ..runtime.c09_paged_capture_contract_v2 import C09CaptureRecordV2,append_c09_page_v2
     from ..runtime.c09_paged_sql_v2 import (_load_census,_capture_data_state,_capture_write_v2,_wire,
         append_c09_logical_source_row_v3,require_c09_capture_member_v2)
-    if (type(qualified) is not _D13CoreDispositionReadV3 or qualified.builder is not builder
+    from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
+    if (type(qualified) not in (_D13CoreDispositionReadV3,_D13AccountingDispositionReadV3,_PlatformObservationFactDispositionReadV3) or qualified.builder is not builder
             or not qualified.complete or not qualified.quantum_completed or not builder.pair.candidate.in_transaction):
         raise C09PagedCaptureHold('actual adopted D13 semantic/facts producer and candidate transaction required')
     capture=qualified.capture;capture.require_complete(builder,capture.shape,capture.key);db=builder.pair.candidate
@@ -12177,12 +12351,15 @@ def _commit_d13_disposition_v3(builder,qualified,stream,kind,new_commitment,mete
 
 
 def _commit_d13_source_retirement_v3(builder,qualified,stream,meter):
-    from .c09_d13_source_retirement_v3 import (TABLE,COLUMNS,issue_d13_source_retirement_v3)
+    from .c09_d13_source_retirement_v3 import (TABLE,COLUMNS,issue_d13_source_retirement_v3,
+        issue_d13_accounting_source_retirement_v3,retirement_row_v3)
+    from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
     with capture_transaction_v2(builder.pair.candidate):
         _append_d13_logical_source_v3(builder,qualified,meter)
-        original=issue_d13_source_retirement_v3(builder,qualified,meter=meter.parent)
-        row=(original['namespace'],original['kind'],original['item_id'],original['phase'],original['counter_operation_id'],
-            original['generation_call_id'],original['retirement_digest'],canonical_serialize(original),original['key_id'],original['signature'])
+        issuer=(issue_d13_accounting_source_retirement_v3 if type(qualified)is _D13AccountingDispositionReadV3
+            else issue_d13_source_retirement_v3)
+        original=issuer(builder,qualified,meter=meter.parent)
+        row=retirement_row_v3(original)
         _same_insert(builder.pair.candidate,TABLE,COLUMNS,row,COLUMNS[:4],meter)
         _generated(builder.pair,builder.scope,TABLE,COLUMNS,row,'d13-source-retirement-v3',original['retirement_digest'],meter)
         _commit_d13_disposition_v3(builder,qualified,stream,'d13_content_retired_v3',None,meter)
@@ -12270,7 +12447,7 @@ def _advance_d13_core_source_row_v3(builder,budget,position,authority_meter):
                 actual_io_bytes=meter.consumed_bytes,local_ns=monotonic_ns()-started)
         capture.require_complete(builder,shape,key)
         qualified=builder.d13_disposition_v3
-        if qualified is None or qualified.capture is not capture:qualified=_D13CoreDispositionReadV3(capture)
+        if qualified is None or qualified.capture is not capture:qualified=_make_d13_source_disposition_v3(capture)
         if not (qualified.complete and qualified.quantum_completed):
             builder._pending_d13_disposition_v3=qualified.advance(budget,meter)
             return dict(status='progress',role='core',phase='d13_original_disposition_'+builder._pending_d13_disposition_v3.phase,
@@ -12296,6 +12473,10 @@ def _row_phase(builder,budget,phase,position,meter):
         result=_advance_c09_census_v2(pair.source,pair.candidate,stream,shape,_reduced_budget(budget,meter),check_frozen_source=pair.check_source)
         if result['eof']: phase='table_rows'
     elif phase=='table_rows':
+        if transform.role=='core' and table=='authority_c09_originals_archive_v1':
+            if not _prepare_fact_archive_source_v3(builder,budget,position,meter.parent):
+                return dict(status='progress',role='core',phase='observation_fact_archive_source_proof')
+            budget=replace(budget,max_records=1)
         if transform.role=='core'and table in legacy._HABIT_CORE_TABLES:
             from .c09_habit_policy_rows_v1 import advance_habit_core_source_row_v1
             value=advance_habit_core_source_row_v1(builder,budget,position,meter)
@@ -12307,6 +12488,9 @@ def _row_phase(builder,budget,phase,position,meter):
             if value is not None:return value
             budget=replace(budget,max_records=1)
         from ..segmented_sql_cell_v1 import CORE_REF_DDLS_V2
+        if transform.role=='core' and table=='authority_platform_observation_facts_v3':
+            value=_advance_fact_core_source_row_v3(builder,budget,position,meter)
+            if value is not None:return value
         if transform.role=='core' and table in CORE_REF_DDLS_V2:
             value=_advance_d13_core_source_row_v3(builder,budget,position,meter)
             if value is not None:return value
@@ -12492,6 +12676,12 @@ def _target_row_commitment(builder,shape,key,row,meter):
     proof=meter.read_one(pair.candidate,'authority_c09_role_rows_v2',
         ('old_commitment','disposition','new_commitment'),'scope_digest=? AND role=? AND table_name=? AND key_digest=?',
         (scope.scope_digest,scope_role(pair),shape.table,canonical_digest(key)))
+    if shape.table=='authority_platform_observation_facts_v3':
+        if proof is None or proof[1]!='platform_observation_fact_logical_preserved_v3':
+            raise C09PagedCaptureHold('Fact target lacks its exact logical preservation disposition')
+        original=_require_fact_target_header_v3(builder,pair.candidate,shape,key,row,meter)
+        if proof[2]!=original['fact_row_commitment']:raise C09PagedCaptureHold('Fact target logical commitment differs')
+        return canonical_digest(('sylanne3.c09.authority-target-row.v2',shape.table,key,commitment))
     if (shape.table in {'authority_d13_counter_originals_v1','authority_d13_provider_http_bindings_v1'}
             and proof is not None and proof[1]=='d13_logical_preserved_v3'):
         if shape.columns!=(*shape.primary_key_columns,'payload_cell_id','payload_digest'):
@@ -12513,13 +12703,30 @@ def _verify_generated(builder,shape,row,producer,original_digest,meter):
     """Independently rederive each generated target from its actual original."""
     transform=builder.transform;namespace=builder.scope.authority_namespace
     if producer=='d13-source-retirement-v3':
-        from .c09_d13_source_retirement_v3 import COLUMNS,validate_retirement_original_v3
+        from .c09_d13_source_retirement_v3 import COLUMNS,validate_retirement_row_v3
         if shape.table!=D13_RETIREMENT_TABLE or shape.columns!=COLUMNS:
             raise C09PagedCaptureHold('unknown actual D13 bodyless retirement producer target')
-        original=validate_retirement_original_v3(builder.session._control.maintenance.control,json.loads(row[7]))
-        if original_digest!=original['retirement_digest'] or row[:7]!=(original['namespace'],original['kind'],original['item_id'],original['phase'],
-                original['counter_operation_id'],original['generation_call_id'],original['retirement_digest']) or row[8:]!=(original['key_id'],original['signature']):
+        original=validate_retirement_row_v3(builder.session._control.maintenance.control,tuple(row))
+        if original_digest!=original['retirement_digest']:
             raise C09PagedCaptureHold('actual generated D13 retirement target differs from its signed Source producer')
+    elif producer=='character-labor-execution-history-v1':
+        from .c09_character_labor_execution_v1 import verify_character_labor_archive_row_v1
+        original=verify_character_labor_archive_row_v1(builder,shape.columns,row,source=False,meter=meter.parent)
+        if original_digest!=original['history_digest']:
+            raise C09PagedCaptureHold('labor generated history digest differs')
+    elif producer=='observation-fact-history-v3':
+        from .observation_fact_history_v3 import KIND,validate_observation_fact_history_v3
+        if shape.table!='authority_c09_originals_archive_v1' or row[:3]!=(namespace,row[1],KIND):
+            raise C09PagedCaptureHold('unknown generated Fact history archive row')
+        original=json.loads(row[4]);validate_observation_fact_history_v3(builder.session._control.maintenance.control,
+            original,namespace=namespace)
+        if original_digest!=original['history_digest'] or row[3]!=original_digest or row[4]!=canonical_serialize(original):
+            raise C09PagedCaptureHold('generated Fact history signed bytes/digest differs')
+        factshape=read_c09_table_shape_v2(builder.pair.candidate,'authority_platform_observation_facts_v3',meter=meter.parent)
+        fact=meter.read_one(builder.pair.candidate,factshape.table,factshape.columns,'fact_operation_id=?',(row[1],))
+        if fact is None:raise C09PagedCaptureHold('Fact history generated original has no retained Fact target')
+        actual=_require_fact_target_header_v3(builder,builder.pair.candidate,factshape,(row[1],),fact,meter)
+        if actual!=original:raise C09PagedCaptureHold('generated Fact history target binding differs')
     elif producer=='verified_recovery_identity_v2':
         if shape.table!='authority_c09_consumed_execution_v1' or row[0]!=namespace or row[5]!=transform.completion.pin_digest or original_digest!=transform.completion.pin_digest:
             raise C09PagedCaptureHold('generated consumed ledger binding differs')
@@ -12530,7 +12737,14 @@ def _verify_generated(builder,shape,row,producer,original_digest,meter):
         transform.probe=(row[1],row[2],row[3],row[4]);transform.probe_seen=False
         try:
             key=tuple(json.loads(origin[2]))
-            if origin[0]=='source_row':
+            if origin[0]=='source_row' and origin[1]=='authority_platform_observation_facts_v3':
+                qualified=transform.fact_disposition_v3
+                if (type(qualified)is not _PlatformObservationFactDispositionReadV3 or not qualified.complete
+                        or not qualified.quantum_completed or not qualified.affected or qualified.capture.key!=key
+                        or (row[1],row[2],row[3],row[4])!=('platform_observation_fact_v3',key[0],key[0],qualified.capture.commitment)):
+                    raise C09PagedCaptureHold('Fact consumed identity lacks complete independently replayed retirement proof')
+                transform._consume(row[1],row[2],row[3],row[4],meter)
+            elif origin[0]=='source_row':
                 source_shape=_table_shape(builder.pair.source,origin[1])
                 source_row=meter.read_one(builder.pair.source,origin[1],source_shape.columns,
                     ' AND '.join(_q(name)+'=?' for name in source_shape.primary_key_columns),key)
@@ -12733,7 +12947,7 @@ def _verify_d13_cold_record_v3(builder,reader,stream,kind,record,budget,meter):
             raise C09PagedCaptureHold('cold full Core Source bytes/shape/descriptor/member differ')
         builder.d13_source_capture_v3=None;return True
     qualified=builder.d13_disposition_v3
-    if qualified is None or qualified.capture is not capture:qualified=_D13CoreDispositionReadV3(capture)
+    if qualified is None or qualified.capture is not capture:qualified=_make_d13_source_disposition_v3(capture)
     if not (qualified.complete and qualified.quantum_completed):
         builder._pending_d13_disposition_v3=qualified.advance(budget,meter.parent);return False
     source_shape=_core_source_shape_v3(builder,physical,meter.parent)
@@ -12752,13 +12966,15 @@ def _verify_d13_cold_record_v3(builder,reader,stream,kind,record,budget,meter):
     shape=read_c09_table_shape_v2(reader,physical.table,meter=meter.parent)
     target=meter.read_one(reader,shape.table,shape.columns,' AND '.join(_q(name)+'=?' for name in shape.primary_key_columns),capture.key)
     if qualified.affected:
-        from .c09_d13_source_retirement_v3 import TABLE,COLUMNS,validate_retirement_original_v3
+        from .c09_d13_source_retirement_v3 import TABLE,COLUMNS,validate_retirement_row_v3
+        from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
         if target is not None:raise C09PagedCaptureHold('actual retired D13 target still retains Source payload')
         retirement=meter.read_one(reader,TABLE,COLUMNS,'namespace=? AND kind=? AND item_id=? AND phase=?',
             (capture.key[0],qualified.kind,capture.key[1],capture.key[2]))
         if retirement is None:raise C09PagedCaptureHold('cold affected D13 phase has no actual bodyless retirement original')
-        original=validate_retirement_original_v3(builder.session._control.maintenance.control,json.loads(retirement[7]))
-        body=qualified.require_retirement_body(builder,meter=meter.parent)
+        original=validate_retirement_row_v3(builder.session._control.maintenance.control,tuple(retirement))
+        body=(qualified.require_accounting_retirement_body_v3(builder,meter=meter.parent)
+            if type(qualified)is _D13AccountingDispositionReadV3 else qualified.require_retirement_body(builder,meter=meter.parent))
         if any(original[name]!=value for name,value in body.items()):
             raise C09PagedCaptureHold('cold D13 retirement differs from independently replayed semantic/deletion/facts originals')
         wanted=(old,'d13_content_retired_v3',None)
@@ -12792,6 +13008,9 @@ class _AuthorityColdSweepV2:
         self.builder=builder;self.reader=_open_candidate_readback(builder.pair);self.census_reader=_open_candidate_readback(builder.pair)
         builder.transform.habit_current_v1=None
         builder.owner_stop_read_v3=None;builder._pending_owner_stop_read_v3=None
+        builder.inspection_core_reverse_v3=None;builder._pending_inspection_core_reverse_v3=None
+        builder.numeric_core_reverse_v1=None;builder._pending_numeric_core_reverse_v1=None
+        builder.fact_source_capture_v3=None;builder.fact_disposition_v3=None;builder.transform.fact_disposition_v3=None
         if builder.transform.role=='core':
             builder.transform.facts._authority_basis()._owner_reply_stop_ready_v3=None
         self.after=None;self.active=None;self.verification=None;self.source=None;self.shape=None
@@ -12969,6 +13188,10 @@ class _AuthorityColdSweepV2:
                 from .c09_owner_reply_disposition_v3 import verify_owner_reply_stop_core_cold_record_v3
                 ready=verify_owner_reply_stop_core_cold_record_v3(builder,self.reader,stream,record,meter)
                 if ready is not None:return ready
+            if transform.role=='core' and self.active[0]=='authority_platform_observation_facts_v3' and self.active[1]in{'row_dispositions','source_originals_v3'}:
+                return _verify_fact_cold_record_v3(builder,self.reader,stream,self.active[1],record,budget,meter)
+            if transform.role=='core' and not _prepare_fact_cold_metadata_v3(builder,self.source,self.shape,record.primary_key,budget,meter):
+                return False
             if (transform.role=='core' and self.active[0] in {'authority_d13_counter_originals_v1','authority_d13_provider_http_bindings_v1'}
                     and self.active[1] in {'row_dispositions','source_originals_v3'}):
                 return _verify_d13_cold_record_v3(builder,self.reader,stream,self.active[1],record,budget,meter)
@@ -13133,6 +13356,19 @@ class VerifiedAuthorityRoleRebaseV2:
         self.target_path=builder.pair.target_path;self.target_identity=builder.pair.target_identity
         self.target_sha256=file_digest;self.cold_digest=cold_digest
         if self.role=='core':
+            from .c09_platform_observation_lineage_v3 import require_inspection_core_reverse_v3
+            reverse_root,reverse_count=require_inspection_core_reverse_v3(builder)
+            from ..runtime.c09_life_numeric_originals_v1 import require_numeric_life_core_reverse_v1
+            numeric_root,numeric_count=require_numeric_life_core_reverse_v1(builder)
+            if builder.labor_core_production_v1 is None or builder.labor_core_reverse_v1 is None:
+                raise C09PagedCaptureHold('actual complete labor production and cold replay required')
+            labor_production=builder.labor_core_production_v1.require_complete(builder)
+            labor_cold=builder.labor_core_reverse_v1.require_complete(builder)
+            if labor_production!=labor_cold:raise C09PagedCaptureHold('labor cold reverse differs from actual source production')
+            cold_digest=canonical_digest(('sylanne3.c09.authority-labor-cold.v1',cold_digest,*labor_cold))
+            self.cold_digest=canonical_digest(('sylanne3.c09.authority-cold-inspection-numeric-reverse.v3',
+                cold_digest,reverse_root,reverse_count,numeric_root,numeric_count))
+        if self.role=='core':
             census=builder.graph_imported_wire_census_v3
             if type(census) is not _D13GraphImportedWireCensusV3:
                 raise C09PagedCaptureHold('actual independent Graph V7 reverse census required before Core completion')
@@ -13204,10 +13440,32 @@ def advance_installed_authority_role_rebase_v2(builder):
     builder._pending_natural_core_required_v4=None;builder._pending_natural_core_obligations_v4=None
     builder._pending_paid_owner_final_retention_v3=None
     builder._pending_habit_read_v1=None
+    builder._pending_inspection_core_reverse_v3=None
+    builder._pending_numeric_core_reverse_v1=None
+    builder._pending_labor_core_production_v1=None;builder._pending_labor_core_reverse_v1=None
+    builder._pending_fact_capture_v3=None;builder._pending_fact_disposition_v3=None
     builder._pending_owner_stop_read_v3=None
     builder._pending_source_physical_reader_v3=None
     builder._pending_d13_disposition_v3=None;builder._pending_graph_imported_wire_census_v3=None;builder._pending_graph_imported_wire_cold_v3=None
     result=_advance_installed_authority_role_quantum_v2(builder)
+    if builder._pending_fact_capture_v3 is not None:
+        capture=builder._pending_fact_capture_v3;capture.quantum_completed=True
+        builder.fact_source_capture_v3=capture;builder._pending_fact_capture_v3=None
+    if builder._pending_fact_disposition_v3 is not None:
+        disposition=builder._pending_fact_disposition_v3;disposition.quantum_completed=True
+        builder.fact_disposition_v3=disposition;builder._pending_fact_disposition_v3=None
+    if builder._pending_inspection_core_reverse_v3 is not None:
+        builder.inspection_core_reverse_v3=builder._pending_inspection_core_reverse_v3
+        builder._pending_inspection_core_reverse_v3=None
+    if builder._pending_labor_core_production_v1 is not None:
+        builder.labor_core_production_v1=builder._pending_labor_core_production_v1
+        builder._pending_labor_core_production_v1=None
+    if builder._pending_labor_core_reverse_v1 is not None:
+        builder.labor_core_reverse_v1=builder._pending_labor_core_reverse_v1
+        builder._pending_labor_core_reverse_v1=None
+    if builder._pending_numeric_core_reverse_v1 is not None:
+        builder.numeric_core_reverse_v1=builder._pending_numeric_core_reverse_v1
+        builder._pending_numeric_core_reverse_v1=None
     if builder._pending_owner_stop_read_v3 is not None:
         state=builder._pending_owner_stop_read_v3;state.quantum_completed=True
         builder.owner_stop_read_v3=state;builder._pending_owner_stop_read_v3=None
@@ -13259,7 +13517,14 @@ def advance_installed_authority_role_rebase_v2(builder):
         builder.d13_root_epoch_v3=epoch;builder._pending_d13_root_epoch_v3=None
     if builder._pending_d13_disposition_v3 is not None:
         disposition=builder._pending_d13_disposition_v3;disposition.quantum_completed=True
-        if disposition.family_capture is not None:disposition.family_capture.quantum_completed=True
+        if type(disposition)is _D13CoreDispositionReadV3:
+            if disposition.family_capture is not None:disposition.family_capture.quantum_completed=True
+            if disposition.pressure_mapping is not None:disposition.pressure_mapping.confirm_quantum_v3()
+        else:
+            from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
+            if type(disposition)is not _D13AccountingDispositionReadV3:
+                raise C09PagedCaptureHold('unknown actual D13 semantic quantum continuation')
+            disposition.confirm_quantum_v3()
         builder.d13_disposition_v3=disposition;builder._pending_d13_disposition_v3=None
     if builder._pending_graph_imported_wire_census_v3 is not None:
         builder.graph_imported_wire_census_v3=builder._pending_graph_imported_wire_census_v3
@@ -13292,6 +13557,7 @@ def _advance_installed_authority_role_quantum_v2(builder):
         with target.quantum() as quantum:target.install_empty_layout(quantum)
         builder.segmented_target_v3=target
         return dict(status='progress',role=builder.transform.role,phase='segmented_layout')
+    if builder.fact_target_state_v3 is not None:return _advance_fact_target_copy_v3(builder)
     if builder.d13_target_writer_v3 is not None:return _advance_d13_target_copy_v3(builder)
     if builder.segmented_finish_pending_v3:
         from .c09_segmented_census_v3 import begin_segmented_census_v3,VerifiedSegmentedPhysicalSweepV3
@@ -13305,6 +13571,27 @@ def _advance_installed_authority_role_quantum_v2(builder):
     if builder.cold_position_v3 is not None:
         builder.segmented_sweep_v3.require_current()
         with builder.session.reserve_batch() as budget:
+            if builder.transform.role=='core' and (builder.inspection_core_reverse_v3 is None
+                    or not builder.inspection_core_reverse_v3.complete):
+                from .c09_platform_observation_lineage_v3 import advance_inspection_core_reverse_v3
+                from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                actual=current_c09_sql_meter_v2()
+                advance_inspection_core_reverse_v3(builder)
+                return dict(status='progress',role='core',phase='inspection_final_core_reverse_eof',
+                    actual_io_bytes=actual.consumed_bytes)
+            if builder.transform.role=='core' and (builder.labor_core_reverse_v1 is None
+                    or not builder.labor_core_reverse_v1.complete):
+                from .c09_character_labor_execution_v1 import advance_character_labor_core_reverse_v1
+                advance_character_labor_core_reverse_v1(builder,production=False)
+                return dict(status='progress',role='core',phase='character_labor_cold_reverse_eof')
+            if builder.transform.role=='core' and (builder.numeric_core_reverse_v1 is None
+                    or not builder.numeric_core_reverse_v1.complete):
+                from ..runtime.c09_life_numeric_originals_v1 import advance_numeric_life_core_reverse_v1
+                from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                actual=current_c09_sql_meter_v2()
+                advance_numeric_life_core_reverse_v1(builder)
+                return dict(status='progress',role='core',phase='numeric_final_core_reverse_eof',
+                    actual_io_bytes=actual.consumed_bytes)
             if builder.transform.role=='core' and builder.paid_owner_final_retention_proof_v3 is None:
                 from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
                 from .c09_pre_graph_core_dependency_source_v3 import begin_final_core_paid_owner_retention_v3
@@ -13345,6 +13632,12 @@ def _advance_installed_authority_role_quantum_v2(builder):
         if not _has_table(builder.pair.candidate,'authority_c09_role_build_v2',meter):
             return _bootstrap_quantum(builder,budget,{})
         phase,position=_position(builder.pair,builder.scope,meter)
+        if (builder.transform.role=='core' and phase not in {
+                'bootstrap','schema_census','schema_capture','schema_seal'}
+                and (builder.labor_core_production_v1 is None or not builder.labor_core_production_v1.complete)):
+            from .c09_character_labor_execution_v1 import advance_character_labor_core_reverse_v1
+            advance_character_labor_core_reverse_v1(builder,production=True)
+            return dict(status='progress',role='core',phase='character_labor_source_history')
         if phase=='bootstrap': return _bootstrap_quantum(builder,budget,position)
         if phase in {'schema_census','schema_capture'}:
             return _schema_quantum(builder.transform,budget,phase,position)
@@ -13498,3 +13791,527 @@ def _advance_verify_c09_census_v2(*args,**kwargs):
 
 def _advance_verify_c09_stream_v2(*args,**kwargs):
     return _run_c09_engine(advance_verify_c09_stream_v2,*args,**kwargs)
+
+
+def _make_d13_source_disposition_v3(capture):
+    from .d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+    if (capture.shape.table=='authority_d13_provider_http_bindings_v1'
+            and capture.key[2] in D13_ACCOUNTING_PHASES_V3):
+        from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
+        return _D13AccountingDispositionReadV3(capture)
+    return _D13CoreDispositionReadV3(capture)
+
+def require_dispatch_lineage_parent_source_v3(parent,meter):
+    """Only the two actual producers may reuse frozen dispatch provenance."""
+    if type(parent)is _D13OutboundAdoptionReadV3:
+        if parent.adoption_fence is None or not parent.adoption_fence.complete:
+            raise C09PagedCaptureHold('outbound adoption lacks its actual frozen WRITE fence')
+        source=parent.adoption_fence.source_original
+    elif type(parent)is _PlatformObservationFactDispositionReadV3:
+        parent.capture.require_complete(parent.builder,parent.capture.shape,parent.capture.key)
+        if parent.fact_fence is None or not parent.fact_fence.complete:
+            raise C09PagedCaptureHold('Fact lacks its actual frozen WRITE fence')
+        source=parent.fact_fence.source_original
+    else:raise C09PagedCaptureHold('unknown registered frozen dispatch-lineage parent')
+    parent.builder.require_current()if type(parent)is _PlatformObservationFactDispositionReadV3 else parent.capture.builder.require_current()
+    if source!=parent.capture.builder.pair.source_original:
+        raise C09PagedCaptureHold('dispatch parent crossed its actual frozen Core Source')
+    return source
+
+
+class _PlatformObservationFactFenceReadV3(_D13PaidWriteFenceReadV3):
+    def __init__(self,parent):
+        if type(parent)is not _PlatformObservationFactDispositionReadV3 or parent.phase!='fact_fence':
+            raise C09PagedCaptureHold('actual Fact disposition WRITE proof required')
+        parent.capture.require_complete(parent.builder,parent.capture.shape,parent.capture.key)
+        self.capture=parent.capture;self.builder=parent.builder;self.pair=self.builder.pair;self.worker=parent;self.scope=self.builder.scope
+        self.phase='source';self.source_original=self.pair.source_original;self.shape=None;self.small=None
+        self.total=None;self.offset=0;self.buffer=bytearray();self.row_commitment=None;self.complete=False
+        self.capture.parser._source_arena.add(self);self.capture.parser._require_arena()
+    def _operation_id(self):return self.worker.fact.fact_write_permit.operation_id
+    def _finish_identity(self):return 'finish:'+self.worker.fact.mutation_id,'sha256:'+self.capture.hashes['receipt']
+    def _permit_wire_bound(self):return self.capture.sizes['updated_fact_permit']
+    def _anchor(self):return self.worker.permit.pinned_anchor
+
+
+class _PlatformObservationFactJournalReadV3(_D13OutboundJournalReadV3):
+    def __init__(self,parent):
+        if type(parent)is not _PlatformObservationFactDispositionReadV3 or parent.phase!='fact_journal':
+            raise C09PagedCaptureHold('actual Fact journal producer required')
+        self.parent=parent;self.capture=parent.capture;self.builder=parent.builder;self.pair=self.builder.execution_pair
+        if self.pair is None or self.pair._producer.session is not self.builder.session:
+            raise C09PagedCaptureHold('actual same-session execution Source required')
+        self.pair.require_current();self.pending=parent.fact;self.phase='source';self.shape=None;self.small=None
+        self.expected=None;self.offset=0;self.digest=sha256();self.complete=False
+        self.capture.parser._source_arena.add(self)
+    def advance(self,meter):
+        if self.phase not in {'prepare','blob'}:return super().advance(meter)
+        from ..runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2
+        if self.phase=='prepare':
+            result=self.copy();result.phase='blob';return result
+        # Stream state advances only in a successfully reserved parent quantum.
+        # Reconstruct the expected fragment from immutable qualified pending bytes.
+        from .observation_refinement_contract_v3 import ENTRY_PREFIX
+        prefix=ENTRY_PREFIX;suffix=b'}';total=len(prefix)+self.capture.sizes['pending']+1
+        amount=min(4096,total-self.offset);pieces=[];left=self.offset;remaining=amount
+        if left<len(prefix):
+            part=prefix[left:min(len(prefix),left+remaining)];pieces.append(part);remaining-=len(part);left+=len(part)
+        if remaining and left<len(prefix)+self.capture.sizes['pending']:
+            start=left-len(prefix);take=min(remaining,self.capture.sizes['pending']-start)
+            if self.capture.mapped:
+                part,size=self.capture.source_scope.read_cell_fragment_v3(self.capture.cell_ids['pending'],start=start,length=take,meter=meter)
+            else:
+                with legacy_cell_read_transaction_v2(self.builder.pair.source):
+                    part,size,kind=read_legacy_sql_cell_fragment_v2(self.builder.pair.source,table=self.capture.shape.table,
+                        column='pending',where='fact_operation_id=?',parameters=self.capture.key,start=start,length=take,meter=meter)
+                if kind!='blob':raise C09PagedCaptureHold('Fact pending native storage kind changed')
+            if size!=self.capture.sizes['pending']or len(part)!=take:raise C09PagedCaptureHold('Fact qualified Source bytes changed')
+            pieces.append(part);remaining-=take;left+=take
+        if remaining:pieces.append(suffix[left-len(prefix)-self.capture.sizes['pending']:][:remaining])
+        expected=b''.join(pieces)
+        with legacy_cell_read_transaction_v2(self.pair.source):
+            raw,size,kind=read_legacy_sql_cell_fragment_v2(self.pair.source,table='authority_v2_execution_entries',
+                column='pending',where='seq=?',parameters=(self.pending.expected_execution_seq,),start=self.offset,length=amount,meter=meter)
+        if (kind,size,len(raw))!=('blob',total,amount)or raw!=expected:
+            raise C09PagedCaptureHold('actual Fact journal entry differs from its complete frozen pending Source')
+        result=self.copy();result.digest.update(raw);result.offset+=amount
+        if result.offset==total:result.phase='index'
+        return result
+
+
+class _PlatformObservationFactDispositionReadV3:
+    """Actual Fact + native dispatch predecessors + frozen Core/execution lineage."""
+    def __init__(self,capture):
+        from .c09_platform_observation_fact_storage_v3 import ActualFactSourceCaptureV3
+        if type(capture)is not ActualFactSourceCaptureV3:raise C09PagedCaptureHold('actual Fact Source capture required')
+        capture.require_complete(capture.builder,capture.shape,capture.key)
+        self.capture=capture;self.builder=capture.builder;self.fact=capture.typed['pending'];self.receipt=capture.typed['receipt']
+        self.permit=capture.typed['updated_fact_permit'];self.graph=self.builder.session.require_actual_post_mirror_graph_v3()
+        self.namespace=NamespaceId(*json.loads(self.builder.scope.graph_namespace))
+        self.phase='history';self.total=None;self.offset=0;self.buffer=bytearray();self.values={}
+        self.historical_certificate=None;self.historical_archive_json=None
+        self.observed=None;self.refined_observation=self.fact.platform_observation
+        self.fact_fence=None;self.fact_journal=None;self.dispatch_mutation=None;self.dispatch_stage=0
+        self.predecessor=None;self.handoff=None;self.graph_claim=None;self.graph_lineage=None
+        self.complete=False;self.quantum_completed=False;self.affected=False;self.references=();self.reference_index=0
+        self.graph_root=canonical_digest(('sylanne3.c09.observation-fact-source-dispositions.v3',capture.key))
+        self.graph_count=0;self.graph_proofs=[];self.marker_origin=None;self.history_original=None
+        self.capture.parser._source_arena.add(self)
+    @staticmethod
+    def _json_size(value,**options):
+        return _D13OutboundAdoptionReadV3._json_size(value,**options)
+    def _constructor_encoding_bound(self,value,**options):
+        return _D13OutboundAdoptionReadV3._constructor_encoding_bound(self,value,**options)
+    def _digest(self,value,meter):
+        size=self._json_size(value);meter.require_available(size*3)
+        self.capture._require_arena(size*4+65536);encoded=canonical_serialize(value).encode('ascii');meter.charge_encode(len(encoded)*2)
+        return sha256(encoded).hexdigest()
+    def _source_heap_bytes(self):
+        from ..runtime.c09_logical_source_v3 import _retained_size
+        skip={'capture','builder','graph','graph_lineage','fact_fence','fact_journal','dispatch_mutation','predecessor','handoff','graph_claim'}
+        return 8192+_retained_size({k:v for k,v in self.__dict__.items()if k not in skip},set())
+    def copy(self):
+        from copy import copy
+        self.capture._require_arena(self._source_heap_bytes());result=copy(self);result.buffer=bytearray(self.buffer)
+        result.values=dict(self.values);result.graph_proofs=list(self.graph_proofs);result.quantum_completed=False
+        self.capture.parser._source_arena.add(result);return result
+    def advance(self,budget,meter):
+        from dataclasses import asdict
+        from .v2_contract import MutationReceiptV2,PlatformObservationV2,from_wire
+        from ..runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2
+        self.capture.require_complete(self.builder,self.capture.shape,self.capture.key)
+        result=self.copy();db=self.builder.pair.source
+        if result.phase=='history':
+            from .observation_fact_history_v3 import read_frozen_observation_fact_history_v3
+            history=read_frozen_observation_fact_history_v3(result.capture,meter=meter)
+            if history is None:result.phase='observed_length'
+            else:
+                result.historical_certificate,result.historical_archive_json=history
+                result.references=tuple(tuple(pair)for pair in result.historical_certificate['source_versions'])
+                result.phase='source_dispositions'
+        elif result.phase=='observed_length':
+            with legacy_cell_read_transaction_v2(db):
+                _,result.total,kind=read_legacy_sql_cell_fragment_v2(db,table='authority_v2_mutations',column='receipt',
+                    where='mutation_id=?',parameters=(result.fact.predecessor_mutation_id,),start=0,length=0,meter=meter)
+            if kind!='blob'or result.total<1:raise C09PagedCaptureHold('Fact requires its actual first observed predecessor')
+            result.capture._require_arena(result.total*3+65536);result.phase='observed_bytes'
+        elif result.phase=='observed_bytes':
+            amount=min(4096,result.total-result.offset)
+            with legacy_cell_read_transaction_v2(db):
+                raw,total,kind=read_legacy_sql_cell_fragment_v2(db,table='authority_v2_mutations',column='receipt',
+                    where='mutation_id=?',parameters=(result.fact.predecessor_mutation_id,),start=result.offset,length=amount,meter=meter)
+            if (kind,total,len(raw))!=('blob',result.total,amount):raise C09PagedCaptureHold('Fact predecessor bytes changed')
+            result.buffer.extend(raw);result.offset+=amount
+            if result.offset==total:result.phase='observed_identity'
+        elif result.phase=='observed_identity':
+            result.capture._require_arena(result.total*24+65536);wire=json.loads(result.buffer)
+            fee=result._constructor_encoding_bound(wire);meter.require_available(fee)
+            observed=from_wire(wire);meter.charge_encode(result._constructor_encoding_bound(wire,exact=True))
+            if (type(observed)is not MutationReceiptV2 or observed.durable_state!='committed'or observed.pending.phase!='observed'
+                    or observed.pending.mutation_id!=result.fact.predecessor_mutation_id
+                    or 'sha256:'+sha256(result.buffer).hexdigest()!=result.fact.predecessor_receipt_digest
+                    or observed.pending.claimed_receipt!=result.fact.original_claimed_receipt
+                    or type(observed.pending.platform_observation)is not PlatformObservationV2
+                    or observed.after_anchor.execution_seq>=result.fact.expected_execution_seq
+                    or observed.after_anchor.execution_journal_id!=result.fact.expected_execution_journal_id):
+                raise C09PagedCaptureHold('Fact predecessor/claim/journal/sequence identity differs')
+            from .observation_refinement_v3 import _refinement_v3
+            _refinement_v3(observed.pending.platform_observation,result.fact.platform_observation)
+            result.observed=observed;result.values['observation_json']=wire;result.buffer.clear();result.phase='fact_fence'
+        elif result.phase=='fact_fence':
+            if result.fact_fence is None:result.fact_fence=_PlatformObservationFactFenceReadV3(result)
+            elif not result.fact_fence.complete:result.fact_fence=result.fact_fence.advance(meter)
+            else:result.phase='fact_journal'
+        elif result.phase=='fact_journal':
+            if result.fact_journal is None:result.fact_journal=_PlatformObservationFactJournalReadV3(result)
+            elif not result.fact_journal.complete:result.fact_journal=result.fact_journal.advance(meter)
+            else:result.phase='dispatch_originals'
+        elif result.phase=='dispatch_originals':
+            if result.dispatch_stage==3:result.phase='dispatch_predecessors'
+            elif result.dispatch_mutation is None:result.dispatch_mutation=_D13OutboundMutationReadV3(result)
+            elif not result.dispatch_mutation.complete:result.dispatch_mutation=result.dispatch_mutation.advance(meter)
+            else:result.dispatch_stage+=1;result.dispatch_mutation=None
+        elif result.phase=='dispatch_predecessors':
+            if result.predecessor is None:result.predecessor=_D13OutboundPredecessorReadV3(result)
+            elif not result.predecessor.complete:result.predecessor=result.predecessor.advance(meter)
+            else:result.phase='handoff_originals'
+        elif result.phase=='handoff_originals':
+            if result.handoff is None:result.handoff=_D13OutboundHandoffReadV3(result)
+            elif not result.handoff.complete:result.handoff=result.handoff.advance(meter)
+            else:result.phase='graph_claim_original'
+        elif result.phase=='graph_claim_original':
+            if result.graph_claim is None:result.graph_claim=_D13OutboundGraphClaimReadV3(result)
+            elif not result.graph_claim.complete:result.graph_claim=result.graph_claim.advance(meter)
+            else:result.phase='producer_source'
+        elif result.phase=='producer_source':
+            from .c09_platform_observation_lineage_v3 import begin_final_dispatch_source_lineage_v3,advance_final_dispatch_source_lineage_v3
+            if result.graph_lineage is None:
+                result.graph_lineage=begin_final_dispatch_source_lineage_v3(result.builder,result.namespace,
+                    result.fact.original_claimed_receipt.pending.permit.effect_id,meter=meter)
+            elif not result.graph_lineage.complete:
+                result.graph_lineage=advance_final_dispatch_source_lineage_v3(result.graph_lineage,meter)
+            else:
+                if asdict(result.graph_lineage.claim)!=result.graph_claim.value:
+                    raise C09PagedCaptureHold('Fact Core handoff and complete Graph producer claim differ')
+                result.references=tuple((token,revision)for token,revision,digest in result.graph_lineage.source_proofs)
+                result.phase='source_dispositions'
+        elif result.phase=='source_dispositions':
+            if result.reference_index==len(result.references):result.phase='historical_closure'if result.historical_certificate is not None else'marker'
+            else:
+                token,revision=result.references[result.reference_index]
+                from ..runtime.c09_paged_sql_v2 import read_c09_table_shape_v2
+                shape=read_c09_table_shape_v2(result.graph.pair.source,'graph_history',meter=meter)
+                disposition=(result.graph.require_original_disposition_row_v3('graph_history',(token,revision),meter=meter)
+                    if 'value_cell_id'in shape.columns else result.builder.basis._graph_disposition_key_v3(result.graph,shape,(token,revision),meter))
+                if disposition.disposition in {'payload_erased_retained_facts','derived_removed','rebuilt_from_surviving_sources'}:result.affected=True
+                elif disposition.disposition not in {'preserved_exact','logical_preserved_v3'}:
+                    raise C09PagedCaptureHold('Fact Source has no completed registered Graph disposition')
+                committed=canonical_digest(disposition);result.graph_proofs.append((token,revision,committed))
+                result.graph_count+=1;result.graph_root=canonical_digest((result.graph_root,result.graph_count,(token,revision),committed))
+                result.reference_index+=1
+        elif result.phase=='historical_closure':
+            from ..runtime.c09_closure_index_v2 import C09ClosureIndexV2
+            closure=C09ClosureIndexV2(result.graph._read_db,result.builder.scope)
+            cert=result.historical_certificate
+            hit=any(closure.contains_atom(token)or closure.contains_source_id(AtomKey.from_token(token).owner.subject)
+                for token in cert['source_refs'])
+            if hit and not result.affected:
+                raise C09PagedCaptureHold('historical Fact actual Source closure hit lacks its registered disposition')
+            facts=result.builder.transform.facts
+            fact=facts.lookup_execution(cert['effect_id'],meter=meter)
+            binding=facts.lookup_execution_binding(cert['effect_id'],meter=meter)
+            if (fact is None or binding is None or binding.execution_kind!='dispatch'
+                    or binding.business_operation_id!=cert['dispatch_operation_id']
+                    or binding.execution_id!=fact.execution_id or binding.input_commitment!=fact.input_commitment):
+                raise C09PagedCaptureHold('historical Fact lacks its actual retained dispatch accounting lineage')
+            result.complete=True
+        elif result.phase=='marker':
+            from ..runtime.c09_closure_index_v2 import C09ClosureIndexV2
+            closure=C09ClosureIndexV2(result.graph._read_db,result.builder.scope)
+            effect=result.fact.original_claimed_receipt.pending.permit.effect_id
+            roots=result.graph_lineage.roots
+            hit=any(closure.contains_atom(token)or closure.contains_source_id(AtomKey.from_token(token).owner.subject)for token in roots)
+            marker=meter.read_fixed_row(result.graph._read_db,'c09_closure_members_v2',
+                ('origin_stream_id','origin_record_ordinal','origin_commitment'),
+                'scope_digest=? AND kind=? AND ref=?',(result.builder.scope.scope_digest,'domain_link',
+                    canonical_serialize(('platform_observation_effect_v3',effect))))
+            if hit!=(marker is not None)or hit and not result.affected:
+                raise C09PagedCaptureHold('Fact Source hit differs from actual producer-origin effect marker')
+            if marker is not None:
+                member=meter.read_fixed_row(result.graph._read_db,'c09_capture_members_v2',
+                    ('primary_key_json','commitment'),'stream_id=? AND record_ordinal=?',marker[:2])
+                if member is None or member[1]!=marker[2]or tuple(json.loads(member[0]))not in (
+                        (result.graph_claim.reference.ref,),(result.graph_claim.reference.ref,1)):
+                    raise C09PagedCaptureHold('Fact effect marker lost its actual full dispatch claim Source member')
+                stream=meter.read_fixed_row(result.graph._read_db,'c09_capture_streams_v2',('identity_json',),'stream_id=?',(marker[0],))
+                identity=None if stream is None else json.loads(stream[0])
+                if (identity is None or identity['scope_digest']!=result.builder.scope.scope_digest
+                        or identity['role_source_digest']!=result.graph.pair.source_original.role_source_digest
+                        or identity['family']not in {'graph_atoms','graph_history'}):
+                    raise C09PagedCaptureHold('Fact effect marker origin is not its actual frozen Graph Source stream')
+                result.marker_origin=tuple(marker)
+            result.phase='effect'
+        elif result.phase=='effect':
+            effect=result.fact.original_claimed_receipt.pending.permit.effect_id
+            row=meter.read_fixed_row(db,'authority_effects',('state','execution_seq'),'namespace=? AND effect_id=?',
+                (result.builder.scope.authority_namespace,effect))
+            if row!=('unresolved',result.fact.expected_execution_seq):
+                raise C09PagedCaptureHold('Fact is not the actual frozen Core effect tail')
+            result.complete=True
+        else:raise C09PagedCaptureHold('unknown actual observation Fact provenance phase')
+        result.capture._require_arena();return result
+
+
+def _dispatch_claim_epoch_bound_v3(parent,epoch,meter):
+    if type(parent)is _D13OutboundAdoptionReadV3:return epoch<parent.birth_epoch
+    if type(parent)is not _PlatformObservationFactDispositionReadV3:
+        raise C09PagedCaptureHold('unknown actual dispatch claim epoch parent')
+    parent.graph.require_current()
+    actual=meter.read_fixed_row(parent.graph.pair.source,'graph_epochs',('epoch',),
+        'bot=? AND persona=?',parent.namespace.as_tuple)
+    if actual is None or type(actual[0])is not int:
+        raise C09PagedCaptureHold('Fact Graph Source epoch is absent')
+    return epoch<=actual[0]
+
+def _advance_fact_core_source_row_v3(builder,budget,position,authority_meter):
+    from .c09_platform_observation_fact_storage_v3 import ActualFactSourceCaptureV3,TABLE
+    from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3,read_c09_next_row_metadata_v2
+    meter=require_c09_reserved_meter_v3(budget);shape=_table_shape(builder.pair.source,TABLE)
+    source_shape=_core_source_shape_v3(builder,shape,meter)
+    stream=_stream(builder.pair,builder.scope,source_shape,'row_dispositions')
+    cursor=read_capture_cursor_v2(builder.pair.candidate,stream)
+    found=read_c09_next_row_metadata_v2(builder.pair.source,shape,cursor.last_key)
+    if found is None:
+        if source_shape is not shape:
+            from ..runtime.c09_paged_sql_v2 import _capture_data_state,_capture_write_v2
+            source_stream=_stream(builder.pair,builder.scope,source_shape,'source_originals_v3')
+            with capture_transaction_v2(builder.pair.candidate):
+                sc=read_capture_cursor_v2(builder.pair.candidate,source_stream)
+                data=_capture_data_state(builder.pair.candidate,source_stream)
+                if read_c09_next_row_metadata_v2(builder.pair.source,shape,sc.last_key)is not None:
+                    raise C09PagedCaptureHold('Fact logical Source stream omitted an actual row')
+                data['eof']=canonical_digest(('sylanne3.c09.data-eof.v2',source_stream.stream_id,sc.record_offset,sc.last_key))
+                _capture_write_v2(builder.pair.candidate,"UPDATE c09_capture_progress_v2 SET progress_json=? WHERE stream_id=? AND phase='data'",
+                    (canonical_serialize(data),source_stream.stream_id))
+        return None
+    key,_=found;capture=builder.fact_source_capture_v3
+    if capture is None or capture.shape!=shape or capture.key!=key:
+        capture=ActualFactSourceCaptureV3(builder,shape,key,meter=meter)
+    if not(capture.complete and capture.quantum_completed):
+        builder._pending_fact_capture_v3=capture.advance(meter)
+        return dict(status='progress',role='core',phase='observation_fact_frozen_source',actual_io_bytes=meter.consumed_bytes)
+    capture.require_complete(builder,shape,key)
+    qualified=builder.fact_disposition_v3
+    if qualified is None or qualified.capture is not capture:qualified=_PlatformObservationFactDispositionReadV3(capture)
+    if not(qualified.complete and qualified.quantum_completed):
+        builder._pending_fact_disposition_v3=qualified.advance(budget,meter)
+        return dict(status='progress',role='core',phase='observation_fact_'+builder._pending_fact_disposition_v3.phase,
+            actual_io_bytes=meter.consumed_bytes)
+    if qualified.affected:
+        with capture_transaction_v2(builder.pair.candidate):
+            _append_d13_logical_source_v3(builder,qualified,authority_meter)
+            builder.transform.origin=('source_row',capture.shape.table,_json(capture.key))
+            builder.transform._consume('platform_observation_fact_v3',capture.key[0],capture.key[0],capture.commitment,authority_meter)
+            _commit_d13_disposition_v3(builder,qualified,stream,'payload_erased_retained_facts',None,authority_meter)
+        builder.fact_source_capture_v3=None;builder.fact_disposition_v3=None
+        return dict(status='progress',role='core',phase='observation_fact_retired')
+    builder.fact_target_state_v3=dict(index=0,writer=None,seals=())
+    return dict(status='progress',role='core',phase='observation_fact_target_begin')
+
+
+def _advance_fact_target_copy_v3(builder):
+    from ..segmented_sql_cell_v1 import VerifiedSealedCellV1
+    from .c09_platform_observation_fact_storage_v3 import BLOB_COLUMNS,PHYSICAL_COLUMNS
+    from .observation_fact_history_v3 import issue_observation_fact_history_v3,KIND
+    qualified=builder.fact_disposition_v3;capture=qualified.capture;state=builder.fact_target_state_v3
+    if (type(qualified)is not _PlatformObservationFactDispositionReadV3 or not qualified.complete
+            or not qualified.quantum_completed or qualified.affected):
+        raise C09PagedCaptureHold('actual unaffected Fact final provenance required')
+    next_state=dict(state);finished=False
+    with builder.segmented_target_v3.quantum()as q:
+        target=builder.segmented_target_v3;capture.require_complete(builder,capture.shape,capture.key)
+        index=state['index']
+        if index<3:
+            column=BLOB_COLUMNS[index];writer=state['writer']
+            if writer is None:
+                writer=(target.begin_cell_copy(q,table=capture.shape.table,primary_key=capture.key,column=column)
+                    if capture.logical_original is None else
+                    target.begin_mapped_cell_copy(q,source_row=capture.logical_original,column=column))
+                next_state['writer']=writer
+            elif writer.phase=='replay_prefix':writer.replay_prefix(q)
+            elif writer.phase=='write':writer.advance(q)
+            elif writer.phase=='verify':
+                seal=writer.verify_and_seal(q)
+                if type(seal)is VerifiedSealedCellV1:
+                    seal.require_current(target,quantum=q,table=capture.shape.table,primary_key=capture.key,column=column)
+                    if(seal.ref.payload_sha256,seal.ref.total_bytes)!=(capture.hashes[column],capture.sizes[column]):
+                        raise C09PagedCaptureHold('Fact target cell differs from its complete frozen original')
+                    next_state=dict(index=index+1,writer=None,seals=state['seals']+(seal,))
+            else:raise C09PagedCaptureHold('Fact target writer lost registered progress phase')
+        else:
+            for column,seal in zip(BLOB_COLUMNS,state['seals']):
+                seal.require_current(target,quantum=q,table=capture.shape.table,primary_key=capture.key,column=column)
+            shape=read_c09_table_shape_v2(builder.pair.candidate,capture.shape.table,meter=q.meter)
+            if shape.columns!=PHYSICAL_COLUMNS:raise C09PagedCaptureHold('Fact target lost its exact three-BLOB physical schema')
+            row=capture.identity+tuple(seal.ref.cell_id for seal in state['seals'])
+            meter=C09AuthorityRowMeterV2(q.budget.max_bytes)
+            source_shape=_core_source_shape_v3(builder,capture.shape,q.meter)
+            stream=_stream(builder.pair,builder.scope,source_shape,'row_dispositions')
+            original=(issue_observation_fact_history_v3(builder,qualified,meter=q.meter)
+                if qualified.historical_certificate is None else qualified.historical_certificate)
+            archive=(builder.scope.authority_namespace,capture.key[0],KIND,original['history_digest'],
+                canonical_serialize(original)if qualified.historical_archive_json is None else qualified.historical_archive_json,
+                original['maintenance_generation'])
+            columns=('namespace','operation_id','original_kind','original_digest','original_json','maintenance_generation')
+            with capture_transaction_v2(builder.pair.candidate):
+                _same_insert(builder.pair.candidate,shape.table,shape.columns,row,shape.primary_key_columns,meter)
+                _same_insert(builder.pair.candidate,'authority_c09_originals_archive_v1',columns,archive,columns[:3],meter)
+                if qualified.historical_certificate is None:
+                    _generated(builder.pair,builder.scope,'authority_c09_originals_archive_v1',columns,archive,
+                        'observation-fact-history-v3',original['history_digest'],meter)
+                _append_d13_logical_source_v3(builder,qualified,meter)
+                _commit_d13_disposition_v3(builder,qualified,stream,'platform_observation_fact_logical_preserved_v3',capture.commitment,meter)
+            finished=True
+    if finished:
+        builder.fact_target_state_v3=None;builder.fact_source_capture_v3=None;builder.fact_disposition_v3=None
+    else:builder.fact_target_state_v3=next_state
+    return dict(status='progress',role='core',phase='observation_fact_target_committed'if finished else'observation_fact_target_copy')
+
+def _prepare_fact_source_provenance_v3(builder,key,budget,meter):
+    from .c09_platform_observation_fact_storage_v3 import ActualFactSourceCaptureV3,TABLE
+    shape=_table_shape(builder.pair.source,TABLE);capture=builder.fact_source_capture_v3
+    if capture is None or capture.shape!=shape or capture.key!=tuple(key):
+        capture=ActualFactSourceCaptureV3(builder,shape,tuple(key),meter=meter)
+    if not(capture.complete and capture.quantum_completed):
+        builder._pending_fact_capture_v3=capture.advance(meter);return False
+    capture.require_complete(builder,shape,key)
+    qualified=builder.fact_disposition_v3
+    if qualified is None or qualified.capture is not capture:qualified=_PlatformObservationFactDispositionReadV3(capture)
+    if not(qualified.complete and qualified.quantum_completed):
+        builder._pending_fact_disposition_v3=qualified.advance(budget,meter);return False
+    builder.transform.fact_disposition_v3=qualified
+    return True
+
+
+def _prepare_fact_archive_source_v3(builder,budget,position,meter):
+    from ..runtime.c09_paged_sql_v2 import read_c09_next_row_metadata_v2
+    from .observation_fact_history_v3 import KIND
+    shape=_table_shape(builder.pair.source,'authority_c09_originals_archive_v1')
+    stream=_stream(builder.pair,builder.scope,shape,'row_dispositions')
+    cursor=read_capture_cursor_v2(builder.pair.candidate,stream)
+    found=read_c09_next_row_metadata_v2(builder.pair.source,shape,cursor.last_key)
+    if found is None:return True
+    key,_=found
+    if len(key)!=3 or key[0]!=builder.scope.authority_namespace or key[2]!=KIND:return True
+    return _prepare_fact_source_provenance_v3(builder,(key[1],),budget,meter)
+
+
+def _fact_archive_disposition_v3(transform,columns,row,meter):
+    from .observation_fact_history_v3 import KIND,validate_observation_fact_history_v3
+    if tuple(columns)!=('namespace','operation_id','original_kind','original_digest','original_json','maintenance_generation'):
+        raise C09PagedCaptureHold('Fact history archive exact columns differ')
+    q=transform.fact_disposition_v3
+    if(type(q)is not _PlatformObservationFactDispositionReadV3 or not q.complete or not q.quantum_completed
+            or q.builder.transform is not transform or q.capture.key!=(row[1],)or q.historical_certificate is None):
+        raise C09PagedCaptureHold('actual complete frozen Fact/archive qualification required')
+    original=json.loads(row[4])
+    validate_observation_fact_history_v3(q.builder.session._control.maintenance.control,original,namespace=transform.scope.authority_namespace)
+    if (row[:4]!=(transform.scope.authority_namespace,q.capture.key[0],KIND,original['history_digest'])
+            or original!=q.historical_certificate or row[4]!=q.historical_archive_json
+            or row[5]!=original['maintenance_generation']):
+        raise C09PagedCaptureHold('Fact archive differs from its full authenticated same-Source original')
+    return (None,'payload_erased_retained_facts')if q.affected else(row,'preserved_exact')
+
+
+def _require_fact_target_header_v3(builder,reader,shape,key,row,meter):
+    from .c09_platform_observation_fact_storage_v3 import PHYSICAL_COLUMNS,BLOB_COLUMNS,require_fact_cell_binding_v3
+    from .observation_fact_history_v3 import KIND,validate_observation_fact_history_v3
+    if shape.columns!=PHYSICAL_COLUMNS or tuple(row[:2])!=(builder.scope.authority_namespace,key[0])or row[2]!=key[0]or row[5]!='committed':
+        raise C09PagedCaptureHold('Fact target exact physical row/namespace/identity differs')
+    archive=meter.read_one(reader,'authority_c09_originals_archive_v1',('original_digest','original_json','maintenance_generation'),
+        'namespace=? AND operation_id=? AND original_kind=?',(builder.scope.authority_namespace,key[0],KIND))
+    if archive is None:raise C09PagedCaptureHold('retained Fact lacks its actual historical provenance original')
+    original=json.loads(archive[1]);validate_observation_fact_history_v3(builder.session._control.maintenance.control,
+        original,namespace=builder.scope.authority_namespace)
+    if (archive[0]!=original['history_digest']or archive[2]!=original['maintenance_generation']
+            or archive[1]!=canonical_serialize(original)or row[3:5]!=(original['subject'],original['request_digest'])):
+        raise C09PagedCaptureHold('Fact target archive identity/digest differs')
+    for column,cell in zip(BLOB_COLUMNS,row[6:]):
+        header=meter.read_one(reader,'segmented_cells_v1',('cell_id','codec_id','erasure_owner_ref','producer_operation_id',
+            'total_bytes','segment_count','payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(cell,))
+        if header is None:raise C09PagedCaptureHold('Fact target sealed header is absent')
+        require_fact_cell_binding_v3(namespace=row[0],operation_id=row[1],column=column,header=header)
+        expected=original['column_commitments'][column]
+        if(header[6],header[4])!=(expected['sha256'],expected['byte_count']):
+            raise C09PagedCaptureHold('Fact target header differs from original complete bytes/SHA')
+        if builder.segmented_sweep_v3 is not None:
+            from .c09_segmented_census_v3 import require_segmented_target_row_v3
+            require_segmented_target_row_v3(builder.segmented_sweep_v3,'segmented_cells_v1',(cell,),header,meter=meter.parent)
+    return original
+
+def _verify_fact_cold_record_v3(builder,reader,stream,kind,record,budget,meter):
+    from .c09_platform_observation_fact_storage_v3 import TABLE
+    from .observation_fact_history_v3 import KIND,observation_fact_history_body_v3
+    from ..runtime.c09_paged_sql_v2 import require_c09_logical_source_row_member_v3
+    if not _prepare_fact_source_provenance_v3(builder,record.primary_key,budget,meter.parent):return False
+    q=builder.fact_disposition_v3;c=q.capture;logical=c.logical_original
+    if kind=='source_originals_v3':
+        if logical is None:raise C09PagedCaptureHold('native Fact has no mapped Source descriptor')
+        member=meter.read_one(reader,'c09_capture_members_v2',('record_ordinal',),'stream_id=? AND key_digest=?',
+            (stream.stream_id,canonical_digest(c.key)))
+        if member is None:raise C09PagedCaptureHold('cold Fact logical Source member is absent')
+        descriptor=require_c09_logical_source_row_member_v3(reader,stream,role='core',table_name=TABLE,
+            key=c.key,record_ordinal=member[0],meter=meter.parent)
+        if canonical_digest(descriptor)!=logical.descriptor_digest or record.commitment!=logical.descriptor_digest:
+            raise C09PagedCaptureHold('cold Fact full logical Source descriptor differs')
+        builder.fact_source_capture_v3=None;builder.fact_disposition_v3=None;return True
+    old=logical.descriptor_digest if logical is not None else c.commitment
+    proof=meter.read_one(reader,'authority_c09_role_rows_v2',('old_commitment','disposition','new_commitment'),
+        'scope_digest=? AND role=? AND table_name=? AND key_digest=?',(builder.scope.scope_digest,'core',TABLE,canonical_digest(c.key)))
+    shape=read_c09_table_shape_v2(reader,TABLE,meter=meter.parent)
+    target=meter.read_one(reader,TABLE,shape.columns,'fact_operation_id=?',c.key)
+    if q.affected:
+        if target is not None:raise C09PagedCaptureHold('affected Fact target retains its original payload')
+        consumed=meter.read_one(reader,'authority_c09_consumed_execution_v1',
+            ('operation_id','original_commitment'),'namespace=? AND kind=? AND item_id=?',
+            (builder.scope.authority_namespace,'platform_observation_fact_v3',c.key[0]))
+        if consumed!=(c.key[0],c.commitment):raise C09PagedCaptureHold('cold Fact retirement lacks its exact original commitment')
+        archive=meter.read_one(reader,'authority_c09_originals_archive_v1',('operation_id',),
+            'namespace=? AND operation_id=? AND original_kind=?',(builder.scope.authority_namespace,c.key[0],KIND))
+        if archive is not None:raise C09PagedCaptureHold('affected Fact retains its old Source-bearing historical certificate')
+        wanted=(old,'payload_erased_retained_facts',None)
+    else:
+        if target is None:raise C09PagedCaptureHold('retained Fact target is absent')
+        original=_require_fact_target_header_v3(builder,reader,shape,c.key,target,meter)
+        if q.historical_certificate is None:
+            body=observation_fact_history_body_v3(builder,q,meter=meter.parent)
+            if any(original[name]!=value for name,value in body.items()):
+                raise C09PagedCaptureHold('cold Fact certificate differs from independently replayed complete Source/Core/execution proof')
+        elif original!=q.historical_certificate:
+            raise C09PagedCaptureHold('cold historical Fact certificate bytes were changed or re-signed')
+        wanted=(old,'platform_observation_fact_logical_preserved_v3',c.commitment)
+    if proof!=wanted:raise C09PagedCaptureHold('cold Fact disposition differs from its complete actual proof')
+    values=(builder.scope.scope_digest,'core',TABLE,canonical_digest(c.key),_json(c.key),*wanted)
+    if record.commitment!=canonical_digest(('sylanne3.c09.authority-row-disposition.v2',values)):
+        raise C09PagedCaptureHold('cold Fact disposition member differs')
+    builder.fact_source_capture_v3=None;builder.fact_disposition_v3=None
+    return True
+
+
+def _prepare_fact_cold_metadata_v3(builder,source,shape,key,budget,meter):
+    """Prepare only actual registered archive/consumed/generated natural keys."""
+    if shape.table=='authority_c09_originals_archive_v1'and len(key)==3 and key[2]=='observation_fact_history_v3':
+        if key[0]!=builder.scope.authority_namespace:raise C09PagedCaptureHold('Fact archive cold key crosses namespace')
+        return _prepare_fact_source_provenance_v3(builder,(key[1],),budget,meter.parent)
+    target_key=key
+    if shape.table=='authority_c09_role_generated_v2':
+        row=meter.read_one(source,shape.table,('table_name','key_json'),
+            'scope_digest=? AND role=? AND table_name=? AND key_digest=?',key)
+        if row is None:raise C09PagedCaptureHold('Fact generated metadata key disappeared')
+        if row[0]!='authority_c09_consumed_execution_v1':return True
+        target_key=tuple(json.loads(row[1]))
+    elif shape.table!='authority_c09_consumed_execution_v1':return True
+    if len(target_key)==3 and target_key[1]=='platform_observation_fact_v3':
+        if target_key[0]!=builder.scope.authority_namespace:raise C09PagedCaptureHold('Fact consumed cold key crosses namespace')
+        return _prepare_fact_source_provenance_v3(builder,(target_key[2],),budget,meter.parent)
+    return True

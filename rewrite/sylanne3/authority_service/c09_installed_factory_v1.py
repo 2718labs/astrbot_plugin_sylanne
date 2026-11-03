@@ -5,6 +5,7 @@ callbacks or caller-created cleanup receipts. No old process hot-swap exists.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 from dataclasses import dataclass
 
@@ -134,7 +135,10 @@ class InstalledC09MaintenanceFactoryV1:
             raise AuthorityUnavailable('one exact installed peer registry initializer required')
         self._controlled_sdk_registry_assets_v3=(root_descriptor,closed_services)
 
-    def advance_peer_registry_preparation_v3(self, *, control, config, context):
+    def advance_peer_registry_preparation_v3(self, *, control, config, context, fresh_installation=None):
+        if fresh_installation is not None:
+            from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+            _require_fresh_d13_request_v3(fresh_installation,config=config)
         from .c09_storage_maintenance_v1 import (InstalledC09WriterGateV1,
             VerifiedInstalledPeerRegistryActivationV3,_PEER_REGISTRY_ACTIVATION_ISSUER_V3)
         from .daemon import _bootstrap_control_quantum_v3
@@ -142,13 +146,18 @@ class InstalledC09MaintenanceFactoryV1:
         if state is None:
             gate=InstalledC09WriterGateV1(control=control,installed_config=config)
             original=control.read_writer_peer_registry_activation_v3()
-            state={'gate':gate,'original':original,'phase':'qualify','existing':original is not None}
+            from ..runtime.d13_consumer_manifest_v3 import requires_current_core_birth_v4
+            state={'gate':gate,'original':original,'phase':'qualify','existing':original is not None,'fresh':fresh_installation,
+                'current_core_birth_required_v4':fresh_installation is None and requires_current_core_birth_v4(config)}
             self._peer_registry_preparations_v3[control]=state
-            if original is None and self._peer_registry_census_v3 is not None:
-                self._peer_registry_census_v3.begin(control=control,config=config,context=context)
+            if (original is None or fresh_installation is not None)and self._peer_registry_census_v3 is not None:
+                census=self._peer_registry_census_v3
+                if census.control is None:census.begin(control=control,config=config,context=context)
+                elif census.control is not control or census.config is not config or census.context is not context:
+                    raise AuthorityUnavailable('initial same-channel census changed its actual selected composition')
             return dict(status='progress',phase='writer_peer_registry_qualification')
         gate=state['gate']
-        if gate._installed_config_v3 is not config:
+        if gate._installed_config_v3 is not config or state['fresh']is not fresh_installation:
             raise AuthorityUnavailable('peer registry preparation changed selected installed config')
         if state['phase']=='complete':return gate
         if state['phase']=='pending_coverage':
@@ -156,11 +165,16 @@ class InstalledC09MaintenanceFactoryV1:
             if self._controlled_sdk_registry_assets_v3 is not None:
                 hold=state['sdk_census']
             else:
-                if 'pending_hold' not in state:
-                    supervisor=self._peer_registry_census_v3.supervisor
-                    supervisor.install_peer_registry_start_v3(control=control,gate=gate)
-                    state['pending_hold']=supervisor.hold_pending_peer_start_coverage_v3()
-                hold=state['pending_hold']
+                supervisor=self._peer_registry_census_v3.supervisor
+                supervisor.install_peer_registry_start_v3(control=control,gate=gate)
+                if fresh_installation is not None:
+                    # The original Root loop is still waiting on this exact genesis channel.
+                    hold=self._peer_registry_census_v3.hold
+                else:
+                    if 'pending_hold' not in state:
+                        state['pending_hold']=supervisor.hold_pending_peer_start_coverage_v3(
+                            authority_spec=self._peer_registry_census_v3.authority_spec_v4 if state['current_core_birth_required_v4']else None)
+                    hold=state['pending_hold']
             gate._pending_start_bootstrap_hold_v3=hold
             result=control.advance_writer_peer_pending_start_coverage_v3(gate,operation_id=None,context=context)
             if type(result) is not VerifiedWriterPeerPendingStartCoverageV3:
@@ -168,21 +182,30 @@ class InstalledC09MaintenanceFactoryV1:
                     gate.resolve_pending_start_coverage_v3(result['pending_start_original'])
                 return result
             gate._bootstrap_pending_start_coverage_v3=result
-            if self._controlled_sdk_registry_assets_v3 is not None:hold.close()
-            else:hold.close(result.original)
-            gate._pending_start_bootstrap_hold_v3=None
+            state['pending_completion']=result.original
             state['phase']='complete'
+            if state['current_core_birth_required_v4']:
+                from ..runtime.d13_consumer_manifest_v3 import issue_current_core_birth_qualification_v4
+                issue_current_core_birth_qualification_v4(control=control,gate=gate,config=config,context=context,state=state)
+            elif fresh_installation is None:
+                if self._controlled_sdk_registry_assets_v3 is not None:hold.close()
+                else:hold.close(result.original)
+                gate._pending_start_bootstrap_hold_v3=None
             return gate
-        if state['original'] is None and self._peer_registry_census_v3 is not None:
+        if (state['original'] is None or fresh_installation is not None)and self._peer_registry_census_v3 is not None:
             self._peer_registry_census_v3.advance()
         elif self._controlled_sdk_registry_assets_v3 is None and state['original'] is None:
             raise AuthorityUnavailable('missing peer registry has no actual installed process census activation; HOLD')
         if self._controlled_sdk_registry_assets_v3 is not None and 'sdk_census' not in state:
             from ..host.c09_controlled_sdk_bootstrap_v3 import hold_controlled_sdk_process_census_v3
             descriptor,_=self._controlled_sdk_registry_assets_v3
-            state['sdk_census']=hold_controlled_sdk_process_census_v3(root_descriptor=descriptor,config=config,
-                inventory=self.inventory,peer=self.peer)
-        with gate.hold_peer_registry_activation_v3() as token:
+            initial_census=getattr(self,'_initial_sdk_genesis_census_v4',None)
+            if initial_census is not None:
+                initial_census.require_current();state['sdk_census']=initial_census
+            else:
+                state['sdk_census']=hold_controlled_sdk_process_census_v3(root_descriptor=descriptor,config=config,
+                    inventory=self.inventory,peer=self.peer)
+        with self._peer_registry_activation_scope_v3(state,fresh_installation)as token:
             with _bootstrap_control_quantum_v3(control) as meter:
                 if self._controlled_sdk_registry_assets_v3 is not None:
                     descriptor,closed=self._controlled_sdk_registry_assets_v3
@@ -191,13 +214,19 @@ class InstalledC09MaintenanceFactoryV1:
                     if state['original'] is None:
                         qualification=issue_controlled_sdk_genesis_v3(gate=gate,control=control,config=config,
                             closed_services=closed,root_descriptor=descriptor,process_census=state['sdk_census'],meter=meter)
+                    elif fresh_installation is not None and fresh_installation.mode=='finalize':
+                        from ..host.c09_controlled_sdk_bootstrap_v3 import read_controlled_sdk_fresh_finalization_original_v3
+                        qualification=read_controlled_sdk_fresh_finalization_original_v3(gate=gate,control=control,config=config,
+                            root_descriptor=descriptor,process_census=state['sdk_census'],original=state['original'].original,
+                            closed_services=closed,consumer_closures=fresh_installation.consumer_closures,
+                            fresh_request=fresh_installation,meter=meter)
                     else:
                         qualification=read_controlled_sdk_activation_original_v3(gate=gate,control=control,config=config,
                             root_descriptor=descriptor,process_census=state['sdk_census'],original=state['original'].original,meter=meter)
                     activation=VerifiedInstalledPeerRegistryActivationV3(_PEER_REGISTRY_ACTIVATION_ISSUER_V3,
                         control=control,gate=gate,qualification=qualification,hold_token=token,meter=meter)
                     gate._controlled_sdk_activation_v3=activation
-                elif state['original'] is None:
+                elif state['original'] is None or fresh_installation is not None:
                     activation=VerifiedInstalledPeerRegistryActivationV3(_PEER_REGISTRY_ACTIVATION_ISSUER_V3,
                         control=control,gate=gate,qualification=self._peer_registry_census_v3,hold_token=token,meter=meter)
                 if state['original'] is None:
@@ -207,18 +236,77 @@ class InstalledC09MaintenanceFactoryV1:
                 actual_original=state['original'].original if state['existing'] else state['original']
                 gate.require_registry_activation_domain_v3(actual_original,meter=meter)
                 control.install_writer_peer_gate_v3(gate)
-        if self._peer_registry_census_v3 is not None:self._peer_registry_census_v3.close()
+                if fresh_installation is not None:
+                    state['activation'],state['actual_original']=activation,actual_original
+        if fresh_installation is None and self._peer_registry_census_v3 is not None:self._peer_registry_census_v3.close()
         state['phase']='pending_coverage'
         return dict(status='progress',phase='writer_peer_pending_start_coverage')
 
-    def take_prepared_peer_registry_gate_v3(self, *, control, config):
-        state=self._peer_registry_preparations_v3.pop(control,None)
-        if state is None or state['phase']!='complete' or state['gate']._installed_config_v3 is not config:
+    def take_prepared_peer_registry_gate_v3(self, *, control, config, fresh_installation=None):
+        state=self._peer_registry_preparations_v3.get(control)
+        if (state is None or state['phase']!='complete' or state['gate']._installed_config_v3 is not config
+                or state['fresh']is not fresh_installation):
             raise AuthorityUnavailable('actual complete selected peer registry Gate required before composition')
+        if fresh_installation is not None:
+            fresh_installation.bind_composition_v3(fresh_installation.selected_composition,state['activation'],state['actual_original'])
+            fresh_installation.peer_registry_state=state
+        if fresh_installation is None and not state['current_core_birth_required_v4']:
+            self._peer_registry_preparations_v3.pop(control)
         return state['gate']
+
+    @contextmanager
+    def _peer_registry_activation_scope_v3(self,state,fresh_installation):
+        gate=state['gate']
+        if fresh_installation is None:
+            with gate.hold_peer_registry_activation_v3()as token:yield token
+            return
+        fresh_installation.require_v3(gate._installed_config_v3)
+        if 'activation_hold'not in state:
+            state['activation_hold']=gate.hold_peer_registry_activation_v3()
+            state['activation_token']=state['activation_hold'].__enter__()
+        gate.require_peer_registry_activation_hold_v3(state['activation_token'])
+        yield state['activation_token']
+
+    def finish_fresh_d13_peer_registry_v3(self,request):
+        state=getattr(request,'peer_registry_state',None)
+        if state is None:return
+        if state['fresh']is not request:raise AuthorityUnavailable('fresh D13 Gate closure changed its actual owner')
+        if 'pending_hold'in state:state['pending_hold'].close(state['pending_completion'])
+        if 'sdk_census'in state:state['sdk_census'].close()
+        state['gate']._pending_start_bootstrap_hold_v3=None
+        if self._peer_registry_census_v3 is not None:self._peer_registry_census_v3.close()
+        if 'activation_hold'in state:state['activation_hold'].__exit__(None,None,None)
+        self._peer_registry_preparations_v3.pop(state['gate'].control,None)
+        request.peer_registry_state=None
+
+    def current_core_birth_qualification_v4(self,*,control,config):
+        from ..runtime.d13_consumer_manifest_v3 import CurrentCoreBirthQualificationV4
+        state=self._peer_registry_preparations_v3.get(control)
+        proof=None if state is None else state.get('current_core_birth_qualification_v4')
+        if (state is None or state['fresh']is not None or state['phase']!='complete'
+                or state['gate']._installed_config_v3 is not config or type(proof)is not CurrentCoreBirthQualificationV4):
+            raise AuthorityUnavailable('actual completed current Core birth qualification required')
+        return proof.require_v4()
+
+    def finish_current_core_birth_v4(self,*,control,qualification):
+        proof=self.current_core_birth_qualification_v4(control=control,config=qualification.config)
+        if proof is not qualification or proof.birth is None:
+            raise AuthorityUnavailable('current Core cannot release its Root hold before its actual birth ACK')
+        from .d13_original_owner_v3 import require_actual_d13_current_core_receiver_cleanup_complete_v4
+        require_actual_d13_current_core_receiver_cleanup_complete_v4(proof.daemon,qualification=proof)
+        state=self._peer_registry_preparations_v3[control]
+        if 'pending_hold'in state:state['pending_hold'].close(state['pending_completion'])
+        if 'sdk_census'in state:state['sdk_census'].close()
+        state['gate']._pending_start_bootstrap_hold_v3=None
+        self._peer_registry_preparations_v3.pop(control)
+        qualification.close_v4()
 
     def close_peer_registry_preparation_v3(self, control):
         state=self._peer_registry_preparations_v3.pop(control,None)
+        if state is not None and state.get('current_core_birth_qualification_v4')is not None:
+            state['current_core_birth_qualification_v4'].close_v4()
+        if state is not None and 'activation_hold'in state:
+            state['activation_hold'].__exit__(None,None,None)
         if state is not None and 'sdk_census' in state:state['sdk_census'].close()
         if state is not None and 'pending_hold' in state:state['pending_hold'].close()
         if self._peer_registry_census_v3 is not None:self._peer_registry_census_v3.close()

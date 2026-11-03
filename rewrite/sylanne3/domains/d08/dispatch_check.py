@@ -214,6 +214,8 @@ def read_dispatch_check_scope_v2(
     stored_schema = d08_types["d08.action_schema.v1"].validator(schema_atom.value)
     cancellation = d08_types["d08.action_cancellation.v1"].validator(
         cancellation_atom.value)
+    from ...runtime.d08_commitment_communication_v1 import current_named_commitment_for_action_v1
+    named = current_named_commitment_for_action_v1(db, namespace, intent, now_utc=now_utc)
     if (type(goal) is not Goal or goal_atom.revision != 1
             or goal.goal_id != intent.goal_ref or goal.revision != 1
             or goal.state != "active"
@@ -231,7 +233,7 @@ def read_dispatch_check_scope_v2(
             or cancellation.effect_id != intent.identity.effect_id
             or cancellation.operation_id != intent.identity.operation_id
             or cancellation.state != "active" or cancellation.cancel_epoch != 0
-            or intent.commitment_refs):
+            or (intent.commitment_refs and named is None)):
         raise ValueError("D08 goal, schema or initial cancellation is not current")
 
     from ...runtime.dispatch_current_commitments import read_current_d08_conflict_facts
@@ -250,7 +252,8 @@ def read_dispatch_check_scope_v2(
         if item.counterparty_ref == intent.target_ref)
     conflicting_commitments = tuple(
         item.commitment_id for item in applicable_commitments
-        if item.fulfillment_state not in {"fulfilled", "withdrawn"})
+        if item.fulfillment_state not in {"fulfilled", "withdrawn"}
+        and (named is None or item.commitment_id != named.commitment.key.name))
     unfinished_actions = []
     for other in facts.action_intents:
         if other.action_id == intent.action_id:
@@ -283,6 +286,11 @@ def read_dispatch_check_scope_v2(
         f"execution-epoch:{intent.action_id}": anchor.execution_seq,
         f"cancellation-epoch:{intent.action_id}": cancellation_atom.revision,
     }
+    if named is not None:
+        expected[named.commitment.key.name] = named.commitment.revision
+        from ...runtime.d08_commitment_communication_v1 import current_named_commitment_check_refs_v1
+        named_refs = current_named_commitment_check_refs_v1(db, namespace, intent, now_utc=now_utc)
+        expected.update((ref.ref, ref.version) for ref in named_refs)
     frozen = {item.ref: item.version for item in spec.required_input_versions}
     if (spec.criteria_version != D08_CRITERIA_REF_V1
             or spec.subject_ref != f"persona:{namespace.persona_id}"
@@ -311,6 +319,8 @@ def read_dispatch_check_scope_v2(
         raise ValueError("D08 current provider did not pass")
     positive = (source_version,) + tuple(VersionedRef(atom.key.token, atom.revision) for atom in (
         goal_atom, action_atom, schema_atom, cancellation_atom))
+    if named is not None:
+        positive = (*positive, *named_refs)
     commitments = tuple(VersionedRef(item.key.token, item.revision)
                         for item in facts.graph_versions
                         if item.key.type_name == "d08.commitment.v1")

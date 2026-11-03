@@ -129,6 +129,16 @@ def verify_d07_production_stage_v1(stage):
 
 
 def read_plan_current_d07_operation_v1(db, *, namespace, activity_id, operation_kind, request,installed_readers=None):
+    if operation_kind=="serve_concern":
+        from .d07_ordinary_continuity_cognition_v1 import read_plan_bound_ordinary_continuity_concern_v1
+        service=installed_readers.execution_reader if type(installed_readers)is InstalledD07ProductionReadersV1 else None
+        plan=read_plan_bound_ordinary_continuity_concern_v1(db,namespace=namespace,activity_id=activity_id,
+            request=request,issuer=None if service is None else service.d11_issuer)
+        if plan is not None:return plan
+        from .d07_single_event_review_v1 import read_plan_bound_single_event_review_concern_v1
+        plan=read_plan_bound_single_event_review_concern_v1(db,namespace=namespace,activity_id=activity_id,
+            request=request,issuer=None if service is None else service.d11_issuer)
+        if plan is not None:return plan
     from .foreground_command_source_v3 import read_bound_foreground_command_concern_plan_v3
     handled,plan=read_bound_foreground_command_concern_plan_v3(db,namespace=namespace,activity_id=activity_id,
         operation_kind=operation_kind,request=request)

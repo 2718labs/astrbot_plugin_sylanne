@@ -15,7 +15,7 @@ import sqlite3
 import threading
 
 from ..contracts import canonical_json
-from ..runtime_storage_v3 import (read_core_payload_row_v3, insert_core_payload_row_v3,
+from ..runtime_storage_v3 import (
     core_payload_schema_v3, read_graph_head_v3,
     bind_runtime_database_from_control_v3, runtime_storage_operation_v3, runtime_storage_quantum_v3)
 from ..runtime_contracts import canonical_digest, canonical_serialize, NamespaceId
@@ -87,6 +87,7 @@ class InstalledD13CoreCounterServiceV1:
         self.billing_contract_digest = billing_contract_digest
         self._lock = threading.RLock()
         self._active_claim = None
+        self._pending_owner_draft_v3 = None
         self._claims = _D13CounterClaimRegistryV1(self._require_current_claim,self._require_recorded_execution_origin)
         self.internal_work = AuthorityInternalWorkService(bridge.journal,
             current_prepared_reader=self._read_prepared_for_binding,
@@ -111,34 +112,53 @@ class InstalledD13CoreCounterServiceV1:
                     db.execute(f"CREATE TRIGGER authority_d13_counter_no_{operation.lower()}_v1 BEFORE {operation} ON authority_d13_counter_originals_v1 BEGIN SELECT RAISE(ABORT,'Core counter original is immutable'); END")
             elif present != (core_payload_schema_v3(db, "authority_d13_counter_originals_v1", _SCHEMA),):
                 raise AuthorityUnavailable('installed Core counter original store unavailable')
+            from ..runtime_storage_v3 import runtime_storage_v3, runtime_storage_operation_v3
+            handle = runtime_storage_v3(db)
+            if handle is not None and handle.source_kind == 'initial_segmented_v4':
+                from .d13_provider_http_admission_v1 import install_actual_initial_runtime_counter_index_v4
+                with runtime_storage_operation_v3(db, operation_id='d13-initial-counter-index'):
+                    install_actual_initial_runtime_counter_index_v4(self, db=db)
+
+    def _d13_use_enabled_v3(self):
+        from ..runtime.d13_cache_use_admission_v2 import _bundle_use_enabled_v2
+        return _bundle_use_enabled_v2(self.source.observer.installed_bundle)
+
+    def _require_original_owner_in_tx_v3(self, db, operation_id, phase=None):
+        if not self._d13_use_enabled_v3():
+            return
+        from .d13_original_owner_v3 import _control, prepare_d13_counter_original_use_v3
+        if phase is not None:
+            row = db.execute('SELECT 1 FROM authority_d13_counter_originals_v1 '
+                'WHERE namespace=? AND counter_operation_id=? AND phase=?',
+                (self.bridge.namespace, operation_id, phase)).fetchone()
+            if row is None:
+                return
+        _control(self).require_original_execution_use_in_tx_v3(db,
+            prepare_d13_counter_original_use_v3(self, operation_id))
 
     def _original(self, operation_id, phase):
         from ..runtime_storage_v3 import runtime_storage_v3,begin_core_payload_read_v3
         from .c09_d13_source_retirement_v3 import require_not_retired_d13_source_v3
         key=(self.bridge.namespace,operation_id,phase)
         if runtime_storage_v3(self.core._db)is None:
-            with self.core._tx()as db:
-                require_not_retired_d13_source_v3(db,control=getattr(self.core,'_c09_storage_reader_v1',None),
-                    namespace=self.bridge.namespace,kind='counter',item_id=operation_id)
-                row=read_core_payload_row_v3(db,'authority_d13_counter_originals_v1',key)
-            if row is None:return None
-            payload=json.loads(row[0])
-            if canonical_serialize(payload)!=row[0]or canonical_digest(payload)!=row[1]:
-                raise AuthorityUnavailable('protected counter original bytes differ')
-            return payload
+            raise AuthorityUnavailable('V3 Counter original Body reads require actual selected Core storage')
         from .d13_core_counter_source_v1 import require_counter_call_resource_scope_v3
         scope=require_counter_call_resource_scope_v3(self,operation_id)
+        with self.core._tx() as db:
+            self._require_original_owner_in_tx_v3(db, operation_id, phase)
         reader=begin_core_payload_read_v3(scope.db,'authority_d13_counter_originals_v1',key)
         try:
             while not reader.complete:
                 scope=require_counter_call_resource_scope_v3(self,operation_id)
                 with self.core._tx()as db:
                     with runtime_storage_quantum_v3(db)as meter:
+                        self._require_original_owner_in_tx_v3(db, operation_id, phase)
                         require_not_retired_d13_source_v3(db,control=getattr(self.core,'_c09_storage_reader_v1',None),
                             namespace=self.bridge.namespace,kind='counter',item_id=operation_id)
                         reader.advance(meter=meter)
             with self.core._tx()as db:
                 with runtime_storage_quantum_v3(db):
+                    self._require_original_owner_in_tx_v3(db, operation_id, phase)
                     scope=require_counter_call_resource_scope_v3(self,operation_id)
                     require_not_retired_d13_source_v3(db,control=getattr(self.core,'_c09_storage_reader_v1',None),
                         namespace=self.bridge.namespace,kind='counter',item_id=operation_id)
@@ -155,23 +175,11 @@ class InstalledD13CoreCounterServiceV1:
         from .c09_d13_source_retirement_v3 import require_not_retired_d13_source_v3
         from ..runtime_storage_v3 import runtime_storage_v3,begin_core_payload_write_v3
         key=(self.bridge.namespace,operation_id,phase)
+        from .d13_original_owner_v3 import (_control, prepare_d13_counter_frame_owner_v3,
+            bind_d13_counter_owner_writer_v3)
+        owner_proof = prepare_d13_counter_frame_owner_v3(self, source, payload) if phase == 'draft' and self._d13_use_enabled_v3() else None
         if runtime_storage_v3(self.core._db)is None:
-            encoded=canonical_serialize(payload);commitment=canonical_digest(payload)
-            with self.core._tx()as db:
-                require_not_retired_d13_source_v3(db,control=getattr(self.core,'_c09_storage_reader_v1',None),
-                    namespace=self.bridge.namespace,kind='counter',item_id=operation_id)
-                if source is not None:self.source.self_identity._source_location.require_current_in_tx_v1(db,source.source_location)
-                prior=read_core_payload_row_v3(db,'authority_d13_counter_originals_v1',key)
-                if prior is None:
-                    insert_core_payload_row_v3(db,'authority_d13_counter_originals_v1',key,encoded,commitment,
-                        read_proof={'phase':phase,'payload_digest':commitment,'source_location':None if source is None
-                            else json.loads(canonical_serialize(source_location_material(source.source_location)))})
-                elif prior!=(encoded,commitment):
-                    raise AuthorityUnavailable('counter phase attempted to replace its immutable original')
-                if phase=='header':
-                    from .d13_provider_http_admission_v1 import register_runtime_counter_header_index_v3
-                    register_runtime_counter_header_index_v3(db,counter=self,operation=operation_id,payload=payload,digest=commitment)
-            return payload
+            raise AuthorityUnavailable('V3 Counter original publication requires actual selected Core storage')
         from .d13_core_counter_source_v1 import require_counter_call_resource_scope_v3
         from ..runtime_contracts import _canonical_value
         scope=require_counter_call_resource_scope_v3(self,operation_id)
@@ -180,12 +188,20 @@ class InstalledD13CoreCounterServiceV1:
             while writer.phase=='canonical':
                 require_counter_call_resource_scope_v3(self,operation_id)
                 with runtime_storage_quantum_v3(scope.db)as meter:writer.advance(meter=meter)
+            if owner_proof is not None:
+                bind_d13_counter_owner_writer_v3(owner_proof, writer)
             with self.core._tx()as db:
                 with runtime_storage_quantum_v3(db):
                     scope=require_counter_call_resource_scope_v3(self,operation_id)
                     require_not_retired_d13_source_v3(db,control=getattr(self.core,'_c09_storage_reader_v1',None),
                         namespace=self.bridge.namespace,kind='counter',item_id=operation_id)
                     if source is not None:self.source.self_identity._source_location.require_current_in_tx_v1(db,source.source_location)
+                    if owner_proof is not None:
+                        owner_registration = _control(self).register_original_owner_in_tx_v3(db, owner_proof)
+                        from .d13_original_owner_v3 import _record_actual_counter_birth_in_tx_v3
+                        _record_actual_counter_birth_in_tx_v3(_control(self), db, owner_proof, owner_registration)
+                    else:
+                        self._require_original_owner_in_tx_v3(db, operation_id)
                     writer.attach_read_proof_v3({'phase':phase,'payload_digest':writer.digest,
                         'source_location':None if source is None else _canonical_value(source_location_material(source.source_location),set())})
                 while not writer.complete:
@@ -202,6 +218,8 @@ class InstalledD13CoreCounterServiceV1:
                     if phase=='header':
                         from .d13_provider_http_admission_v1 import register_runtime_counter_header_index_v3
                         register_runtime_counter_header_index_v3(db,counter=self,operation=operation_id,payload=result,digest=writer.digest)
+            if owner_proof is not None:
+                scope.d13_frame_owner_registration_v3 = owner_registration
             return result
         except BaseException:
             writer.release_payload_v3();raise
@@ -351,6 +369,7 @@ class InstalledD13CoreCounterServiceV1:
                     complete=digest_reader.advance(meter)
                 if complete:break
             value['frame_intent_digest']=digest_reader.digest
+        self._pending_owner_draft_v3 = (value, current, work) if self._d13_use_enabled_v3() else None
         return value
 
     def _instruction(self,draft):
@@ -550,6 +569,7 @@ class InstalledD13CoreCounterServiceV1:
                 self.bridge._check_execution_head_locked(db,execution)
                 self.source.self_identity._source_location.require_current_in_tx_v1(db,current.source_location)
                 self._current_owner_in_tx(db,current,draft)
+                self._require_original_owner_in_tx_v3(db,draft['selector']['counter_operation_id'])
                 require_lifecycle_admission_in_tx_v1(db,self.bridge.namespace,action='first_internal_work_claim')
                 if execution!=before_head or self.bridge.journal.read_internal_work_v1(binding).claim is not None:
                     raise AuthorityUnavailable('counter durable execution right was already consumed')
@@ -585,6 +605,7 @@ class InstalledD13CoreCounterServiceV1:
                     or anchor.execution_digest!=inspection.claim_append.chain_digest):
                 raise AuthorityUnavailable('counter current execution interval changed')
             self._current_owner_in_tx(db,current,draft)
+            self._require_original_owner_in_tx_v3(db, draft['selector']['counter_operation_id'])
         self._read_prepared(draft,current=True)
 
     def _terminal(self,binding,claim,observed,claimed):
@@ -704,45 +725,148 @@ class InstalledD13CoreCounterServiceV1:
                     return self._awaiting(draft,inspection)
                 if inspection.terminal is None:
                     return self._awaiting(draft,inspection)
-                if not self.internal_work.verify_installed_terminal(prepared.binding,inspection.claim,inspection.terminal):
-                    raise AuthorityUnavailable('counter durable terminal has no actual installed measurement signature')
-                accounting=self._read_accounting(draft,prepared,inspection)
-                if accounting is None:
-                    return self._awaiting(draft,inspection)
-                if inspection.terminal.status!='completed':
-                    raise AuthorityUnavailable('counter failed execution was charged but yields no count evidence')
-                with self._current_source(prepare_selector,draft,read_credential=read_credential,subject=subject) as (current,permit):
-                    accounting=self._read_accounting(draft,prepared,inspection)
-                    if accounting is None:
-                        raise AuthorityUnavailable('counter accounting originals disappeared before signature')
-                    terminal=inspection.terminal
-                    output=json.loads(terminal.output_json)
-                    measurement=output['measurement']
-                    if (canonical_digest(measurement)!=terminal.result_digest
-                            or output['input_digest']!='sha256:'+prepared.binding.input_digest
-                            or terminal.actual_cpu_ms!=(measurement['actual_cpu_ns']+999999)//1000000):
-                        raise AuthorityUnavailable('counter actual CPU/result differs from signed terminal original')
-                    result=self._require_kernel_result(draft,measurement)
-                    cpu,body,settlement_digest=accounting
-                    payload=D13CoreFullWireEvidenceV1(frame=header,selector_digest=selector.selector_digest,
-                        raw_authority_digest=raw.frozen_input_digest,
-                        compressed_authority_digest=None if compressed is None else compressed.frozen_input_digest,
-                        raw_request_digest=raw.model_request_digest,
-                        compressed_request_digest=None if compressed is None else compressed.model_request_digest,
-                        **{name:result[name] for name in ('raw_http_template_digest','compressed_http_template_digest',
-                            'raw_http_bytes','compressed_http_bytes','token_evidence','raw_lower_tokens','raw_upper_tokens',
-                            'compressed_lower_tokens','compressed_upper_tokens')},
-                        **{name:getattr(self.policy,name) for name in ('counter_policy_fingerprint','tokenizer_fingerprint',
-                            'wire_policy_fingerprint','serializer_fingerprint','applicability_fingerprint')},
-                        cpu_execution_id=prepared.binding.execution_id,cpu_worker_binding_digest=prepared.binding.binding_digest,
-                        cpu_claim_digest=canonical_digest(inspection.claim),cpu_input_digest=prepared.binding.input_digest,
-                        cpu_terminal_digest=terminal.terminal_digest,actual_cpu_ns=measurement['actual_cpu_ns'],
-                        cpu_settlement_ref=body.settlement_ref,cpu_settlement_digest=settlement_digest,
-                        d02_accounting_digest=canonical_digest(body),d11_accounting_digest=canonical_digest(cpu))
-                    signature=self._key.sign(SIGNING_DOMAIN+canonical_serialize(asdict(payload)).encode('utf-8'))
-                    envelope=D13CoreFullWireEnvelopeV1(payload,self.policy.counter_key_id,base64.b64encode(signature).decode('ascii'))
-                    self._record(selector.counter_operation_id,'evidence',asdict(envelope),source=current)
-                    return envelope
+                return self._finalize_existing_d13_wire_v1(selector,draft,header,prepared,inspection,
+                    raw,compressed,prepare_selector,read_credential=read_credential,subject=subject)
+
+    def read_or_finalize_accounted_d13_wire_v1(self, *, selector, awaiting, accounting_receipt,
+            read_credential, subject):
+        """Complete only this already claimed, measured and settled counter original."""
+        self._installed_runtime.require_current(self.worker)
+        if (type(selector) is not D13CurrentWireCountSelectorV1
+                or type(awaiting) is not D13CounterAwaitingAccountingV1):
+            raise AuthorityUnavailable('accounted-only counter requires its exact original selectors')
+        self._require_accounted_receipt_shape(accounting_receipt)
+        with self._lock:
+            from .d13_core_counter_source_v1 import retain_counter_call_resource_scope_v3
+            with retain_counter_call_resource_scope_v3(self,selector=selector,
+                    read_credential=read_credential,subject=subject):
+                draft=self._original(selector.counter_operation_id,'draft')
+                saved_header=self._original(selector.counter_operation_id,'header')
+                if draft is None or saved_header is None:
+                    raise AuthorityUnavailable('accounted-only counter original frame is missing')
+                header=d13_core_counter_from_wire_v1(saved_header,D13CoreFrameIntentHeaderV7)
+                raw,compressed=self._require_selector(selector,draft,header)
+                prepared=self._read_prepared(draft)
+                if header!=self._header(draft,prepared):
+                    raise AuthorityUnavailable('accounted-only counter changed its original CPU preparation')
+                inspection=self.internal_work.inspect(prepared.binding)
+                if inspection.claim is None or inspection.terminal is None or inspection.terminal_append is None:
+                    raise AuthorityUnavailable('accounted-only counter cannot create or run an absent original claim')
+                if (awaiting!=self._awaiting(draft,inspection) or awaiting.status!='completed'
+                        or awaiting.binding_digest!=prepared.binding.binding_digest):
+                    raise AuthorityUnavailable('accounted-only counter terminal commitments differ')
+                prepare_selector=d13_core_counter_from_wire_v1(draft['selector'],D13CurrentFramePrepareSelectorV7)
+                return self._finalize_existing_d13_wire_v1(selector,draft,header,prepared,inspection,
+                    raw,compressed,prepare_selector,read_credential=read_credential,subject=subject,
+                    awaiting=awaiting,accounting_receipt=accounting_receipt)
+
+    @staticmethod
+    def _require_accounted_receipt_shape(receipt):
+        if (type(receipt) is not dict or set(receipt)!={'schema','frame_intent_id','operation_id',
+                'binding_digest','cpu_original_digest','body_original_digest','graph_receipt_digest','job_id','status'}
+                or receipt['schema']!='sylanne3.d13.counter-accounting-receipt.v1'
+                or any(type(value)is not str for value in receipt.values())):
+            raise AuthorityUnavailable('accounted-only counter requires the closed original settlement receipt')
+
+    def _require_accounted_counter_commitments(self,draft,prepared,inspection,accounting,awaiting,receipt):
+        from ..runtime.d13_counter_cpu_accounting_v1 import ATTEMPT_TABLE
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+        from ..graph_types import GraphReceipt,NamespaceEpoch
+        from ..graph_store import GraphStore
+        self._require_accounted_receipt_shape(receipt)
+        cpu,body,_=accounting
+        operation=draft['selector']['counter_operation_id']
+        if (awaiting!=self._awaiting(draft,inspection) or awaiting.status!='completed'
+                or (receipt['frame_intent_id'],receipt['operation_id'],receipt['binding_digest'],
+                    receipt['job_id'],receipt['status'])!=(draft['frame_intent_id'],operation,
+                    prepared.binding.binding_digest,draft['job_id'],'completed')
+                or receipt['cpu_original_digest']!=canonical_digest(asdict(cpu))
+                or receipt['body_original_digest']!=canonical_digest(asdict(body))):
+            raise AuthorityUnavailable('accounted-only original terminal and cost commitments differ')
+        with self._graph_db(operation_id=operation,deadline_utc=draft['expires_at_utc'])as db:
+            with runtime_storage_quantum_v3(db)as meter:
+                row=_runtime_bounded_fixed_row_v3(db,meter,ATTEMPT_TABLE,('binding_digest','receipt_json'),
+                    'bot=? AND persona=? AND operation_id=?',(*self.namespace.as_tuple,operation))
+                if row is None or row[0]!=prepared.binding.binding_digest or row[1]!=canonical_json(receipt):
+                    raise AuthorityUnavailable('accounted-only counter has no exact stored settlement receipt')
+                event_key=(*self.namespace.as_tuple,'d13-counter-v1',operation+':settle')
+                event=_runtime_bounded_fixed_row_v3(db,meter,'graph_events',
+                    ('revisions','invalidated','epoch_revision'),
+                    'bot=? AND persona=? AND session=? AND event_id=?',event_key)
+                if event is None:
+                    raise AuthorityUnavailable('accounted-only settlement has no actual Graph event')
+                graph_receipt=GraphReceipt('committed',GraphStore._version_rows(event[0]),
+                    GraphStore._version_rows(event[1]),NamespaceEpoch(*self.namespace.as_tuple,event[2]))
+                if canonical_digest(graph_receipt)!=receipt['graph_receipt_digest']:
+                    raise AuthorityUnavailable('accounted-only settlement Graph receipt commitment differs')
+                if not any(v.key.token==body.settlement_ref for v in graph_receipt.revisions):
+                    raise AuthorityUnavailable('accounted-only Body settlement is not an actual event member')
+                for versions,valid in ((graph_receipt.revisions,1),(graph_receipt.invalidated,0)):
+                    for version in versions:
+                        history=meter.read_fixed_row(db,'graph_history',
+                            ('valid','event_bot','event_persona','event_session','event_id'),
+                            'token=? AND revision=?',(version.key.token,version.revision))
+                        if history!=(valid,*event_key):
+                            raise AuthorityUnavailable('accounted-only Graph receipt member has another producer')
+
+    def _finalize_existing_d13_wire_v1(self,selector,draft,header,prepared,inspection,
+            raw,compressed,prepare_selector,*,read_credential,subject,awaiting=None,accounting_receipt=None):
+        if not self.internal_work.verify_installed_terminal(prepared.binding,inspection.claim,inspection.terminal):
+            raise AuthorityUnavailable('counter durable terminal has no actual installed measurement signature')
+        accounting=self._read_accounting(draft,prepared,inspection)
+        if accounting is None:
+            if awaiting is not None:
+                raise AuthorityUnavailable('accounted-only counter requires its original CPU and Body settlement')
+            return self._awaiting(draft,inspection)
+        if inspection.terminal.status!='completed':
+            raise AuthorityUnavailable('counter failed execution was charged but yields no count evidence')
+        with self._current_source(prepare_selector,draft,read_credential=read_credential,subject=subject) as (current,permit):
+            accounting=self._read_accounting(draft,prepared,inspection)
+            if accounting is None:
+                raise AuthorityUnavailable('counter accounting originals disappeared before signature')
+            if awaiting is not None:
+                self._require_accounted_counter_commitments(draft,prepared,inspection,accounting,awaiting,accounting_receipt)
+            terminal=inspection.terminal
+            output=json.loads(terminal.output_json)
+            measurement=output['measurement']
+            if (canonical_digest(measurement)!=terminal.result_digest
+                    or output['input_digest']!='sha256:'+prepared.binding.input_digest
+                    or terminal.actual_cpu_ms!=(measurement['actual_cpu_ns']+999999)//1000000):
+                raise AuthorityUnavailable('counter actual CPU/result differs from signed terminal original')
+            result=self._require_kernel_result(draft,measurement)
+            cpu,body,settlement_digest=accounting
+            payload=D13CoreFullWireEvidenceV1(frame=header,selector_digest=selector.selector_digest,
+                raw_authority_digest=raw.frozen_input_digest,
+                compressed_authority_digest=None if compressed is None else compressed.frozen_input_digest,
+                raw_request_digest=raw.model_request_digest,
+                compressed_request_digest=None if compressed is None else compressed.model_request_digest,
+                **{name:result[name] for name in ('raw_http_template_digest','compressed_http_template_digest',
+                    'raw_http_bytes','compressed_http_bytes','token_evidence','raw_lower_tokens','raw_upper_tokens',
+                    'compressed_lower_tokens','compressed_upper_tokens')},
+                **{name:getattr(self.policy,name) for name in ('counter_policy_fingerprint','tokenizer_fingerprint',
+                    'wire_policy_fingerprint','serializer_fingerprint','applicability_fingerprint')},
+                cpu_execution_id=prepared.binding.execution_id,cpu_worker_binding_digest=prepared.binding.binding_digest,
+                cpu_claim_digest=canonical_digest(inspection.claim),cpu_input_digest=prepared.binding.input_digest,
+                cpu_terminal_digest=terminal.terminal_digest,actual_cpu_ns=measurement['actual_cpu_ns'],
+                cpu_settlement_ref=body.settlement_ref,cpu_settlement_digest=settlement_digest,
+                d02_accounting_digest=canonical_digest(body),d11_accounting_digest=canonical_digest(cpu))
+            signature=self._key.sign(SIGNING_DOMAIN+canonical_serialize(asdict(payload)).encode('utf-8'))
+            envelope=D13CoreFullWireEnvelopeV1(payload,self.policy.counter_key_id,base64.b64encode(signature).decode('ascii'))
+            self._record(selector.counter_operation_id,'evidence',asdict(envelope),source=current)
+            from .d13_current_pressure_mapping_v1 import retain_current_d13_pressure_mapping_v1
+            from .d13_pressure_policy_origin_v1 import D13PressurePolicyNotMigratedV1
+            try:
+                retain_current_d13_pressure_mapping_v1(self,current=current,counter_envelope=envelope)
+            except D13PressurePolicyNotMigratedV1:
+                # Legacy V7 counting remains usable; new scheduling
+                # requires its separately retained pressure original.
+                pass
+            return envelope
+
+    def read_current_d13_pressure_mapping_v1(self, *, counter_operation_id, read_credential, subject):
+        from .d13_current_pressure_mapping_v1 import read_current_d13_pressure_mapping_v1
+        return read_current_d13_pressure_mapping_v1(self,counter_operation_id=counter_operation_id,
+            read_credential=read_credential,subject=subject)
 
     def _read_accounting(self,draft,prepared,inspection):
         from ..runtime.d13_counter_cpu_accounting_v1 import (

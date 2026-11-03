@@ -244,7 +244,7 @@ def execute_claimed_artifact_draft_v1(service, *, prepared, claim, frame, conten
     temporary_path, temporary_owned = None, False
     try:
         with service._execution_lock:
-            actual_claim, terminal = service.read_d11_life_original_v1(binding)
+            actual_claim, terminal = service.read_own_d11_draft_execution_original_v1(binding)
             if actual_claim != claim or terminal is not None or claim.payload.prepared_digest != prepared.digest:
                 raise AuthorityUnavailable("draft original claim is absent, changed or already terminal")
             service._verify_payload(claim.payload)

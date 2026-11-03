@@ -6,7 +6,7 @@ const props = defineProps<{ backend: BackendController }>()
 const projection = ref<RelationsProjection | null>(null), page = ref(0), busy = ref(false), message = ref('')
 let generation = 0
 const catalogue = computed(() => props.backend.state.workspace.data)
-const eligible = computed(() => props.backend.canRead.value && !busy.value && catalogue.value?.views.some(view => view.view_type === 'relations' && view.status === 'available') === true)
+const eligible = computed(() => props.backend.canRead.value && !busy.value && catalogue.value?.views.some(view => view.view_type === 'relations' && view.status === 'readable_not_loaded') === true)
 const numberLabel = (value: number | 'unknown' | null | undefined) => typeof value === 'number' ? String(value) : '未知'
 const statusLabel = (value: string) => ({ available: '当前可用', unavailable: '不可用', unknown: '未知', stale: '已过期', blocked_rebuild: '等待重建', rebuilt: '已重建', sanitized: '已清理', reset: '已重置', current: '当前有效', time_unavailable: '当前时间未核验', qualified: '来源符合查看条件', complete: '完整', partial: '部分', bounded_applied: '在既有边界内应用', unapplied_pending: '尚未应用', not_evaluated: '未评估', legacy_unresolved: '旧状态尚未核实' }[value] ?? value)
 function clear() { ++generation; projection.value = null; page.value = 0; message.value = '' }

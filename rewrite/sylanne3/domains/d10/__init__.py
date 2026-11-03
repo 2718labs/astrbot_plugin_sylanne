@@ -455,6 +455,7 @@ class LifeDomain:
         from .production_operations_v1 import d10_production_type_specs_v1
         from .project_checkpoint_v1 import project_checkpoint_type_specs_v1
         from .contact_claim_v2 import contact_claim_type_spec_v2
+        from ...runtime.persona_growth_review_contract_v1 import growth_review_type_specs_v1
         from .habit_policy_v1 import habit_policy_type_spec_v1
         from .habit_occurrence_v1 import habit_occurrence_type_specs_v1
         return (
@@ -463,7 +464,7 @@ class LifeDomain:
             D10TypeSpec("d10.contact_claim.v1", "d10", schema_hash({"d10.contact_claim.v1": 1}), ("persona",), "state", contact),
             D10TypeSpec("d10.contact_policy.v1", "d10", schema_hash({"d10.contact_policy.v1": 1}), ("persona",), "state", policy),
             D10TypeSpec("d10.proactive_opportunity.v1", "d10", schema_hash({"d10.proactive_opportunity.v1": 1}), ("persona",), "state", opportunity),
-        ) + (contact_claim_type_spec_v2(),) + d10_production_type_specs_v1() + project_checkpoint_type_specs_v1() + (habit_policy_type_spec_v1(),) + habit_occurrence_type_specs_v1()
+        ) + growth_review_type_specs_v1("d10") + (contact_claim_type_spec_v2(),) + d10_production_type_specs_v1() + project_checkpoint_type_specs_v1() + (habit_policy_type_spec_v1(),) + habit_occurrence_type_specs_v1()
 
     def proposal_for(self, envelope: CommandEnvelope, contribution_keys: tuple[str, ...] = ()) -> DomainProposal:
         if not isinstance(envelope, CommandEnvelope):
@@ -546,6 +547,9 @@ class LifeDomain:
             raise ValueError("unrecognized D10 proposal schema")
         if snapshot is not None and not isinstance(snapshot, GraphSnapshot):
             raise TypeError("D10 snapshot must be GraphSnapshot")
+        if any(write.key.type_name == "d10.persona_growth_review.v1" for write in proposal.typed_writes):
+            from ...runtime.persona_growth_review_v1 import validate_growth_review_proposal_v1
+            return validate_growth_review_proposal_v1(proposal)
         from .habit_occurrence_v1 import validate_habit_graph_proposal_v1
         if validate_habit_graph_proposal_v1(proposal,snapshot):return proposal
         if not proposal.typed_writes:

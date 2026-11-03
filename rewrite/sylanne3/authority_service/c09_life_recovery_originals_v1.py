@@ -112,7 +112,7 @@ def _cost_original(business, binding, terminal, service,core_db):
         max(0, amount - binding.cpu_ceiling_ms), "thread_cpu_ms")
 
 
-def read_life_recovery_originals_v1(*, business, core_db, journal, rows, service, namespace):
+def read_life_recovery_originals_v1(*, business, core_db, journal, rows, service, namespace,labor_context=None):
     from .d11_life_service_v1 import AuthorityD11LifeServiceV1
     from ..runtime.d11_life_accounting_v1 import read_life_accounting_prepared_v1
     from .c09_installed_original_verifiers_v1 import InstalledC09OriginalVerifierV1
@@ -126,8 +126,23 @@ def read_life_recovery_originals_v1(*, business, core_db, journal, rows, service
                 or (type(service) is InstalledC09OriginalVerifierV1 and service.kind != "life")):
             raise AuthorityUnavailable("C09 actual installed life verifier absent")
         binding, claim_payload, terminal_payload = service.verify_life_journal_row_v1(journal, row)
-        prepared = read_life_accounting_prepared_v1(business, binding=binding,
-            issuer=service.issuer, resource_issuer=service.resource_issuer)
+        from ..runtime.d11_character_labor_accounting_v1 import read_character_labor_accounting_prepared_v1
+        labor=read_character_labor_accounting_prepared_v1(business,binding=binding,
+            issuer=service.issuer,resource_issuer=service.resource_issuer)
+        if labor is not None:
+            if labor_context is None:
+                raise AuthorityUnavailable("new labor recovery needs its actual frozen Source session")
+            from .c09_paged_capture_control_v2 import C09PagedCaptureSessionV2
+            from .c09_role_capture_pair_v2 import InstalledC09RolePairV2
+            session,pair=labor_context
+            if (type(session) is not C09PagedCaptureSessionV2 or type(pair) is not InstalledC09RolePairV2
+                    or pair._producer.session is not session or pair.source is not business.db
+                    or pair.source_original.role!="graph" or session.scope.authority_namespace!=namespace):
+                raise AuthorityUnavailable("labor recovery crossed actual frozen Graph/Core source")
+            prepared=labor[1]
+        else:
+            prepared = read_life_accounting_prepared_v1(business, binding=binding,
+                issuer=service.issuer, resource_issuer=service.resource_issuer)
         if (binding.authority_namespace != namespace or prepared is None
                 or prepared.prepared_digest != claim_payload.prepared_digest):
             raise AuthorityUnavailable("C09 life signed accounting preparation differs")
@@ -148,6 +163,13 @@ def read_life_recovery_originals_v1(*, business, core_db, journal, rows, service
             permit = _closed_gate(core_db, binding, "terminal", terminal)
             if permit.command_digest != "sha256:" + canonical_digest((binding.digest, prior[1].claim_digest)):
                 raise AuthorityUnavailable("C09 life terminal gate crossed its claim")
-            originals[binding.execution_id] = (binding, prior[1], terminal, prepared,
-                _cost_original(business, binding, terminal, service,core_db))
+            if labor is None:
+                cost=_cost_original(business,binding,terminal,service,core_db)
+            else:
+                from .c09_character_labor_history_v1 import require_character_labor_cpu_closure_v1
+                from ..runtime.c09_paged_sql_v2 import current_c09_sql_meter_v2
+                cost,_=require_character_labor_cpu_closure_v1(session,pair,business=business,
+                    core_db=core_db,basis=labor[0],accounting=prepared,terminal=terminal,
+                    meter=current_c09_sql_meter_v2())
+            originals[binding.execution_id] = (binding, prior[1], terminal, prepared,cost)
     return tuple(originals[key] for key in sorted(originals))

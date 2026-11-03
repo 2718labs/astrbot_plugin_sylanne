@@ -105,17 +105,18 @@ class _GeneralGrowthVerifiedProvenanceV1:
             self.operation.reserve_retained_state_growth_v3(self,bound)
             try:
                 payload=json.loads(self.encoded)
-                from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1
-                kind=self.witness.operation.operation_kind
-                validate_domain_stage_provenance_v1('d01',kind,payload['provenance'])
-                from .domain_production_erasure_v1 import (_general_growth_provenance_types_v1,
-                    decode_typed_production_value_v1)
-                self.provenance=({name:(raw if cls is None else decode_typed_production_value_v1(raw,cls))
-                    for name,cls in _general_growth_provenance_types_v1(kind).items()
-                    for raw in (payload['provenance'][name],)}if payload['provenance']else {})
+                self.provenance=self._decode_provenance_v1(payload)
             finally:self.operation.finish_retained_state_growth_v3(self)
         except BaseException:
             self.close_v1();raise
+    def _decode_provenance_v1(self,payload):
+        from .domain_production_erasure_v1 import (validate_domain_stage_provenance_v1,
+            _general_growth_provenance_types_v1,decode_typed_production_value_v1)
+        kind=self.witness.operation.operation_kind
+        validate_domain_stage_provenance_v1('d01',kind,payload['provenance'])
+        return({name:(raw if cls is None else decode_typed_production_value_v1(raw,cls))
+            for name,cls in _general_growth_provenance_types_v1(kind).items()
+            for raw in(payload['provenance'][name],)}if payload['provenance']else {})
     def close_v1(self):
         self.operation.unregister_retained_state_v3(self);self.provenance=None
 
@@ -239,6 +240,233 @@ def _record_general_growth_pre_cas_validation_v1(witness,graph,db,bundle):
     elif pre[0]is not witness or pre[1]is not db or pre[2]!=primary.original_payload_json:
         raise ValueError('General growth exact verified payload changed in its actual CAS')
     return witness
+
+
+from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1 as _SINGLE_EVENT_COMMIT_KINDS_V1
+_SINGLE_EVENT_PRECAS_VALIDATED_V1={}
+_SINGLE_EVENT_POSTCAS_V1={}
+
+
+class _SingleEventVerifiedProvenanceV1(_GeneralGrowthVerifiedProvenanceV1):
+    def _decode_provenance_v1(self,payload):
+        from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1,decode_typed_production_value_v1
+        from .d01_single_event_growth_v1 import provenance_types_single_event_v1
+        kind=self.witness.operation.operation_kind
+        validate_domain_stage_provenance_v1('d01',kind,payload['provenance'])
+        return({name:(raw if cls is None else decode_typed_production_value_v1(raw,cls))
+            for name,cls in provenance_types_single_event_v1(kind).items()
+            for raw in(payload['provenance'][name],)}if payload['provenance']else {})
+
+
+def _record_single_event_pre_cas_validation_v1(witness,graph,db,bundle):
+    if(type(witness)is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness))is not witness
+            or witness.operation.domain!='d01'or witness.operation.operation_kind not in _SINGLE_EVENT_COMMIT_KINDS_V1
+            or witness.graph is not graph or witness.runtime.graph is not graph or witness.bundle!=bundle
+            or db is not graph._GraphCoordinator__store._db or not db.in_transaction
+            or not graph._GraphCoordinator__store._lock._is_owned()or witness.scope.operation!='write'):
+        raise ValueError('single-event growth requires its actual active W01 pre-CAS witness')
+    if(witness.runtime._active_owner_task_issuance_v1 is not None
+            or witness.runtime._active_foreground_issuance_v1 is not None):
+        raise ValueError('single-event growth cannot borrow another Owner/Self production channel')
+    from .domain_production_registry_v1 import installed_operation_v1
+    if witness.operation!=installed_operation_v1(witness.operation.operation_kind)or type(witness.request)is not witness.operation.request_type:
+        raise ValueError('single-event actual registered request changed before CAS')
+    rebuilt_frame,rebuilt,_=witness.runtime.compile_in_transaction(db,operation=witness.operation,
+        request=witness.request,envelope=witness.frame.envelope,scope=witness.scope,
+        owner=witness.owner,guard=witness.guard,now_utc=witness.frame.now_utc,
+        external_originals=witness.external_originals)
+    from .d01_single_event_growth_v1 import verify_single_event_stage_v1
+    verify_single_event_stage_v1(rebuilt)
+    primary,proposals,*_=_members(rebuilt)
+    if not proposals:
+        registration=graph._GraphCoordinator__providers['d01']
+        proposals=(DomainProposal('d01',registration[1],registration[2],witness.frame.envelope,(),DependencySet(),(),()),)
+    if(rebuilt_frame!=witness.frame or rebuilt!=witness.stage or proposals!=bundle.proposals
+            or primary.operation_kind!=witness.operation.operation_kind):
+        raise ValueError('single-event actual qualification or provenance changed before its CAS')
+    pre=_SINGLE_EVENT_PRECAS_VALIDATED_V1.get(id(witness))
+    if pre is None:
+        holder=_SingleEventVerifiedProvenanceV1(witness,db,primary.original_payload_json)
+        holder.decode_v1()
+        _SINGLE_EVENT_PRECAS_VALIDATED_V1[id(witness)]=(witness,db,primary.original_payload_json,holder)
+    elif pre[0]is not witness or pre[1]is not db or pre[2]!=primary.original_payload_json:
+        raise ValueError('single-event verified provenance changed in its actual CAS')
+    return witness
+
+
+def require_actual_single_event_commit_v1(witness,graph,db,bundle=None):
+    """Consume the actual prevalidated W01 writer; never mint it from a DTO."""
+    pre=_SINGLE_EVENT_PRECAS_VALIDATED_V1.get(id(witness))
+    if(type(witness)is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness))is not witness
+            or pre is None or pre[0]is not witness or pre[1]is not db
+            or witness.operation.operation_kind not in _SINGLE_EVENT_COMMIT_KINDS_V1
+            or witness.operation.domain!='d01'or witness.graph is not graph or witness.runtime.graph is not graph
+            or db is not graph._GraphCoordinator__store._db or not db.in_transaction
+            or not graph._GraphCoordinator__store._lock._is_owned()or witness.scope.operation!='write'
+            or bundle is not None and bundle!=witness.bundle
+            or _members(witness.stage)[0].original_payload_json!=pre[2]
+            or pre[3].operation.closed or pre[3].provenance is None):
+        raise ValueError('single-event writer lacks its actual private pre-CAS qualification')
+    return witness
+
+
+@contextmanager
+def _single_event_post_cas_v1(witness,db,primary,receipt):
+    require_actual_single_event_commit_v1(witness,witness.graph,db,witness.bundle)
+    pre=_SINGLE_EVENT_PRECAS_VALIDATED_V1[id(witness)]
+    if(type(receipt)is not CommitReceipt or receipt.status!='committed'
+            or receipt.operation_id!=primary.operation_id or receipt.activity_id!=primary.activity_id
+            or receipt.operation_digest!=witness.bundle.digest
+            or receipt.read_versions!=witness.frame.envelope.version_guard.read_versions
+            or primary.original_payload_json!=pre[2]):
+        raise ValueError('single-event post-CAS requires its actual successful verified W01 receipt')
+    if primary.operation_kind in {'register_single_event_growth_policy_v1','prepare_single_event_growth_v1','read_single_event_growth_v1'}:
+        if primary.jobs or any(p.typed_writes for p in witness.bundle.proposals):
+            raise ValueError('single-event policy/input/read cannot carry business or control writes')
+    expected={write.key for proposal in witness.bundle.proposals for write in proposal.typed_writes}
+    if {v.key for v in receipt.write_versions}!=expected:
+        raise ValueError('single-event actual receipt write members differ from its verified bundle')
+    epoch,recovery=_general_growth_post_cas_metadata_v1(db,primary.namespace)
+    if epoch is None or recovery is None:raise ValueError('single-event actual post-CAS metadata is absent')
+    from ..graph_store import GraphStore
+    metadata=GraphStore._decode_recovery(recovery,primary.namespace)
+    if not witness.graph._anchor_matches(metadata.requirements,witness.scope.pinned_anchor):
+        raise ValueError('single-event post-CAS changed its Source/Owner/Control anchor')
+    _SINGLE_EVENT_POSTCAS_V1[id(witness)]=(witness,db,primary,receipt,pre[2],get_ident(),epoch,recovery,pre[3])
+    try:yield witness
+    finally:_SINGLE_EVENT_POSTCAS_V1.pop(id(witness),None)
+
+
+def require_single_event_after_cas_witness_v1(witness,*,db,frame,producing_operation_id,request,receipt,operation_kind):
+    entry=_SINGLE_EVENT_POSTCAS_V1.get(id(witness))
+    if(entry is None or entry[0]is not witness or _ACTIVE.get(id(witness))is not witness
+            or entry[1]is not db or entry[3]is not receipt or entry[5]!=get_ident()
+            or frame is not witness.frame or request is not witness.request
+            or operation_kind not in _SINGLE_EVENT_COMMIT_KINDS_V1
+            or operation_kind!=witness.operation.operation_kind or producing_operation_id!=entry[2].operation_id
+            or witness.runtime.graph is not witness.graph or witness.scope.operation!='write'
+            or not db.in_transaction or not witness.graph._GraphCoordinator__store._lock._is_owned()
+            or entry[2].original_payload_json!=entry[4]):
+        raise ValueError('single-event input signing crossed its actual same-transaction post-CAS handle')
+    if _general_growth_post_cas_metadata_v1(db,entry[2].namespace)!=(entry[6],entry[7]):
+        raise ValueError('single-event signing lost its actual post-CAS metadata')
+    if entry[8].operation.closed or entry[8].provenance is None:
+        raise ValueError('single-event verified typed provenance retention ended')
+    return entry[8].provenance
+
+
+from .d01_ordinary_cumulative_growth_v1 import OPERATION_KINDS as _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1
+_ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1={}
+_ORDINARY_CUMULATIVE_POSTCAS_V1={}
+
+
+class _OrdinaryCumulativeVerifiedProvenanceV1(_GeneralGrowthVerifiedProvenanceV1):
+    def _decode_provenance_v1(self,payload):
+        from .domain_production_erasure_v1 import validate_domain_stage_provenance_v1,decode_typed_production_value_v1
+        from .d01_ordinary_cumulative_growth_v1 import provenance_types_ordinary_cumulative_v1
+        kind=self.witness.operation.operation_kind
+        validate_domain_stage_provenance_v1('d01',kind,payload['provenance'])
+        return({name:(raw if cls is None else decode_typed_production_value_v1(raw,cls))
+            for name,cls in provenance_types_ordinary_cumulative_v1(kind).items() if name in payload['provenance']
+            for raw in(payload['provenance'][name],)}if payload['provenance']else {})
+
+
+def _record_ordinary_cumulative_pre_cas_validation_v1(witness,graph,db,bundle):
+    if(type(witness)is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness))is not witness
+            or witness.operation.domain!='d01'or witness.operation.operation_kind not in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1
+            or witness.graph is not graph or witness.runtime.graph is not graph or witness.bundle!=bundle
+            or db is not graph._GraphCoordinator__store._db or not db.in_transaction
+            or not graph._GraphCoordinator__store._lock._is_owned()or witness.scope.operation!='write'):
+        raise ValueError('ordinary cumulative growth requires its actual active W01 pre-CAS witness')
+    if(witness.runtime._active_owner_task_issuance_v1 is not None
+            or witness.runtime._active_foreground_issuance_v1 is not None):
+        raise ValueError('ordinary cumulative growth cannot borrow another Owner/Self production channel')
+    from .domain_production_registry_v1 import installed_operation_v1
+    if witness.operation!=installed_operation_v1(witness.operation.operation_kind)or type(witness.request)is not witness.operation.request_type:
+        raise ValueError('ordinary cumulative actual registered request changed before CAS')
+    rebuilt_frame,rebuilt,_=witness.runtime.compile_in_transaction(db,operation=witness.operation,
+        request=witness.request,envelope=witness.frame.envelope,scope=witness.scope,
+        owner=witness.owner,guard=witness.guard,now_utc=witness.frame.now_utc,
+        external_originals=witness.external_originals)
+    from .d01_ordinary_cumulative_growth_v1 import verify_ordinary_cumulative_stage_v1,require_actual_ordinary_cumulative_stage_v1
+    verify_ordinary_cumulative_stage_v1(rebuilt)
+    require_actual_ordinary_cumulative_stage_v1(_members(rebuilt)[0],db,frame=rebuilt_frame)
+    primary,proposals,*_=_members(rebuilt)
+    if not proposals:
+        registration=graph._GraphCoordinator__providers['d01']
+        proposals=(DomainProposal('d01',registration[1],registration[2],witness.frame.envelope,(),DependencySet(),(),()),)
+    if(rebuilt_frame!=witness.frame or rebuilt!=witness.stage or proposals!=bundle.proposals
+            or primary.operation_kind!=witness.operation.operation_kind):
+        raise ValueError('ordinary cumulative actual qualification or provenance changed before its CAS')
+    pre=_ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1.get(id(witness))
+    if pre is None:
+        holder=_OrdinaryCumulativeVerifiedProvenanceV1(witness,db,primary.original_payload_json)
+        holder.decode_v1()
+        _ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1[id(witness)]=(witness,db,primary.original_payload_json,holder)
+    elif pre[0]is not witness or pre[1]is not db or pre[2]!=primary.original_payload_json:
+        raise ValueError('ordinary cumulative verified provenance changed in its actual CAS')
+    return witness
+
+
+def require_actual_ordinary_cumulative_commit_v1(witness,graph,db,bundle=None):
+    """Consume the actual prevalidated W01 writer; never mint it from a DTO."""
+    pre=_ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1.get(id(witness))
+    if(type(witness)is not _ProductionCommitWitnessV1 or _ACTIVE.get(id(witness))is not witness
+            or pre is None or pre[0]is not witness or pre[1]is not db
+            or witness.operation.operation_kind not in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1
+            or witness.operation.domain!='d01'or witness.graph is not graph or witness.runtime.graph is not graph
+            or db is not graph._GraphCoordinator__store._db or not db.in_transaction
+            or not graph._GraphCoordinator__store._lock._is_owned()or witness.scope.operation!='write'
+            or bundle is not None and bundle!=witness.bundle
+            or _members(witness.stage)[0].original_payload_json!=pre[2]
+            or pre[3].operation.closed or pre[3].provenance is None):
+        raise ValueError('ordinary cumulative writer lacks its actual private pre-CAS qualification')
+    return witness
+
+
+@contextmanager
+def _ordinary_cumulative_post_cas_v1(witness,db,primary,receipt):
+    require_actual_ordinary_cumulative_commit_v1(witness,witness.graph,db,witness.bundle)
+    pre=_ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1[id(witness)]
+    if(type(receipt)is not CommitReceipt or receipt.status!='committed'
+            or receipt.operation_id!=primary.operation_id or receipt.activity_id!=primary.activity_id
+            or receipt.operation_digest!=witness.bundle.digest
+            or receipt.read_versions!=witness.frame.envelope.version_guard.read_versions
+            or primary.original_payload_json!=pre[2]):
+        raise ValueError('ordinary cumulative post-CAS requires its actual successful verified W01 receipt')
+    if primary.operation_kind in {'register_ordinary_cumulative_growth_policy_v1','assess_ordinary_continuity_v1'}:
+        if primary.jobs or any(p.typed_writes for p in witness.bundle.proposals):
+            raise ValueError('ordinary cumulative policy/input/read cannot carry business or control writes')
+    expected={write.key for proposal in witness.bundle.proposals for write in proposal.typed_writes}
+    if {v.key for v in receipt.write_versions}!=expected:
+        raise ValueError('ordinary cumulative actual receipt write members differ from its verified bundle')
+    epoch,recovery=_general_growth_post_cas_metadata_v1(db,primary.namespace)
+    if epoch is None or recovery is None:raise ValueError('ordinary cumulative actual post-CAS metadata is absent')
+    from ..graph_store import GraphStore
+    metadata=GraphStore._decode_recovery(recovery,primary.namespace)
+    if not witness.graph._anchor_matches(metadata.requirements,witness.scope.pinned_anchor):
+        raise ValueError('ordinary cumulative post-CAS changed its Source/Owner/Control anchor')
+    _ORDINARY_CUMULATIVE_POSTCAS_V1[id(witness)]=(witness,db,primary,receipt,pre[2],get_ident(),epoch,recovery,pre[3])
+    try:yield witness
+    finally:_ORDINARY_CUMULATIVE_POSTCAS_V1.pop(id(witness),None)
+
+
+def require_ordinary_cumulative_after_cas_witness_v1(witness,*,db,frame,producing_operation_id,request,receipt,operation_kind):
+    entry=_ORDINARY_CUMULATIVE_POSTCAS_V1.get(id(witness))
+    if(entry is None or entry[0]is not witness or _ACTIVE.get(id(witness))is not witness
+            or entry[1]is not db or entry[3]is not receipt or entry[5]!=get_ident()
+            or frame is not witness.frame or request is not witness.request
+            or operation_kind not in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1
+            or operation_kind!=witness.operation.operation_kind or producing_operation_id!=entry[2].operation_id
+            or witness.runtime.graph is not witness.graph or witness.scope.operation!='write'
+            or not db.in_transaction or not witness.graph._GraphCoordinator__store._lock._is_owned()
+            or entry[2].original_payload_json!=entry[4]):
+        raise ValueError('ordinary cumulative input signing crossed its actual same-transaction post-CAS handle')
+    if _general_growth_post_cas_metadata_v1(db,entry[2].namespace)!=(entry[6],entry[7]):
+        raise ValueError('ordinary cumulative signing lost its actual post-CAS metadata')
+    if entry[8].operation.closed or entry[8].provenance is None:
+        raise ValueError('ordinary cumulative verified typed provenance retention ended')
+    return entry[8].provenance
 
 
 def require_owner_stop_projection_commit_v1(witness, graph, db, bundle=None):
@@ -494,6 +722,25 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
         raise ValueError('installed domain commit witness/current Graph fence differs')
     witness.runtime._current()
     primary_census,*_=_members(witness.stage)
+    from .d06_retention_v1 import OPERATIONS as RETENTION_OPERATIONS,require_actual_retention_stage_v1
+    from ..domains.d06.retention_v1 import POLICY_TYPE,DETAIL_TYPE,READ_TYPE,CONTRIBUTION_TYPE
+    retention_types={POLICY_TYPE,DETAIL_TYPE,READ_TYPE,CONTRIBUTION_TYPE}
+    touched_retention={write.key.type_name for proposal in primary_census.proposals
+        for write in proposal.typed_writes if write.key.type_name in retention_types}
+    if witness.operation.operation_kind in RETENTION_OPERATIONS:
+        require_actual_retention_stage_v1(primary_census,db,scope=witness.scope,
+            owner_guard=witness.frame.owner_guard)
+    elif touched_retention:
+        raise ValueError('retention writes require their actual qualified retention stage or Self C04 producer')
+    from ..domains.d08.commitment_fulfillment_v1 import TERMS_TYPE, ACCEPTANCE_TYPE, EVIDENCE_TYPE
+    from ..domains.d08.commitment_communication_v1 import TERMS_SCOPE_TYPE
+    terms_writes = tuple(write for proposal in bundle.proposals for write in proposal.typed_writes
+        if write.key.type_name in {TERMS_TYPE, ACCEPTANCE_TYPE, EVIDENCE_TYPE, TERMS_SCOPE_TYPE}
+        or write.key.type_name == 'd08.commitment.v1' and write.value.get('fulfillment_state') == 'fulfilled')
+    if terms_writes:
+        from .d08_commitment_fulfillment_v1 import require_actual_commitment_terms_stage_v1
+        require_actual_commitment_terms_stage_v1(primary_census, db,
+            scope=witness.scope, owner_guard=witness.frame.owner_guard)
     from .habit_census_provenance_v1 import require_current_habit_census_payload_v1
     require_current_habit_census_payload_v1(witness.frame,json.loads(primary_census.original_payload_json))
     from .named_joint_binding_write_v1 import current_named_joint_write_v1,require_named_joint_commit_witness_v1
@@ -540,6 +787,10 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
         return witness
     if witness.operation.operation_kind in _GENERAL_GROWTH_COMMIT_KINDS_V1:
         return _record_general_growth_pre_cas_validation_v1(witness,graph,db,bundle)
+    if witness.operation.operation_kind in _SINGLE_EVENT_COMMIT_KINDS_V1:
+        return _record_single_event_pre_cas_validation_v1(witness,graph,db,bundle)
+    if witness.operation.operation_kind in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1:
+        return _record_ordinary_cumulative_pre_cas_validation_v1(witness,graph,db,bundle)
     from .owner_stop_reply_v1 import OwnerStopReplyProjectionStageV1
     if type(witness.stage) is OwnerStopReplyProjectionStageV1:
         return require_owner_stop_projection_commit_v1(witness, graph, db, bundle)
@@ -779,6 +1030,9 @@ def require_current_production_commit_v1(witness, graph, db, bundle, v2_write):
 
 
 def _members(stage):
+    from .d02_character_labor_rebuild_v1 import CharacterLaborTerminalBodyV1
+    if type(stage)is CharacterLaborTerminalBodyV1:
+        return stage.stage,stage.stage.proposals,(),(),()
     from .habit_schedule_driver_v1 import HabitScheduleStageV1
     if type(stage)is HabitScheduleStageV1:return stage.stage,stage.stage.proposals,(),(),()
     from .owner_material_source_storage_v3 import StagedDomainOperationV3
@@ -858,6 +1112,9 @@ def _members(stage):
         return stage.stage, stage.stage.proposals, (), (), ()
     if type(stage) is LifeBodyPreparationStageV1:
         return stage.stage, stage.stage.proposals, (), (), ()
+    from .d11_character_work_segment_v1 import CharacterLaborBodyStageV1
+    if type(stage)is CharacterLaborBodyStageV1:
+        return stage.stage,stage.stage.proposals,(),(),()
     from ..domains.d06.structured_experience_v1 import StructuredExperienceBundleV1
     from ..domains.d10.production_operations_v1 import CurrentLifeEffectExperienceBundleV1
     from .domain_production_inputs_v1 import StagedDomainInputV1
@@ -874,6 +1131,20 @@ def _members(stage):
     if type(stage) is StructuredExperienceBundleV1:
         return stage.memory_stage, (*stage.memory_stage.proposals, stage.context_proposal), stage.episode_refs, (), ()
     raise TypeError('registered operation returned an unrecognized concrete stage')
+
+
+def build_domain_production_result_v1(*,primary,receipt,original,produced,job_states):
+    """Project only actual committed stage/receipt metadata into the native reply."""
+    return {'schema': 'sylanne.domain-production-receipt.v1', 'domain': primary.domain,
+        'operation_kind': primary.operation_kind, 'operation_id': primary.operation_id,
+        'activity_id': primary.activity_id, 'original_ref': original.original_ref,
+        'original_digest': original.original_digest, 'receipt': _receipt_wire(receipt),
+        'receipt_digest': canonical_digest(receipt), 'job_states': [[j.job_id, j.phase] for j in job_states],
+        'coverage': primary.coverage, 'missing_inputs': list(primary.missing_inputs),
+        'continuation_ref': primary.continuation_ref,
+        'outbox': [event.dedupe_key for event in primary.outbox],
+        'produced_originals': [{'kind': item.kind, 'original_ref': item.original_ref,
+            'original_digest': item.original_digest} for item in produced]}
 
 
 def commit_installed_domain_operation_v1(runtime, db, *, operation, request, frame, stage,
@@ -1013,6 +1284,9 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
     from .d02_life_body_preparation_v1 import LifeBodyPreparationStageV1, issue_life_body_quotes_before_cas_v1
     if type(stage) is LifeBodyPreparationStageV1:
         issue_life_body_quotes_before_cas_v1(db, frame=frame, staged=stage, installed_readers=readers)
+    from .d11_character_work_segment_v1 import CharacterLaborBodyStageV1,issue_character_labor_quotes_before_cas_v1
+    if type(stage)is CharacterLaborBodyStageV1:
+        issue_character_labor_quotes_before_cas_v1(db,frame=frame,staged=stage,installed_readers=readers)
     primary, proposals, experiences, settlements, paid_costs = _members(stage)
     if type(primary) is StagedDomainOperationV1:
         from .domain_mesh_tick_v1 import verify_semantic_mesh_composition_v1
@@ -1118,9 +1392,15 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             'operation_id': primary.operation_id, 'request_digest': attempt[0], 'permit_token': scope.permit.token})
     general_original=None
     general_produced=()
+    single_event_original=None
+    single_event_produced=()
+    ordinary_cumulative_original=None
+    ordinary_cumulative_produced=()
     numeric_trace_produced=None
     numeric_encoding_produced=None
     numeric_drive_produced=None
+    labor_rebuild_original=None
+    labor_rebuild_native_result=None
     _ACTIVE[id(witness)] = witness
     try:
         from .d07_general_growth_attention_v1 import capture_actual_general_growth_outcome_before_cas_v1
@@ -1167,17 +1447,47 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
                 general_original=record_adopted_domain_operation_v1(db,primary,receipt)
                 general_produced=_record_general_growth_after_cas_v1(readers,db,witness=witness,
                     frame=frame,primary=primary,request=request,receipt=receipt)
+        if operation.operation_kind in _SINGLE_EVENT_COMMIT_KINDS_V1 and primary.coverage=='complete':
+            from .d01_single_event_growth_v1 import record_single_event_after_cas_v1
+            with _single_event_post_cas_v1(witness,db,primary,receipt):
+                single_event_original=record_adopted_domain_operation_v1(db,primary,receipt)
+                single_event_produced=record_single_event_after_cas_v1(readers,db,witness=witness,
+                    frame=frame,primary=primary,request=request,receipt=receipt)
+        if operation.operation_kind in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1 and primary.coverage=='complete':
+            from .d01_ordinary_cumulative_growth_v1 import record_ordinary_cumulative_after_cas_v1
+            with _ordinary_cumulative_post_cas_v1(witness,db,primary,receipt):
+                ordinary_cumulative_original=record_adopted_domain_operation_v1(db,primary,receipt)
+                ordinary_cumulative_produced=record_ordinary_cumulative_after_cas_v1(readers,db,witness=witness,
+                    frame=frame,primary=primary,request=request,receipt=receipt)
+        if operation.operation_kind == "rebuild_character_labor_body":
+            from .character_labor_rebuild_selector_v1 import peek_current_character_labor_rebuild_binding_context_v1
+            if peek_current_character_labor_rebuild_binding_context_v1(witness) is not None:
+                from .d02_character_labor_rebuild_v1 import record_character_labor_rebuild_selection_binding_after_cas_v1
+                labor_rebuild_original=record_adopted_domain_operation_v1(db,primary,receipt)
+                labor_rebuild_native_result=build_domain_production_result_v1(primary=primary,
+                    receipt=receipt,original=labor_rebuild_original,produced=(),job_states=())
+                record_character_labor_rebuild_selection_binding_after_cas_v1(witness,
+                    db=db,receipt=receipt,domain_original=labor_rebuild_original)
         from .habit_followup_source_v3 import record_habit_followup_before_witness_release_v3
         record_habit_followup_before_witness_release_v3(witness,db,frame=frame,stage=primary,receipt=receipt)
     finally:
+        if operation.operation_kind == "rebuild_character_labor_body":
+            from .d02_character_labor_rebuild_v1 import release_character_labor_rebuild_graph_receipt_v1
+            release_character_labor_rebuild_graph_receipt_v1(witness)
         _ACTIVE.pop(id(witness), None)
         _FOREGROUND_VALIDATED.pop(id(witness), None)
         _FOREGROUND_APPLIED.pop(id(witness), None)
         pre=_GENERAL_GROWTH_PRECAS_VALIDATED_V1.pop(id(witness),None)
         if pre is not None:pre[3].close_v1()
         _GENERAL_GROWTH_POSTCAS_V1.pop(id(witness),None)
+        single_pre=_SINGLE_EVENT_PRECAS_VALIDATED_V1.pop(id(witness),None)
+        if single_pre is not None:single_pre[3].close_v1()
+        _SINGLE_EVENT_POSTCAS_V1.pop(id(witness),None)
+        ordinary_pre=_ORDINARY_CUMULATIVE_PRECAS_VALIDATED_V1.pop(id(witness),None)
+        if ordinary_pre is not None:ordinary_pre[3].close_v1()
+        _ORDINARY_CUMULATIVE_POSTCAS_V1.pop(id(witness),None)
     from .domain_production_inputs_v1 import StagedDomainInputV1, record_current_domain_input_after_commit_v1
-    produced = general_produced
+    produced = (*general_produced,*single_event_produced,*ordinary_cumulative_produced)
     if primary.operation_kind=="register_current_habit_source_note_life_plan_v1":
         from .d10_habit_v1 import record_habit_source_note_life_plan_after_cas_v1
         produced=(record_habit_source_note_life_plan_after_cas_v1(db,frame=frame,stage=primary,receipt=receipt,installed=readers),)
@@ -1197,6 +1507,10 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         produced = (record_source_note_action_after_cas_v1(db, frame=frame, staged=stage, receipt=receipt, issuer=readers.issuer),)
     if type(stage) is LifeBodyPreparationStageV1:
         produced = (record_life_body_preparation_after_cas_v1(db, frame=frame, staged=stage, receipt=receipt, issuer=readers.issuer),)
+    if type(stage)is CharacterLaborBodyStageV1:
+        from .d11_character_work_segment_v1 import record_character_labor_body_preparation_after_cas_v1
+        produced=(record_character_labor_body_preparation_after_cas_v1(db,frame=frame,staged=stage,
+            receipt=receipt,issuer=readers.issuer),)
     from .d11_host_lifecycle_v1 import HostLifecycleStageV1, record_host_lifecycle_after_cas_v1
     if type(stage) is HostLifecycleStageV1:
         produced = (record_host_lifecycle_after_cas_v1(db, frame=frame,
@@ -1241,7 +1555,7 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         root_original = record_draft_root_registration_after_commit_v1(db, graph=graph,
             issued=runtime._active_draft_root_registration_v1, frame=frame, receipt=receipt, issuer=readers.issuer)
         produced = (*produced, root_original)
-    original=(general_original if general_original is not None else input_original if input_original is not None
+    original=(labor_rebuild_original if labor_rebuild_original is not None else ordinary_cumulative_original if ordinary_cumulative_original is not None else general_original if general_original is not None else single_event_original if single_event_original is not None else input_original if input_original is not None
         else record_adopted_domain_operation_v1(db,primary,receipt))
     if operation.operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"}:
         from .d03_world_history_v1 import record_world_assertion_after_commit_v1
@@ -1262,6 +1576,15 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         frame=frame, stage=primary, receipt=receipt, issuer=graph._GraphCoordinator__d11_issuer)
     if general_growth_attention_original is not None:
         produced = (*produced, general_growth_attention_original)
+    from .d07_ordinary_continuity_cognition_v1 import record_ordinary_continuity_attention_after_cas_v1
+    ordinary_attention_original=record_ordinary_continuity_attention_after_cas_v1(db,
+        frame=frame,stage=primary,receipt=receipt,issuer=graph._GraphCoordinator__d11_issuer)
+    if ordinary_attention_original is not None:produced=(*produced,ordinary_attention_original)
+    from .d07_single_event_review_v1 import record_single_event_review_attention_after_cas_v1
+    single_event_attention_original=record_single_event_review_attention_after_cas_v1(db,
+        graph._GraphCoordinator__d11_issuer,primary,receipt)
+    if single_event_attention_original is not None:produced=(*produced,single_event_attention_original)
+
     if type(stage) is CancelOwnerSourceNoteTaskStageV1:
         from .cancel_owner_source_note_task_v1 import record_cancel_owner_source_note_task_after_cas_v1
         produced=(*produced,*record_cancel_owner_source_note_task_after_cas_v1(db,frame=frame,
@@ -1318,6 +1641,12 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
         proof_write = next(write for proposal in primary.proposals for write in proposal.typed_writes if write.key.type_name == PROVENANCE)
         validate_internal_life_episode_history_v2(db, decode_internal_life_value_v2(PROVENANCE, proof_write.value))
     for event in primary.outbox:
+        if (operation.operation_kind=='review_single_event_growth_v1' and event.receiver_domain=='d07'
+                and event.event_kind=='d01.single_event_review_case_registered_v1'):
+            matches=tuple(value for value in single_event_produced if value.kind=='d01.single_event_review_case_v1')
+            if len(matches)!=1:
+                raise ValueError('single-event review event lacks its actual same-CAS signed Case original')
+            event=replace(event,trigger_original=matches[0])
         if (operation.operation_kind in _GENERAL_GROWTH_COMMIT_KINDS_V1
                 and event.event_kind in {'general_growth_intent_available_for_future_trial',
                     'general_growth_trial_start_available_for_observation','general_growth_trial_completed_for_adoption'}):
@@ -1327,6 +1656,12 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             matches=tuple(value for value in general_produced if value.kind==output_kind)
             if len(matches)!=1:raise ValueError('General lifecycle requires its actual same-CAS signed produced input')
             event=replace(event,trigger_original=matches[0])
+        if (single_event_attention_original is not None and event.receiver_domain=='d07'
+                and event.event_kind=='single_event_review_attention_available_for_service'):
+            event=replace(event,trigger_original=single_event_attention_original)
+        if (ordinary_attention_original is not None and event.receiver_domain=='d07'
+                and event.event_kind=='ordinary_continuity_attention_available_for_service'):
+            event=replace(event,trigger_original=ordinary_attention_original)
         if (general_growth_attention_original is not None and event.receiver_domain == "d07"
                 and event.event_kind == "general_growth_attention_available_for_service"):
             event = replace(event, trigger_original=general_growth_attention_original)
@@ -1346,17 +1681,30 @@ def commit_installed_domain_operation_v1(runtime, db, *, operation, request, fra
             raise ValueError('domain followup event changed its durable identity')
         if old is None:
             db.execute('INSERT INTO graph_domain_production_outbox_v1 VALUES(?,?,?,?,?,?,?,?,?,?,?)', row)
-    return {'schema': 'sylanne.domain-production-receipt.v1', 'domain': primary.domain,
-        'operation_kind': primary.operation_kind, 'operation_id': primary.operation_id,
-        'activity_id': primary.activity_id, 'original_ref': original.original_ref,
-        'original_digest': original.original_digest, 'receipt': _receipt_wire(receipt),
-        'receipt_digest': canonical_digest(receipt), 'job_states': [[j.job_id, j.phase] for j in
-            ((stage.after_job,) if type(stage) is ForegroundCycleStageV1 else primary.jobs)],
-        'coverage': primary.coverage, 'missing_inputs': list(primary.missing_inputs),
-        'continuation_ref': primary.continuation_ref,
-        'outbox': [event.dedupe_key for event in primary.outbox],
-        'produced_originals': [{'kind': item.kind, 'original_ref': item.original_ref,
-            'original_digest': item.original_digest} for item in produced]}
+    result = build_domain_production_result_v1(primary=primary,receipt=receipt,
+        original=original,produced=produced,
+        job_states=((stage.after_job,) if type(stage) is ForegroundCycleStageV1 else primary.jobs))
+    from .domain_production_inputs_v1 import (
+        committed_commitment_scope_summary_v1, committed_commitment_scope_metadata_v1)
+    scope_summary = committed_commitment_scope_summary_v1(stage, receipt)
+    if scope_summary is not None:
+        result['commitment_communication_scope'] = scope_summary
+        result['commitment_communication_scope_metadata'] = committed_commitment_scope_metadata_v1(stage, receipt)
+    from .d08_commitment_fulfillment_v1 import committed_commitment_fulfillment_view_v1
+    fulfillment_view = committed_commitment_fulfillment_view_v1(stage, receipt)
+    if fulfillment_view is not None:
+        result['commitment_fulfillment'] = fulfillment_view
+    if operation.operation_kind in _SINGLE_EVENT_COMMIT_KINDS_V1:
+        from .d01_single_event_growth_v1 import committed_single_event_growth_view_v1
+        single_event_view=committed_single_event_growth_view_v1(primary,receipt)
+        if single_event_view is not None:result['single_event_growth']=single_event_view
+    if operation.operation_kind in _ORDINARY_CUMULATIVE_COMMIT_KINDS_V1:
+        from .d01_ordinary_cumulative_growth_v1 import committed_ordinary_cumulative_view_v1
+        ordinary_view=committed_ordinary_cumulative_view_v1(primary,receipt)
+        if ordinary_view is not None:result['ordinary_cumulative_growth']=ordinary_view
+    if labor_rebuild_native_result is not None and result != labor_rebuild_native_result:
+        raise ValueError("labor rebuild saved native reply differs from the actual committed result")
+    return result
 
 
 def _d07_preparation_bundle_v1(graph, preparation):
@@ -1407,6 +1755,15 @@ def commit_d07_preparation_v1(runtime, db, *, operation, request, preparation, r
         from .d07_source_preparation_members_v3 import bind_d07_source_postcas_v3
         with bind_d07_source_postcas_v3(witness,receipt):
             original_digest = record_d07_preparation_after_cas_v1(db, service.d11_issuer, preparation, receipt)
+            from .domain_followup_consumer_v1 import capture_actual_ordinary_continuity_d07_preparation_v1
+            from .current_method_learning_read_v3 import (
+                _method_active, bind_actual_native_method_postcas_v1)
+            actual_method=_method_active(db)
+            actual_inputs=None if actual_method is None else actual_method.result
+            with bind_actual_native_method_postcas_v1(runtime.graph,db,witness=witness,
+                    frame=preparation.frame,stage=preparation,receipt=receipt,prepared_inputs=actual_inputs):
+                capture_actual_ordinary_continuity_d07_preparation_v1(runtime,db,witness=witness,
+                    preparation=preparation,receipt=receipt,original_digest=original_digest)
     finally:
         _ACTIVE.pop(id(witness), None)
     return {'schema':'sylanne.domain-production-receipt.v1','domain':'d07',

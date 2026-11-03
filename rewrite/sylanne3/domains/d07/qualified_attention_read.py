@@ -105,14 +105,21 @@ def _qualify_source_node_values_v3(namespace,ref,source_atom,access_atom,head_at
 
 
 def _qualify_source_rights_values_v3(namespace,ref,source_atom,access_atom,head_atom,*,audience,purpose,metadata_only):
-    """Original pure Source/access/correction rule, without a read grant."""
+    """Current Source reads retain the original strict correction-head rule."""
+    if (not metadata_only and head_atom is None
+            or head_atom is not None and(head_atom.valid or head_atom.revision!=0)):
+        return None
+    return _qualify_source_acl_values_v3(namespace,ref,source_atom,access_atom,
+        audience=audience,purpose=purpose,metadata_only=metadata_only)
+
+
+def _qualify_source_acl_values_v3(namespace,ref,source_atom,access_atom,*,audience,purpose,metadata_only):
+    """Pure Source/access validation; this helper issues no currentness or read grant."""
     try:
         key=AtomKey.from_token(ref)
         if key!=source_key(*namespace.as_tuple,key.owner.subject or ''):return None
         if (source_atom is None or not source_atom.valid or source_atom.revision<1
-                or access_atom is None or not access_atom.valid or access_atom.revision<1
-                or not metadata_only and head_atom is None
-                or head_atom is not None and(head_atom.valid or head_atom.revision!=0)):
+                or access_atom is None or not access_atom.valid or access_atom.revision<1):
             return None
         if metadata_only:
             from ...runtime.dispatch_initial_source_read_v3 import _SourceMetadataRecordV3

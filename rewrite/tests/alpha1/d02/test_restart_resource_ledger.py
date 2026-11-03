@@ -46,8 +46,8 @@ def test_restart_keeps_pending_cost_and_settled_component_once(tmp_path):
     state = BodyState("body", 1, 0.8, {"thinking": 0.1}, 0.2, 0.0)
     quote = domain.quote_work(profile, state, "activity", "thinking", 5.0,
                               (WorkComponent("work", "duration", duration_rate=0.1),),
-                              valid_until=20.0)
-    reserved = domain.reserve_work(state, (), quote, "reservation", "effect")
+                              valid_until=20.0, now_utc=10.0)
+    reserved = domain.reserve_work(state, (), quote, "reservation", "effect", now_utc=10.0)
     unknown = domain.release_or_cancel(reserved, execution_known=False).reservation
     registry = TypeRegistry()
     for spec in domain.type_specs():

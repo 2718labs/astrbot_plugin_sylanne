@@ -18,6 +18,9 @@ from sylanne3.memory_repository import MemoryRepository
 from sylanne3.memory_types import (
     InterpretationRecord, SourceRecord, access_key, interpretation_key, source_key,
 )
+from sylanne3.domains.d06.inspection_metadata_v1 import (
+    SOURCE_TYPE, INTERPRETATION_TYPE, inspection_key_v1,
+)
 from sylanne3.runtime_contracts import (
     AuthorityContext, CommandEnvelope, NamespaceId, OperationIdentity,
     RUNTIME_SCHEMA, VersionGuard, canonical_digest,
@@ -50,6 +53,8 @@ def setup():
     reads = SourceCorrectionReadSetV1((source,), (access,), (interpretation,), (D07.token,))
     new_source = ADAPTER.correction_source_key(request)
     new_access = access_key("bot", "persona", new_source.owner.subject)
+    source_metadata = inspection_key_v1(new_source, 1)
+    interpretation_metadata = inspection_key_v1(TARGET, 2)
     input_refs = (new_source.token, SOURCE.token, TARGET.token, D07.token)
     qualification = ADAPTER.admit_source(SourceAdmission(
         "source-1", source.text, source.speaker_id, "reported", "reported",
@@ -65,6 +70,7 @@ def setup():
                          ("event", "persona"), "context", ("owner",), "policy", 1),
         VersionGuard((
             GraphVersion(new_source, 0), GraphVersion(new_access, 0),
+            GraphVersion(source_metadata, 0), GraphVersion(interpretation_metadata, 0),
             GraphVersion(SOURCE, 1), GraphVersion(ACCESS, 1),
             GraphVersion(HEAD, 0),
             GraphVersion(TARGET, 1), GraphVersion(D07, 1),
@@ -78,7 +84,9 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     request, reads, envelope = setup()
     candidate = ADAPTER.compile_source_correction(envelope, request, reads, recorded_at=5.0)
     proposal = candidate.proposal
-    new_source, new_access, head, invalidation = proposal.typed_writes
+    new_source, new_access, head, invalidation, source_projection, interpretation_projection = proposal.typed_writes
+    source_metadata = inspection_key_v1(new_source.key, 1)
+    interpretation_metadata = inspection_key_v1(TARGET, 2)
     assert candidate.status == "proposal_requires_w01_atomic_bundle"
     assert candidate.correction_source_ref == new_source.key.token
     assert candidate.invalidated_target_refs == (TARGET.token,)
@@ -101,17 +109,27 @@ def test_correction_compiles_reported_source_and_retraction_without_claiming_com
     assert invalidation.value["status"] == "retracted"
     assert invalidation.value["valid_to"] == 5.0
     assert invalidation.value["claim"] == reads.interpretations[0].claim
-    assert GraphVersion(TARGET, 1) not in proposal.dependencies.current_invalidation
+    assert TARGET not in invalidation.dependencies
     assert GraphVersion(TARGET, 1) in proposal.dependencies.historical_provenance
     assert GraphVersion(D07, 1) not in proposal.dependencies.current_invalidation
     assert GraphVersion(D07, 1) in proposal.dependencies.historical_provenance
     actual_current = {dependency for write in proposal.typed_writes
                       for dependency in write.dependencies}
     classified_current = {version.key for version in proposal.dependencies.current_invalidation}
-    assert actual_current == classified_current == {new_source.key}
+    assert actual_current == classified_current == {new_source.key, TARGET}
     assert new_access.dependencies == (new_source.key,)
     assert head.dependencies == (new_source.key,)
     assert invalidation.dependencies == (new_source.key,)
+    assert source_projection.key == source_metadata
+    assert source_projection.key.type_name == SOURCE_TYPE
+    assert source_projection.value["target_ref"] == new_source.key.token
+    assert source_projection.value["target_revision"] == 1
+    assert source_projection.dependencies == (new_source.key,)
+    assert interpretation_projection.key == interpretation_metadata
+    assert interpretation_projection.key.type_name == INTERPRETATION_TYPE
+    assert interpretation_projection.value["target_ref"] == TARGET.token
+    assert interpretation_projection.value["target_revision"] == 2
+    assert interpretation_projection.dependencies == (TARGET,)
 
 
 def test_correction_writes_commit_without_self_dependency_cycle():

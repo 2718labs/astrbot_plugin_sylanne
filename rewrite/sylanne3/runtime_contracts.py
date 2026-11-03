@@ -92,7 +92,23 @@ def _typed_tuple(values: object, expected: type, label: str) -> tuple:
         raise TypeError(f"{label} must be iterable") from exc
     if any(not isinstance(value, expected) for value in result):
         raise TypeError(f"{label} must contain {expected.__name__} values")
-    fingerprints = tuple(canonical_serialize(value) for value in result)
+    if expected is GraphVersion and all(type(value) is GraphVersion
+            and type(value.key) is AtomKey and type(value.key.owner) is Owner
+            and all(type(text) is str and (text.isascii() or not any(0xD800 <= ord(char) <= 0xDFFF for char in text))
+                for text in (value.key.owner.kind,value.key.owner.bot,value.key.owner.persona,
+                    value.key.type_name,value.key.name))
+            and (value.key.owner.subject is None or type(value.key.owner.subject) is str
+                and (value.key.owner.subject.isascii() or not any(0xD800 <= ord(char) <= 0xDFFF for char in value.key.owner.subject)))
+            for value in result):
+        # Exact JSON primitives without surrogate aliases have this identity.
+        # Python-only strings and JSON surrogate aliases keep the canonical path.
+        # Avoid allocating/encoding the complete version set again in a receipt.
+        fingerprints = tuple((value.key.owner.kind, value.key.owner.bot,
+            value.key.owner.persona, value.key.owner.subject, value.key.type_name,
+            value.key.name, value.revision) for value in result)
+    else:
+        # Preserve the existing canonical type tag/extra fields for extensions.
+        fingerprints = tuple(canonical_serialize(value) for value in result)
     if len(set(fingerprints)) != len(fingerprints):
         raise ValueError(f"{label} must be unique")
     return result

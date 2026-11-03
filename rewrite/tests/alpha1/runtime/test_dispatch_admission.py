@@ -940,3 +940,90 @@ def test_public_bundle_without_trusted_admission_clock_rolls_back(tmp_path):
             (bundle.envelope.identity.operation_id,),
         ).fetchone() is None
     store.close()
+
+
+@pytest.mark.parametrize("tamper", [False, True])
+def test_prepared_admission_streams_large_actual_columns_under_original_byte_meter(tamper):
+    """Column/codec unit only; this fixture issues no Graph/Source/send authority."""
+    from types import SimpleNamespace
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    from sylanne3.runtime.c09_paged_sql_v2 import C09BatchBudgetV2, C09SqlByteMeterV2
+    from sylanne3.runtime.dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    from sylanne3.runtime.dispatch_admission import insert_admission, _stored_json
+    from sylanne3.runtime.dispatch_admission_read_v3 import DispatchAdmissionReadV3
+    from sylanne3.runtime_contracts import meter_canonical_outputs
+
+    request = _candidates()[3]
+    admission = replace(_admission(), request_digest=canonical_digest(request),
+        payload_digest=request.payload_digest,
+        graph_reads=tuple(("source:" + str(i).zfill(110), 1) for i in range(1300)))
+    receipt = DispatchAdmissionReceiptV1(admission, 2, 3, canonical_digest({
+        "admission_digest": admission.digest, "graph_revision": 2, "graph_epoch": 3}))
+    assert len(_stored_json(admission)) * 2 > 262144
+    db = sqlite3.connect(":memory:")
+    install_schema(db)
+    insert_admission(db, receipt, request)
+    if tamper:
+        altered = replace(admission, graph_reads=admission.graph_reads[:-1] + (("source:altered", 1),))
+        db.execute("UPDATE graph_dispatch_admissions SET admission_json=?", (_stored_json(altered),))
+    db.commit()
+
+    class ColumnRetention:
+        closed = False
+        retained = 0
+        def retain(self, count):
+            self.retained += count
+            assert self.retained <= 8388608
+
+    # A bare state isolates this codec from Graph authorization: none is claimed.
+    owner = object.__new__(_DispatchInventoryReadV3)
+    owner.db, owner.namespace, owner.operation = db, NamespaceId("bot", "persona"), ColumnRetention()
+    owner.binding = SimpleNamespace(origin=SimpleNamespace(admission_ref=admission.admission_ref))
+    owner.admission, owner.request = receipt, request
+    reader = DispatchAdmissionReadV3(owner)
+    budget = C09BatchBudgetV2(100, 262144, 25000000, 250000000, 8388608)
+    phases = set()
+    try:
+        for _ in range(3000):
+            meter = C09SqlByteMeterV2(budget)
+            phases.add(reader.phase)
+            with meter_canonical_outputs(meter):
+                done = reader.advance(meter)
+            from sylanne3.runtime.dispatch_current_inventory_v3 import _FrozenObjectV3,_FrozenArrayV3
+            import sys
+            def retained_heap(value,seen):
+                if id(value)in seen:return 0
+                seen.add(id(value));size=sys.getsizeof(value)
+                if type(value)in(_FrozenObjectV3,_FrozenArrayV3):
+                    return size+retained_heap(value.__dict__,seen)
+                if type(value)is dict:
+                    return size+sum(retained_heap(k,seen)+retained_heap(v,seen)for k,v in value.items())
+                if type(value)in(list,tuple):return size+sum(retained_heap(v,seen)for v in value)
+                return size
+            for column in (reader.admission,reader.request):
+                if column is not None and not column.complete:
+                    actual=retained_heap((column.nodes,column.scalar,column.fragment,column.value),set())
+                    assert owner.operation.retained >= actual
+            assert meter.consumed_bytes <= 262144
+            if done:
+                break
+        else:
+            pytest.fail("finite actual column EOF did not complete")
+    except AuthorityUnavailable as exc:
+        assert tamper and "admission digest differs" in str(exc)
+        assert reader.result is None
+        return
+    assert not tamper
+    assert {"admission_digest", "request_stored_digest", "request_digest"} <= phases
+    proof = reader.result
+    meter = C09SqlByteMeterV2(budget)
+    with meter_canonical_outputs(meter):
+        assert load_admission(db, owner.namespace, admission.admission_ref, prepared_admission=proof) == receipt
+        assert load_request(db, owner.namespace, admission.admission_ref, prepared_admission=proof) == (receipt, request)
+    assert meter.encoded_bytes == 0
+    db.execute("UPDATE graph_dispatch_admissions SET graph_epoch=4")
+    with pytest.raises(AuthorityUnavailable, match="scalar identity changed"):
+        proof.receipt_v3()
+    proof.release_payload_v3()
+    with pytest.raises(AuthorityUnavailable, match="retention changed"):
+        proof.request_v3()

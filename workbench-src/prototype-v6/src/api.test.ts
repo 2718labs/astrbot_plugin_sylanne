@@ -852,3 +852,60 @@ test('Owner material keeps exact Unicode text and original UUID while rejecting 
   assert.throws(()=>validateOwnerMaterialStatus({...status,state:'unknown'},scope,operationId,inputDigest))
   assert.throws(()=>validateOwnerMaterialStatus({...status,input_digest:'0'.repeat(64)},scope,operationId,inputDigest))
 })
+
+
+test('source erasure submits audit/Owner command once and preserves same operation for pending/accepted', async () => {
+  const attempt={scope,sourceId:'source-erasure-fixture',operationId:'0fe04b50-ec1a-4b31-8cb2-8f250c9f7301'}
+  const pending={schema:'d12.scoped_erasure_pending.v2',phase:'authority_pending',operation_id:attempt.operationId,
+    source_id:attempt.sourceId,deletion_epoch:7,request_digest:'sha256:'+'a'.repeat(64)}
+  const accepted={schema:'d12.scoped_erasure_accepted.v1',phase:'authority_accepted',operation_id:attempt.operationId,
+    source_id:attempt.sourceId,deletion_epoch:7,scope_digest:'sha256:'+'b'.repeat(64),graph_barrier_digest:'sha256:'+'c'.repeat(64),cleanup_complete:false}
+  const commands:Record<string,unknown>[]=[]
+  const api=client(async(url,init)=>{
+    if(url.endsWith('/session'))return response(session)
+    commands.push(JSON.parse(String(init.body)))
+    assert.equal((init.headers as Record<string,string>)['x-csrf-token'],session.csrf_token)
+    return response(commands.length===1?{status:'pending',receipt:pending}:{status:'accepted',receipt:accepted})
+  })
+  assert.deepEqual(await api.eraseSource(attempt),pending)
+  assert.equal(commands.length,1)
+  assert.deepEqual(commands[0],{schema_version:'d12.contract.v1',action:'erase_or_retire',scope,purpose:'audit',audience:'owner',
+    operation_id:attempt.operationId,input:{schema:'d12.scoped_erasure_request.v2',source_id:attempt.sourceId}})
+  assert.deepEqual(await api.eraseSource(attempt),accepted)
+  assert.deepEqual(commands[1],commands[0])
+})
+
+test('source erasure rejects changed identity or cleanup claim and never retries POST', async () => {
+  const attempt={scope,sourceId:'source-erasure-fixture',operationId:'0fe04b50-ec1a-4b31-8cb2-8f250c9f7301'}
+  const accepted={schema:'d12.scoped_erasure_accepted.v1',phase:'authority_accepted',operation_id:attempt.operationId,
+    source_id:attempt.sourceId,deletion_epoch:7,scope_digest:'sha256:'+'b'.repeat(64),graph_barrier_digest:'sha256:'+'c'.repeat(64),cleanup_complete:false}
+  for(const change of [{source_id:'foreign'},{operation_id:'3a20a21c-17f6-4ec2-a363-3643c115975c'},{cleanup_complete:true},{extra:true}]){
+    let posts=0
+    const api=client(async(url)=>{if(url.endsWith('/session'))return response(session);++posts;return response({status:'accepted',receipt:{...accepted,...change}})})
+    await assert.rejects(api.eraseSource(attempt),{code:'invalid_response'});assert.equal(posts,1)
+  }
+  let posts=0
+  const api=client(async(url)=>{if(url.endsWith('/session'))return response(session);++posts;throw new Error('transport failed after send')})
+  await assert.rejects(api.eraseSource(attempt),{code:'network_unavailable'});assert.equal(posts,1)
+})
+
+
+test('source erasure clears actual controller protected views before an uncertain POST', async () => {
+  let backend:Awaited<ReturnType<typeof controller>>,posts=0
+  backend=await controller(async(url,init)=>{
+    if(url.endsWith('/session'))return response(session)
+    ++posts
+    assert.equal(backend.state.view.data,null)
+    assert.equal(backend.state.workspace.data,null)
+    throw new Error('unknown after request reached transport')
+  })
+  await backend.checkSession();backend.setScope(scope)
+  backend.state.workspace={status:'ready',data:workspace.projection as never,message:''}
+  backend.state.view={status:'ready',data:creation.projection as never,message:''}
+  const attempt={scope,sourceId:'selected-source',operationId:'0fe04b50-ec1a-4b31-8cb2-8f250c9f7301'}
+  backend.sourceErasures.pending.value=attempt
+  await assert.rejects(backend.sourceErasures.submit(attempt),{code:'network_unavailable'})
+  assert.equal(posts,1);assert.deepEqual({...backend.sourceErasures.pending.value},attempt)
+  backend.setScope('other-bot/other-persona');assert.equal(backend.sourceErasures.pending.value,null)
+  backend.setScope(scope);assert.deepEqual({...backend.sourceErasures.pending.value},attempt)
+})

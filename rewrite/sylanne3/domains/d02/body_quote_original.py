@@ -181,7 +181,7 @@ class D02BodyQuoteAuthority:
         envelope: CommandEnvelope, resource_quote: ResourceQuote,
         policy_id: str, policy_version: int, state: BodyState,
         current_reservations: tuple[BodyReservation, ...],
-        reservation_id: str, effect_id: str,
+        reservation_id: str, effect_id: str, *, now_utc: float,
     ) -> OriginalFixedBodyReservation:
         if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
                 or type(resource_issuer) is not D02ResourceIssuer
@@ -207,8 +207,7 @@ class D02BodyQuoteAuthority:
         domain = BodyDomain()
         quote = domain.quote_work(
             policy.profile, state, identity.activity_id, policy.work_kind,
-            0.0, (policy.component,), valid_until=policy.valid_until,
-        )
+            0.0, (policy.component,), valid_until=policy.valid_until, now_utc=now_utc)
         quote = replace(quote, quote_id="body-quote:" + canonical_digest({
             "namespace": list(namespace.as_tuple),
             "operation_id": identity.operation_id,
@@ -234,8 +233,7 @@ class D02BodyQuoteAuthority:
                                              matches[0]), True,
             )
         reservation = domain.reserve_work(
-            state, current_reservations, quote, reservation_id, effect_id,
-        )
+            state, current_reservations, quote, reservation_id, effect_id, now_utc=now_utc)
         payload = canonical_serialize(asdict(quote))
         resource_digest = canonical_digest(resource_quote)
         signed = self._sign("d02-body-quote.v1", canonical_serialize({

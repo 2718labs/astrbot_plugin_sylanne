@@ -121,6 +121,68 @@ Source evidence SHA-256:
 - `webui-heritage/pnpm-lock.yaml`: `f549a593870b26e7f02c4629936a2aed082d7cf6cb9ab05dadba9be48ae832b7`
 
 
+## Prototype-v6 main Workbench runtime licenses
+
+The current primary Workbench is built from `workbench-src/prototype-v6`. Its runtime uses the already listed `vue 3.5.39` and `three 0.186.1`, including `three/addons/loaders/GLTFLoader.js` in `src/ArchiveArc.vue`. The independent maintenance console does not import Vue, Three.js or model files; its existing noble-hashes notice remains below. The following complete license texts are copied from the installed packages actually used by this build. No model assets or dependency source trees are added to the runtime package by this notice.
+
+### vue 3.5.39 — primary Workbench runtime
+
+Declared license: MIT. Package metadata SHA-256: `a47a52a49abb476476237bfb7a6337fee5976d516bb5df1cf1354fd3b5eff288`.
+License source: `workbench-src/prototype-v6/node_modules/vue/LICENSE`; SHA-256: `1bb85cc9b13b81ef41c81c51866172fc345e0503c86726a6755b796590b70175`.
+
+```text
+The MIT License (MIT)
+
+Copyright (c) 2018-present, Yuxi (Evan) You
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
+### three 0.186.1 — primary Workbench scene and GLTF loader
+
+Declared license: MIT. Package metadata SHA-256: `f9c474a27c920b9435353a6235968f4453436bee0444fac7e5fd289c8fa463de`.
+License source: `workbench-src/prototype-v6/node_modules/three/LICENSE`; SHA-256: `8b378ebe60e2fe500158cb0ac71cb5e8b7d92953c2abcc63a0eb90499653b5bc`.
+
+```text
+The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.
+```
+
 ## Prototype-v6 HTTP-compatible SHA-256 dependency
 
 `@noble/hashes 2.0.1` is bundled for the existing SHA-256 content/request commitments. Source: https://github.com/paulmillr/noble-hashes/tree/2.0.1 . Declared license: MIT. Package metadata SHA-256: `ceb30ba96a14786c419db53f2b8d3d59ece7ac5221c198ac03def462cf96ef23`.

@@ -8,9 +8,9 @@ import pytest
 
 from sylanne3.domains.d13.precompression import compile_deterministic_candidate
 from sylanne3.runtime.d13_precompression_job import (
-    D13CacheCommitReceiptV1, D13CallUsageV1, D13PrecompressionHold,
+    D13CacheCommitReceiptV1, D13PrecompressionHold,
     D13ProviderUsageV2,
-    account_d13_calls_v2, check_activation_v1, combine_usage_v1,
+    account_d13_calls_v2, check_activation_v1,
     prepare_activation_intent_v1, prepare_adoption_intent_v1,
     prepare_precompression_intent_v1, prepare_retirement_intent_v1,
     prepare_standby_v1, plan_from_precompression_job_v1, retirement_due_v1,
@@ -57,6 +57,13 @@ def intent(w=None, **changes):
                 ceiling={"input_tokens": 100, "output_tokens": 30,
                          "model_microusd": 1000}, deadline_utc=w.trusted_utc + 600)
     args.update(changes)
+    if "pressure" not in args:
+        from sylanne3.domains.d13.precompression import D13CurrentMainPressureV2
+        from sylanne3.runtime_contracts import canonical_digest
+        budget = args["history_token_budget"]
+        args["pressure"] = D13CurrentMainPressureV2(
+            canonical_digest(w), "b" * 64, "install", "provider", "model",
+            "a" * 64, max(budget * 3 // 2, 1), "exact-tokenizer")
     return prepare_precompression_intent_v1(w, **args)
 
 
@@ -182,7 +189,7 @@ def test_late_or_lost_fence_cannot_adopt_and_expiry_does_not_renew():
     assert retirement_due_v1(standby, standby.expires_at_utc)
 
 
-def test_activation_targets_and_two_usage_ledgers_preserve_unknown():
+def test_activation_targets_preserve_currentness():
     w = window()
     prepared = intent(w)
     candidate = compile_deterministic_candidate(w, prepared.plan)
@@ -208,17 +215,6 @@ def test_activation_targets_and_two_usage_ledgers_preserve_unknown():
         raw_tail_input_tokens=350,
         raw_window_fits=False, proven_future_saving=False)
     assert stale.decision == "invalid"
-    foreground = D13CallUsageV1(1000, 80, 700, 25)
-    background = D13CallUsageV1(200, 20, None, 7)
-    ledger = combine_usage_v1(foreground, background, candidate_used=False)
-    assert ledger.foreground_window_tokens == 1000
-    assert ledger.foreground_cached_tokens == 700
-    assert ledger.total_billed_microusd == 32
-    assert ledger.unused_candidate_cost_microusd == 7
-    assert combine_usage_v1(foreground, replace(background, billed_microusd=None),
-                            candidate_used=False).total_billed_microusd is None
-    with pytest.raises(ValueError):
-        D13CallUsageV1(10, 0, 11, 1)
 
 
 def test_typed_cache_cas_intents_keep_epochs_fence_and_three_day_retirement():

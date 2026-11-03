@@ -25,26 +25,48 @@ def register_current_fixed_body_work_policy_v1(graph, bootstrap, authority, leas
     request_digest = canonical_digest(("d02.fixed-work-policy-adoption.v1", namespace, operation_id, policy))
     profile_write = BodyDomain.profile_write(policy.profile)
     state_write = BodyDomain.state_write(namespace, policy.initial_state)
+    from ..runtime_storage_v3 import runtime_storage_v3
+    from .d02_fixed_policy_read_v3 import (bound_d02_fixed_policy_read_v3,
+        bind_prepared_d02_fixed_policy_read_v3, prepare_d02_fixed_policy_read_v3)
+    prepared = bound_d02_fixed_policy_read_v3()
+    if runtime_storage_v3(store._db) is not None:
+        if prepared is None:
+            work = prepare_d02_fixed_policy_read_v3(graph,bootstrap,authority,lease,
+                operation_id=operation_id,policy=policy,request_digest=request_digest)
+            def completed(capsule):
+                with bind_prepared_d02_fixed_policy_read_v3(capsule):
+                    return register_current_fixed_body_work_policy_v1(graph,bootstrap,authority,lease,
+                        operation_id=operation_id,policy=policy)
+            def failed(error):
+                raise error
+            return work.map_terminal_v3("issuer",completed,failed)
+        prepared.require_invocation_v3(graph,authority=authority,lease=lease,
+            operation_id=operation_id,request_digest=request_digest)
+        if prepared.is_replay_v3:
+            return prepared.replay_result_v3(graph,policy,operation_id=operation_id,request_digest=request_digest)
     def commit(db, metadata, epoch, now, current_owner, scope):
         if policy.valid_until <= now:
             raise ValueError("fixed body work policy expired before actual Owner adoption")
         install_body_quote_schema(db)
-        profile = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (profile_write.key.token,)).fetchone()
-        state = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (state_write.key.token,)).fetchone()
-        if (profile is None) != (state is None):
-            raise ValueError("body profile/state initialization is partial")
+        if prepared is not None:
+            profile,state = prepared.require_bound_compare_v3(graph,policy,
+                operation_id=operation_id,request_digest=request_digest)
+        else:
+            profile = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (profile_write.key.token,)).fetchone()
+            state = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (state_write.key.token,)).fetchone()
+            if (profile is None) != (state is None):
+                raise ValueError("body profile/state initialization is partial")
+            if profile is not None:
+                initial = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=1",
+                    (state_write.key.token,)).fetchone()
+                if (profile[2] != 1 or state[2] != 1 or json.loads(profile[1]) != profile_write.value
+                        or initial is None or initial[1] != 1 or json.loads(initial[0]) != state_write.value):
+                    raise ValueError("additional work policy cannot rewrite the original body definition or reset current state")
         if profile is None:
             writes = (profile_write, state_write)
             reads = (GraphVersion(profile_write.key, 0), GraphVersion(state_write.key, 0))
         else:
-            initial = db.execute("SELECT value,valid FROM graph_history WHERE token=? AND revision=1",
-                (state_write.key.token,)).fetchone()
-            if (profile[2] != 1 or state[2] != 1 or json.loads(profile[1]) != profile_write.value
-                    or initial is None or initial[1] != 1 or json.loads(initial[0]) != state_write.value):
-                raise ValueError("additional work policy cannot rewrite the original body definition or reset current state")
-            # Current fatigue, energy, cursor and unsettled components remain
-            # actual current state. Only the explicitly signed work policy is
-            # added for an already allowed work kind in the same profile.
+            # Only add the signed work policy; preserve the actual current state.
             writes = ()
             reads = (GraphVersion(profile_write.key, profile[0]), GraphVersion(state_write.key, state[0]))
         signer.install_policy(db, policy)
@@ -65,4 +87,4 @@ def register_current_fixed_body_work_policy_v1(graph, bootstrap, authority, leas
             "work_kind": policy.work_kind, "body_initialized": profile is None,
             "graph_receipt_digest": canonical_digest(receipt)}
     return graph._owner_domain_write_v3(authority, lease, operation_id=operation_id,
-        request_digest=request_digest, domains=("d02",), capability="d02.body_policy.install", commit=commit)
+        request_digest=request_digest, domains=("d02",), capability="d02.body_policy.install", commit=commit,d02_policy_prepare=prepared)

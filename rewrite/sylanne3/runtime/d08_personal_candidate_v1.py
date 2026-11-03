@@ -921,6 +921,26 @@ def read_current_personal_value_evaluation_v1(db, read, request, candidate_refs,
     return evaluation
 
 
+def read_evaluation_value_rules_v1(evaluation):
+    """Consume rules from an already-qualified actual evaluation, never claims.
+
+    Legacy originals retain their bytes. Their rule list can be consumed without
+    decoding or granting permission to the old PersonaView.blocks copy.
+    """
+    from ..domains.d01 import PersonaValuesProjectionV1, ValueRule
+    from .domain_production_erasure_v1 import decode_typed_production_value_v1
+    provenance = evaluation["payload"]["provenance"]
+    if "persona_values" in provenance:
+        if "persona_view" in provenance:
+            raise ValueError("evaluation repeats incompatible persona projections")
+        projection = decode_typed_production_value_v1(provenance["persona_values"], PersonaValuesProjectionV1)
+        rules = projection.values
+    else:
+        rules = tuple(decode_typed_production_value_v1(raw, ValueRule)
+            for raw in provenance["persona_view"]["values"])
+    return tuple(plain_v1(rule) for rule in rules)
+
+
 def _need(db, read, readers, request, plan_atom, goal_atom, *, _phase_transition=None):
     if readers.need_qualification_reader is None:
         raise MissingProductionOriginalV1("installed_current_personal_need_reader")

@@ -196,6 +196,12 @@ def current_life_fixture_policy_v3(peer,admin_peer,authority_namespace,installat
             return candidate==admin_peer and selected==authority_namespace
         if action in {'owner_claim','owner_session'}:return candidate==peer and selected==authority_namespace
         if action=='current' and candidate==admin_peer:return selected==authority_namespace
+        if action in {'d13_cache_use_install','d13_cache_use_observe','d13_cache_use_acquire',
+                'd13_cache_use_transfer','d13_cache_use_release','d13_cache_use_inspect','d13_cache_use_reclaim',
+                'd13_cache_use_register_original','d13_cache_use_inspect_original','d13_cache_use_close_original',
+                'd13_cache_use_natural_acquire','d13_cache_use_natural_inspect',
+                'd13_cache_use_natural_close_parent','d13_cache_use_natural_parent_inspect'}:
+            return candidate==peer and selected==authority_namespace and holder in {None,'host:reply'}
         return (candidate==peer and selected in {authority_namespace,'ns:bootstrap'}
             and action in {'install','seal_v2_only','namespace_genesis','current','read','write','dispatch',
                 'execution','owner_guard_read','self_identity_read','model_egress','accounting','owner_authorization_revoke'}
@@ -210,8 +216,183 @@ def current_life_fixture_policy_v3(peer,admin_peer,authority_namespace,installat
     return authorize,administrator,credential
 
 
+def read_current_d13_fixture_assets_v3(initial):
+    """Read the real protected policy pins and Counter assets as one exact cohort."""
+    from dataclasses import fields
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    from sylanne3.authority_service.d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
+    from sylanne3.runtime.d13_technical_policy import InstalledD13CacheUseAssetsV2
+    from sylanne3.runtime_contracts import NamespaceId
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    if type(initial)is not M1PhaseFixtureInstallationV2 or initial.d13_installation_assets is None:
+        raise ValueError('selected fresh SDK fixture needs its explicit new protected D13 asset cohort; HOLD_PREPARATION')
+    raw=read_installed_bytes_v1(initial.d13_installation_assets,limit=65536,private=True,allowed_gid=os.getegid())
+    value=json.loads(raw)
+    if (type(value)is not dict or set(value)!={'schema','d13_cache_use_assets_v2','d13_counter_assets_v1'}
+            or value['schema']!='sylanne.test.beta1.d13-installation-assets.v3'):
+        raise ValueError('exact current D13 fixture asset codec required')
+    decoded=[]
+    for key,kind in (('d13_cache_use_assets_v2',InstalledD13CacheUseAssetsV2),('d13_counter_assets_v1',InstalledD13CounterAssetsV2)):
+        rows=value[key]
+        if type(rows)is not list or len(rows)!=1 or set(rows[0])!={f.name for f in fields(kind)}:
+            raise ValueError('one actual fixed D13 asset record required per namespace')
+        row=dict(rows[0]);row['namespace']=NamespaceId(**row['namespace']);decoded.append(kind(**row))
+    use,counter=decoded;bundle=initial.initial_bundle
+    use.require_installation_v2(bundle)
+    if (counter.namespace!=use.namespace or counter.installation_id!=use.installation_id
+            or counter.package_root!=str(initial.package_root)or counter.package_manifest_sha256!=use.package_manifest_sha256):
+        raise ValueError('Counter and use policy assets differ from the current actual protected package')
+    return raw,{use.authority_namespace:use},{use.authority_namespace:counter}
+
+
+async def install_current_sdk_fresh_fixture_v3(*,initial,config,setup_file,registry,
+        authority_loop,encoding_request_issuer,suppression_registry):
+    """Use the formal dormant capture, real Root publication and final SDK readiness."""
+    import asyncio
+    from sylanne3.authority_service.linux_deployment_v1 import open_controlled_sdk_d13_fresh_installation_v3
+    from sylanne3.host.c09_controlled_sdk_bootstrap_v3 import (
+        read_controlled_sdk_root_descriptor_v3,publish_controlled_sdk_d13_fresh_installation_v3)
+    from sylanne3.runtime.d13_consumer_manifest_v3 import prepare_controlled_sdk_d13_consumers_v3
+    from sylanne3.authority_service.deployment_config import InstalledNaturalModelAuthorityV2
+    from sylanne3.authority_service.c09_installed_factory_v1 import InstalledC09MaintenanceFactoryV1
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    from sylanne3.authority_service.d13_cache_use_control_v2 import InstalledD13CacheUseControlPortV2
+    from sylanne3.graph_coordinator import GraphCoordinator
+    from sylanne3.graph_worker import GraphWorker
+    from sylanne3.runtime.c04_cpu_quote_policy import C04InternalCpuQuotePolicyAuthorityV1
+    from sylanne3.host.authority_client import AUTHORITY_PROTOCOL,AuthorityProvisioningRequest,PublisherPackageIdentity
+    from sylanne3.authority_service.v2_contract import SCHEMA as V2_PROTOCOL
+    from sylanne3.host.mtls_transport import MtlsAuthorityTransport
+    from sylanne3.host.v2_fence_port import V2FencePort
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    async def listen(dormant):
+        return await asyncio.to_thread(lambda:asyncio.run_coroutine_threadsafe(
+            dormant.start_metadata_listener_v3(),authority_loop).result(timeout=30))
+    async def capture(boot,phase_initial):
+        dormant=await boot.await_fresh_dormant_composition_v3()
+        listener=await listen(dormant);daemon=dormant.daemon
+        bundle=phase_initial.initial_bundle;policy=bundle.installation_policy
+        ns=policy.authority_namespace;factory=daemon.config.c09_maintenance_factory
+        request=AuthorityProvisioningRequest(AUTHORITY_PROTOCOL,phase_initial.profile_id,
+            'astrbot_plugin_sylanne','4.28.1',phase_initial.package_root,phase_initial.data_dir,
+            PublisherPackageIdentity(policy.manifest_digest))
+        transport=MtlsAuthorityTransport({phase_initial.profile_id:bundle.tls_profile})
+        try:
+            handshake=await transport.handshake(request,protocol=V2_PROTOCOL)
+            grant=await transport.installation_grant_v2(request,handshake)
+        finally:await transport.close()
+        bootstrap=object()
+        def coordinator(store):
+            port=V2FencePort(request,{phase_initial.profile_id:bundle.tls_profile},grant)
+            try:
+                use=InstalledD13CacheUseControlPortV2(fence_port=port,bundle=bundle)
+                return GraphCoordinator(store,bootstrap,holder=policy.administrator_holder,
+                    content_fence_v2=port,d02_issuer=factory.resource_issuer,d11_issuer=factory.budget_job_issuer,
+                    body_quote_authority=factory.body_authority,
+                    c04_cpu_quote_authority=C04InternalCpuQuotePolicyAuthorityV1(hmac.digest(bundle.d11_signing_key,
+                        b'sylanne3.c04.internal_cpu_quote_policy.v1\0'+policy.installation_id.encode(),'sha256')),
+                    d13_precompression_policy=bundle.d13_precompression,d13_paid_precompression_policy=bundle.d13_paid_precompression,
+                    d13_derived_cache_maintenance_v2=bundle.d13_derived_cache_maintenance_v2,
+                    d13_cache_use_control_v2=use,d13_cache_use_coverage_v2=(bundle.d13_derived_cache_maintenance_v2.coverage_ref,
+                        bundle.d13_derived_cache_maintenance_v2.coverage_digest),
+                    encoding_request_issuer=encoding_request_issuer,scene_clock_policy=bundle.ingress_clock,
+                    reply_suppression_ack_verifier=suppression_registry.verify_and_consume,
+                    owner_principal_resolver=lambda actor,namespace:(binding.principal if binding is not None
+                        and binding.namespace==namespace else None)if(binding:=daemon.owner_pairings.current_actor_binding(
+                            authority_namespace=ns,installation_id=policy.installation_id,actor_id=actor))is not None else None)
+            except BaseException:
+                port.close()
+                raise
+        host_binding=await boot.read_fresh_sdk_host_graph_binding_v4()
+        from sylanne3.graph_store import ProductionGraphStore
+        worker=await GraphWorker.start(lambda:ProductionGraphStore(host_binding.member('graph')['resolved_path'],
+            registry,host_storage_binding=host_binding),coordinator)
+        consumers=await prepare_controlled_sdk_d13_consumers_v3(worker=worker,dormant=dormant,bootstrap=bootstrap)
+        graph=consumers.graph
+        return dormant,worker,consumers,graph,bootstrap,listener,grant,request
+    profile_path=initial.profile_root/initial.profile_id/'profile.json'
+    profile_bytes=read_installed_bytes_v1(profile_path,limit=32768)
+    assets_bytes,_use,_counter=read_current_d13_fixture_assets_v3(initial)
+    prepare_boot=open_controlled_sdk_d13_fresh_installation_v3(config,mode='prepare',
+        profile_bytes=profile_bytes,assets_bytes=assets_bytes)
+    try:
+        _dormant,_worker,_consumers,_graph,_bootstrap,_listener,_grant,_request=await capture(prepare_boot,initial)
+        prepared=await prepare_boot.await_fresh_prepared_v3()
+        closed=await prepare_boot.close_fresh_sdk_preparation_v3()
+        if closed['status']!='complete':raise ValueError('actual fresh SDK preparation drain remains pending')
+        publication=await publish_controlled_sdk_d13_fresh_installation_v3(prepared,
+            closed_services=closed['closed_services'],consumer_closure=closed['consumer_closure'])
+    except BaseException as original_failure:
+        if prepare_boot._plan.fresh_installation.sdk_consumers is not None:
+            result=await prepare_boot._plan.fresh_installation.sdk_consumers.close_v3()
+            if result['status']!='complete':
+                raise BaseExceptionGroup('SDK preparation failure and pending consumer cleanup',
+                    [original_failure,ValueError('actual consumer drain remains pending')])
+        await prepare_boot.aclose()
+        raise
+    final_initial=M1PhaseFixtureInstallationV2.from_protected_setup_v2(setup_file)
+    final_bundle=final_initial.initial_bundle
+    if (final_bundle.installation_policy!=initial.initial_bundle.installation_policy
+            or final_bundle.model_workflows!=initial.initial_bundle.model_workflows
+            or final_bundle.d02_signing_key!=initial.initial_bundle.d02_signing_key
+            or final_bundle.d11_signing_key!=initial.initial_bundle.d11_signing_key):
+        raise ValueError('Root fresh publication changed the original issued policy or model/issuer')
+    final_assets,use_assets,counter_assets=read_current_d13_fixture_assets_v3(final_initial)
+    factory=config.c09_maintenance_factory
+    final_factory=InstalledC09MaintenanceFactoryV1(namespace=factory.namespace,peer=factory.peer,registry=factory.registry,
+        resource_issuer=factory.resource_issuer,body_authority=factory.body_authority,inventory_manifest=factory.inventory,
+        target_directory=factory.target_directory,provider_cache_cleanup=factory.provider_cache_cleanup,
+        controlled_backup_cleanup=factory.controlled_backup_cleanup,controlled_backup_registry=factory.controlled_backup_registry,
+        budget_job_issuer=factory.budget_job_issuer)
+    ns=final_bundle.installation_policy.authority_namespace
+    installed=config.natural_model_authorities_v2[ns]
+    final_config=replace(config,c09_maintenance_factory=final_factory,d13_cache_use_assets_v2=use_assets,
+        d13_counter_assets_v1=counter_assets,natural_model_authorities_v2={ns:InstalledNaturalModelAuthorityV2(
+            installed.d11_issuer,final_bundle.model_workflows,installed.observer_peer,final_bundle)})
+    descriptor=read_controlled_sdk_root_descriptor_v3(final_initial.c09_sdk_peer_cohort,
+        config=final_config,inventory=final_factory.inventory,peer=final_factory.peer)
+    final_factory.install_controlled_sdk_peer_registry_v3(root_descriptor=descriptor,closed_services=closed['closed_services'])
+    final_profile=read_installed_bytes_v1(profile_path,limit=32768)
+    final_boot=open_controlled_sdk_d13_fresh_installation_v3(final_config,mode='finalize',
+        profile_bytes=final_profile,assets_bytes=final_assets,publication_receipt=prepared.publication_receipt,
+        consumer_closures=(closed['consumer_closure'],))
+    try:
+        dormant,worker,consumers,graph,bootstrap,listener,grant,request=await capture(final_boot,final_initial)
+        daemon=await final_boot.await_business_ready_v3()
+        context=daemon.c09_control.read_verified_current_storage_v3();context.require_current('business')
+        process=read_process_identity_v1(os.getpid())
+        admission=daemon.c09_gate.register_peer_process_v1(peer=final_factory.peer,process_id=os.getpid(),
+            process_incarnation='current-c09-business:'+process['birth'],pointer_version=context.pointer_version,
+            storage_generation=context.storage_generation)
+        ready=await consumers.mark_ready_v3(peer_admission=admission)
+        return dict(initial=final_initial,bootstrap_daemon=final_boot,daemon=daemon,worker=worker,consumers=consumers,
+            graph=graph,store=consumers.store,bootstrap=bootstrap,port=consumers.port,grant=grant,request=request,
+            listener=listener,publication=publication,ready=ready,writer_admission=admission)
+    except BaseException as original_failure:
+        consumer=final_boot._plan.fresh_installation.sdk_consumers
+        if consumer is not None:
+            result=await consumer.close_v3()
+            if result['status']!='complete':
+                raise BaseExceptionGroup('SDK finalization failure and pending consumer cleanup',
+                    [original_failure,ValueError('actual consumer drain remains pending')])
+        dormant=final_boot._plan.fresh_installation.dormant
+        if dormant is not None:await dormant.close_metadata_listener_v3()
+        await final_boot.aclose()
+        raise
+
+
 def _initial_current_life_deployment_v3(*,core,protected,execution,registry,server_kwargs,peer,namespace,
         authority_namespace,files,control,inventory,directories,initial,assets):
+    from sylanne3.authority_service.deployment_config import InstalledC09AuthorityV1
+    installation=InstalledC09AuthorityV1(control.path,control.key_path,control.installation_id,control.authority_id,
+        control.control_store_id,control.key_id,control._roots)
+    return _assemble_initial_current_life_deployment_v4(registry=registry,server_kwargs=server_kwargs,peer=peer,
+        namespace=namespace,authority_namespace=authority_namespace,files=files,c09_installation=installation,
+        instance_lock=control.lease.path,journal_id=execution.journal_id,inventory=inventory,directories=directories,initial=initial,assets=assets)
+
+
+def _assemble_initial_current_life_deployment_v4(*,registry,server_kwargs,peer,namespace,
+        authority_namespace,files,c09_installation,instance_lock,journal_id,inventory,directories,initial,assets):
     """Official initial config and assets, before the first business call."""
     from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
     from sylanne3.authority_service.deployment_config import (AuthorityDeploymentConfig,ExecutionJournalInstallation,
@@ -223,7 +404,7 @@ def _initial_current_life_deployment_v3(*,core,protected,execution,registry,serv
     if type(initial) is not M1PhaseFixtureInstallationV2 or initial.data_dir.resolve()!=Path(assets['data_dir']).resolve():
         raise ValueError('C09 current requires the actual protected initial phase installation')
     bundle=initial.initial_bundle;policy=bundle.installation_policy;installation_peer=(peer.certificate_sha256,'reply')
-    if (policy.namespace!=namespace or policy.installation_id!=control.installation_id
+    if (policy.namespace!=namespace or policy.installation_id!=c09_installation.installation_id
             or policy.manifest_digest!=server_kwargs['installations_v2'][installation_peer].manifest_digest
             or bundle.model_workflows is not initial.workflows
             or assets['d11_issuer'].resource_issuer is not assets['d02_issuer']):
@@ -232,7 +413,7 @@ def _initial_current_life_deployment_v3(*,core,protected,execution,registry,serv
         b'sylanne3.d02.body_quote_original.v1\0'+policy.installation_id.encode(),'sha256'))
     graph_parent=files['graph'].parent
     cache=ControlledLifeProviderCacheV1(graph_parent.parent/(graph_parent.name+'-c09-provider-cache'),assets['provider_configuration'],phase_config=initial)
-    cache.bind(authority_id=control.authority_id,installation_id=control.installation_id,namespace=authority_namespace)
+    cache.bind(authority_id=c09_installation.authority_id,installation_id=c09_installation.installation_id,namespace=authority_namespace)
     factory=InstalledC09MaintenanceFactoryV1(namespace=namespace,peer=installation_peer,registry=registry,
         resource_issuer=assets['d02_issuer'],body_authority=body,inventory_manifest=inventory,
         target_directory=directories['rebuild_temp'],provider_cache_cleanup=cache.installed_disposition(),
@@ -246,10 +427,14 @@ def _initial_current_life_deployment_v3(*,core,protected,execution,registry,serv
     if initial.c04_component_key is None:
         raise ValueError('C09 current requires its actual Root-prepared component key')
     component_key=initial.c04_component_key
+    use_assets=counter_assets=None
+    if initial.d13_installation_assets is not None:
+        _d13_raw,use_assets,counter_assets=read_current_d13_fixture_assets_v3(initial)
     config=AuthorityDeploymentConfig(authority_db=files['core'],deletion_db=files['deletion'],graph_db=files['graph'],
-        instance_lock=control.lease.path,execution_journals={authority_namespace:ExecutionJournalInstallation(files['execution'],execution.journal_id)},
+        instance_lock=instance_lock,execution_journals={authority_namespace:ExecutionJournalInstallation(files['execution'],journal_id)},
         tls=assets['tls'],bind_host='127.0.0.1',bind_port=bundle.tls_profile.port,
-        installations_v2=server_kwargs['installations_v2'],namespace_bindings_v2=server_kwargs['namespace_bindings_v2'],
+        installations_v2=({installation_peer:server_kwargs['installations_v2'][installation_peer]}if initial.initial_segmented_genesis_v4 else server_kwargs['installations_v2']),
+        namespace_bindings_v2=({key:value for key,value in server_kwargs['namespace_bindings_v2'].items()if key[:2]==installation_peer}if initial.initial_segmented_genesis_v4 else server_kwargs['namespace_bindings_v2']),
         reverse_handoff_profiles={authority_namespace:assets['reverse_profile']},
         reverse_handoff_issuers=server_kwargs['v2_final_handoff_issuers'],core_authorizer=core_authorizer,
         core_verifier_factory=installed_core_verifier_factory,administrator_authorizer=administrator_authorizer,
@@ -260,9 +445,8 @@ def _initial_current_life_deployment_v3(*,core,protected,execution,registry,serv
         worker_result_fact_committers_v2=server_kwargs['worker_result_fact_committers_v2'],
         host_onebot_observations_v2=server_kwargs['host_onebot_observations_v2'],
         c04_installations_v3={authority_namespace:InstalledC04AuthorityV3(initial.package_root,policy.manifest_digest,component_key)},
-        d13_counter_assets_v1=assets.get('d13_counter_assets'),
-        c09_storage_v1=InstalledC09AuthorityV1(control.path,control.key_path,control.installation_id,control.authority_id,
-            control.control_store_id,control.key_id,control._roots),c09_maintenance_factory=factory)
+        d13_counter_assets_v1=counter_assets,d13_cache_use_assets_v2=use_assets,
+        c09_storage_v1=c09_installation,c09_maintenance_factory=factory)
     return config,factory,cache,body
 
 
@@ -282,6 +466,10 @@ def install_actual_offline_authority_case_v1(case, *, register_host_process=True
     daemon=case.get('c09_daemon')
     if daemon is not None:
         assert daemon.core is core and daemon.server is server and daemon.c09_control is control
+        sdk_consumers=case.get('c09_sdk_consumers')
+        if sdk_consumers is not None:
+            from sylanne3.runtime.d13_consumer_manifest_v3 import require_actual_d13_host_consumer_ready_v3
+            assert require_actual_d13_host_consumer_ready_v3(graph)is sdk_consumers
         gate=daemon.c09_gate;maintenance=daemon.c09_maintenance
         assert gate.control is control and maintenance.control is control
         service=server._d11_offline_tick_services_v1[authority_namespace]
@@ -289,10 +477,12 @@ def install_actual_offline_authority_case_v1(case, *, register_host_process=True
         admission=None
         if register_host_process:
             process=read_process_identity_v1(os.getpid());assert process is not None
-            writer_original=gate.register_peer_process_v1(
-                peer=(case['peer'].certificate_sha256,case['installed_bundle'].tls_profile.profile_id),
-                process_id=os.getpid(),process_incarnation='current-c09-business:'+process['birth'],
-                pointer_version=context.pointer_version,storage_generation=context.storage_generation)
+            writer_original=case.get('c09_writer_admission_original')
+            if writer_original is None:
+                writer_original=gate.register_peer_process_v1(
+                    peer=(case['peer'].certificate_sha256,case['installed_bundle'].tls_profile.profile_id),
+                    process_id=os.getpid(),process_incarnation='current-c09-business:'+process['birth'],
+                    pointer_version=context.pointer_version,storage_generation=context.storage_generation)
             control.verify_original_v1(writer_original,'admission_digest')
             assert writer_original['schema']=='sylanne3.c09.writer-peer-admission.v3'
             assert writer_original['peer']==[case['peer'].certificate_sha256,case['installed_bundle'].tls_profile.profile_id]
@@ -461,3 +651,51 @@ def install_phase_fixture_recall_owner_policies_v1(case):
         "cpu_policy": cpu, "cpu_policy_digest": canonical_digest(cpu), "cpu_signature": cpu_signature}
     case["phase_fixture_recall_owner_originals"] = originals
     return originals
+
+
+def build_actual_initial_sdk_deployment_v4(*,initial,registry,server_kwargs,peer,namespace,authority_namespace,assets):
+    """Read the selected Root installation before any of its four role files exist."""
+    from test_post_c02_reply_assembly_v2 import M1PhaseFixtureInstallationV2
+    from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+    from sylanne3.authority_service.deployment_config import InstalledC09AuthorityV1
+    from sylanne3.authority_service.linux_bootstrap_v1 import build_initial_inventory_v1
+    from sylanne3.runtime.c09_installation_inventory_v2 import InstallationFilesystemManifestV2
+    from sylanne3.runtime_contracts import canonical_digest
+    from sylanne3.host.c09_controlled_sdk_bootstrap_v3 import read_controlled_sdk_root_descriptor_v3
+    from sylanne3.authority_service.c09_initial_segmented_genesis_v4 import install_controlled_sdk_initial_storage_contract_v4
+    if type(initial)is not M1PhaseFixtureInstallationV2 or not initial.initial_segmented_genesis_v4:
+        raise ValueError('explicit Root-selected fresh segmented genesis setup required')
+    raw=json.loads(read_installed_bytes_v1(initial.c09_installation_assets,limit=16384,private=True,allowed_gid=os.getegid()))
+    fields={'schema','authority_id','installation_id','control_store_id','key_id','namespace','sdk_peer_descriptor',
+        'manifest_digest','inventory_manifest_digest','control_path','key_path','instance_lock'}
+    policy=initial.initial_bundle.installation_policy
+    if (type(raw)is not dict or set(raw)!=fields or raw['schema']!='sylanne3.c09.controlled-sdk-installation-assets.v3'
+            or raw['authority_id']!=policy.expected_authority_id or raw['installation_id']!=policy.installation_id
+            or raw['namespace']!=authority_namespace or raw['sdk_peer_descriptor']!=[peer.certificate_sha256,initial.profile_id]
+            or raw['manifest_digest']!=policy.manifest_digest or policy.namespace!=namespace):
+        raise ValueError('actual Root initial Control/peer/namespace/profile identity changed')
+    files=dict(core=initial.authority_store,deletion=initial.data_dir/'deletion.db',execution=initial.data_dir/'execution.db',
+        graph=initial.data_dir/'host-data/sylanne3.sqlite3')
+    if any(path.exists()for path in (*files.values(),Path(raw['control_path']))):
+        raise ValueError('actual fresh segmented genesis refuses all preexisting role/Control files')
+    managed=initial.data_dir/'offline-managed-artifacts'
+    directories={name:managed/name for name in ('controlled_backup','export','rebuild_temp','cache')}
+    if any(not path.is_dir()or path.is_symlink()for path in directories.values()):
+        raise ValueError('actual Root resource directories changed')
+    inventory=build_initial_inventory_v1(authority_id=raw['authority_id'],installation_id=raw['installation_id'],
+        namespace=authority_namespace,files=files,directories=directories)
+    export_id=initial.artifact_draft.tool_scope.resource_id
+    resources=tuple(replace(item,content_coverage=tuple(sorted({*item.content_coverage,'jobs_drafts','imports_exports'})))
+        if item.resource_id==export_id and item.kind=='export'else item for item in inventory.resources)
+    inventory=InstallationFilesystemManifestV2(inventory.authority_id,inventory.installation_id,inventory.namespace,resources,
+        canonical_digest((inventory.schema,inventory.authority_id,inventory.installation_id,inventory.namespace,resources)))
+    if inventory.manifest_digest!=raw['inventory_manifest_digest']:
+        raise ValueError('actual Root initial complete resource inventory differs')
+    installation=InstalledC09AuthorityV1(Path(raw['control_path']),Path(raw['key_path']),raw['installation_id'],
+        raw['authority_id'],raw['control_store_id'],raw['key_id'],(initial.data_dir.resolve(),))
+    config,factory,cache,body=_assemble_initial_current_life_deployment_v4(registry=registry,server_kwargs=server_kwargs,
+        peer=peer,namespace=namespace,authority_namespace=authority_namespace,files=files,c09_installation=installation,
+        instance_lock=Path(raw['instance_lock']),journal_id='execution',inventory=inventory,directories=directories,initial=initial,assets=assets)
+    descriptor=read_controlled_sdk_root_descriptor_v3(initial.c09_sdk_peer_cohort,config=config,inventory=inventory,peer=factory.peer)
+    install_controlled_sdk_initial_storage_contract_v4(config=config,root_descriptor=descriptor)
+    return config,factory,cache,body

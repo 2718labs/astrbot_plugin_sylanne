@@ -35,6 +35,15 @@ class InstalledD12InstallationControlPortV1:
             response=await self.port._transport._content_rpc(self.port._request,handshake,CONTROL_METHOD,
                 {"namespace":request.authority_namespace,"action":action,"owner_actor_id":authority.actor,
                  "owner_session_token":token,"owner_session_request":session_to_wire(request),**extra},protocol=SCHEMA)
+            if action=="migrate_source_inspection":
+                if set(response)!={"inspection_migration","channel_binding_sha256"}:
+                    raise RuntimeError("installed inspection migration response differs")
+                result=response["inspection_migration"]
+                if (result["schema"] not in {"sylanne.source-inspection-migration-progress.v1",
+                        "sylanne.source-inspection-migration-receipt.v1"}
+                        or result["operation_id"]!=extra["operation_id"]):
+                    raise PermissionError("inspection migration result belongs to another operation")
+                return result
             if action=="inspect":
                 if set(response)!={"lifecycle_head","channel_binding_sha256"}:
                     raise RuntimeError("installed lifecycle inspection response differs")
@@ -56,6 +65,12 @@ class InstalledD12InstallationControlPortV1:
             "installation_id":head.installation_id, "state":head.state,
             "lifecycle_epoch":head.epoch, "head_digest":head.head_digest,
             "operation_id":head.operation_id}
+
+    def advance_current_source_inspection_migration_v1(self, authority, lease, *, operation_id,
+            pause_operation_id, scope_kind, target_refs, deadline_utc, interpretation_status_discovery):
+        return self._rpc(authority,lease,action="migrate_source_inspection",operation_id=operation_id,
+            pause_operation_id=pause_operation_id,scope_kind=scope_kind,target_refs=list(target_refs),
+            deadline_utc=deadline_utc,interpretation_status_discovery=interpretation_status_discovery)
 
     def execute_current_lifecycle_control_v1(self, authority, lease, *, operation_id, request_digest, command, input_data):
         try:

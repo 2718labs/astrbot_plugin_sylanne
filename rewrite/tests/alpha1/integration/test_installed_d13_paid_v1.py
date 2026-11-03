@@ -23,7 +23,6 @@ from sylanne3.authority_service.d13_paid_block_verifier_v1 import build_installe
 from sylanne3.domains.d13.provider import _block_from_graph_value
 from sylanne3.graph_worker import GraphWorker
 from sylanne3.graph_coordinator import AuthorityDenied, UnavailableGuard
-from sylanne3.host.installed_d13_paid_driver import run_installed_d13_paid_precompression_v1
 from sylanne3.host.owner_revoke_orchestration import installed_owner_revoke_orchestrator_v2
 from sylanne3.host.v2_installation import V2InstallationAssembly
 from sylanne3.model_broker.d13_precompression import INPUT_SCHEMA
@@ -36,7 +35,10 @@ from sylanne3.runtime_context import RuntimeContext
 from sylanne3.runtime_contracts import AuthorityContext
 
 
-TEXT = "Keep this exact detail. " + "Another useful sentence. " * 7
+# Both clauses fit the real compiler's 160-byte bound and remain distinct.
+# The current Source compiler must issue NoReduction itself; the paid model
+# independently extracts the first clause. This text is no authority witness.
+TEXT = "Keep this exact detail. " + "abcdefghij" * 15 + "abcdefgh."
 
 
 def _paid_schedule_original_evidence(db, original):
@@ -248,7 +250,14 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
         case["model_service"].install_current_source_location_v1(location)
         assert case["model_service"]._source_location is location
         configured = bundle.d13_paid_precompression
-        assert configured is not None
+        technical = bundle.d13_precompression
+        assert configured is not None and technical is not None
+        assert technical.history_token_budget == configured.history_token_budget == 2048
+        assert technical.max_slots <= configured.max_slots
+        assert technical.work_kind in policy.root_grant.allowed_work_kinds
+        assert policy.root_lease.limits["d13_compute_units"] >= 1
+        assert policy.root_grant.max_ceiling["d13_compute_units"] >= 1
+        assert graph._GraphCoordinator__d13_precompression_policy == technical
         assert bundle.model_workflows.reply.purpose == "proposal"
         assert graph._GraphCoordinator__d13_paid_precompression_policy == configured
         owns_worker=case.get("phase_worker") is None
@@ -424,9 +433,8 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
 
         async def drive():
             nonlocal paid_job_id
-            result=await run_installed_d13_paid_precompression_v1(runtime,installation,
-                context=case["model_context"],trusted_umo=json.loads(envelope.conversation_ref)[0],
-                envelope=envelope,ingress_operation_id=ingress_ids(envelope.lineage.source_ref)[2])
+            from beta1_fixture_phase_controller_v1 import drive_current_beta1_d13_paid_v3
+            result = await drive_current_beta1_d13_paid_v3(case, runtime, installation, envelope)
             if result is not None:paid_job_id=result.job_id
             return result
 
@@ -441,6 +449,9 @@ async def _run_installed_d13_paid_case(tmp_path, installed_d04_root, *, expired=
                     confirmed.append(await confirm(next_envelope,c02))
             window=await current_window()
             assert len(window.turns)==6 and not window.missing_ranges
+            assert all(turn.text == TEXT for turn in window.turns)
+            assert sum(len(f"{turn.speaker_ref}: {turn.text}".encode("utf8"))
+                for turn in window.turns) >= technical.history_token_budget * 0.6
             if after_window_async is not None:
                 if selected:raise ValueError("cold consumer cannot produce or redeliver the original window")
                 await after_window_async(case,window,tuple(confirmed))
@@ -838,7 +849,10 @@ async def _expired_original(case, runtime, installation, worker, envelope, calls
                 model.provider_config_ref, "unknown", False, False),
             admin_model=model, installation_bundle=bundle)
         executor = HostModelEgressExecutor(authority=client, bundle=bundle, grant=current_grant, adapter=adapter)
-        saved = await graph_call("schedule_d13_paid_precompression_v1", scene_ref=scene)
+        from beta1_fixture_phase_controller_v1 import current_beta1_d13_paid_method_decision_v3
+        async with current_beta1_d13_paid_method_decision_v3(case, runtime, envelope) as decision:
+            saved = await graph_call("schedule_d13_paid_precompression_v1", scene_ref=scene,
+                                     deterministic_decision=decision)
         assert saved is not None and saved.job.phase == "queued"
         prepared = await graph_call("prepare_d13_paid_call_v1", job_id=saved.job.job_id,
             timeout_seconds=model.timeout_seconds, privacy_tier=model.privacy_tier, lease_seconds=30)
@@ -1082,9 +1096,18 @@ async def verify_installed_d13_paid_cold_v4(case, locators):
         assert value.verified is True and value.saved.job.job_id == paid_job_id
         return value
     async def drive():
-        return await run_installed_d13_paid_precompression_v1(runtime, installation,
-            context=case["model_context"], trusted_umo=json.loads(envelope.conversation_ref)[0],
-            envelope=envelope, ingress_operation_id=ingress_ids(envelope.lineage.source_ref)[2])
+        from sylanne3.host.installed_d13_paid_driver import resume_installed_d13_paid_original_v1
+        observed = await runtime.discover_d13_paid_originals_v1()
+        with RuntimeContext._background_graph_result_v3(observed) as items:
+            try:
+                selected_items = tuple(item for item in items if item.job_ref == paid_job_id)
+                assert len(selected_items) <= 1
+                if not selected_items:
+                    return None
+                return await resume_installed_d13_paid_original_v1(runtime, installation,
+                    context=case["model_context"], selection=selected_items[0])
+            finally:
+                items = observed = selected_items = None
     async def fresh_upper():
         reading = await asyncio.to_thread(case["port"].read_ingress_clock, bundle.ingress_clock)
         now = reading.sample.utc_seconds + reading.sample.utc_error_seconds

@@ -112,6 +112,13 @@ def _issue_post_c02_reply_action_v2(
     In particular its D11 set must include the actual reservation digest and
     lease ancestry. The caller cannot provide receipts or a prebuilt bundle.
     """
+    from .d08_commitment_communication_v1 import (
+        CommitmentLiteralExpressionV1, require_live_commitment_literal_v1, commitment_communication_parameters_v1)
+    named = type(expression) is CommitmentLiteralExpressionV1
+    if named:
+        approved = require_live_commitment_literal_v1(expression, envelope.identity)
+    from ..domains.d08.commitment_communication_v1 import CommitmentTermsCommunicationIntentV2
+    expression_sources = approved.source_refs if named and type(approved)is CommitmentTermsCommunicationIntentV2 else (source_ref,)
     if (type(envelope) is not CommandEnvelope or type(c02_receipt) is not CommitReceipt
             or type(route) is not CurrentReplyRouteManifestV2
             or type(route_binding) is not CurrentReplyEntityRouteBindingV2
@@ -119,7 +126,7 @@ def _issue_post_c02_reply_action_v2(
             or type(attention) is not AttentionTicket or type(focus) is not FocusState
             or type(budget_grant) is not BudgetLeaseGrant
             or type(resource_quote) is not ResourceQuote
-            or type(expression) is not SourceReplyExpressionV1
+            or type(expression) not in (SourceReplyExpressionV1, CommitmentLiteralExpressionV1)
             or type(anchor) is not RestoreAnchor
             or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
         return _hold("reply.typed_current_inputs")
@@ -132,7 +139,7 @@ def _issue_post_c02_reply_action_v2(
             or route.namespace != namespace or route.source_ref != source_ref
             or envelope.identity.operation_id != operation_id
             or c02_receipt.operation_id not in envelope.causation
-            or envelope.source_qualification.source_refs != (source_ref,)
+            or envelope.source_qualification.source_refs != expression_sources
             or source_ref not in envelope.input_refs
             or envelope.authority.purpose != "expression"
             or envelope.authority.audience != (route.conversation_ref,)
@@ -194,8 +201,8 @@ def _issue_post_c02_reply_action_v2(
             or not segment.covered_slots or not segment.claim_uses
             or segment_payload_digest(segment.body, segment.media_refs,
                                       segment.claim_uses) != expression.payload_digest
-            or any(claim.kind is not ClaimKind.REPORTED_CLAIM
-                   or claim.source_refs != (source_ref,)
+            or any(claim.kind is not (ClaimKind.INTERNAL_ACTIVITY if named else ClaimKind.REPORTED_CLAIM)
+                   or claim.source_refs != expression_sources
                    or claim.allowed_audiences != (route.conversation_ref,)
                    or claim.disclosure_ref != source_ref
                    for claim in expression.claims)):
@@ -251,6 +258,11 @@ def _issue_post_c02_reply_action_v2(
         f"execution-epoch:{action_id}": anchor.execution_seq,
         f"cancellation-epoch:{action_id}": 1,
     }
+    if named:
+        d08_expected[approved.commitment.key.name] = approved.commitment.revision
+        from .d08_commitment_communication_v1 import named_commitment_check_refs_v1
+        d08_expected.update((ref.ref, ref.version) for ref in named_commitment_check_refs_v1(
+            approved, identity=envelope.identity, action_id=action_id))
     graph = {atom.key.token: atom for atom in snapshot.atoms}
     if len(graph) != len(snapshot.atoms):
         return _hold("reply.duplicate_graph_atoms")
@@ -303,7 +315,7 @@ def _issue_post_c02_reply_action_v2(
                 return _hold(f"reply.{kind}_graph_versions")
             pinned.extend(GraphVersion(key, revision) for key, revision in keys.items())
         if kind == "source_grant":
-            pending = [source.owner.subject or ""]
+            pending = [AtomKey.from_token(ref).owner.subject or "" for ref in expression_sources]
             seen = set()
             while pending:
                 source_id = pending.pop()
@@ -340,7 +352,7 @@ def _issue_post_c02_reply_action_v2(
         "communicated", "d11.delivery", (),
         float(envelope.source_qualification.learned_at),
         float(envelope.deadline_utc))
-    goal = Goal(goal_id, 1, "active", predicate, (source_ref,), (), None, (), ())
+    goal = Goal(goal_id, 1, "active", predicate, expression_sources, (), None, (), ())
     parameters_digest = canonical_digest({
         "route_digest": route.route_digest,
         "entity_route_binding_digest": route_binding.binding_digest,
@@ -356,16 +368,19 @@ def _issue_post_c02_reply_action_v2(
         "budget_grant_version": budget_grant.version,
         "anchor_proof": anchor.proof,
     })
+    if named:
+        parameters_digest = commitment_communication_parameters_v1(expression)
     intent = ActionIntent(
-        action_id, 1, goal_id, (), route_binding.target_entity_ref, "message",
+        action_id, 1, goal_id, (approved.commitment.key.name,) if named else (), route_binding.target_entity_ref, "message",
         "expression", "limited", parameters_digest, identity, schema_id,
-        tuple(specs), predicate, (identity.effect_id,), None, (source_ref,))
+        tuple(specs), predicate, (identity.effect_id,), None, expression_sources)
     schema = ActionSchema(schema_id, "message", False, tuple(specs))
     communication = CommunicationGrantRequest(
         "communication:" + canonical_digest({"action_id": action_id}),
         "contact:" + canonical_digest({"route": route.route_digest}),
         1, (route.conversation_ref,), segment.covered_slots,
-        (ClaimKind.REPORTED_CLAIM.value,), (),
+        ((ClaimKind.INTERNAL_ACTIVITY if named else ClaimKind.REPORTED_CLAIM).value,),
+        (expression.scope_version.key.token,) if named else (),
         (CommunicationSegmentSpec(
             segment.segment_id, segment.effect_id, 0,
             expression.payload_digest, len(segment.body), (), None),), 0)

@@ -37,5 +37,6 @@ def model_workflows_v9_from_payload(raw):
 
 def is_installed_artifact_observation_cognition_slot_v1(bundle,workflow):
     from .authority_profile import AdminInstallationBundle
-    return(type(bundle)is AdminInstallationBundle and type(bundle.model_workflows)is AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
+    return(type(bundle)is AdminInstallationBundle and type(bundle.model_workflows)in (AdminModelWorkflowsV9,AdminModelWorkflowsV10)
         and type(workflow)is AdminModelWorkflowV2 and workflow is bundle.model_workflows.artifact_observation_cognition)

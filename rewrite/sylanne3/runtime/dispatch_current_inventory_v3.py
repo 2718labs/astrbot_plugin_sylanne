@@ -1,12 +1,13 @@
-"""Private full-EOF inventory prepared on the ordinary worker before P1/P2."""
+"""Private selected-cell and independent Source-metadata EOF before P1/P2."""
 from __future__ import annotations
 
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from hashlib import sha256
 import json
 import sys
+from time import monotonic
 from types import MappingProxyType
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -17,7 +18,6 @@ from ..graph_worker import GraphStorageStepV3, OwnedGraphStorageResultV3, create
 from ..runtime_storage_v3 import (begin_runtime_storage_operation_v3, bind_runtime_storage_operation_v3,
     finish_runtime_storage_operation_v3, runtime_storage_quantum_v3, runtime_storage_v3, begin_runtime_cell_read_v3)
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
-from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
 from .source_correction_read_v3 import _heap
 from .d11_types import _VALUE_TYPES,RuntimeJobValue
 
@@ -33,6 +33,54 @@ _DISPATCH_TYPES = frozenset({'d03.role_binding','d05.boundary_rule','d08.goal.v1
     'memory.access','d06.source_correction_head.v1',OWNER_GRANT_TYPE,'d03.account_binding','d03.entity_anchor',
     'd08.contact_expression_plan.v2','d08.contact_expression_plan_provenance.v2','d08.contact_expression_plan_eligibility.v2',
     'd03.world_event','d07.focus.v1','d07.attention_ticket.v1',_RUNTIME_JOB_TYPE_V3})
+
+
+_READ_TIMES_V3 = WeakKeyDictionary()
+
+
+@dataclass(frozen=True, eq=False)
+class _DispatchInventoryTimeV3:
+    graph: object
+    binding: object
+    reading: object
+    monotonic_sample: float
+    initial_upper: float
+    deadline: float
+    monotonic_limit: float
+
+    def require_current_v3(self, graph, binding):
+        actual = (self.graph,self.binding,self.reading,self.monotonic_sample,
+            self.initial_upper,self.deadline,self.monotonic_limit)
+        if (_READ_TIMES_V3.get(self) != actual or graph is not self.graph or binding != self.binding):
+            raise AuthorityUnavailable('actual original dispatch inventory time required')
+        from .first_ingress_v2 import trusted_upper_at_v4
+        now = monotonic()
+        upper = trusted_upper_at_v4(self.reading,now)
+        if now >= self.monotonic_limit or upper >= self.deadline:
+            raise AuthorityUnavailable('dispatch inventory original admission deadline expired')
+        return upper
+
+
+def _issue_dispatch_inventory_time_v3(graph,binding):
+    from ..host.v2_fence_port import VerifiedIngressClockV2
+    from .first_ingress_v2 import trusted_upper_at_v4
+    store = graph._GraphCoordinator__store
+    if store._db.in_transaction or store._lock._is_owned():
+        raise AuthorityUnavailable('dispatch clock observation must precede Graph SQL')
+    policy = graph._GraphCoordinator__dispatch_clock_policy
+    if (binding.clock_policy_ref != policy.source_id
+            or binding.clock_policy_digest != 'sha256:' + canonical_digest(asdict(policy))):
+        raise AuthorityUnavailable('dispatch inventory installed clock policy differs')
+    reading = graph._GraphCoordinator__content_fence_v2.read_ingress_clock(policy)
+    if type(reading) is not VerifiedIngressClockV2 or reading.sample.source_id != policy.source_id:
+        raise AuthorityUnavailable('dispatch inventory requires its actual verified installed clock')
+    sampled = monotonic()
+    upper = trusted_upper_at_v4(reading,sampled)
+    deadline = datetime.fromisoformat(binding.utc_deadline.replace('Z','+00:00')).timestamp()
+    value = _DispatchInventoryTimeV3(graph,binding,reading,sampled,upper,deadline,sampled+(deadline-upper))
+    _READ_TIMES_V3[value] = (graph,binding,reading,sampled,upper,deadline,value.monotonic_limit)
+    value.require_current_v3(graph,binding)
+    return value
 
 
 @dataclass(frozen=True)
@@ -91,52 +139,6 @@ class CurrentDispatchTypedProjectionV3:
         return tuple(self._view(atom)for atom in self._atoms if atom.key.type_name in type_names)
 
 
-class _DispatchSourceStreamV3(C09MemorySourceJSONStreamV3):
-    """Real Source semantics or the exact valid=0 C09 erased marker, both EOF."""
-    def __init__(self,reader,key,valid,**profile):
-        self._inventory_reader,self._inventory_key,self._inventory_valid=reader,key,valid
-        self.erased=None;self._marker_fields=set();self._marker_value={};self._marker_scalar=bytearray()
-        super().__init__(**profile)
-
-    def _source_heap_bytes(self):
-        return super()._source_heap_bytes()+_heap((self._marker_fields,self._marker_value,self._marker_scalar))
-
-    def _source_require_arena(self,extra=0):
-        self._inventory_reader._reserve(extra if self._inventory_reader.parser is self else self._source_heap_bytes()+extra)
-        super()._source_require_arena(extra)
-
-    def _emit(self,emit,kind,path,start,end,**values):
-        if kind=='key' and len(path)==1 and self.erased is None:
-            self.erased=values['key']=='key_digest'
-        if not self.erased:return super()._emit(emit,kind,path,start,end,**values)
-        if kind=='key':
-            if len(path)!=1 or values['key'] not in {'key_digest','schema'}:
-                raise ValueError('erased Source marker fields differ')
-            self._marker_fields.add(values['key'])
-        elif kind in {'object_start','array_start'} and path:
-            raise ValueError('erased Source marker cannot contain nested values')
-        elif kind=='scalar_start':
-            if len(path)!=1 or path[0] not in {'key_digest','schema'} or values.get('scalar_kind')!='string':
-                raise ValueError('erased Source marker requires exact strings')
-            self._marker_scalar.clear()
-        elif kind=='scalar_chunk':
-            self._source_require_arena(len(values['raw'])+1024)
-            if len(self._marker_scalar)+len(values['raw'])>256:raise ValueError('erased Source marker scalar bound differs')
-            self._marker_scalar.extend(values['raw'])
-        elif kind=='scalar_end':
-            self._marker_value[path[0]]=json.loads(self._marker_scalar)
-            self._marker_scalar.clear()
-        return C09CanonicalJSONStreamV2._emit(self,emit,kind,path,start,end,**values)
-
-    def finish(self):
-        if not self.erased:return super().finish()
-        result=C09CanonicalJSONStreamV2.finish(self)
-        if (self._inventory_valid!=0 or self._marker_fields!={'key_digest','schema'} or self._marker_value!={
-                'schema':'sylanne3.graph.erased_value.v1','key_digest':canonical_digest(self._inventory_key.token)}):
-            raise ValueError('actual bodyless erased Source marker is invalid')
-        return result
-
-
 class VerifiedDispatchSourceMetadataV3:
     @property
     def key(self):return self.source_key
@@ -162,7 +164,7 @@ class VerifiedDispatchSourceMetadataV3:
 
     def __init__(self, issuer, reader, key, revision, valid, cell, header, digest, metadata):
         if issuer is not _ISSUER:
-            raise TypeError('actual full-EOF dispatch Source reader required')
+            raise TypeError('actual issued dispatch Source metadata reader required')
         self.source_key, self.revision, self.valid = key, revision, valid
         self.cell_id, self.header, self.payload_sha256 = cell, tuple(header), digest
         self.byte_count = header[3]
@@ -182,46 +184,113 @@ class PreparedCurrentDispatchInventoryV3:
         self.graph, self.db, self.namespace = reader.graph, reader.db, reader.namespace
         self.binding, self.admission, self.request = reader.binding, reader.admission, reader.request
         self.operation, self.selection_digest = reader.operation, reader.selection_digest
+        self.reader=reader
+        self.read_time = reader.read_time
         self.scope, self.graph_stamp = reader.fence.scope, reader.graph_stamp
         self.query, self.authority_epochs, self.catalogue_hash = reader.query, reader.authority_epochs, reader.catalogue_hash
-        self.leaf_count, self.ordered_root, self.full_eof = reader.count, reader.root, True
-        self.projection = CurrentDispatchTypedProjectionV3(tuple(_FrozenDispatchAtomV3(atom.key,atom.revision,
-            _freeze_value_v3(atom.value),atom.valid,_heap(atom.value))for atom in reader.atoms),
-            (reader.graph_stamp[1],),reader.operation)
+        self.leaf_count, self.ordered_root = reader.count, reader.root
+        self.natural_source_all = None
+        self.natural_c02_originals = reader.natural_c02_originals
+        if reader.family == "natural_reply":
+            from .natural_dispatch_p2_read_v1 import require_natural_p2_source_all_v1, NaturalP2ClosedProjectionV1
+            self.natural_source_all = require_natural_p2_source_all_v1(reader, reader.db)
+            self.full_eof = False
+            self.coverage_profile = "sylanne.natural-p2-closed-source-read.v1"
+            self.projection = NaturalP2ClosedProjectionV1(reader.natural_task)
+        elif reader.family == 'private_reply':
+            from .private_dispatch_source_read_v3 import PrivateDispatchProjectionV3
+            self.full_eof=False
+            self.coverage_profile="sylanne.private-p2-metadata-source-read.v3"
+            self.projection=PrivateDispatchProjectionV3(reader.private_task)
+        else:
+            self.full_eof = True
+            self.coverage_profile = "sylanne.dispatch-full-inventory.v3"
+            self.projection = CurrentDispatchTypedProjectionV3(tuple(_FrozenDispatchAtomV3(atom.key,atom.revision,
+                _freeze_value_v3(atom.value),atom.valid,_heap(atom.value))for atom in reader.atoms),
+                (reader.graph_stamp[1],),reader.operation)
         self.sources, self.heads = MappingProxyType(dict(reader.sources)), MappingProxyType(dict(reader.heads))
         self.qualified_sources = frozenset(reader.qualified_sources)
         self.family=reader.family
         self.source_descriptors=reader.auxiliary.descriptors
+        self.named_commitment_task=reader.auxiliary.named_commitment_task
         self.artifact_receipt_originals=getattr(reader.auxiliary,'prepared_receipt',None)
         self.contact_birth=getattr(reader.auxiliary,'prepared_birth',None)
         self.natural_originals=getattr(reader.auxiliary,'natural_values',None)
         self.natural_history=getattr(reader.auxiliary,'natural_history',None)
+        self.natural_scope_original=getattr(reader.auxiliary,'natural_scope_original',None)
+        self.natural_review_originals=getattr(reader.auxiliary,'natural_review_originals',None)
+        self.natural_parent_stop=getattr(reader.auxiliary,'natural_parent_stop',None)
+        self.admission_originals=reader.admission_originals
+        self.natural_read_locator=None
+        self.natural_evidence_canonical=None
         self._successors = WeakSet()
-        _ISSUED[self] = (self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
-            self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
-            self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
+        _ISSUED[self] = self._identity_v3()
 
     def release_payload_v3(self):
         """Invalidate the ephemeral proof and detach payloads after real dispatch ends."""
         for successor in tuple(self._successors):successor.release_payload_v3()
         self._successors.clear()
         _ISSUED.pop(self,None)
+        if type(self) is PreparedCurrentDispatchInventoryV3:
+            from .source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+            release_inspection_metadata_owner_v3(self.reader)
+        if type(self) is PreparedCurrentDispatchInventoryV3 and self.named_commitment_task is not None:
+            self.named_commitment_task.release_v1()
+        self.named_commitment_task=None
+        if type(self)is PreparedCurrentDispatchInventoryV3 and self.family=='private_reply':
+            from .private_dispatch_source_read_v3 import release_private_dispatch_source_read_v3
+            release_private_dispatch_source_read_v3(self.reader)
         self.projection = self.sources = self.heads = None
-        self.contact_birth=self.natural_originals=self.natural_history=self.artifact_receipt_originals=None
+        if type(self) is PreparedCurrentDispatchInventoryV3:
+            if self.natural_c02_originals is not None:
+                self.natural_c02_originals.release_payload_v3()
+            if self.natural_source_all is not None:
+                self.natural_source_all.reader.release_payload_v3()
+        self.natural_c02_originals = self.natural_source_all = None
+        if type(self) is PreparedCurrentDispatchInventoryV3:
+            self.admission_originals.release_payload_v3()
+        self.admission_originals=None
+        if self.natural_evidence_canonical is not None and type(self)is PreparedCurrentDispatchInventoryV3:
+            self.natural_evidence_canonical.release_payload_v3()
+        self.natural_evidence_canonical=None
+        if self.natural_read_locator is not None and type(self)is PreparedCurrentDispatchInventoryV3:
+            self.natural_read_locator.release_payload_v1()
+        self.natural_read_locator=None
+        self.contact_birth=self.natural_originals=self.natural_history=self.artifact_receipt_originals=self.natural_scope_original=self.natural_review_originals=self.natural_parent_stop=None
         self.qualified_sources = frozenset()
+        self.read_time = None
+
+    def _identity_v3(self):
+        return (self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,self.reader,
+            self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
+            self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
+            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals,self.admission_originals,self.natural_scope_original,self.natural_review_originals,self.natural_parent_stop,self.natural_read_locator,self.natural_evidence_canonical,self.read_time,
+            self.coverage_profile,self.natural_source_all,self.natural_c02_originals,self.named_commitment_task)
 
     def _actual(self):
         expected = _ISSUED.get(self)
-        actual = (self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
-            self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
-            self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
-        if expected is None or actual != expected or not self.full_eof or self.operation.closed:
+        actual = self._identity_v3()
+        if expected is None or actual != expected or self.operation.closed:
             raise AuthorityUnavailable('actual dispatch inventory issuer/retention/EOF differs')
+        if self.family == 'natural_reply':
+            from .natural_dispatch_p2_read_v1 import _NaturalP2SourceAllV1, NaturalP2ClosedProjectionV1
+            if (self.full_eof or self.coverage_profile != 'sylanne.natural-p2-closed-source-read.v1'
+                    or type(self.natural_source_all) is not _NaturalP2SourceAllV1
+                    or type(self.projection) is not NaturalP2ClosedProjectionV1
+                    or self.projection.head_root != self.ordered_root or self.projection.head_count != self.leaf_count):
+                raise AuthorityUnavailable('Natural P2 actual closed coverage/SourceALL is incomplete')
+            self.natural_source_all.require_current_v1(self.natural_source_all.owner,self.db)
+        elif self.family=='private_reply':
+            from .private_dispatch_source_read_v3 import require_private_dispatch_inventory_source_all_v3,PrivateDispatchProjectionV3
+            if self.full_eof or self.coverage_profile!='sylanne.private-p2-metadata-source-read.v3'or type(self.projection)is not PrivateDispatchProjectionV3:
+                raise AuthorityUnavailable('private P2 closed projection profile changed')
+            require_private_dispatch_inventory_source_all_v3(self,self.db)
+        elif not self.full_eof:
+            raise AuthorityUnavailable('actual dispatch whole-cell EOF is incomplete')
 
     def require_current(self, db, namespace, query, projection=None):
         self._actual()
+        self.read_time.require_current_v3(self.graph,self.binding)
         store = self.graph._GraphCoordinator__store
         if (db is not self.db or not db.in_transaction or not store._lock._is_owned()
                 or namespace != self.namespace or query != self.query
@@ -241,6 +310,9 @@ class PreparedCurrentDispatchInventoryV3:
             (*namespace.as_tuple,owner_key.token)).fetchone()
         if expected_owner is None or owner is None or tuple(owner) != expected_owner:
             raise AuthorityUnavailable('prepared dispatch current Owner head changed')
+        if self.family=='private_reply':
+            from .private_dispatch_source_read_v3 import require_private_dispatch_inventory_source_all_v3
+            with runtime_storage_quantum_v3(db)as meter:require_private_dispatch_inventory_source_all_v3(self,db,meter)
         return self.projection
 
     def require_for(self, context, binding, claimed, db, *, authority_snapshot):
@@ -256,17 +328,28 @@ class PreparedCurrentDispatchInventoryV3:
         projection=self.require_current(db,self.namespace,self.query,self.projection)
         from .dispatch_initial_source_read_v3 import require_dispatch_source_originals_current_v3
         require_dispatch_source_originals_current_v3(self,db)
+        if self.family=='natural_reply':
+            from .natural_dispatch_read_locator_current_v1 import require_natural_dispatch_read_locator_v1
+            require_natural_dispatch_read_locator_v1(self,db)
         from .current_graph_full_read_v3 import _qualify_bound_dispatch_full_read_v3
         _qualify_bound_dispatch_full_read_v3(self,db,context,binding,claimed,authority_snapshot)
         return projection
 
     def atoms_for(self, db, namespace, query, type_names, *, valid_only=True):
         self.require_current(db,namespace,query)
+        if self.family == 'natural_reply':
+            return tuple(atom for atom in self.projection.atoms_for_types_v3(frozenset(type_names))
+                if atom.valid or not valid_only)
+        if self.family=='private_reply':
+            return self.projection._selected(frozenset(type_names),valid_only=valid_only)
         self.operation.retain(128+len(self.projection._atoms)*16)
         return tuple(self.projection._view(atom)for atom in self.projection._atoms
             if atom.key.type_name in type_names and (atom.valid or not valid_only))
 
     def atom_rows(self, db, namespace, query, type_names, columns, *, valid_only=True, name=None):
+        if self.family=='private_reply':
+            self.require_current(db,namespace,query)
+            return self.projection.atom_rows_v3(frozenset(type_names),columns,name=name,valid_only=valid_only)
         atoms = self.atoms_for(db,namespace,query,type_names,valid_only=valid_only)
         self.operation.retain(128+len(atoms)*(128+len(columns)*16))
         return tuple(tuple({'token':atom.key.token,'revision':atom.revision,'valid':int(atom.valid),
@@ -359,6 +442,8 @@ class _CurrentNamespaceInventoryKernelV3:
         self.cell,self.parser,self.pending=None,None,None
         self.fragment,self.offset,self.body=b'',0,None
         self.complete,self.result,self.graph_eof=False,None,False
+        self.source_inspection_task=None
+        self.source_inspections={}
         self.reserved=0
         self._reserve(65536)
 
@@ -370,8 +455,6 @@ class _CurrentNamespaceInventoryKernelV3:
         for token,source in self.sources.items():
             size += _heap(token,seen) + sys.getsizeof(source) + sys.getsizeof(source.__dict__)
             size += sys.getsizeof(source.metadata) + sum(_heap(k,seen)+_heap(v,seen) for k,v in source.metadata.items())
-        if self.parser is not None and isinstance(self.parser,C09MemorySourceJSONStreamV3):
-            size += self.parser._source_heap_bytes()
         size += extra + 65536
         if size > self.reserved:
             self.operation.retain(size-self.reserved)
@@ -386,7 +469,47 @@ class _CurrentNamespaceInventoryKernelV3:
         return tuple(row)
 
 
+    def _start_source_inspection_v3(self, owner, meter):
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
+        key,revision,valid,_,cell=self.pending
+        if valid:
+            self.source_inspection_task=InspectionMetadataReadV3(owner,key)
+            return
+        # Invalidated Source cells may retain their previous bytes; an erased
+        # Source has a marker instead. Neither is readable or issues a Source
+        # witness here. The complete negative head is covered by its real seal.
+        header=begin_runtime_cell_read_v3(self.db,cell,erasure_owner_ref=key.token).header
+        if header[0]not in('canonical-json.ascii.v1','canonical-json.utf8.v1')or header[1]!=key.token:
+            raise AuthorityUnavailable('invalid Source head has no actual canonical owner header')
+        self.root=canonical_digest((self.leaf_schema,self.root,key.token,revision,valid,'memory.source',header[5],cell,tuple(header)))
+        self.count+=1
+        self.pending=None
+
+    def _source_from_inspection_v3(self, original):
+        return VerifiedDispatchSourceMetadataV3(_ISSUER,self,original.key,original.revision,original.valid,
+            original.cell_id,original.header,original.payload_sha256,original.metadata)
+
+    def _advance_source_inspection_v3(self, meter):
+        task=self.source_inspection_task
+        task.advance(meter)
+        if not task.complete:return
+        original=task.result.require_v3(task.owner,meter)
+        key,revision,valid,_,cell=self.pending
+        if (original.key,original.revision,int(original.valid),original.cell_id)!=(key,revision,valid,cell):
+            raise AuthorityUnavailable('Source inspection differs from its actual namespace census head')
+        self._reserve(_heap(dict(original.metadata))*4+32768)
+        self.source_inspections[key.token]=original
+        self.sources[key.token]=self._source_from_inspection_v3(original)
+        self.heads[key.token]=(revision,valid,cell)
+        self.root=canonical_digest((self.leaf_schema,self.root,key.token,revision,valid,'memory.source',
+            original.payload_sha256,cell,original.header))
+        self.count+=1
+        self.pending=None
+        self.source_inspection_task=None
+
     def _next(self, meter):
+        if self.source_inspection_task is not None:
+            return self._advance_source_inspection_v3(meter)
         meter.require_available(32768)
         row = meter.read_fixed_row(self.db,'graph_atoms',('token','revision','valid','type_name','value_cell_id'),
             'bot=? AND persona=? AND token>? ORDER BY token',(*self.namespace.as_tuple,self.cursor))
@@ -404,15 +527,32 @@ class _CurrentNamespaceInventoryKernelV3:
         self.store._validate_key(key)
         self.cursor = token
         self.pending = (key,revision,valid,type_name,cell)
+        if type_name=='memory.source':
+            self._start_source_inspection_v3(self,meter)
+            return
         self.cell = begin_runtime_cell_read_v3(self.db,cell,erasure_owner_ref=token)
         codec = self.cell.header[0]
         if codec not in ('canonical-json.ascii.v1','canonical-json.utf8.v1'):
             raise AuthorityUnavailable('dispatch graph value is not actual canonical JSON')
-        self.parser = (_DispatchSourceStreamV3(self,key,valid,ensure_ascii=codec=='canonical-json.ascii.v1')
-            if type_name=='memory.source' else C09CanonicalJSONStreamV2(ensure_ascii=codec=='canonical-json.ascii.v1'))
-        retain = type_name != 'memory.source' and (type_name in self.projection_types or token in self.selected_tokens)
+        self._begin_census_value_v3(codec,meter)
+
+    def _begin_census_value_v3(self,codec,meter):
+        key,revision,valid,type_name,cell=self.pending
+        self.parser=C09CanonicalJSONStreamV2(ensure_ascii=codec=='canonical-json.ascii.v1')
+        retain=type_name in self.projection_types or key.token in self.selected_tokens
         self._reserve(self.cell.header[3]*8+32768 if retain else 32768)
-        self.body = bytearray() if retain else None
+        self.body=bytearray()if retain else None
+
+    def _feed_census_value_v3(self,part):
+        self.parser.feed(part,lambda event:None)
+        if self.body is not None:self.body.extend(part)
+
+    def _finish_census_value_v3(self,key,revision,valid,type_name,cell,digest):
+        if self.body is not None:
+            self._reserve(len(self.body)*8+32768)
+            value=json.loads(self.body)
+            self.atoms.append(GraphAtom(key,revision,value,bool(valid)))
+            self.heads[key.token]=(revision,valid,cell)
 
 
     def _cell(self, meter):
@@ -420,8 +560,7 @@ class _CurrentNamespaceInventoryKernelV3:
             end = min(self.offset+1024,len(self.fragment))
             self._reserve(65536)
             part = self.fragment[self.offset:end]
-            self.parser.feed(part,lambda event:None)
-            if self.body is not None:self.body.extend(part)
+            self._feed_census_value_v3(part)
             self.offset = end
             return
         fragment = self.cell.read_fragment(meter=meter)
@@ -436,19 +575,7 @@ class _CurrentNamespaceInventoryKernelV3:
         self.root = canonical_digest((self.leaf_schema,self.root,key.token,
             revision,valid,type_name,digest,cell,tuple(self.cell.header)))
         self.count += 1
-        if type_name=='memory.source' and not self.parser.erased:
-            metadata = self.parser._source_metadata
-            if metadata['source_id'] != key.owner.subject or key.name != 'record':
-                raise AuthorityUnavailable('fulltyped Source canonical identity changed')
-            self._reserve(_heap(metadata)*4+32768)
-            self.sources[key.token] = VerifiedDispatchSourceMetadataV3(_ISSUER,self,key,revision,bool(valid),
-                cell,self.cell.header,digest,metadata)
-            self.heads[key.token] = (revision,valid,cell)
-        elif self.body is not None:
-            self._reserve(len(self.body)*8+32768)
-            value = json.loads(self.body)
-            self.atoms.append(GraphAtom(key,revision,value,bool(valid)))
-            self.heads[key.token] = (revision,valid,cell)
+        self._finish_census_value_v3(key,revision,valid,type_name,cell,digest)
         self.cell,self.parser,self.pending = None,None,None
         self.fragment,self.offset,self.body = b'',0,None
         self._reserve()
@@ -459,16 +586,55 @@ class _CurrentNamespaceInventoryKernelV3:
 
 
 class _DispatchInventoryReadV3(_CurrentNamespaceInventoryKernelV3):
-    def __init__(self,graph,authority,lease,binding,admission,request,operation,fence,family,now_utc):
+    def __init__(self,graph,authority,lease,binding,admission,request,operation,fence,family,now_utc,read_time):
         self.authority,self.lease,self.binding,self.admission,self.request=authority,lease,binding,admission,request
+        self.read_time=read_time
         self.family,self.now_utc,self.auxiliary=family,now_utc,None
         self.qualified_sources=set()
         selected=frozenset({ref for ref,_ in admission.admission.graph_reads}
             | {item.ref for check in admission.admission.check_receipts for item in check.input_versions})
         super().__init__(graph,operation,fence,projection_types=_DISPATCH_TYPES,selected_tokens=selected,
             census_schema='sylanne.dispatch-full-inventory.v3',leaf_schema='sylanne.dispatch-full-inventory-leaf.v3')
+        from .dispatch_admission_read_v3 import DispatchAdmissionReadV3
+        self.work = None
+        self.natural_task = None
+        self.natural_c02_originals = None
+        self.admission_task = None if family == 'natural_reply' else DispatchAdmissionReadV3(self)
+        if family == 'natural_reply':
+            from .natural_dispatch_p2_read_v1 import begin_natural_p2_read_v1
+            self.natural_task = begin_natural_p2_read_v1(self)
+        self.admission_originals=None
+        self.locator_task=None
+        self.evidence_task=None
+        self.private_task=None
+        if family=='private_reply':
+            from .private_dispatch_source_read_v3 import PrivateDispatchSourceReadV3
+            self.private_task=PrivateDispatchSourceReadV3(self)
+
+    def require_current(self,*,meter=None):
+        if self.private_task is None:raise AuthorityUnavailable('private currentness requires its actual private P2 Work')
+        self.private_task.actual(meter)
+
+    def _begin_census_value_v3(self,codec,meter):
+        if self.private_task is None:return super()._begin_census_value_v3(codec,meter)
+        self.private_task.begin_census(codec)
+
+    def _feed_census_value_v3(self,part):
+        if self.private_task is None:return super()._feed_census_value_v3(part)
+        self.private_task.feed_census(part)
+
+    def _finish_census_value_v3(self,key,revision,valid,type_name,cell,digest):
+        if self.private_task is None:return super()._finish_census_value_v3(key,revision,valid,type_name,cell,digest)
+        self.private_task.finish_census(key,revision,valid,type_name,cell,digest)
+
+    def _start_source_inspection_v3(self,owner,meter):
+        if self.private_task is not None:
+            key,revision,valid,_,cell=self.pending
+            self.heads[key.token]=(revision,valid,cell)
+        return super()._start_source_inspection_v3(owner,meter)
 
     def _graph_eof_v3(self):
+        if self.private_task is not None:return
         from .dispatch_initial_source_read_v3 import DispatchInitialSourceReadsV3
         self.auxiliary=DispatchInitialSourceReadsV3(self,self.family,self.now_utc)
 
@@ -519,15 +685,66 @@ class _DispatchInventoryReadV3(_CurrentNamespaceInventoryKernelV3):
 
 
     def advance(self):
+        from .dispatch_initial_source_read_v3 import bind_host_natural_roster_metadata_v3
         with bind_runtime_storage_operation_v3(self.operation,self.db):
             with runtime_storage_quantum_v3(self.db) as meter:
-                if self.authority_epochs is None:self.authority_epochs = self._epochs(meter)
+                if self.locator_task is not None:
+                    self.db.execute('BEGIN')
+                    try:
+                        with bind_host_natural_roster_metadata_v3(self):
+                            if self.locator_task.advance(meter):
+                                proof=self.locator_task.result
+                                proof.require_v1(self.result,self.db)
+                                expression = frozenset(ref for purpose, _, refs in proof.groups
+                                    if purpose == 'expression' for ref in refs)
+                                current_expression = frozenset(ref for purpose, _, refs in self.result.natural_source_all.groups
+                                    if purpose == 'expression' for ref in refs)
+                                self.result.qualified_sources=frozenset(self.result.qualified_sources|expression|current_expression)
+                                self.result.natural_read_locator=proof
+                                _ISSUED[self.result]=self.result._identity_v3()
+                                from .natural_dispatch_claim_v2 import _NaturalEvidenceCanonicalReadV3
+                                self.evidence_task=_NaturalEvidenceCanonicalReadV3(self)
+                                self.locator_task=None
+                    finally:self.db.rollback()
+                elif self.evidence_task is not None:
+                    self.db.execute('BEGIN')
+                    try:
+                        with bind_host_natural_roster_metadata_v3(self):
+                            if self.evidence_task.advance(meter):
+                                self.result.natural_evidence_canonical=self.evidence_task.result
+                                _ISSUED[self.result]=self.result._identity_v3()
+                                self.evidence_task=None;self.complete=True
+                    finally:self.db.rollback()
+                elif self.natural_task is not None:
+                    self.db.execute('BEGIN')
+                    try:
+                        with bind_host_natural_roster_metadata_v3(self):
+                            if self.natural_task.advance(meter):
+                                self._qualify_sources()
+                                self.complete = True
+                                self.result = PreparedCurrentDispatchInventoryV3(_ISSUER,self)
+                                from .natural_dispatch_read_locator_current_v1 import NaturalDispatchReadLocatorCurrentV1
+                                self.locator_task = NaturalDispatchReadLocatorCurrentV1(self)
+                                self.complete = False
+                    finally:self.db.rollback()
+                elif self.admission_originals is None:
+                    if self.admission_task.advance(meter):
+                        self.admission_originals=self.admission_task.result
+                        self.admission_task=None
+                elif self.authority_epochs is None:self.authority_epochs = self._epochs(meter)
+                elif self.graph_eof and self.private_task is not None and not self.private_task.complete:
+                    self.private_task.advance(meter)
                 elif self.graph_eof:
                     self.db.execute('BEGIN')
                     try:
-                        if self.auxiliary.advance(meter):
-                            self._qualify_sources();self.complete=True;self._reserve(self.reserved+65536)
-                            self.result=PreparedCurrentDispatchInventoryV3(_ISSUER,self)
+                        with bind_host_natural_roster_metadata_v3(self):
+                            if self.auxiliary.advance(meter):
+                                self._qualify_sources();self.complete=True;self._reserve(self.reserved+65536)
+                                self.result=PreparedCurrentDispatchInventoryV3(_ISSUER,self)
+                                if self.family=='natural_reply':
+                                    from .natural_dispatch_read_locator_current_v1 import NaturalDispatchReadLocatorCurrentV1
+                                    self.locator_task=NaturalDispatchReadLocatorCurrentV1(self)
+                                    self.complete=False
                     finally:self.db.rollback()
                 elif self.cell is None:self._next(meter)
                 else:self._cell(meter)
@@ -536,7 +753,6 @@ class _DispatchInventoryReadV3(_CurrentNamespaceInventoryKernelV3):
 
 def prepare_current_dispatch_inventory_v3(graph, authority, lease, *, binding, admission, request, permit, now_utc, dispatch_family):
     from ..authority_service.v2_contract import ExecutionBindingV2
-    from .dispatch_admission import load_admission
     from .dispatch_binding_v2 import build_non_authorizing_execution_binding_v2
     require_graph_storage_work_admission_v3(graph)
     graph._authorize(lease,authority,frozenset({'d08','d09','d11'}))
@@ -546,22 +762,26 @@ def prepare_current_dispatch_inventory_v3(graph, authority, lease, *, binding, a
         recovered_request=request,original_dispatch_permit=permit,adapter_ref=binding.origin.adapter_ref,now_utc=now_utc)
     if exact != binding:raise AuthorityUnavailable('initial admitted dispatch request/binding changed')
     store,db = graph._GraphCoordinator__store,graph._GraphCoordinator__store._db
-    deadline = datetime.fromisoformat(binding.utc_deadline.replace('Z','+00:00')).timestamp()
+    read_time = _issue_dispatch_inventory_time_v3(graph,binding)
+    now_utc = read_time.require_current_v3(graph,binding)
+    admission.admission.require_current(now_utc)
+    deadline = read_time.deadline
     operation = begin_runtime_storage_operation_v3(db,'dispatch-inventory:'+binding.operation_id,deadline)
     fence = None
     try:
+        operation.retain(4096)
         with bind_runtime_storage_operation_v3(operation,db):
             fence = graph._begin_read_fence_v3(authority,operation_id=operation.operation_id)
-            with store._lock,runtime_storage_quantum_v3(db):
-                if db.in_transaction:raise AuthorityUnavailable('inventory preparation cannot inherit a transaction')
-                db.execute('BEGIN')
-                try:
-                    if load_admission(db,authority.namespace,binding.origin.admission_ref) != admission:
-                        raise AuthorityUnavailable('initial actual durable dispatch admission differs')
-                finally:db.rollback()
-            reader = _DispatchInventoryReadV3(graph,authority,lease,binding,admission,request,operation,fence,dispatch_family,now_utc)
-        return create_graph_storage_work_v3(graph,kind='dispatch_inventory_prepare_v3',operation_id=operation.operation_id,
+            now_utc = read_time.require_current_v3(graph,binding)
+            if db.in_transaction:raise AuthorityUnavailable('inventory preparation cannot inherit a transaction')
+            reader = _DispatchInventoryReadV3(graph,authority,lease,binding,admission,request,operation,fence,
+                dispatch_family,now_utc,read_time)
+        work = create_graph_storage_work_v3(graph,kind='dispatch_inventory_prepare_v3',operation_id=operation.operation_id,
             selection_digest=operation.selection_digest,deadline_utc=deadline,state=reader,operation=operation)
+        reader.work = work
+        if reader.natural_task is not None:
+            reader.natural_task.attach_work_v1(work)
+        return work
     except BaseException:
         try:
             if fence is not None:graph._finish_read_fence_v3(fence)
@@ -573,33 +793,76 @@ def advance_current_dispatch_inventory_v3(graph,work):
     reader = work.state
     if type(reader) is not _DispatchInventoryReadV3 or reader.graph is not graph or reader.operation is not work.operation:
         raise AuthorityUnavailable('actual same-operation dispatch inventory work required')
+    reader.now_utc=reader.read_time.require_current_v3(graph,reader.binding)
     with bind_runtime_storage_operation_v3(work.operation,reader.db):
         graph._authorize(reader.lease,reader.authority,frozenset({'d08','d09','d11'}))
         graph._validate_read_fence_v3(reader.fence)
+        reader.now_utc=reader.read_time.require_current_v3(graph,reader.binding)
+        if reader.private_task is not None and reader.private_task.phase=='owner'and reader.private_task.owner_entry is None:
+            reader.private_task.prepare_owner()
+            graph._validate_read_fence_v3(reader.fence)
+            return GraphStorageStepV3('progress')
+        named=None if reader.auxiliary is None else reader.auxiliary.named_commitment_task
+        if named is not None and named.needs_protected_observation:
+            if reader.db.in_transaction:
+                raise AuthorityUnavailable('named current Self observation retained Graph SQL')
+            named.observe_protected_v1()
+            graph._validate_read_fence_v3(reader.fence)
+            return GraphStorageStepV3('progress')
+        from .dispatch_initial_source_read_v3 import prepare_pending_host_natural_roster_metadata_v3
+        prepare_pending_host_natural_roster_metadata_v3(reader)
         with reader.store._lock:
             if reader.db.in_transaction:raise AuthorityUnavailable('dispatch inventory continuation retained a transaction')
             if graph._v2_graph_stamp(reader.namespace) != reader.graph_stamp:
                 raise AuthorityUnavailable('dispatch inventory original graph stamp changed')
             reader.advance()
+            reader.now_utc=reader.read_time.require_current_v3(graph,reader.binding)
         graph._validate_read_fence_v3(reader.fence)
+        reader.now_utc=reader.read_time.require_current_v3(graph,reader.binding)
     return GraphStorageStepV3('complete',reader.result) if reader.complete else GraphStorageStepV3('progress')
 
 
 def finish_current_dispatch_inventory_v3(graph,work,error):
     from .dispatch_initial_source_read_v3 import detach_dispatch_preparation_workspace_v3
     reader=work.state
+    failed=error is not None
     try:
         graph._finish_read_fence_v3(reader.fence)
-        if error is None:work.result_lease=work.operation
+        if not failed:work.result_lease=work.operation
     except BaseException:
-        detach_dispatch_preparation_workspace_v3(reader)
-        finish_runtime_storage_operation_v3(work.operation)
+        failed=True
         raise
     finally:
-        detach_dispatch_preparation_workspace_v3(reader)
-        reader.cell=reader.parser=reader.pending=reader.body=reader.fragment=reader.result=None
-        reader.atoms=reader.sources=reader.heads=None
-    if error is not None:finish_runtime_storage_operation_v3(work.operation)
+        try:
+            if failed:
+                if reader.private_task is not None:
+                    from .private_dispatch_source_read_v3 import release_private_dispatch_source_read_v3
+                    release_private_dispatch_source_read_v3(reader)
+                from .source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+                release_inspection_metadata_owner_v3(reader)
+                if reader.auxiliary is not None and reader.auxiliary.named_commitment_task is not None:
+                    reader.auxiliary.named_commitment_task.release_v1()
+                    reader.auxiliary.named_commitment_task=None
+                if reader.result is not None:
+                    result=reader.result;reader.result=None
+                    result.release_payload_v3();reader.admission_originals=None
+                    reader.natural_c02_originals = None
+                    reader.natural_task = None
+                elif reader.admission_originals is not None:
+                    reader.admission_originals.release_payload_v3()
+                if reader.natural_c02_originals is not None:
+                    reader.natural_c02_originals.release_payload_v3()
+                    reader.natural_c02_originals = None
+                if reader.natural_task is not None:
+                    reader.natural_task.release_payload_v3()
+        finally:
+            reader.locator_task=reader.evidence_task=None
+            detach_dispatch_preparation_workspace_v3(reader)
+            reader.cell=reader.parser=reader.pending=reader.body=reader.fragment=reader.result=None
+            if failed or reader.private_task is None:
+                reader.atoms=reader.sources=reader.heads=None
+                reader.admission_originals=reader.admission_task=None
+            if failed:finish_runtime_storage_operation_v3(work.operation)
 
 
 @asynccontextmanager
@@ -618,7 +881,8 @@ async def prepare_dispatch_inventory_on_worker_v3(worker,authority,lease,*,bindi
         value._actual()
         yield value
     finally:
-        if type(value) is PreparedCurrentDispatchInventoryV3:value.release_payload_v3()
+        # The same Owned lease owns payload cleanup, including abandonment
+        # before this context takes delivery. Do not release it a second time.
         value = None
         retention.release()
 
@@ -628,11 +892,13 @@ def bind_prepared_dispatch_inventory_v3(proof,db):
     if proof is None:
         yield None
         return
-    proof._actual()
-    if proof.db is not db:raise AuthorityUnavailable('prepared dispatch retention belongs to another database')
-    from .current_graph_full_read_v3 import _bind_prepared_dispatch_full_read_v3
-    with _bind_prepared_dispatch_full_read_v3(proof,proof.graph,db):
-        yield proof
+    from .dispatch_initial_source_read_v3 import bind_host_natural_roster_operation_v3
+    with bind_runtime_storage_operation_v3(proof.operation,db),bind_host_natural_roster_operation_v3(proof,db):
+        proof._actual()
+        if proof.db is not db:raise AuthorityUnavailable('prepared dispatch retention belongs to another database')
+        from .current_graph_full_read_v3 import _bind_prepared_dispatch_full_read_v3
+        with _bind_prepared_dispatch_full_read_v3(proof,proof.graph,db):
+            yield proof
 
 
 class _DispatchCommittedDeltaCaptureV3:
@@ -728,9 +994,9 @@ class PreparedCurrentDispatchSuccessorInventoryV3(PreparedCurrentDispatchInvento
             tuple((write.key,write.dependencies,_freeze_value_v3(write.value))for write in candidate.writes),candidate.epochs)
         self.delta_receipt,self.delta_before,self.delta_after=receipt,before_stamp,after_stamp
         self.delta_heads,self.delta_seals=changed_heads,seals
-        for name in ('graph','db','namespace','binding','admission','request','operation','selection_digest','scope',
+        for name in ('graph','db','namespace','binding','admission','request','operation','reader','selection_digest','scope',
                 'authority_epochs','catalogue_hash','leaf_count','ordered_root','full_eof','sources','qualified_sources',
-                'family','source_descriptors','contact_birth','natural_originals','natural_history','artifact_receipt_originals'):
+                'family','source_descriptors','contact_birth','natural_originals','natural_history','artifact_receipt_originals','admission_originals','natural_scope_original','natural_review_originals','natural_parent_stop','natural_read_locator','natural_evidence_canonical','read_time','coverage_profile','natural_source_all','natural_c02_originals','named_commitment_task'):
             setattr(self,name,getattr(base,name))
         self.base_leaf_count,self.base_ordered_root=base.leaf_count,base.ordered_root
         self.coverage_kind='actual_base_eof_plus_committed_delta'
@@ -745,10 +1011,7 @@ class PreparedCurrentDispatchSuccessorInventoryV3(PreparedCurrentDispatchInvento
         self.projection=CurrentDispatchTypedProjectionV3(tuple(frozen[key]for key in sorted(frozen)),
             (after_stamp[1],),base.operation)
         self.heads=MappingProxyType(dict(base.heads)|dict(changed_heads))
-        _ISSUED[self]=(self.graph,self.db,self.namespace,self.binding,self.admission,self.request,self.operation,
-            self.selection_digest,self.scope,self.graph_stamp,self.query,self.authority_epochs,self.catalogue_hash,
-            self.leaf_count,self.ordered_root,self.projection,self.sources,self.heads,self.qualified_sources,
-            self.family,self.source_descriptors,self.contact_birth,self.natural_originals,self.natural_history,self.artifact_receipt_originals)
+        _ISSUED[self] = self._identity_v3()
         _SUCCESSOR_ISSUED[self]=self._successor_identity_v3()
 
     def _successor_identity_v3(self):

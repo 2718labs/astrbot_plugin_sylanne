@@ -377,6 +377,38 @@ class InstalledRootLifetimeObserverV3:
             census_root=canonical_digest(()),eof_digest=canonical_digest((record['source_root'],self.boot,(),hold_nonce)),complete=True,
             resource_scope_original_digest=self.resource['approval_original_digest'])
         return dict(status='old_root_cohort_retired',original=original)
+    def observe_retired_core_authority_v4(self,birth_wire,hold_nonce):
+        from .d13_cache_use_contract_v2 import D13AuthorityCoreBirthReceiptV4,cache_use_from_wire_v2,validate_core_authority_retirement_original_v4
+        from .d13_core_authority_retirement_v4 import core_authority_retirement_common_v4
+        from .installed_process_supervisor_v1 import decode_process_supervisor_observation_v2,load_process_supervisor_spec_v1
+        self.require_current();birth=cache_use_from_wire_v2(birth_wire,D13AuthorityCoreBirthReceiptV4)
+        if (birth.birth_profile!='production_root' or birth.authority_id!=self.spec['authority_id']
+                or birth.installation_id!=self.spec['installation_id']or birth.authority_namespace not in self.spec['namespace_cohort']):
+            raise AuthorityUnavailable('Core authority retirement selector differs from the actual installed Root lifetime')
+        observed=decode_process_supervisor_observation_v2(birth.root_observation_original)
+        authority_spec=load_process_supervisor_spec_v1(self.spec['authority_spec']['path'])
+        if (observed.service_role!='authority'or observed.state!='active'or observed.main_process_original!=birth.authority_process_original
+                or observed.observation_digest!=birth.root_authority_observation_digest
+                or canonical_digest(birth.root_observation_original)!=birth.root_process_census_digest
+                or observed.spec_digest!=birth.authority_spec_digest or authority_spec.spec_digest!=birth.authority_spec_digest):
+            raise AuthorityUnavailable('old Core birth has no actual fixed Authority-role observation')
+        record=self.records.get(canonical_digest(observed.launcher_process_original))
+        if (record is None or record['local']!=observed.launcher_process_original
+                or record['pidns']!=observed.pid_namespace_identity or record['mntns']!=observed.mount_namespace_identity):
+            raise AuthorityUnavailable('old Core Root namespace has no continuous actual kernel custody record')
+        if not self._census(record):return dict(status='progress',phase='core_authority_retirement_v4')
+        original=dict(schema='sylanne3.d13.core-authority-retirement.production-root.v4',
+            **core_authority_retirement_common_v4(birth,hold_nonce),old_root_process_original=record['local'],
+            old_ancestor_root_process_original=record['ancestor'],old_pid_namespace_identity=record['pidns'],
+            old_mount_namespace_identity=record['mntns'],old_procfs_identity=record['proc_identity'],
+            observer_process_original=self.original,kernel_boot_id=self.boot,observer_spec_digest=self.spec['spec_digest'],
+            lifetime_id=self.lifetime_id,launch_id=record['launch_id'],cohort_source_root=record['source_root'],
+            root_pidfd_exit=True,census_count=0,census_root=canonical_digest(()),
+            eof_digest=canonical_digest((record['source_root'],self.boot,(),hold_nonce)),
+            resource_scope_original_digest=self.resource['approval_original_digest'])
+        validate_core_authority_retirement_original_v4(original,birth_profile='production_root')
+        return dict(status='core_authority_retired_v4',original=original)
+
     def _serve_connection_v3(self,channel):
         self._packet_timeout_v3(channel);pid,uid,_=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
         if uid!=0:raise AuthorityUnavailable('installed outer Root caller must be the actual Root OS principal')
@@ -385,6 +417,17 @@ class InstalledRootLifetimeObserverV3:
             reply=self._register(pid,request);self._packet_timeout_v3(channel);_send(channel,reply);return
         if request=={'action':'start_root','spec_digest':self.spec['spec_digest']}:
             self.start_root_v3();self._packet_timeout_v3(channel);_send(channel,dict(status='root_started',launch_id=self.launch_id));return
+        if request.get('action')=='retire_core_authority_v4':
+            if set(request)!={'action','spec_digest','birth_original'}or request['spec_digest']!=self.spec['spec_digest']:
+                raise AuthorityUnavailable('closed actual Core authority retirement request required')
+            nonce=uuid4().hex;reply=self.observe_retired_core_authority_v4(request['birth_original'],nonce)
+            self._packet_timeout_v3(channel);_send_retirement(channel,reply)
+            if reply['status']=='progress':return
+            self._packet_timeout_v3(channel);release=_packet(channel)
+            if release!=dict(action='release_core_authority_custody_v4',observer_hold_nonce=nonce):
+                raise AuthorityUnavailable('actual Core authority custody release differs')
+            self._packet_timeout_v3(channel);_send(channel,dict(status='core_authority_custody_released_v4',observer_hold_nonce=nonce))
+            return
         if set(request)!={'action','spec_digest','pending_original'} or request['action']!='retire_old_root' or request['spec_digest']!=self.spec['spec_digest']:
             raise AuthorityUnavailable('closed actual installed Root lifetime request required')
         nonce=uuid4().hex;reply=self.observe_retired_cohort_v3(request['pending_original'],nonce)

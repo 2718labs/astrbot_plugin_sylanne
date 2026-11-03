@@ -1,10 +1,13 @@
 """Actual OS lease remains continuously held across final-close continuation."""
+import sys
 import threading
 import pytest
 from sylanne3.authority_service.c09_storage_control_v1 import InstalledC09InstanceLeaseV1
 from sylanne3.authority_service.contract import AuthorityUnavailable
 
 
+@pytest.mark.skipif(sys.platform == "win32",
+                    reason="POSIX flock continuation semantics; not meaningful on Windows")
 def test_actual_lease_cannot_close_or_reacquire_inside_continuation(tmp_path):
     lease=InstalledC09InstanceLeaseV1(tmp_path/'instance.lock')
     entered=threading.Event();finished=threading.Event()

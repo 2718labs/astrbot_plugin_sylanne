@@ -320,3 +320,168 @@ def test_current_output_dispatch_keeps_semantic_version_and_frozen_identity(monk
     values = {field.name: getattr(frozen, field.name) for field in fields(frozen)}
     with pytest.raises(TypeError, match='unknown natural generation original version'):
         parse_natural_reply_output_current_v1(text, UnknownFrozen(**values))
+
+
+def _semantic_saved_pair(monkeypatch,version):
+    """Real versioned codecs/seals with synthetic business history and terminals."""
+    from dataclasses import fields
+    from sylanne3.model_broker.natural_reply_history_v3 import D13NaturalHistorySelectionV1
+    from sylanne3.model_broker.natural_reply_history_v4 import NaturalReplyInputV4,freeze_natural_reply_request_v4
+    from sylanne3.model_broker.natural_review import freeze_natural_reply_review_v1,NaturalReviewInstallationV1
+    from sylanne3.runtime.natural_original_v4 import NaturalReplyGenerationOriginalSealV4,NaturalReplyReviewOriginalSealV4
+    from sylanne3.runtime.natural_original_v6 import NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6
+    from sylanne3.runtime.natural_original_v7 import NaturalReplyGenerationOriginalSealV7,NaturalReplyReviewOriginalSealV7
+    from sylanne3.runtime.natural_reply_job_v2 import SavedNaturalPreparationV2
+    from sylanne3.runtime_contracts import canonical_digest,NATURAL_REPLY_REVIEW_WORKFLOW_V2
+    from test_natural_review import _frozen_and_seals
+    base,plan,question,window=materials(1)
+    collection,_=collect_software_pages(monkeypatch,window)
+    args=dict(collection=collection,plan=plan,question=question,installation=base.installation,
+        frozen_at_utc=100.0,expires_at_utc=130.0,policy_digest='9'*64)
+    raw6,_=build_natural_frame_v6(**args)
+    if version==7:frozen,_=build_natural_frame_v7(**args)
+    elif version==6:frozen=raw6
+    else:
+        selected=raw6.input.history_selection
+        values={field.name:getattr(selected,field.name)for field in fields(D13NaturalHistorySelectionV1)
+            if field.name not in {'schema','block_ref'}}
+        selected1=D13NaturalHistorySelectionV1(**values,block_ref=None)
+        values={field.name:getattr(raw6.input,field.name)for field in fields(NaturalReplyInputV4)
+            if field.name not in {'schema','history_selection'}}
+        frozen=freeze_natural_reply_request_v4(NaturalReplyInputV4(**values,history_selection=selected1,
+            schema='sylanne.d09.context_reply_input.v5'),base.installation)
+    gen_class,review_class={5:(NaturalReplyGenerationOriginalSealV4,NaturalReplyReviewOriginalSealV4),
+        6:(NaturalReplyGenerationOriginalSealV6,NaturalReplyReviewOriginalSealV6),
+        7:(NaturalReplyGenerationOriginalSealV7,NaturalReplyReviewOriginalSealV7)}[version]
+    old_generation,_,old_review=_frozen_and_seals()
+    values={field.name:getattr(old_generation,field.name)for field in fields(old_generation)}
+    values.update(namespace=plan.namespace,frozen_input_digest=frozen.frozen_input_digest,
+        qualified_units_digest=frozen.qualified_units_digest,model_request_digest=frozen.model_request_digest,
+        schema='sylanne.d09.natural_generation_seal.v'+str(version),
+        template_version='sylanne.d09.context_reply_input.v'+str(version))
+    seal=gen_class(**values)
+    output={'schema':'sylanne.d09.context_reply_output.v3','body':'Hello. Bye.','units':[
+        {'start':0,'end':6,'kind':plan.units[0].kind.value,'basis_ids':[plan.units[0].basis_id],
+            'speech_act':'paraphrase','promise_grant_id':None,'slot_ids':['answer']},
+        {'start':6,'end':11,'kind':plan.units[0].kind.value,'basis_ids':[plan.units[0].basis_id],
+            'speech_act':'paraphrase','promise_grant_id':None,'slot_ids':[]}],
+        'semantic_segments':[{'start':0,'end':6},{'start':6,'end':11}]}
+    reviewed=freeze_natural_reply_review_v1(seal,output,plan.units,tuple(ref.ref for ref in plan.promise_grants),
+        'policy:semantic',NaturalReviewInstallationV1('review:installation','review:provider','a'*64,'review:model'))
+    generation=SavedNaturalPreparationV2('generation',seal.c02_operation_id,seal,frozen,(),(),0,0,0,
+        'terminal',None,1,'f'*64,canonical_digest(output))
+    values={field.name:getattr(old_review,field.name)for field in fields(old_review)}
+    values.update(namespace=plan.namespace,generation_original_operation_id=seal.original_operation_id,
+        generation_call_id=seal.call_id,generation_frozen_input_digest=seal.frozen_input_digest,
+        generation_output_digest=generation.terminal_output_digest,qualified_units_digest=seal.qualified_units_digest,
+        review_frozen_input_digest=reviewed.digest,model_request_digest=reviewed.wire_digest,
+        review_policy_version=reviewed.review_policy_version,schema='sylanne.d09.natural_review_seal.v'+str(version),
+        template_version=NATURAL_REPLY_REVIEW_WORKFLOW_V2)
+    review_seal=review_class(**values)
+    review=SavedNaturalPreparationV2('review',seal.c02_operation_id,review_seal,reviewed,(),(),0,0,0,
+        'terminal',None,1,'e'*64,'d'*64)
+    return generation,review,output
+
+
+@pytest.mark.parametrize('version',[5,6,7])
+def test_registered_semantic_originals_reach_actual_graph_child_identity(monkeypatch,version):
+    import sqlite3
+    from threading import RLock
+    from types import SimpleNamespace
+    from sylanne3.graph_coordinator import GraphCoordinator
+    from sylanne3.domains.d09.natural_reply import natural_segment_identity_v3
+    import sylanne3.runtime.natural_reply_job_v2 as jobs
+    generation,review,output=_semantic_saved_pair(monkeypatch,version)
+    monkeypatch.setattr(jobs,'read_original_preparation',lambda db,ns,parent,stage:
+        generation if stage=='generation'else review)
+    graph=object.__new__(GraphCoordinator);db=sqlite3.connect(':memory:');lock=RLock()
+    graph._GraphCoordinator__store=SimpleNamespace(_db=db,_lock=lock)
+    try:
+        with lock:
+            db.execute('BEGIN')
+            first=graph._natural_reply_segment_scope_locked(generation.seal.namespace,generation.parent_original_id,0)
+            second=graph._natural_reply_segment_scope_locked(generation.seal.namespace,generation.parent_original_id,1)
+            assert first[0]is generation and first[1]==output and first[4]==2
+            assert first[2:4]==natural_segment_identity_v3(generation.frozen.input.plan,output,0)[:2]
+            assert second[2:4]==natural_segment_identity_v3(generation.frozen.input.plan,output,1)[:2]
+            assert second[2:4]!=first[2:4]
+    finally:db.rollback();db.close()
+
+
+def test_semantic_profile_keeps_legacy_and_rejects_crossed_originals(monkeypatch):
+    from dataclasses import fields
+    from sylanne3.runtime.natural_reply_job_v2 import natural_semantic_original_version_v3,NaturalReplyJobHold,SavedNaturalPreparationV2
+    from sylanne3.runtime_contracts import NaturalReplyGenerationOriginalSealV2
+    from test_natural_reply import frozen as legacy_frozen
+    generation6,review6,_=_semantic_saved_pair(monkeypatch,6)
+    generation7,review7,_=_semantic_saved_pair(monkeypatch,7)
+    with pytest.raises(NaturalReplyJobHold,match='review crossed'):
+        natural_semantic_original_version_v3(generation7,review6)
+    with pytest.raises(NaturalReplyJobHold,match='seal profiles differ'):
+        natural_semantic_original_version_v3(replace(generation7,seal=generation6.seal))
+    class UnknownFrozen(type(generation7.frozen)):pass
+    unknown=UnknownFrozen(**{field.name:getattr(generation7.frozen,field.name)for field in fields(generation7.frozen)})
+    with pytest.raises(NaturalReplyJobHold,match='unknown or crossed'):
+        natural_semantic_original_version_v3(replace(generation7,frozen=unknown))
+    frozen=legacy_frozen()
+    values={field.name:getattr(generation6.seal,field.name)for field in fields(generation6.seal)}
+    values.update(schema='sylanne.d09.natural_generation_seal.v2',template_version='sylanne.d09.context_reply_input.v2',
+        frozen_input_digest=frozen.frozen_input_digest,qualified_units_digest=frozen.qualified_units_digest,
+        model_request_digest=frozen.model_request_digest)
+    seal=NaturalReplyGenerationOriginalSealV2(**values)
+    assert natural_semantic_original_version_v3(SavedNaturalPreparationV2('generation',seal.c02_operation_id,
+        seal,frozen,(),(),0,0,0,'terminal',None,1,'f'*64,'d'*64))is None
+
+
+@pytest.mark.parametrize("version",[6,7])
+def test_actual_frozen_locator_metadata_omits_body_and_requires_original_sources(monkeypatch,version):
+    """Actual codecs/projector only; no installed Source grant is simulated."""
+    from pathlib import Path
+    import runpy
+    from sylanne3.graph_types import AtomKey,GraphVersion
+    from sylanne3.memory_types import source_key,access_key
+    from sylanne3.domains.d06 import source_correction_head_key
+    from sylanne3.runtime.dispatch_admission import DispatchAdmissionReceiptV1
+    from sylanne3.runtime.natural_dispatch_read_locator_v1 import (
+        project_natural_dispatch_frozen_metadata_v1,NaturalDispatchReadLocatorHold)
+    from sylanne3.runtime_contracts import VersionedRef,canonical_digest
+    generation,_,_=_semantic_saved_pair(monkeypatch,version)
+    old=generation.frozen;ns=old.input.plan.namespace
+    question_ref=VersionedRef(source_key(*ns.as_tuple,"locator-ingress").token,1)
+    unit_source=VersionedRef(source_key(*ns.as_tuple,"locator-claim").token,2)
+    old_unit=old.input.plan.units[0]
+    unit=replace(old_unit,source_refs=(unit_source,),
+        access_refs=(VersionedRef(access_key(*ns.as_tuple,"locator-claim").token,3),),
+        correction_refs=(VersionedRef(source_correction_head_key(ns,"locator-claim").token,0),))
+    plan=replace(old.input.plan,units=(unit,))
+    input=replace(old.input,plan=plan,question=replace(old.input.question,ref=question_ref))
+    module=v6 if version==6 else v7
+    freeze=module.freeze_natural_reply_request_v6 if version==6 else module.freeze_natural_reply_request_v7
+    frozen=freeze(input,old.installation)
+    seal=replace(generation.seal,source_ref=question_ref.ref,frozen_input_digest=frozen.frozen_input_digest,
+        qualified_units_digest=frozen.qualified_units_digest,model_request_digest=frozen.model_request_digest)
+    generation=replace(generation,frozen=frozen,seal=seal,
+        read_versions=(GraphVersion(AtomKey.from_token(question_ref.ref),1),GraphVersion(AtomKey.from_token(unit_source.ref),2)))
+    fixture_path=Path(__file__).resolve().parents[1]/"runtime"/"test_dispatch_binding_v2.py"
+    receipt,_,_=runpy.run_path(str(fixture_path))["_fixture"]()
+    value=replace(receipt.admission,namespace="/".join(ns.as_tuple),audience=(plan.audience_id,),
+        scene_ref=plan.scene_id,destination_ref=plan.audience_id,purpose="expression")
+    def issued(admission):
+        digest=canonical_digest({"admission_digest":admission.digest,
+            "graph_revision":receipt.graph_revision,"graph_epoch":receipt.graph_epoch})
+        return DispatchAdmissionReceiptV1(admission,receipt.graph_revision,receipt.graph_epoch,digest)
+    actual=issued(value)
+    metadata=project_natural_dispatch_frozen_metadata_v1(generation,admission=actual)
+    wire=json.dumps(metadata,ensure_ascii=False)
+    assert frozen.input.question.text not in wire and old_unit.qualified_text not in wire
+    groups=metadata["source_groups"]
+    assert groups[0]["purpose"]=="context" and groups[0]["source_versions"]==[{"ref":question_ref.ref,"version":1}]
+    assert any(g["group"]=="plan_unit"and g["purpose"]=="expression"
+        and g["source_versions"]==[{"ref":unit_source.ref,"version":2}]for g in groups)
+    assert metadata["commitments"]["frozen_input_digest"]==frozen.frozen_input_digest
+    # The positive above establishes all other projected prerequisites before
+    # either precise metadata error; these are not provider-admission negatives.
+    with pytest.raises(NaturalDispatchReadLocatorHold,match="original Source version is absent"):
+        project_natural_dispatch_frozen_metadata_v1(replace(generation,read_versions=()),admission=actual)
+    with pytest.raises(NaturalDispatchReadLocatorHold,match="audience/scene differs"):
+        project_natural_dispatch_frozen_metadata_v1(generation,admission=issued(replace(value,audience=("foreign:audience",))))

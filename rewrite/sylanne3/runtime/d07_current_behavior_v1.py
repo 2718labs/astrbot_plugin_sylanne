@@ -232,8 +232,7 @@ def _activity(envelope, execution, stop_reason):
             or execution.effect_id != envelope.identity.effect_id
             or execution.attempt_id != envelope.identity.attempt_id
             or execution.activation_generation != envelope.authority.activation_generation
-            or execution.parent_budget_ref != envelope.parent_budget_lease_ref
-            or execution.ended_at > envelope.deadline_utc):
+            or execution.parent_budget_ref != envelope.parent_budget_lease_ref):
         raise ValueError("D07 activity execution differs from frozen operation/budget/generation")
     activity = CognitiveActivity(execution.activity_id, execution.effect_id,
         execution.attempt_id, execution.work_kind, execution.started_at,

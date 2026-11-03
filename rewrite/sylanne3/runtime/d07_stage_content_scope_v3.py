@@ -171,9 +171,11 @@ def _host_prepared_class_v3(schema):
     from .d07_execution_v1 import D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3
     from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
     from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
     types={item.__dataclass_fields__["schema"].default:item for item in
-        (D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)}
+        (D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1,D07ArtifactObservationPreparedV3)}
     if schema not in types:raise AuthorityUnavailable("unregistered actual Host prepared stage schema")
     return types[schema]
 
@@ -210,7 +212,9 @@ class _HostMetadataReaderV3:
             raise AuthorityUnavailable("Host original effective Source authority metadata differs")
         if source.actor==self.owner_acl_authority.actor:return source
         from .d07_execution_v1 import D07PreparedExecutionV1,D07ReflectionPreparedV3
-        if header.prepared_class is D07PreparedExecutionV1 or header.prepared_class is D07ReflectionPreparedV3 and header.value["cycle_ref"] is None:
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+        if header.prepared_class in {D07PreparedExecutionV1,D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1} or header.prepared_class is D07ReflectionPreparedV3 and header.value["cycle_ref"] is None:
             raise AuthorityUnavailable("ordinary Owner preparation cannot borrow current Self")
         if self.current_self is None or self.current_self.self_entity_ref!=source.actor:
             raise AuthorityUnavailable("Host effective Source actor has no actual current paired Self certificate")
@@ -639,6 +643,8 @@ class _HostSpecialParentMetadataReadV3:
         from .d07_execution_v1 import D07ReflectionPreparedV3,D07RelationshipPreparedV2
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
         from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         r=self.reader;w=self.work;r.require_current_v3(meter)
         if _HOST_PARENT_TASKS.get(self)!=(r,w,w.operation,w.read_scope,w.graph_stamp):
@@ -686,7 +692,9 @@ class _HostSpecialParentMetadataReadV3:
                     or owner.owner_head_digest!=actual_guard.authorization_head.removeprefix("sha256:")):
                 raise AuthorityUnavailable("D07 special parent original Owner head differs from its current protected Core guard")
             self.owner=owner
-            if kind is D07GeneralGrowthPreparedV1:self.phase="general"
+            if kind is D07SingleEventReviewPreparedV1:self.phase="single_event_review"
+            elif kind is D07OrdinaryContinuityPreparedV1:self.phase="ordinary_continuity"
+            elif kind is D07GeneralGrowthPreparedV1:self.phase="general"
             elif kind is D07ReflectionPreparedV3:self.phase="reflection"
             elif kind in {D07MethodGrowthPreparedV2,D07RelationshipPreparedV2}:self.phase="question"
             elif kind is D07ArtifactObservationPreparedV3:self.phase="artifact_observation"
@@ -699,6 +707,12 @@ class _HostSpecialParentMetadataReadV3:
             self.artifact_observation=leaf.basis
             self.cycle_ref=leaf.basis.request.selector.task.cycle_job_ref
             self.phase="cycle";return
+        if self.phase=="single_event_review":
+            from .d07_single_event_review_v1 import advance_single_event_review_parent_metadata_v3
+            advance_single_event_review_parent_metadata_v3(self,meter,side="host");return
+        if self.phase=="ordinary_continuity":
+            from .d07_ordinary_continuity_cognition_v1 import advance_ordinary_continuity_parent_metadata_v3
+            advance_ordinary_continuity_parent_metadata_v3(self,meter,side="host");return
         if self.phase=="general":
             question=self._leaf_v3(("general-question",header.job_id),_HostSignedParentMetadataReadV3(r,
                 family="d07",kind="semantic_question",ref=raw["semantic_question_ref"],
@@ -747,6 +761,8 @@ class _HostSpecialParentMetadataReadV3:
             leaf=self._leaf_v3(("ordinary-job",header.job_id),_HostParentJobMetadataReadV3(r,header.job_id))
             if leaf is None:return
             job=leaf.value
+            if kind in {D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1} and job["budget_ref"]!=raw["original_parent_budget_lease_ref"]:
+                raise AuthorityUnavailable("Host ordinary continuity changed its actual original parent budget")
             if ((job["operation_id"],job["activity_id"],job["effect_id"],job["work_kind"])!=
                     (raw["operation_id"],raw["activity_id"],raw["effect_id"],"d07."+raw["work_kind"])
                     or job["cancel_epoch"] or job["phase"]not in {"queued","running","completed"}):
@@ -1093,7 +1109,7 @@ class _HostSpecialParentMetadataReadV3:
                 raise AuthorityUnavailable("D07 special parent exceeded its original ancestor deadline minimum")
             source_versions=tuple(sorted({(row["ref"],row["revision"])for item in self.headers for row in item.source_rows}))
             names={D07MethodGrowthPreparedV2:"method_growth_self",
-                D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",D07GeneralGrowthPreparedV1:"general_growth_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
+                D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",D07GeneralGrowthPreparedV1:"general_growth_owner",D07OrdinaryContinuityPreparedV1:"ordinary_continuity_owner",D07SingleEventReviewPreparedV1:"single_event_review_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
             self.complete=True
             self.result=_HostParentQualifiedV3(_HOST_ISSUER,self,kind=names.get(original.prepared_class,"ordinary_owner"),
                 authority=source,parent_originals=self.originals,deadline=deadline,source_versions=source_versions)
@@ -1342,7 +1358,10 @@ class _HostStageAccountingMetadataReadV3:
             leaf=self._leaf_v3("request",_HostSignedParentMetadataReadV3(r,family="d07",kind="request",ref=raw["job_id"],mode="request"))
             value=leaf.value;envelope=value["envelope"];job=r.stage_job.value
             from ..model_broker.d07_cognition_v1 import TEMPLATE_DIGEST
-            if raw["schema"]=="d07.general-growth-prepared.v1":
+            if raw["schema"]=="d07.ordinary-continuity-prepared.v1":
+                from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_template_digest_v1
+                TEMPLATE_DIGEST=ordinary_continuity_template_digest_v1(raw["phase"])
+            elif raw["schema"]=="d07.general-growth-prepared.v1":
                 from ..model_broker.general_growth_cognition_v1 import TEMPLATE_DIGEST
             if (value["call_id"]!=raw["call_id"] or value["prompt_template_digest"]!=TEMPLATE_DIGEST
                     or envelope["identity"]["operation_id"]!=self.acquire_id
@@ -1478,11 +1497,17 @@ class _HostStageContentScopeReadV3:
                 if self.parents.complete:
                     from .domain_background_read_v3 import _D07StageSourceQualificationV3
                     self.sources=_D07StageSourceQualificationV3(w)
-                    if self.parents.result.kind=="general_growth_owner":
+                    if self.parents.result.kind in {"general_growth_owner","ordinary_continuity_owner"}:
                         roots=set(r.header.value["context_source_refs"])|set(r.header.value["support_source_refs"])
                         self.sources.expected={ref:revision for ref,revision in self.sources.expected.items()if ref in roots}
                         if set(self.sources.expected)!=roots:
                             raise AuthorityUnavailable("Host General original input omitted exact source-column version")
+                        self.sources.pending=list(self.sources.expected)
+                    if self.parents.result.kind=="single_event_review_owner":
+                        roots=set(r.header.value["context_source_refs"])|set(r.header.value["consolidation_source_refs"])
+                        self.sources.expected={ref:rev for ref,rev in self.sources.expected.items()if ref in roots}
+                        if set(self.sources.expected)!=roots:
+                            raise AuthorityUnavailable("Host review omitted its exact signed Source groups")
                         self.sources.pending=list(self.sources.expected)
                     w.d07_source_qualification=self.sources
                     self.phase="sources"
@@ -1497,6 +1522,8 @@ class _HostStageContentScopeReadV3:
         finally:r.reserve_v3()
     def release_v3(self):
         r=self.reader
+        from .d07_single_event_review_v1 import release_single_event_review_parent_metadata_v1
+        release_single_event_review_parent_metadata_v1(r.work)
         _HOST_METADATA.pop(r,None)
         if self.parents is not None:_HOST_PARENT_TASKS.pop(self.parents,None)
         r.work.operation.unregister_retained_state_v3(r)

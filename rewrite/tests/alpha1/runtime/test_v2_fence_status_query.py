@@ -107,11 +107,11 @@ def service_rpc(tmp_path):
 
 
 def paired(server, peer, channel):
-    binding = server._dispatch_for_test("handshake", REQUEST_WIRE, peer, channel)[
+    binding = server.dispatch("handshake", REQUEST_WIRE, peer, channel)[
         "channel_binding_sha256"]
 
     def call(method, command):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, REQUEST_WIRE, peer, channel,
             handshake_binding=binding, command=command)
 

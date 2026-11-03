@@ -61,6 +61,12 @@ def read_committed_ingress_identity(db, namespace: NamespaceId,
     from .d13_paid_original_read_v3 import d13_paid_current_reader_v3
     paid=d13_paid_current_reader_v3(db)
     def point(table,columns,legacy_reader):
+        from .current_commitment_input_source_v3 import commitment_input_ingress_point_v3
+        handled,row=commitment_input_ingress_point_v3(db,table,columns,('bot','persona','operation_id'),namespace.as_tuple+(operation_id,))
+        if handled:return row
+        from .current_relationship_source_read_v3 import relationship_point_v3
+        handled,row=relationship_point_v3(db,table,columns,('bot','persona','operation_id'),namespace.as_tuple+(operation_id,))
+        if handled:return row
         if paid is not None:return paid.window_original_point_v3(table,columns,
             ('bot','persona','operation_id'),namespace.as_tuple+(operation_id,))
         return model_reply_scope_point_v3(db,table=table,columns=columns,

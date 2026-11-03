@@ -10,7 +10,7 @@ from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2,
 from .d11_life_preparation_v1 import life_prepared_from_wire_v1
 from .d11_life_source_note_v1 import ARTIFACT_SCHEMA
 
-FACT_KINDS = frozenset({"accounting_prepared", "historical_accounting_gate", "historical_accounting_receipt","c4_paid","c4_phase_paid","c4_no_dispatch","c4_phase_no_dispatch"})
+FACT_KINDS = frozenset({"body_policy_checkpoint_v1","character_labor_accounting_basis_v1","character_work_segment_v1","accounting_prepared", "historical_accounting_gate", "historical_accounting_receipt","c4_paid","c4_phase_paid","c4_no_dispatch","c4_phase_no_dispatch"})
 C4_KINDS=frozenset({"c4_frozen","c4_prepared","c4_request","c4_call","c4_result","c4_paid","c4_adopted","c4_no_dispatch"})
 C4_PHASE_KINDS = frozenset("c4_phase_" + part for part in
     ("frozen", "prepared", "request", "call", "result", "paid", "adopted", "verified", "no_dispatch"))
@@ -20,6 +20,10 @@ POSTCONDITION_KINDS = frozenset({"artifact_phase_observation_basis_v1", "artifac
 
 def decode_life_original_content_v1(kind, encoded):
     raw = _json(encoded)
+    from .c09_character_labor_originals_v1 import LABOR_KINDS,decode_character_labor_original_v1
+    if kind in LABOR_KINDS:return decode_character_labor_original_v1(kind,raw)
+    from .c09_life_numeric_originals_v1 import NUMERIC_KINDS,decode_numeric_life_original_v1
+    if kind in NUMERIC_KINDS:return decode_numeric_life_original_v1(kind,raw)
     if kind == 'owner_source_note_values_parent_v1':
         from .owner_source_note_values_v1 import OwnerTaskValuesParentV1
         return decode_typed_production_value_v1(raw,OwnerTaskValuesParentV1)

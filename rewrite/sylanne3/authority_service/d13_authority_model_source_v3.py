@@ -118,6 +118,7 @@ class AuthorityD13PaidSourceV3:
         self.intent_digest_task=self.intent_projection=None
         self.frozen_versions,self.sources,self.source_heads,self.access_atoms={},{},{},{}
         self.pending_sources=[];self.qualified=False
+        self.source_inspection_tasks={}
         self.window_metadata=self.window_body=self.current_window=None
         self.metadata_atoms,self.metadata_columns={},{}
         self.epochs=self.owner_head=None;self.reserved=0;self.complete=False
@@ -315,6 +316,8 @@ class AuthorityD13PaidSourceV3:
         return attachment.require_row_v3(self.work,meter)
 
     def release_v3(self):
+        from ..runtime.d13_paid_original_read_v3 import release_d13_paid_source_inspection_v3
+        release_d13_paid_source_inspection_v3(self)
         if self.current_builder is not None:self.current_builder.release_v3()
         if self.eof is not None:self.eof.release_payload_v3()
         self.eof=self.current_builder=self.verifier=self.column=self.intent_projection=self.intent_digest_task=None

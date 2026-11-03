@@ -237,12 +237,35 @@ class RecollectionBundleTests(unittest.TestCase):
         self.assertEqual(
             {spec.name for spec in specs},
             {
-                "memory.source", "memory.access", "memory.interpretation",
-                "memory.episode.v1", "memory.subjective_trace.v1",
-                "memory.subjective_trace.v2",
-                "memory.association.v1", "d06.recollection.v1",
+                "d06.artifact_task_amendment.v1",
+                "d06.detail_retention.v1",
+                "d06.internal_life_event.v1",
+                "d06.interpretation_inspection_metadata.v1",
+                "d06.recollection.v1",
                 "d06.recollection_projection.v1",
+                "d06.retention_contribution.v1",
+                "d06.retention_policy.v1",
+                "d06.retention_read.v1",
                 "d06.source_correction_head.v1",
+                "d06.source_inspection_metadata.v1",
+                "memory.access",
+                "memory.association.v1",
+                "memory.episode.v1",
+                "memory.episode.v2",
+                "memory.episode_eligibility.v2",
+                "memory.episode_provenance.v2",
+                "memory.internal_life_content_eligibility.v1",
+                "memory.internal_life_content_provenance.v1",
+                "memory.internal_life_content_trace.v1",
+                "memory.internal_life_numeric_eligibility.v1",
+                "memory.internal_life_numeric_provenance.v1",
+                "memory.internal_life_numeric_trace.v1",
+                "memory.interpretation",
+                "memory.source",
+                "memory.source.v2",
+                "memory.subjective_trace.v1",
+                "memory.subjective_trace.v2",
+                "memory.subjective_trace.v3",
             },
         )
         registry = TypeRegistry()
@@ -251,8 +274,9 @@ class RecollectionBundleTests(unittest.TestCase):
             registry.register(spec)
         traces = {spec.name: spec for spec in specs
                   if spec.name.startswith("memory.subjective_trace.v")}
-        self.assertEqual(set(traces), {"memory.subjective_trace.v1", "memory.subjective_trace.v2"})
-        self.assertEqual(len({spec.schema_hash for spec in traces.values()}), 2)
+        self.assertEqual(set(traces), {"memory.subjective_trace.v1", "memory.subjective_trace.v2",
+                                        "memory.subjective_trace.v3"})
+        self.assertEqual(len({spec.schema_hash for spec in traces.values()}), 3)
         invalid = self._key("activity", "activity-1", "d06.recollection.v1", "bad")
         with self.assertRaises(ValueError):
             registry.validate(invalid, {"recollection_id": "bad"})

@@ -215,7 +215,7 @@ def collect_self_c04_graph_v4(db, *, scope, focus_ref, attention_ticket_ref, moo
     return result
 
 
-def prepare_self_c04_body_resources_v4(db, *, scope, work):
+def prepare_self_c04_body_resources_v4(db, *, scope, work, resource_inputs=None):
     """Materialize signed CPU/Body resources once; caller owns final CAS/freeze."""
     from .c04_direct_seed_v4 import AssociationWorkInputV4
     from .c04_frozen_association_original_v3 import _verify_current_association_input_heads_common_v3
@@ -245,6 +245,13 @@ def prepare_self_c04_body_resources_v4(db, *, scope, work):
     if ticket["valid_until"] < env.deadline_utc:
         raise ValueError("Self C04 deadline exceeds its actual attention lifetime")
     authority = actual.graph._GraphCoordinator__c04_cpu_quote_authority
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_resource_inputs_v3 import C04BodyResourceInputsV3
+        if type(resource_inputs)is not C04BodyResourceInputsV3:
+            raise ValueError("Self C04 quote needs its actual complete independent resource Source EOF")
+        resource_inputs.require_v3(db,envelope=env,policy_id=actual.bundle.d06_recall.body_policy_id,
+            policy_version=actual.bundle.d06_recall.body_policy_version)
     quote = authority.request_self_quote_v4(db, scope=actual)
     reads = {AtomKey.from_token(row.ref): row.revision for row in work.reads}
     for target in work.targets:
@@ -256,4 +263,4 @@ def prepare_self_c04_body_resources_v4(db, *, scope, work):
         reservation_id=ids["reservation"], d02_issuer=actual.graph._GraphCoordinator__d02_issuer,
         body_authority=actual.graph._GraphCoordinator__body_quote_authority,
         now_utc=actual.frame.now_utc,
-        original_reads=tuple(GraphVersion(key, revision) for key, revision in sorted(reads.items(), key=lambda pair: pair[0].token)))
+        original_reads=tuple(GraphVersion(key, revision) for key, revision in sorted(reads.items(), key=lambda pair: pair[0].token)),resource_inputs=resource_inputs)

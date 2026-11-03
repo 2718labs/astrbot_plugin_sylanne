@@ -58,9 +58,11 @@ def build_first_ingress_bundle(
 
     source = source_key(*namespace.as_tuple, admission.source_id)
     access = access_key(*namespace.as_tuple, admission.source_id)
+    from ..domains.d06.inspection_metadata_v1 import inspection_key_v1
+    source_metadata = inspection_key_v1(source, 1)
     media = media_source_key(namespace, admission.source_id) if media_admission else None
     reads = {item.key: item for item in command.version_guard.read_versions}
-    if (set(reads) != {source, access, job_key, outbox_key} | ({media} if media else set())
+    if (set(reads) != {source, source_metadata, access, job_key, outbox_key} | ({media} if media else set())
             or len(reads) != len(command.version_guard.read_versions)
             or any(item.revision != 0 for item in reads.values())):
         raise ValueError("first ingress requires complete revision-0 source/runtime proofs")

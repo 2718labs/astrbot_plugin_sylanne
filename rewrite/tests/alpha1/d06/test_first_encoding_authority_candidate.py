@@ -12,7 +12,8 @@ from sylanne3.authority_service.v2_model_result_read_contract import ModelResult
 from sylanne3.authority_service.v2_worker_model_result_contract import (
     WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
 )
-from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+from sylanne3.model_broker.first_ingress_encoding import (
+    FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, build_first_ingress_encoding_payload)
 from sylanne3.runtime_contracts import NamespaceId
 
 
@@ -33,6 +34,8 @@ def test_authority_result_boundary_rejects_changed_original_source():
         "call_id": "call-1",
         "model_request_digest": "a" * 64,
         "prompt_template_digest": template_digest,
+        "prompt_template_version": FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        "prompt_template_version": FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
         "payload": payload,
         "worker_fence": 1,
         "work_kind": "d06.encode_source",
@@ -137,7 +140,7 @@ def test_authority_result_boundary_accepts_v3_only_with_committed_baseline_proof
         "work_kind": "d06.encode_source", "clock_epoch": "clock-1", "envelope": envelope,
         "baseline": baseline, "call_id": "call-1", "provider_id": "provider-1",
         "model_id": "model-1", "required_capabilities": [], "privacy_tier": "private",
-        "prompt_template_digest": template_digest, "payload": payload,
+        "prompt_template_digest": template_digest, "prompt_template_version": FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, "payload": payload,
         "timeout_seconds": 10, "max_output_tokens": 100,
     }
     request["model_request_digest"] = canonical_digest({

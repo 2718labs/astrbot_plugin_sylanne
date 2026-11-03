@@ -63,6 +63,11 @@ def _snapshot(db, namespace):
 
 def read_current_d13_collection_v6(db, namespace, scene_ref, conversation_ref, now_utc, *,
         expected_activation_generation, expected_owner_authorization_head=None, max_slots=256,before_sequence=None):
+    from .graph_d13_cache_use_collection_v2 import read_bound_graph_d13_collection_v2
+    handled,collection=read_bound_graph_d13_collection_v2(db,namespace,scene_ref,conversation_ref,now_utc,
+        expected_activation_generation=expected_activation_generation,
+        expected_owner_authorization_head=expected_owner_authorization_head,max_slots=max_slots,before_sequence=before_sequence)
+    if handled:return collection
     if type(max_slots) is not int or not 1 <= max_slots <= 256:
         raise ValueError('v6 collection reads at most 256 actual slots, 64 per page')
     first_size = min(max_slots, 64)

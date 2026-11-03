@@ -13,7 +13,6 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 import hashlib
 import json
-import logging
 import math
 import secrets
 import ssl
@@ -22,6 +21,7 @@ import time
 import traceback
 from typing import TYPE_CHECKING, Callable
 
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime.graph_write_attempt import domain_bundle_write_attempt_id_v1
 from ..runtime_journal import (
@@ -210,9 +210,15 @@ class _DeferredWorkerDelivery:
     credential: MtlsPeerCredential
     delivery: WorkerResultDeliveryV1 | TerminalC02RecoveryDeliveryV1 | ContextReplyResultDeliveryV2 | ArtifactDraftModelResultDeliveryV1 | ArtifactDraftModelResultDeliveryV2
 
+    after_finish: Callable[[], None] | None = None
+
     def finish(self):
-        return self.service.finish_delivery(
-            credential=self.credential, delivery=self.delivery)
+        try:
+            return self.service.finish_delivery(
+                credential=self.credential, delivery=self.delivery)
+        finally:
+            if self.after_finish is not None:
+                self.after_finish()
 
     def abandon(self) -> None:
         self.service.abandon_delivery(delivery=self.delivery)
@@ -544,6 +550,8 @@ class AuthorityRpcServer:
             raise TypeError("foreground services must share the actual installed self/Core/fence/namespace composition")
         self._v2_foreground_activity = foreground_services
         self._d13_core_counters_v1 = {}
+        self._d13_cache_use_controls_v2 = {}
+        self._d13_cache_use_cleanup_first_failures_v3 = {}
         self._v2_owner_source_note_tasks = {}
         self._v2_conditioned_children = {}
         self._d12_operation_status_services_v1 = {}
@@ -643,7 +651,13 @@ class AuthorityRpcServer:
                                installed[worker_readers[namespace]].administrator_holder)
                        for namespace, service in natural_output_reads.items())):
             raise TypeError("natural output needs installed original model reader")
+        from .d13_original_owner_v3 import install_d13_natural_generation_parse_producer_v3
+        for namespace, output_service in natural_output_reads.items():
+            install_d13_natural_generation_parse_producer_v3(output_service, model_services[namespace])
         self._v2_natural_generation_output_reads = natural_output_reads
+        self._d13_generation_cleanup_first_failures_v3 = {}
+        self._d13_stop_counter_cleanup_first_failures_v3 = {}
+        self._observation_fact_recovery_first_failures_v3 = {}
         self._d04_appraisal_reads_v3 = {}
         self._d07_cognition_reads_v1 = {}
         self._contact_model_reads_v1 = {}
@@ -680,6 +694,9 @@ class AuthorityRpcServer:
                        for namespace, service in review_output_reads.items())):
             raise TypeError("natural review output needs installed original reader")
         self._v2_natural_review_output_reads = review_output_reads
+        from .d13_original_owner_v3 import install_d13_natural_review_verdict_producer_v3
+        for namespace, review_output_service in review_output_reads.items():
+            install_d13_natural_review_verdict_producer_v3(review_output_service, model_services[namespace])
         paid_review_reads = dict(v2_natural_paid_review_reads or {})
         if (not set(paid_review_reads) <=
                 (set(review_output_reads) & set(natural_output_reads))
@@ -785,7 +802,7 @@ class AuthorityRpcServer:
                 for frame in diagnostic.stack]})
             diagnostic = diagnostic.__cause__ or (
                 None if diagnostic.__suppress_context__ else diagnostic.__context__)
-        logging.getLogger(__name__).error(
+        diagnostic_channel_v1(__name__).error(
             "Authority internal failure: %s", json.dumps(chain, separators=(",", ":")))
         return {"ok": False, "error": "authority_unavailable"}
 
@@ -1157,6 +1174,26 @@ class AuthorityRpcServer:
             raise AuthorityUnavailable("installed accepted erasure reader differs")
         self._current_accepted_erasure_reads[key] = reader
 
+    def _recover_observation_fact_before_bootstrap_v3(self, *, credential, subject, namespace):
+        """Adopt at most one real journal append after this peer authenticates."""
+        execution = self._v2_execution.get(namespace)
+        if execution is None:
+            return
+        fact_id = execution.current_observation_refinement_operation_v3(
+            credential=credential, subject=subject)
+        if fact_id is None:
+            return
+        key = (namespace, subject, fact_id)
+        if key in self._observation_fact_recovery_first_failures_v3:
+            raise AuthorityUnavailable('first observation fact recovery failure is retained')
+        try:
+            execution.recover_observation_refinement_v3(
+                credential=credential, subject=subject, fact_operation_id=fact_id)
+        except Exception as exc:
+            self._observation_fact_recovery_first_failures_v3.setdefault(key, type(exc).__name__)
+            diagnostic_channel_v1(__name__).error('observation fact cold adoption held: %s', type(exc).__name__)
+            raise
+
     def _bound_v2_service(self, credential: MtlsPeerCredential, profile_id: str,
                           manifest_digest: str, namespace: object) -> AuthorityV2FenceService:
         installed = self._installations_v2.get((credential.certificate_sha256, profile_id))
@@ -1343,6 +1380,10 @@ class AuthorityRpcServer:
             raise RuntimeError("authority unavailable")
         subject = "mtls:sha256:" + credential.certificate_sha256
         try:
+            from .d13_cache_use_control_v2 import METHODS as D13_CACHE_USE_METHODS_V2, dispatch_d13_cache_use_control_v2
+            if method in D13_CACHE_USE_METHODS_V2:
+                return dispatch_d13_cache_use_control_v2(self,method,command,credential=credential,
+                    profile_id=profile_id,manifest_digest=manifest_digest)
             from .life_numeric_source_read_v3 import NUMERIC_MODEL_SEAL_OBSERVER_METHOD_V3, dispatch_current_numeric_model_seal_observe_v3
             if method == NUMERIC_MODEL_SEAL_OBSERVER_METHOD_V3:
                 return dispatch_current_numeric_model_seal_observe_v3(self, method, command,
@@ -1373,6 +1414,7 @@ class AuthorityRpcServer:
             from .contact_continuation_rpc_v1 import dispatch_contact_continuation_v1
             from .contact_finished_owner_read_rpc_v1 import dispatch_contact_finished_owner_read_v1
             from .installation_management_rpc_v1 import dispatch_installation_management_v1
+            from .retention_control_metadata_v1 import dispatch_retention_control_metadata_v1
             for dispatch in (dispatch_d12_operation_status_v1, dispatch_d12_target_owner_v1,
                              dispatch_d12_installation_lifecycle_v1, dispatch_d04_numeric_bridge_v3, dispatch_d04_series_rpc_v1,
                              dispatch_d04_root_execution_v3, dispatch_d11_offline_tick_v1, dispatch_d11_life_v1, dispatch_d10_contact_policy_v1,
@@ -1380,7 +1422,7 @@ class AuthorityRpcServer:
                              dispatch_d12_package_maintenance_v2, dispatch_first_owner_issue_v1,
                              dispatch_contact_owner_session_v3, dispatch_contact_background_v1, dispatch_contact_finished_owner_read_v1,
                              dispatch_contact_effect_accounting_v1, dispatch_contact_prospective_v1, dispatch_contact_continuation_v1,
-                             dispatch_installation_management_v1):
+                             dispatch_installation_management_v1,dispatch_retention_control_metadata_v1):
                 handled = dispatch(self, method, credential, profile_id, manifest_digest, command)
                 if handled is not None:
                     return handled
@@ -1400,9 +1442,9 @@ class AuthorityRpcServer:
                     effect_id=identifier(command["effect_id"],"effect_id"))
                 from .contact_p2_contract_v1 import contact_observation_projection_to_wire_v1
                 return {"read":contact_observation_projection_to_wire_v1(result)}
-            if method in {"natural_current_graph_identity_v1", "natural_roster_prepared_for_parent_v1"}:
+            if method in {"natural_current_graph_identity_v1", "natural_roster_prepared_for_parent_v1", "natural_roster_selected_metadata_v3"}:
                 expected={"namespace","holder"}
-                if method=="natural_roster_prepared_for_parent_v1":expected.add("parent_original_id")
+                if method!="natural_current_graph_identity_v1":expected.add("parent_original_id")
                 if set(command)!=expected:
                     raise AuthorityUnavailable("natural current metadata exact private wire differs")
                 namespace=identifier(command["namespace"],"namespace")
@@ -1415,6 +1457,14 @@ class AuthorityRpcServer:
                 if method=="natural_current_graph_identity_v1":
                     result=service.read_current_graph_identity_v1(credential=credential,subject=subject)
                     return {"identity":result.to_wire()}
+                if method=="natural_roster_selected_metadata_v3":
+                    from ..runtime.natural_roster_metadata_read_v3 import (
+                        prepare_authority_natural_roster_metadata_v3,natural_roster_metadata_to_wire_v3)
+                    service._paired(credential,subject)
+                    prepared=prepare_authority_natural_roster_metadata_v3(service,
+                        parent_original_id=identifier(command["parent_original_id"],"parent_original_id"))
+                    try:return {"metadata":natural_roster_metadata_to_wire_v3(prepared)}
+                    finally:prepared.release_v3()
                 result=service.read_roster_prepared_for_parent_v1(credential=credential,subject=subject,parent_original_id=command["parent_original_id"])
                 return {"original":None if result is None else result.to_wire()}
             if method=="natural_disposition_reject_unprepared_write_v1":
@@ -3201,6 +3251,25 @@ class AuthorityRpcServer:
                     credential, profile_id, manifest_digest, namespace)
                 return asdict(self._v2_execution[namespace].read_current_effect(
                     credential=credential, subject=subject, effect_id=effect_id))
+            if method == "verify_source_inspection_member_admission_v1" and set(command) == {"namespace", "admission"}:
+                from ..runtime.source_inspection_member_admission_v1 import require_registered_source_inspection_member_service_v1
+                namespace = identifier(command["namespace"], "namespace")
+                fences = self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                migration = require_registered_source_inspection_member_service_v1(fences)
+                installed = self._installations_v2[(credential.certificate_sha256, profile_id)]
+                if (migration.lifecycle.installation_id != installed.installation_id
+                        or migration.lifecycle.peer != (credential.certificate_sha256, profile_id)):
+                    raise AuthorityUnavailable("member admission verifier crosses the actual installed peer")
+                return {"verification": migration.verify_member_admission_v1(command["admission"])}
+            if method == "execution_read_historical_observation_receipt_v3" and set(command) == {
+                    "namespace", "effect_id", "mutation_id", "expected_receipt_digest"}:
+                namespace = identifier(command["namespace"], "namespace")
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                receipt = self._v2_execution[namespace].read_historical_observation_receipt_v3(
+                    credential=credential, subject=subject, effect_id=command["effect_id"],
+                    mutation_id=command["mutation_id"], expected_receipt_digest=command["expected_receipt_digest"])
+                from .observation_refinement_contract_v3 import to_wire as observation_to_wire_v3
+                return {"receipt": observation_to_wire_v3(receipt)}
             if method == "execution_read_current_observation_receipt_v1" and set(command) == {
                     "namespace", "effect_id"}:
                 namespace = identifier(command["namespace"], "namespace")
@@ -3208,7 +3277,8 @@ class AuthorityRpcServer:
                 self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
                 receipt = self._v2_execution[namespace].read_current_observation_receipt_v1(
                     credential=credential, subject=subject, effect_id=effect_id)
-                return {"receipt": to_wire(receipt)}
+                from .observation_refinement_contract_v3 import to_wire as observation_to_wire_v3
+                return {"receipt": observation_to_wire_v3(receipt)}
             if method == "execution_read_natural_final_effect_observation_v4" and set(command)=={"permit","effect_id"}:
                 permit=from_wire(command["permit"])
                 if type(permit) is not FencePermitV2 or permit.operation!="write" or to_wire(permit)!=command["permit"]:
@@ -3296,6 +3366,27 @@ class AuthorityRpcServer:
                     credential=credential, subject=subject,
                     claimed_receipt=claimed, handoff_id=handoff_id)
                 return {"start": start.to_wire()}
+            if method == "execution_refine_observation_v3" and set(command) == {
+                    "claimed_receipt", "observation"}:
+                from .observation_refinement_contract_v3 import to_wire as observation_to_wire_v3
+                claimed = from_wire(command["claimed_receipt"])
+                observation = from_wire(command["observation"])
+                if (type(claimed) is not MutationReceiptV2
+                        or claimed.pending.phase != "claimed"
+                        or claimed.durable_state != "committed"
+                        or type(claimed.pending.binding) is not ExecutionBindingV2
+                        or type(observation) is not PlatformObservationV2
+                        or observation.binding != claimed.pending.binding
+                        or claimed.pending.permit.subject != subject
+                        or to_wire(claimed) != command["claimed_receipt"]
+                        or to_wire(observation) != command["observation"]):
+                    raise AuthorityUnavailable("observation refinement identity differs")
+                namespace = claimed.pending.permit.namespace
+                self._bound_v2_service(credential, profile_id, manifest_digest, namespace)
+                receipt = self._v2_execution[namespace].execution_refine_observation_v3(
+                    credential=credential, subject=subject,
+                    claimed_receipt=claimed, observation=observation)
+                return {"receipt": observation_to_wire_v3(receipt)}
             if method == "execution_observe_v2" and set(command) == {
                     "claimed_receipt", "observation"}:
                 claimed = from_wire(command["claimed_receipt"])
@@ -3454,6 +3545,21 @@ class AuthorityRpcServer:
 
     def _dispatch(self, method, request, credential, channel_binding: bytes, *,
                   handshake_binding: str | None = None, command: object = None):
+        from ..runtime.d13_consumer_manifest_v3 import require_controlled_sdk_dormant_rpc_v3
+        require_controlled_sdk_dormant_rpc_v3(self,method)
+        from .maintenance_console_contract_v1 import MAINTENANCE_CONSOLE_METHOD_V1, MAINTENANCE_CONSOLE_PROTOCOL_V1
+        from .maintenance_console_rpc_v1 import dispatch_maintenance_console_v1, is_maintenance_console_peer_v1
+        console_peer = is_maintenance_console_peer_v1(self, credential.certificate_sha256)
+        console_request = type(request) is dict and request.get('protocol') == MAINTENANCE_CONSOLE_PROTOCOL_V1
+        if console_request or method == MAINTENANCE_CONSOLE_METHOD_V1:
+            if (not console_peer or not console_request or method != MAINTENANCE_CONSOLE_METHOD_V1
+                    or handshake_binding is not None or not channel_binding):
+                raise AuthorityUnavailable('independent console requires its exact installed TLS channel and method')
+            result = dispatch_maintenance_console_v1(self, method, credential,
+                request.get('console_profile_id'), request, command)
+            return {**result, 'channel_binding_sha256': hashlib.sha256(channel_binding).hexdigest()}
+        if console_peer:
+            raise AuthorityUnavailable('maintenance console identity cannot call Host or content RPC')
         maintenance = getattr(self, "_c09_maintenance_v1", None)
         wire = (_WireRequest(request.profile_id, request.plugin_name,
                 request.host_api_version, request.publisher_package.manifest_sha256)
@@ -3489,16 +3595,124 @@ class AuthorityRpcServer:
                            {service.namespace for service in lifecycle}):
             raise AuthorityUnavailable("independent lifecycle management scope differs")
         enrollment = method in {"handshake", "installation_grant_v2", "c09_storage_maintenance_v1"}
-        with ExitStack() as stack:
-            if not management and not enrollment and not installation_management:
-                for service in lifecycle:
-                    stack.enter_context(service.rpc_activity_v1())
-            # Installation management survives runtime disable, but never
-            # bypasses the current C09 storage/maintenance admission boundary.
-            if maintenance is not None and ((not management and not enrollment) or installation_management):
-                stack.enter_context(maintenance.gate.admit_peer_v1(peer=peer))
-            return self._dispatch_admitted(method, request, credential, channel_binding,
-                handshake_binding=handshake_binding, command=command)
+        generation_output = method in {
+            "natural_generation_output_select_v2", "natural_generation_output_recover_finish_v2"}
+        try:
+            with ExitStack() as stack:
+                if not management and not enrollment and not installation_management:
+                    for service in lifecycle:
+                        stack.enter_context(service.rpc_activity_v1())
+                # Installation management survives runtime disable, but never
+                # bypasses the current C09 storage/maintenance admission boundary.
+                if maintenance is not None and ((not management and not enrollment) or installation_management):
+                    stack.enter_context(maintenance.gate.admit_peer_v1(peer=peer))
+                result = self._dispatch_admitted(method, request, credential, channel_binding,
+                    handshake_binding=handshake_binding, command=command)
+        except BaseException:
+            if generation_output:
+                self._reconcile_generation_output_finish_v3(credential, wire, command)
+            raise
+        if generation_output:
+            if type(result) is _DeferredWorkerDelivery:
+                result.after_finish = lambda: self._reconcile_generation_output_finish_v3(credential, wire, command)
+            else:
+                self._reconcile_generation_output_finish_v3(credential, wire, command)
+        if (wire.protocol == AUTHORITY_V2_PROTOCOL and installation is not None
+                and method in {"owner_stop_reply_submit_v1", "owner_stop_reply_status_v1"}):
+            self._reconcile_stopped_counter_original_v3(credential, wire, command, result, installation)
+        cleanup_permit = None
+        if wire.protocol == AUTHORITY_V2_PROTOCOL and installation is not None:
+            from .v2_contract import from_wire
+            if method == "finish_fence" and result["finished"] is True:
+                cleanup_permit = from_wire(command["permit"])
+            elif method == "model_complete_observed_v2":
+                cleanup_permit = from_wire(result["permit"])
+            elif method == "model_no_dispatch_witness_v1":
+                cleanup_permit = from_wire(result["witness"]["original_permit"])
+        if cleanup_permit is not None:
+            service = self._d13_cache_use_controls_v2.get(
+                (cleanup_permit.namespace, installation.installation_id))
+            if service is not None:
+                try:
+                    # Successful content/model terminal dispatch has left its
+                    # original Gate. Admit this separate retained-receiver cleanup.
+                    with ExitStack() as cleanup:
+                        if maintenance is not None:
+                            cleanup.enter_context(maintenance.gate.admit_peer_v1(peer=peer))
+                        from ..runtime.d13_cache_use_admission_v2 import reconcile_d13_cache_use_cleanup_v2
+                        reconcile_d13_cache_use_cleanup_v2(service=service)
+                except Exception as failure:
+                    # A completed fence remains completed; cleanup keeps its
+                    # original durable pins and same operation for the next wake.
+                    self._d13_cache_use_cleanup_first_failures_v3.setdefault(
+                        (cleanup_permit.namespace, installation.installation_id),
+                        {"status": "held", "error_code": type(failure).__name__})
+                    diagnostic_channel_v1(__name__).warning(
+                        "D13 pending receiver cleanup HOLD: %s", type(failure).__name__)
+        return result
+
+    def _reconcile_stopped_counter_original_v3(self, credential, wire, command, result, installation):
+        from ..runtime.lifecycle_operations_v1 import decode_original
+        from ..runtime_contracts import canonical_digest as original_digest
+        namespace = command["namespace"]
+        service = self._d13_cache_use_controls_v2.get((namespace, installation.installation_id))
+        if service is None:
+            return
+        key = (namespace, installation.installation_id, original_digest(result["original"]))
+        if key in self._d13_stop_counter_cleanup_first_failures_v3:
+            return
+        try:
+            original = decode_original(result["original"])
+            with ExitStack() as cleanup:
+                maintenance = getattr(self, "_c09_maintenance_v1", None)
+                if maintenance is not None:
+                    cleanup.enter_context(maintenance.gate.admit_peer_v1(
+                        peer=(credential.certificate_sha256, wire.profile_id)))
+                from .d13_original_owner_v3 import reconcile_actual_d13_owner_stop_unused_counter_v3
+                # One genuine stop/status event advances at most one Counter.
+                # A partial cleanup is never reported as whole-parent completion.
+                reconcile_actual_d13_owner_stop_unused_counter_v3(self, service,
+                    credential=credential, profile_id=wire.profile_id,
+                    manifest_digest=wire.manifest_sha256, stop_original=original)
+        except Exception as failure:
+            self._d13_stop_counter_cleanup_first_failures_v3.setdefault(key,
+                {"status": "held", "error_code": type(failure).__name__})
+            diagnostic_channel_v1(__name__).warning(
+                "D13 stopped Counter cleanup HOLD: %s", type(failure).__name__)
+
+    def _reconcile_generation_output_finish_v3(self, credential, wire, command):
+        # Called after the original RPC Gate unwinds, or after the actual deferred
+        # finish. Only the producer's private parse/finish event can release owners.
+        if (type(command) is not dict or set(command) != {"namespace", "read_request"}
+                or type(command["namespace"]) is not str
+                or type(command["read_request"]) is not dict
+                or type(command["read_request"].get("read_attempt_id")) is not str):
+            return
+        namespace = command["namespace"]
+        service = self._v2_natural_generation_output_reads.get(namespace)
+        if service is None:
+            return
+        attempt = command["read_request"]["read_attempt_id"]
+        key = (namespace, credential.certificate_sha256, wire.profile_id, attempt)
+        if key in self._d13_generation_cleanup_first_failures_v3:
+            return
+        try:
+            with ExitStack() as cleanup:
+                maintenance = getattr(self, "_c09_maintenance_v1", None)
+                if maintenance is not None:
+                    cleanup.enter_context(maintenance.gate.admit_peer_v1(
+                        peer=(credential.certificate_sha256, wire.profile_id)))
+                from .d13_original_owner_v3 import reconcile_actual_d13_generation_output_cleanup_v3
+                reconcile_actual_d13_generation_output_cleanup_v3(self, service,
+                    credential=credential, profile_id=wire.profile_id,
+                    manifest_digest=wire.manifest_sha256, read_attempt_id=attempt)
+        except Exception as failure:
+            # Keep the original parse/finish outcome and first cleanup failure.
+            # Unknown owners stay pinned; this event never retries a held cleanup.
+            self._d13_generation_cleanup_first_failures_v3.setdefault(key,
+                {"status": "held", "error_code": type(failure).__name__})
+            diagnostic_channel_v1(__name__).warning(
+                "D13 generation finish cleanup HOLD: %s", type(failure).__name__)
 
     def _dispatch_admitted(self, method, request, credential, channel_binding: bytes, *,
                   handshake_binding: str | None = None,
@@ -3553,13 +3767,152 @@ class AuthorityRpcServer:
             original=model.bind_observed_d13_provider_http_v1(credential=credential,subject='mtls:sha256:'+peer,
                 holder=installed.administrator_holder,intent=intent,admission=admission,content=content)
             return {'binding':original,'channel_binding_sha256':binding}
-        if method in {"prepare_current_d13_frame_v7","count_current_d13_wire_v1"}:
+        if method == "read_d13_model_accounting_metadata_v3":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace','graph_namespace','call_id'}
+                    or type(command['graph_namespace']) is not dict
+                    or set(command['graph_namespace']) != {'bot_id','persona_id'}):
+                raise AuthorityUnavailable('accounting metadata requires its exact selector-only V2 command')
+            namespace = identifier(command['namespace'],'namespace')
+            graph_namespace = NamespaceId(**command['graph_namespace'])
+            self._bound_v2_service(credential,wire.profile_id,wire.manifest_sha256,namespace)
+            installed = self._installations_v2[(peer,wire.profile_id)]
+            model = self._v2_model_egress.get(namespace)
+            if (model is None or self._namespace_bindings_v2.get((peer,wire.profile_id,graph_namespace)) != namespace):
+                raise AuthorityUnavailable('accounting metadata reader crosses its actual paired namespace')
+            bundle = model._graph_verifier._artifact_draft_bundle
+            if (bundle.installation_policy.installation_id != installed.installation_id
+                    or bundle.installation_policy.manifest_digest != wire.manifest_sha256):
+                raise AuthorityUnavailable('accounting metadata profile differs from the current installed model')
+            from .d13_accounting_metadata_v3 import read_d13_model_accounting_metadata_v3
+            result = read_d13_model_accounting_metadata_v3(model,server=self,bundle=bundle,
+                credential=credential,subject='mtls:sha256:'+peer,namespace=graph_namespace,
+                call_id=identifier(command['call_id'],'call_id'))
+            encoded = asdict(result)
+            encoded['permit'] = None if result.permit is None else to_wire(result.permit)
+            return {'accounting':encoded,'channel_binding_sha256':binding}
+        if method == "read_pending_natural_parent_closures_v3":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace', 'graph_namespace', 'after_operation_id', 'limit'}
+                    or type(command['graph_namespace']) is not dict
+                    or set(command['graph_namespace']) != {'bot_id', 'persona_id'}):
+                raise AuthorityUnavailable('natural parent discovery requires its exact bodyless V2 selector')
+            namespace = identifier(command['namespace'], 'namespace')
+            graph_namespace = NamespaceId(**command['graph_namespace'])
+            self._bound_v2_service(credential, wire.profile_id, wire.manifest_sha256, namespace)
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            service = self._d13_cache_use_controls_v2.get((namespace, installed.installation_id))
+            if (service is None or service.namespace != graph_namespace
+                    or self._self_identity_readers_v2.get(namespace) != (peer, wire.profile_id)
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, graph_namespace)) != namespace):
+                raise AuthorityUnavailable('natural parent discovery crosses its installed Self/namespace reader')
+            from .d13_original_owner_v3 import _actual_peer_admission_v3
+            _actual_peer_admission_v3(self, service, credential, wire.profile_id, wire.manifest_sha256)
+            page = service.read_pending_natural_parent_closures_v3(credential=credential,
+                subject='mtls:sha256:' + peer, namespace=graph_namespace,
+                after_operation_id=command['after_operation_id'], limit=command['limit'])
+            return {'page': asdict(page), 'channel_binding_sha256': binding}
+        if method == "read_natural_parent_closure_original_v3":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace', 'graph_namespace', 'candidate'}
+                    or type(command['graph_namespace']) is not dict
+                    or set(command['graph_namespace']) != {'bot_id', 'persona_id'}
+                    or type(command['candidate']) is not list):
+                raise AuthorityUnavailable('natural parent original requires its exact bodyless V2 selector')
+            namespace = identifier(command['namespace'], 'namespace')
+            graph_namespace = NamespaceId(**command['graph_namespace'])
+            self._bound_v2_service(credential, wire.profile_id, wire.manifest_sha256, namespace)
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            service = self._d13_cache_use_controls_v2.get((namespace, installed.installation_id))
+            if (service is None or service.namespace != graph_namespace
+                    or self._self_identity_readers_v2.get(namespace) != (peer, wire.profile_id)
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, graph_namespace)) != namespace):
+                raise AuthorityUnavailable('natural parent original crosses its installed Self/namespace reader')
+            from .d13_original_owner_v3 import _actual_peer_admission_v3
+            _actual_peer_admission_v3(self, service, credential, wire.profile_id, wire.manifest_sha256)
+            original = service.read_natural_parent_closure_original_v3(credential=credential,
+                subject='mtls:sha256:' + peer, namespace=graph_namespace,
+                candidate=tuple(command['candidate']))
+            return {'original': asdict(original), 'channel_binding_sha256': binding}
+        if method == "read_pending_natural_parent_closures_v4":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace', 'graph_namespace', 'after_operation_id', 'limit'}
+                    or type(command['graph_namespace']) is not dict
+                    or set(command['graph_namespace']) != {'bot_id', 'persona_id'}):
+                raise AuthorityUnavailable('natural parent discovery requires its exact bodyless V2 selector')
+            namespace = identifier(command['namespace'], 'namespace')
+            graph_namespace = NamespaceId(**command['graph_namespace'])
+            self._bound_v2_service(credential, wire.profile_id, wire.manifest_sha256, namespace)
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            service = self._d13_cache_use_controls_v2.get((namespace, installed.installation_id))
+            if (service is None or service.namespace != graph_namespace
+                    or self._self_identity_readers_v2.get(namespace) != (peer, wire.profile_id)
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, graph_namespace)) != namespace):
+                raise AuthorityUnavailable('natural parent discovery crosses its installed Self/namespace reader')
+            from .d13_original_owner_v3 import _actual_peer_admission_v3
+            _actual_peer_admission_v3(self, service, credential, wire.profile_id, wire.manifest_sha256)
+            owner = self._owner_stop_reply_services_v1.get((namespace, installed.installation_id))
+            if owner is None:
+                raise AuthorityUnavailable('V4 parent progress has no actual installed natural owner service')
+            maintenance = owner.natural_disposition_maintenance
+            page = service.read_pending_natural_parent_closures_v4(credential=credential,
+                subject='mtls:sha256:' + peer, namespace=graph_namespace, maintenance=maintenance,
+                after_operation_id=command['after_operation_id'], limit=command['limit'])
+            return {'page': asdict(page), 'channel_binding_sha256': binding}
+        if method == "read_natural_parent_closure_original_v4":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace', 'graph_namespace', 'candidate'}
+                    or type(command['graph_namespace']) is not dict
+                    or set(command['graph_namespace']) != {'bot_id', 'persona_id'}
+                    or type(command['candidate']) is not dict):
+                raise AuthorityUnavailable('natural parent original requires its exact bodyless V2 selector')
+            namespace = identifier(command['namespace'], 'namespace')
+            graph_namespace = NamespaceId(**command['graph_namespace'])
+            self._bound_v2_service(credential, wire.profile_id, wire.manifest_sha256, namespace)
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            service = self._d13_cache_use_controls_v2.get((namespace, installed.installation_id))
+            if (service is None or service.namespace != graph_namespace
+                    or self._self_identity_readers_v2.get(namespace) != (peer, wire.profile_id)
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, graph_namespace)) != namespace):
+                raise AuthorityUnavailable('natural parent original crosses its installed Self/namespace reader')
+            from .d13_original_owner_v3 import _actual_peer_admission_v3
+            _actual_peer_admission_v3(self, service, credential, wire.profile_id, wire.manifest_sha256)
+            owner = self._owner_stop_reply_services_v1.get((namespace, installed.installation_id))
+            if owner is None:
+                raise AuthorityUnavailable('V4 parent progress has no actual installed natural owner service')
+            maintenance = owner.natural_disposition_maintenance
+            from .d13_cache_use_contract_v2 import natural_parent_closure_candidate_from_wire_v4
+            candidate = natural_parent_closure_candidate_from_wire_v4(command['candidate'])
+            original = service.read_natural_parent_closure_original_v4(credential=credential,
+                subject='mtls:sha256:' + peer, namespace=graph_namespace, maintenance=maintenance,
+                candidate=candidate)
+            return {'original': asdict(original), 'channel_binding_sha256': binding}
+        if method == "read_current_d13_pressure_mapping_v1":
+            if (wire.protocol != AUTHORITY_V2_PROTOCOL or type(command) is not dict
+                    or set(command) != {'namespace', 'counter_operation_id'}):
+                raise AuthorityUnavailable("pressure metadata requires its exact selector-only V2 command")
+            namespace = identifier(command['namespace'], 'namespace')
+            self._bound_v2_service(credential, wire.profile_id, wire.manifest_sha256, namespace)
+            installed = self._installations_v2[(peer, wire.profile_id)]
+            service = self._d13_core_counters_v1.get((namespace, installed.installation_id))
+            if (service is None or self._self_identity_readers_v2.get(namespace) != (peer, wire.profile_id)
+                    or self._namespace_bindings_v2.get((peer, wire.profile_id, service.namespace)) != namespace):
+                raise AuthorityUnavailable("pressure reader is not its actual installed Self namespace reader")
+            original = service.read_current_d13_pressure_mapping_v1(
+                counter_operation_id=identifier(command['counter_operation_id'], 'counter_operation_id'),
+                read_credential=credential, subject='mtls:sha256:' + peer)
+            return {'mapping': None if original is None else asdict(original),
+                'channel_binding_sha256': binding}
+        if method in {"prepare_current_d13_frame_v7","count_current_d13_wire_v1","read_or_finalize_accounted_d13_wire_v1"}:
             from .d13_core_counter_contract_v1 import (
                 D13CurrentFramePrepareSelectorV7,D13CurrentWireCountSelectorV1,
                 D13CoreFrameIntentHeaderV7,D13CoreFullWireEnvelopeV1,
                 D13CounterCPUPrepareInstructionV1,D13CounterAwaitingAccountingV1,
                 d13_core_counter_from_wire_v1)
-            if wire.protocol!=AUTHORITY_V2_PROTOCOL or type(command) is not dict or set(command)!={"namespace","selector"}:
+            accounted_only=method=="read_or_finalize_accounted_d13_wire_v1"
+            expected_fields=({"namespace","selector","awaiting","accounting_receipt"} if accounted_only
+                else {"namespace","selector"})
+            if wire.protocol!=AUTHORITY_V2_PROTOCOL or type(command) is not dict or set(command)!=expected_fields:
                 raise AuthorityUnavailable("Core counter requires its closed selector-only V2 command")
             namespace=identifier(command["namespace"],"namespace")
             self._bound_v2_service(credential,wire.profile_id,wire.manifest_sha256,namespace)
@@ -3575,13 +3928,18 @@ class AuthorityRpcServer:
             if kind is D13CurrentFramePrepareSelectorV7 and selector.namespace!=service.namespace:
                 raise AuthorityUnavailable("Core counter preparation crosses actual Graph namespace")
             subject="mtls:sha256:"+peer
-            result=(service.prepare_current_d13_frame_v7(selector=selector,
-                    read_credential=credential,subject=subject)
-                if kind is D13CurrentFramePrepareSelectorV7 else service.count_current_d13_wire_v1(
-                    selector=selector,read_credential=credential,subject=subject))
+            if accounted_only:
+                awaiting=d13_core_counter_from_wire_v1(command['awaiting'],D13CounterAwaitingAccountingV1)
+                result=service.read_or_finalize_accounted_d13_wire_v1(selector=selector,awaiting=awaiting,
+                    accounting_receipt=command['accounting_receipt'],read_credential=credential,subject=subject)
+            else:
+                result=(service.prepare_current_d13_frame_v7(selector=selector,
+                        read_credential=credential,subject=subject)
+                    if kind is D13CurrentFramePrepareSelectorV7 else service.count_current_d13_wire_v1(
+                        selector=selector,read_credential=credential,subject=subject))
             if type(result) is D13CounterCPUPrepareInstructionV1 and kind is D13CurrentFramePrepareSelectorV7:
                 key="progress"
-            elif type(result) is D13CounterAwaitingAccountingV1 and kind is D13CurrentWireCountSelectorV1:
+            elif type(result) is D13CounterAwaitingAccountingV1 and kind is D13CurrentWireCountSelectorV1 and not accounted_only:
                 key="progress"
             elif type(result) is D13CoreFrameIntentHeaderV7 and kind is D13CurrentFramePrepareSelectorV7:
                 key="frame"
@@ -3716,6 +4074,8 @@ class AuthorityRpcServer:
                     namespace_id=namespace_id, request_id=command["request_id"],
                 )
             else:
+                self._recover_observation_fact_before_bootstrap_v3(
+                    credential=credential, subject="mtls:sha256:" + peer, namespace=namespace)
                 result = service.namespace_bootstrap(
                     credential=credential, subject="mtls:sha256:" + peer,
                     namespace_id=namespace_id,
@@ -3762,21 +4122,10 @@ class AuthorityRpcServer:
             command=command,
         )
 
-    def _dispatch_for_test(self, method, request, credential: MtlsPeerCredential,
-                           channel_binding: bytes, *,
-                           handshake_binding: str | None = None,
-                           command: object = None) -> dict[str, object]:
-        """Private deterministic seam; tests still provide an mTLS-shaped peer."""
-        if not isinstance(credential, MtlsPeerCredential):
-            raise TypeError("MtlsPeerCredential is required for test dispatch")
-        return self._dispatch(
-            method, request, credential, channel_binding,
-            handshake_binding=handshake_binding,
-            command=command,
-        )
-
     async def _dispatch_on_worker(self, method, request, credential, binding,
                                   handshake_binding, command, *, _first_owner_phase=False) -> dict[str, object]:
+        from ..runtime.d13_consumer_manifest_v3 import require_controlled_sdk_dormant_rpc_v3
+        require_controlled_sdk_dormant_rpc_v3(self,method)
         if method == 'first_owner_issue_v1' and not _first_owner_phase:
             if self._worker_closed or self._first_owner_closing_v1 or not self._first_owner_slot_v1.acquire(blocking=False):
                 raise RuntimeError('first Owner orchestration unavailable')
@@ -3877,6 +4226,8 @@ class AuthorityRpcServer:
                 )
             shutdown = self._worker_shutdown_task
         await asyncio.shield(shutdown)
+        from .retention_control_metadata_v1 import release_retention_control_metadata_v1
+        release_retention_control_metadata_v1(self)
 
     async def serve_connection(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -3902,12 +4253,21 @@ class AuthorityRpcServer:
                     "command"
                 }:
                     raise RuntimeError("authority unavailable")
-                if (payload.get("protocol") not in (AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL)
+                from .maintenance_console_contract_v1 import MAINTENANCE_CONSOLE_PROTOCOL_V1
+                if (payload.get("protocol") not in (AUTHORITY_PROTOCOL, AUTHORITY_V2_PROTOCOL, MAINTENANCE_CONSOLE_PROTOCOL_V1)
                         or not isinstance(payload.get("request_id"), str)
                         or not isinstance(payload.get("method"), str)):
                     raise RuntimeError("authority unavailable")
                 result = None
                 try:
+                    if payload['protocol'] == MAINTENANCE_CONSOLE_PROTOCOL_V1:
+                        from uuid import UUID
+                        from .maintenance_console_contract_v1 import MAINTENANCE_CONSOLE_METHOD_V1
+                        request_id = UUID(payload['request_id'])
+                        if (set(payload) != {'protocol', 'request_id', 'method', 'request', 'command'}
+                                or str(request_id) != payload['request_id'] or request_id.version != 4
+                                or payload['method'] != MAINTENANCE_CONSOLE_METHOD_V1):
+                            raise AuthorityUnavailable('console requires its exact finite request envelope')
                     if (type(payload.get("request")) is not dict
                             or payload["request"].get("protocol") != payload["protocol"]):
                         raise RuntimeError("authority unavailable")

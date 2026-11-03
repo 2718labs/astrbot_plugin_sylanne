@@ -1,4 +1,4 @@
-"""Closed provenance for a pinned alpha1 test snapshot, separate from release CI."""
+"""Read-only installed package qualification and historical candidate provenance."""
 import json
 import re
 from ..runtime_contracts import canonical_digest
@@ -43,26 +43,10 @@ def _sha(value):
     return type(value) is str and re.fullmatch('[0-9a-f]{64}',value) is not None
 
 
-def qualify_test_snapshot_v1(candidate):
-    value=dict(candidate)
-    value.update(schema=QUALIFICATION_SCHEMA,status='alpha1_test_snapshot',product_status='test_snapshot')
-    return value
 
 
-def qualify_alpha2_candidate_v1(candidate):
-    value = dict(candidate)
-    value.update(schema=ALPHA2_QUALIFICATION_SCHEMA, status='alpha2_candidate',
-        product_status='candidate_only', runtime_scope=ALPHA2_RUNTIME_SCOPE,
-        unmet_product_gates=list(ALPHA2_UNMET_GATES))
-    return value
 
 
-def qualify_beta1_candidate_v1(candidate):
-    value = dict(candidate)
-    value.update(schema=BETA1_QUALIFICATION_SCHEMA, status='beta1_candidate',
-        product_status='candidate_only', runtime_scope=BETA1_RUNTIME_SCOPE,
-        unmet_product_gates=list(BETA1_UNMET_GATES))
-    return value
 
 
 def validate_beta1_candidate_manifest_v1(manifest):

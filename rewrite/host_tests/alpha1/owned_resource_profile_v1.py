@@ -61,6 +61,7 @@ class FixtureKind(StrEnum):
     SDK_GREETING = "sdk_greeting"
     SDK_D13_V6_256 = "sdk_d13_v6_256"
     SDK_D13_V7_256 = "sdk_d13_v7_256"
+    SDK_V10_D13_V7_256 = "sdk_v10_d13_v7_256"
     SDK_REAL_ELAPSED = "sdk_real_elapsed"
     SDK_M1_NATURAL_STOP = "sdk_m1_natural_stop"
     SDK_M1_NATURAL_UNKNOWN = "sdk_m1_natural_unknown"
@@ -133,6 +134,8 @@ FIXTURE_NODES.update({
         "host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_a06_actual_installed_sdk_real_elapsed_day0_day4_day5_resume",),
     "sdk_d13_v7_256": (
         "host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_l03_actual_installed_sdk_d13_v7_256_current_core_count_paid_native_cold_replay",),
+    "sdk_v10_d13_v7_256": (
+        "host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_l03_actual_installed_sdk_v10_d13_v7_256_current_core_count_paid_native_cold_replay",),
     "m1_owner_source_note_full": (
         "tests/alpha1/integration/test_installed_owner_source_note_task_v1.py::test_installed_owner_source_note_public_material_full_self_task_v1",),
     "m1_owner_source_note_cancel": (
@@ -176,7 +179,7 @@ PHASE_FIXTURE_KINDS = frozenset({"c09_current", "m1_phase_full", "m1_phase_revis
     "m1_owner_source_note_full", "m1_owner_source_note_cancel", "m1_owner_source_note_unknown", "m1_owner_source_note_failed",
     "installed_l02_c3_restart", "installed_l02_offline_restart"})
 L02_FIXTURE_KINDS = frozenset({"installed_l02_c3_restart", "installed_l02_offline_restart"})
-SDK_M1_KINDS = frozenset({"sdk_m1", "sdk_m1_natural_stop", "sdk_m1_natural_unknown", "sdk_ordinary_recall", "sdk_greeting", "sdk_d13_v6_256", "sdk_d13_v7_256", "sdk_real_elapsed"})
+SDK_M1_KINDS = frozenset({"sdk_m1", "sdk_m1_natural_stop", "sdk_m1_natural_unknown", "sdk_ordinary_recall", "sdk_greeting", "sdk_d13_v6_256", "sdk_d13_v7_256", "sdk_v10_d13_v7_256", "sdk_real_elapsed"})
 FIXTURE_NODES.update({
     "sdk_d13_v6_256": (
         "host_tests/alpha1/test_b04_installed_lifecycle_v1.py::test_l03_actual_installed_sdk_d13_v6_256_current_paid_native_cold_replay_expiry",),
@@ -206,6 +209,9 @@ METRICS = ("cgroup.events", "memory.current", "memory.peak", "memory.events",
            "memory.events.local", "memory.stat", "memory.swap.current", "memory.swap.events",
            "cpu.stat", "cpu.pressure", "memory.pressure")
 
+
+V10_COMPOSITE_SCHEMA = "sylanne.beta1.protected-numeric-d13-v10-v7-256-suite.v1"
+V10_COMPOSITE_KINDS = ("numeric", "d13_full", "sdk_v10_d13_v7_256")
 
 BETA1_CURRENT_SUITE_KINDS=frozenset({"numeric","numeric_positive","numeric_authorization_groups","numeric_registration","d13_full"})
 BETA1_PACKAGE_NAME="astrbot_plugin_sylanne-3.0.0-beta1-linux-x86_64-glibc-beta1-candidate.zip"
@@ -251,6 +257,13 @@ def _validate_c09_engineering_inventory_v1(spec):
     if (inventory["schema"] != "sylanne.engineering-source-inventory.v1"
             or inventory["sha256"] != actual or spec.engineering_inventory_sha256 != actual):
         raise ValueError("externally pinned current C09 engineering inventory required")
+    if spec.suite_contract == V10_COMPOSITE_SCHEMA:
+        source=Path(spec.frozen_rewrite_root).parent
+        for row in inventory["files"]:
+            member=source/row["path"];body=member.read_bytes()
+            if (member.is_symlink() or not member.resolve(strict=True).is_relative_to(source)
+                    or len(body)!=row["bytes"] or sha256(body).hexdigest()!=row["sha256"]):
+                raise ValueError("actual V10 engineering source differs: "+row["path"])
 
 
 @dataclass(frozen=True)
@@ -277,6 +290,7 @@ class OwnedResourceRunV1:
     sdk_root: str | None = field(default=None, kw_only=True)
     phase_setup_root: str | None = field(default=None, kw_only=True)
     engineering_inventory_sha256: str | None = field(default=None, kw_only=True)
+    suite_contract: str | None = field(default=None, kw_only=True)
     real_elapsed_phase: str | None = field(default=None, kw_only=True)
     real_elapsed_directory: str | None = field(default=None, kw_only=True)
     real_elapsed_approval: str | None = field(default=None, kw_only=True)
@@ -352,7 +366,12 @@ class OwnedResourceRunV1:
                       self.dependency_sha256, self.request_sha256):
             if len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
                 raise ValueError("external byte pins required")
-        if self.fixture_kind == "c09_current":
+        if self.suite_contract is not None and (self.suite_contract != V10_COMPOSITE_SCHEMA
+                or self.fixture_kind not in V10_COMPOSITE_KINDS):
+            raise ValueError("exact independently selected V10 composite child contract required")
+        if self.fixture_kind == "sdk_v10_d13_v7_256" and self.suite_contract != V10_COMPOSITE_SCHEMA:
+            raise ValueError("new V10/V7 fixture requires its explicit composite contract")
+        if self.fixture_kind == "c09_current" or self.suite_contract == V10_COMPOSITE_SCHEMA:
             _validate_c09_engineering_inventory_v1(self)
         elif self.engineering_inventory_sha256 is not None:
             raise ValueError("engineering inventory pin is only valid for current C09")
@@ -458,7 +477,7 @@ def _private_json(path, value):
 
 
 def _pin_inputs_in_child(spec):
-    if spec.fixture_kind == "c09_current":
+    if spec.fixture_kind == "c09_current" or spec.suite_contract == V10_COMPOSITE_SCHEMA:
         _validate_c09_engineering_inventory_v1(spec)
     inputs = ((spec.package_path, spec.package_sha256),
                       (str(Path(spec.frozen_rewrite_root) / FIXTURE_NODES[spec.fixture_kind][0].split("::")[0]), spec.helper_sha256),
@@ -612,12 +631,16 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
             SYLANNE_SDK_M1_REAL_ELAPSED_APPROVAL=spec.real_elapsed_approval)
     for name in ("INSTALLED_ROOT", "MANIFEST_SHA256", "TEST_ROOT", "ENGINEERING_INVENTORY_SHA256"):
         environment.pop("SYLANNE_C09_" + name, None)
-    if spec.fixture_kind == "c09_current":
+    if spec.fixture_kind == "c09_current" or (spec.suite_contract == V10_COMPOSITE_SCHEMA
+            and spec.fixture_kind in {"numeric", "d13_full"}):
         environment.update(SYLANNE_C09_INSTALLED_ROOT=spec.installed_root,
             SYLANNE_C09_MANIFEST_SHA256=spec.manifest_sha256,
             SYLANNE_C09_TEST_ROOT=str(Path(spec.frozen_rewrite_root).parent),
             SYLANNE_C09_ENGINEERING_INVENTORY_SHA256=spec.engineering_inventory_sha256,
             SYLANNE_QUAL_SDK_ROOT=spec.sdk_root)
+    if spec.suite_contract == V10_COMPOSITE_SCHEMA and spec.fixture_kind == "sdk_v10_d13_v7_256":
+        environment.update(SYLANNE_C09_TEST_ROOT=str(Path(spec.frozen_rewrite_root).parent),
+            SYLANNE_C09_ENGINEERING_INVENTORY_SHA256=spec.engineering_inventory_sha256)
     environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     environment.pop("PYTEST_ADDOPTS", None)
     environment.pop("SYLANNE_ARTIFACT_PHASE_FIXTURE_SETUP", None)
@@ -665,7 +688,7 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
         topology = _topology(parent)
         initial = set(_read(parent / "cgroup.subtree_control").split())
         available = set(_read(parent / "cgroup.controllers").split())
-        required_controllers={"cpu", "memory", "pids"} if spec.fixture_kind=="sdk_d13_v7_256" else {"cpu", "memory"}
+        required_controllers={"cpu", "memory", "pids"} if spec.fixture_kind in {"sdk_d13_v7_256", "sdk_v10_d13_v7_256"} else {"cpu", "memory"}
         if not required_controllers <= available:
             raise ValueError("actual CPU/memory controllers unavailable")
         missing = required_controllers - initial
@@ -872,6 +895,13 @@ def run_owned_resource_profile_v1(spec, *, cgroup_parent="/sys/fs/cgroup", timeo
 
 
 if __name__ == "__main__":
+    if len(sys.argv)==4 and sys.argv[1]=="--v10-composite":
+        sys.path.insert(0,str(Path(__file__).resolve().parents[3]))
+        from rewrite.host_tests.alpha1.c09_root_phase_harness_v3 import run_root_controlled_beta1_numeric_d13_v10_v7_256_suite_v1
+        result=run_root_controlled_beta1_numeric_d13_v10_v7_256_suite_v1(
+            descriptor_path=sys.argv[2],descriptor_sha256=sys.argv[3],profile=globals())
+        print(json.dumps(result,sort_keys=True))
+        raise SystemExit(0 if result['status']=='PASS'else 2)
     if len(sys.argv) != 3 or sys.argv[1] != "--fixed-child":
-        raise SystemExit("only the fixed owned fixture child entry is supported")
+        raise SystemExit("only fixed child or explicitly pinned --v10-composite entries are supported")
     raise SystemExit(_fixed_child(sys.argv[2]))

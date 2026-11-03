@@ -14,8 +14,10 @@ import weakref
 
 from ..domains.d01.production_operations_v1 import plain_v1, stage_result_v1
 from ..domains.d04.affect import _decode_appraisal
+from ..domains.d04.contribution_ledger_v3 import TYPE_NAME as CONTRIBUTION_LEDGER_TYPE
 from ..domains.d04.joint_state_output_v1 import joint_checkpoint_payload_v1, joint_state_payload_v1
-from ..domains.d04.numeric_drive import decode_sourced_numeric_drive
+from ..domains.d04.numeric_coupling import TYPE_NAME as NUMERIC_COUPLING_TYPE
+from ..domains.d04.numeric_drive import TYPE_NAME as NUMERIC_DRIVE_TYPE, decode_sourced_numeric_drive
 from ..graph_types import AtomKey, GraphVersion
 from ..runtime_contracts import NamespaceId, canonical_digest, canonical_serialize
 from .d01_production_operations_v1 import CurrentDomainReadV1, production_read_plan_v1
@@ -31,6 +33,11 @@ SCHEMA = 'd04.life-encoding-baseline.v1'
 KIND = 'd04_interval_baseline_v1'
 COMPONENT_TYPES = ('d04.numeric_checkpoint.v1', 'd04.numeric_checkpoint.v2',
     'd04.feeling_state.v1', 'd04.mood_field.v1', 'd04.authored_feeling_state.v1', 'd04.authored_mood_state.v1')
+# Life joint numeric inventory: the component types plus the coupling topology and
+# the contribution ledger. Declaring them in the joint/drive read plan makes the
+# Method census produce complete inventories before Source ALL, so the joint
+# component never has to discover couplings/ledger rows through raw storage.
+LIFE_NUMERIC_COMPONENT_TYPES = (*COMPONENT_TYPES, NUMERIC_COUPLING_TYPE, NUMERIC_DRIVE_TYPE, CONTRIBUTION_LEDGER_TYPE)
 INVENTORIES = (*COMPONENT_TYPES, 'd04.appraisal_bundle.v1', 'd07.current_interpretation.v1', 'd07.belief_revision.v1')
 _STAGES = {}
 _CURRENT = {}

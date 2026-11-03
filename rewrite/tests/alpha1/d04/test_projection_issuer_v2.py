@@ -146,7 +146,7 @@ def test_uninstalled_candidate_package_fails_closed(tmp_path: Path):
 def test_pinned_candidate_policy_is_not_an_installed_policy(tmp_path: Path,
                                                              monkeypatch):
     monkeypatch.setattr(
-        "sylanne3.domains.d04.projection_issuer_v2.verify_installed_package",
+        "sylanne3.domains.d04.projection_issuer_v2.verify_installed_backend_runtime_v1",
         lambda *args, **kwargs: SimpleNamespace(
             verified=True, build_mode="formal-alpha1",
         ),

@@ -326,15 +326,16 @@ def record_contact_plan_physical_after_cas_v3(db,*,prepared,receipt):
 
 
 def verify_selected_contact_plan_cell_origin_v3(db,*,basis,cell_id,header,original,meter):
-    from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+    from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3,runtime_storage_basis_identity_v4
     from ..runtime_contracts import namespace_ref
     from .domain_production_originals_v1 import PHYSICAL_TABLE
     ns = NamespaceId(*original['namespace'])
+    identity=runtime_storage_basis_identity_v4(basis,role='graph',meter=meter)
     operation,locator,proof = original['operation_id'],original['locator'],original['read_proof']
-    if (namespace_ref(ns)!=basis.prepared['namespace'] or header[2]!=operation
+    if (identity.namespace!=ns or identity.authority_namespace!=namespace_ref(ns) or header[2]!=operation
             or set(proof)!={'schema','stream_ref','request_digest','permit_digest','readset_digest',
                 'namespace_epoch','source_selection_digest'}):
-        raise ValueError('Contact Plan3 selected producer scope/closed origin proof differs')
+        raise ValueError('Contact Plan3 actual producer scope/closed origin proof differs')
     physical = _runtime_bounded_fixed_row_v3(db,meter,PHYSICAL_TABLE,
         ('domain','operation_kind','original_digest','original_payload_cell_id','prepared_digest','bundle_digest','receipt_digest'),
         'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,operation))

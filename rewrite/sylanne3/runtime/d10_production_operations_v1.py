@@ -733,7 +733,13 @@ def read_plan_current_d10_operation_v1(db, *, namespace, activity_id, operation_
                     effect = action["identity"]["effect_id"]
                     keys.append(AtomKey(Owner("activity", *namespace.as_tuple, activity_id), "d10.life_progress.v1", effect))
                     source_id = "d10-life-experience:" + canonical_digest((activity_id, effect))[:48]
-                    keys.extend((source_key(*namespace.as_tuple, source_id), access_key(*namespace.as_tuple, source_id)))
+                    from ..domains.d06.inspection_metadata_v1 import inspection_key_v1
+                    from ..runtime_storage_v3 import read_graph_row_v3
+                    sk = source_key(*namespace.as_tuple, source_id)
+                    source_head = read_graph_row_v3(db, ("revision",), where="token=? AND bot=? AND persona=?",
+                        parameters=(sk.token, *namespace.as_tuple))
+                    keys.extend((sk, access_key(*namespace.as_tuple, source_id),
+                        inspection_key_v1(sk, (source_head[0] if source_head is not None else 0) + 1)))
                 from .d02_production_operations_v1 import read_plan_current_d02_operation_v1
                 body = read_plan_current_d02_operation_v1(db, namespace=namespace, activity_id=activity_id,
                     operation_kind="apply_body_effect", request=ApplyCurrentBodyEffectRequestV1(**plan["body_effect_request"]))

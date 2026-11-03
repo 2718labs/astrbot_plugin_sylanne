@@ -31,6 +31,7 @@ from sylanne3.workbench_api.http_transport import (
 )
 
 from test_graph_v2_provisioning import _owner_issue_case
+from graph_worker_harness_v1 import run_graph_call_v1
 
 
 def _request(namespace, source_ref, target_ref, access_epoch, deletion_epoch, *,
@@ -165,11 +166,13 @@ def test_source_correction_commits_atomic_bundle_and_replays_exact_receipt(tmp_p
     case, request, kwargs, source, _, target, belief = _case(tmp_path)
     store, authority_db, coordinator, namespace = case
     try:
-        receipt = coordinator.commit_source_correction_v1(request=request, **kwargs)
+        receipt = run_graph_call_v1(store, coordinator,
+            lambda c: c.commit_source_correction_v1(request=request, **kwargs))
         assert receipt.operation_id == request.operation_id
         assert receipt.source_refs == request.source_refs
         assert receipt.invalidated_target_refs == request.target_refs
-        assert coordinator.commit_source_correction_v1(request=request, **kwargs) == receipt
+        assert run_graph_call_v1(store, coordinator,
+            lambda c: c.commit_source_correction_v1(request=request, **kwargs)) == receipt
         db = store._db
         correction = db.execute(
             "SELECT value FROM graph_atoms WHERE token=?",
@@ -211,7 +214,8 @@ def test_source_correction_commits_atomic_bundle_and_replays_exact_receipt(tmp_p
             request.deletion_epoch, operation_id=request.operation_id,
             statement="Different claim")
         with pytest.raises(UnavailableGuard):
-            coordinator.commit_source_correction_v1(request=changed, **kwargs)
+            run_graph_call_v1(store, coordinator,
+                lambda c: c.commit_source_correction_v1(request=changed, **kwargs))
     finally:
         store.close()
         authority_db.close()

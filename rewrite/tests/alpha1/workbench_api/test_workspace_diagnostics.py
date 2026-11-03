@@ -38,6 +38,8 @@ class Registry:
 class Coordinator:
     def __init__(self):
         self.calls = 0
+        # The current issuer reads the real coordinator's private owner-lease map.
+        self._GraphCoordinator__owner_leases = {}
         atom = GraphAtom(AtomKey(Owner("persona", "bot", "persona"),
                                  "d01.public.v1", "current"), 1, {"private": "secret"})
         self.page = GraphPage(GraphSnapshot((atom,),
@@ -68,13 +70,18 @@ def test_authorized_workspace_reports_real_partial_read_without_content():
     service = WorkbenchService(GraphWorkbenchIssuer(coordinator, resolver, Registry()))
     result = service.handle(request(), session=session(), context=CONTEXT)
     assert result.status == "ready"
+    # Workspace opening reports catalogue diagnostics only; it never opens view content.
+    assert result.projection["views"] == ({
+        "view_type": "overview", "status": "unsupported",
+        "reason_code": "legacy_view_requires_source_work",
+    },)
     assert result.projection["view_diagnostics"] == ({
-        "view_type": "overview", "read_status": "ready",
-        "coverage": "partial", "snapshot_epoch": 9,
+        "view_type": "overview", "read_status": "unsupported",
+        "reason_code": "legacy_view_requires_source_work",
     },)
     assert "private_content" not in str(result.projection["view_diagnostics"])
     assert "secret" not in str(result.projection["view_diagnostics"])
-    assert coordinator.calls == 1
+    assert coordinator.calls == 0
 
 
 def test_unauthorized_workspace_does_not_resolve_or_query():
@@ -92,8 +99,13 @@ def test_failed_graph_read_reports_reason_without_advertising_view():
     service = WorkbenchService(GraphWorkbenchIssuer(coordinator, resolver, Registry()))
     result = service.handle(request(), session=session(), context=CONTEXT)
     assert result.status == "ready"
-    assert result.projection["views"] == ({"view_type": "overview", "status": "unavailable"},)
-    assert result.projection["view_diagnostics"] == ({
-        "view_type": "overview", "read_status": "unavailable",
-        "problem_code": "invalid_graph_snapshot",
+    # A broken legacy page cannot surface as a read reason: no page is opened.
+    assert result.projection["views"] == ({
+        "view_type": "overview", "status": "unsupported",
+        "reason_code": "legacy_view_requires_source_work",
     },)
+    assert result.projection["view_diagnostics"] == ({
+        "view_type": "overview", "read_status": "unsupported",
+        "reason_code": "legacy_view_requires_source_work",
+    },)
+    assert coordinator.calls == 0

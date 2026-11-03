@@ -3,8 +3,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-from ...graph_types import AtomKey, GraphSnapshot, GraphWrite, Owner
-from ...runtime_contracts import canonical_digest
+from ...graph_types import AtomKey, GraphSnapshot, GraphVersion, GraphWrite, Owner
+from ...runtime_contracts import NamespaceId, QueryEpoch, canonical_digest
 from ...runtime.domain_production_contracts_v1 import ProductionOriginalRefV1
 from ..d01.production_operations_v1 import plain_v1, require_locator_v1, stage_result_v1
 from .audience import qualify_contribution_for_audience
@@ -52,6 +52,34 @@ class ReevaluateCurrentRelationshipRequestV1:
 
 
 @dataclass(frozen=True, slots=True)
+class CurrentRelationshipContributionFactsV1:
+    """Current metadata facts; this immutable value confers no authority."""
+    namespace: NamespaceId
+    subject_entity_ref: str
+    dimension: str
+    query_epoch: QueryEpoch
+    census_versions: tuple[GraphVersion, ...]
+    metadata_root: str
+    related_metadata: tuple[tuple[GraphVersion, str], ...]
+    valid_contribution_keys: tuple[AtomKey, ...]
+    has_recollection_or_simulation: bool
+    has_legacy_unresolved: bool
+    prior_projection: GraphVersion
+    prior_projection_status: str | None
+    source_roots: tuple[str, ...]
+
+    def __post_init__(self):
+        if(type(self.namespace)is not NamespaceId or type(self.query_epoch)is not QueryEpoch
+                or self.query_epoch.namespace!=self.namespace or type(self.census_versions)is not tuple
+                or any(type(v)is not GraphVersion or NamespaceId.from_key(v.key)!=self.namespace for v in self.census_versions)
+                or len(set(self.census_versions))!=len(self.census_versions)
+                or type(self.has_recollection_or_simulation)is not bool or type(self.has_legacy_unresolved)is not bool
+                or type(self.prior_projection)is not GraphVersion or NamespaceId.from_key(self.prior_projection.key)!=self.namespace
+                or any(type(key)is not AtomKey or key.type_name!='d05.contribution'for key in self.valid_contribution_keys)):
+            raise ValueError('relationship contribution facts require exact namespace metadata')
+
+
+@dataclass(frozen=True, slots=True)
 class CurrentRelationshipContributionInputsV1:
     contribution: RelationshipContribution
     policy_dimensions: tuple[str, ...]
@@ -62,6 +90,7 @@ class CurrentRelationshipContributionInputsV1:
     existing_contribution: RelationshipContribution | None
     qualification_keys: tuple[AtomKey, ...] = ()
     existing_contribution_valid: bool = True
+    current_facts: CurrentRelationshipContributionFactsV1 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,23 +144,38 @@ def compile_adopt_current_relationship_contribution_v1(frame, request, inputs):
     status, influence_status = "source_qualified", "not_evaluated"
     if item.semantics in {"recollection", "simulation"}:
         influence_status = "unapplied_pending"
-    if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
-           and atom.value["target_dimension"] == request.dimension
-           and atom.value["semantics"] in {"recollection", "simulation"} for atom in frame.snapshot.atoms):
-        influence_status = "unapplied_pending"
-    if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
-           and atom.value["target_dimension"] == request.dimension
-           and atom.value.get("identity_status") == "legacy_unresolved" for atom in frame.snapshot.atoms):
-        influence_status = "legacy_unresolved"
-    if prior_projection is not None and prior_projection.revision > 0:
-        prior_projection_value = decode_relationship_projection_payload_v1(prior_projection.value)
-        if prior_projection_value["status"] == "held_source_correction":
-            status = "held_source_correction"
+    facts=inputs.current_facts
+    if facts is not None:
+        if(type(facts)is not CurrentRelationshipContributionFactsV1 or facts.namespace!=ns
+                or facts.subject_entity_ref!=request.subject_entity_ref or facts.dimension!=request.dimension
+                or facts.query_epoch.revision!=frame.snapshot.epochs[0].revision
+                or not set(facts.census_versions)<=set(frame.envelope.version_guard.read_versions)
+                or facts.source_roots!=frame.envelope.source_qualification.source_refs
+                or facts.prior_projection.key!=projection_key
+                or facts.prior_projection not in frame.envelope.version_guard.read_versions):
+            raise ValueError('relationship metadata facts differ from the actual current frame')
+        if facts.has_recollection_or_simulation:influence_status='unapplied_pending'
+        if facts.has_legacy_unresolved:influence_status='legacy_unresolved'
+        if facts.prior_projection_status=='held_source_correction':status='held_source_correction'
+    else:
+        if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
+               and atom.value["target_dimension"] == request.dimension
+               and atom.value["semantics"] in {"recollection", "simulation"} for atom in frame.snapshot.atoms):
+            influence_status = "unapplied_pending"
+        if any(atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
+               and atom.value["target_dimension"] == request.dimension
+               and atom.value.get("identity_status") == "legacy_unresolved" for atom in frame.snapshot.atoms):
+            influence_status = "legacy_unresolved"
+        if prior_projection is not None and prior_projection.revision > 0:
+            prior_projection_value = decode_relationship_projection_payload_v1(prior_projection.value)
+            if prior_projection_value["status"] == "held_source_correction":
+                status = "held_source_correction"
     # Keep all current contributions in this dimension in the invalidation
     # closure. A later contribution must not erase an earlier source fence.
-    contribution_dependencies = tuple(dict.fromkeys((key, *(atom.key for atom in frame.snapshot.atoms
-        if atom.valid and atom.key.type_name == "d05.contribution" and atom.key.owner == key.owner
-        and atom.value["target_dimension"] == request.dimension))))
+    previous_keys=facts.valid_contribution_keys if facts is not None else tuple(atom.key for atom in frame.snapshot.atoms
+        if atom.valid and atom.key.type_name=='d05.contribution'and atom.key.owner==key.owner
+        and atom.value['target_dimension']==request.dimension)
+    contribution_dependencies=tuple(dict.fromkeys((key,*previous_keys)))
     projection_value = translate_relationship_projection_v2({"subject_entity_ref": request.subject_entity_ref,
         "dimension": request.dimension, "status": status}, source_qualification="qualified")
     projection_value["influence_status"] = influence_status

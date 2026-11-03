@@ -1494,6 +1494,27 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
             command["operation"],
         )
 
+    async def read_pending_natural_parent_closures_v4(self, request, handshake, *,
+            namespace, graph_namespace, after_operation_id, limit):
+        from dataclasses import asdict
+        from ..runtime_contracts import NamespaceId
+        if type(graph_namespace) is not NamespaceId:
+            raise TypeError('actual V4 natural metadata Graph namespace required')
+        return await self._content_rpc(request, handshake, 'read_pending_natural_parent_closures_v4',
+            dict(namespace=namespace, graph_namespace=asdict(graph_namespace),
+                after_operation_id=after_operation_id, limit=limit), protocol=AUTHORITY_V2_PROTOCOL)
+
+    async def read_natural_parent_closure_original_v4(self, request, handshake, *,
+            namespace, graph_namespace, candidate):
+        from dataclasses import asdict
+        from ..runtime_contracts import NamespaceId
+        from ..authority_service.d13_cache_use_contract_v2 import D13NaturalParentClosureCandidateV4
+        if type(graph_namespace) is not NamespaceId or type(candidate) is not D13NaturalParentClosureCandidateV4:
+            raise TypeError('actual closed V4 natural metadata candidate/namespace required')
+        return await self._content_rpc(request, handshake, 'read_natural_parent_closure_original_v4',
+            dict(namespace=namespace, graph_namespace=asdict(graph_namespace), candidate=asdict(candidate)),
+            protocol=AUTHORITY_V2_PROTOCOL)
+
     async def v2_namespace_bootstrap(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,
         namespace: NamespaceId,
@@ -1887,6 +1908,44 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
             raise RuntimeError("authority effect snapshot binding is invalid")
         return snapshot
 
+    async def verify_source_inspection_member_admission_v1(self, request, handshake, *, namespace, admission):
+        response = await self._content_rpc(request, handshake,
+            "verify_source_inspection_member_admission_v1", {"namespace": namespace, "admission": admission},
+            protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {"verification", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("inspection member verification response channel differs")
+        verification = response["verification"]
+        if (type(verification) is not dict
+                or verification.get("authority_id") != handshake.installation_authority_id
+                or verification.get("authority_namespace") != namespace
+                or verification.get("admission_digest") != admission["admission_digest"]):
+            raise RuntimeError("inspection member verification response identity differs")
+        return verification
+
+    async def v2_execution_read_historical_observation_receipt_v3(self, request, handshake, *,
+            namespace, effect_id, mutation_id, expected_receipt_digest):
+        identifier(namespace, 'namespace')
+        identifier(effect_id, 'effect_id')
+        identifier(mutation_id, 'mutation_id')
+        response = await self._content_rpc(request, handshake,
+            'execution_read_historical_observation_receipt_v3',
+            dict(namespace=namespace, effect_id=effect_id, mutation_id=mutation_id,
+                expected_receipt_digest=expected_receipt_digest), protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {'receipt', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('historical observation receipt channel differs')
+        from ..authority_service.observation_refinement_contract_v3 import (
+            from_wire as observation_from_wire_v3, observation_original_dispatch_permit_v3)
+        receipt = observation_from_wire_v3(response['receipt'])
+        permit = observation_original_dispatch_permit_v3(receipt)
+        if (receipt.durable_state != 'committed' or receipt.pending.mutation_id != mutation_id
+                or permit.namespace != namespace
+                or permit.effect_id != effect_id
+                or runtime_canonical_digest(receipt) != expected_receipt_digest):
+            raise RuntimeError('historical observation receipt identity differs')
+        return receipt
+
     async def v2_execution_read_current_observation_receipt_v1(
             self, request, handshake, *, namespace, effect_id):
         identifier(namespace, "namespace")
@@ -1897,11 +1956,13 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
         if (set(response) != {"receipt", "channel_binding_sha256"}
                 or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
             raise RuntimeError("platform observation receipt channel differs")
-        receipt = from_wire(response["receipt"])
-        if (type(receipt) is not MutationReceiptV2 or receipt.durable_state != "committed"
-                or receipt.pending.phase != "observed"
-                or receipt.pending.permit.namespace != namespace
-                or receipt.pending.permit.effect_id != effect_id):
+        from ..authority_service.observation_refinement_contract_v3 import (
+            from_wire as observation_from_wire_v3, observation_original_dispatch_permit_v3)
+        receipt = observation_from_wire_v3(response["receipt"])
+        permit = observation_original_dispatch_permit_v3(receipt)
+        if (receipt.durable_state != "committed"
+                or permit.namespace != namespace
+                or permit.effect_id != effect_id):
             raise RuntimeError("platform observation receipt identity differs")
         return receipt
 
@@ -2010,6 +2071,25 @@ class MtlsAuthorityTransport(MtlsAuthorityChannel):
                 or effect.observation_id is not None):
             raise RuntimeError("current dispatch handoff binding differs")
         return permit, anchor, effect
+
+    async def v2_execution_refine_observation_v3(self, request, handshake, *,
+            claimed_receipt, observation):
+        from ..authority_service.observation_refinement_contract_v3 import (
+            PlatformObservationRefinementReceiptV3, from_wire as observation_from_wire_v3)
+        response = await self._content_rpc(request, handshake,
+            "execution_refine_observation_v3", {"claimed_receipt": to_wire(claimed_receipt),
+            "observation": to_wire(observation)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (set(response) != {"receipt", "channel_binding_sha256"}
+                or response["channel_binding_sha256"] != handshake.channel_binding_sha256):
+            raise RuntimeError("observation refinement response channel differs")
+        receipt = observation_from_wire_v3(response["receipt"])
+        if (type(receipt) is not PlatformObservationRefinementReceiptV3
+                or receipt.pending.original_claimed_receipt != claimed_receipt
+                or receipt.pending.platform_observation != observation
+                or receipt.pending.fact_write_permit.authority_id != handshake.installation_authority_id
+                or receipt.pending.fact_write_permit.subject != handshake.installation_identity_ref):
+            raise RuntimeError("observation refinement response identity differs")
+        return receipt
 
     async def v2_execution_observe_v2(
         self, request: AuthorityProvisioningRequest, handshake: AuthorityHandshake,

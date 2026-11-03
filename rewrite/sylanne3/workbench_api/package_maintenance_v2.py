@@ -2,7 +2,7 @@
 from uuid import UUID
 from ..authority_service.contract import AuthorityUnavailable
 from ..authority_service.d12_package_maintenance_contract_v2 import package_intent_from_wire_v2,STAGES
-from ..authority_service.d12_package_files_v2 import _sha
+from ..authority_service.d12_package_maintenance_contract_v2 import is_package_digest_v2 as _sha
 from ..runtime_contracts import NamespaceId
 from ..runtime_contracts import namespace_ref
 

@@ -36,11 +36,43 @@ def require_retirement_schema_v3(db,*,meter=None):
     return True
 
 
+ACCOUNTING_SCHEMA='sylanne3.c09.d13-accounting-retirement.v3'
+ACCOUNTING_FIELDS=FIELDS|frozenset(('lineage_original_digest','terminal_original_digest',
+    'model_intent_digest','model_admission_digest','model_terminal_receipt_digest'))
+
+
 def validate_retirement_original_v3(control,original):
-    if type(original) is not dict or set(original)!=FIELDS or original['schema']!=SCHEMA:
+    if type(original) is dict and original.get('schema')==ACCOUNTING_SCHEMA:
+        return validate_accounting_retirement_original_v3(control,original)
+    return _validate_retirement_original_v3(control,original,accounting=False)
+
+
+def validate_accounting_retirement_original_v3(control,original):
+    return _validate_retirement_original_v3(control,original,accounting=True)
+
+
+def _validate_retirement_original_v3(control,original,*,accounting):
+    expected_fields=ACCOUNTING_FIELDS if accounting else FIELDS
+    expected_schema=ACCOUNTING_SCHEMA if accounting else SCHEMA
+    if type(original) is not dict or set(original)!=expected_fields or original['schema']!=expected_schema:
         raise AuthorityUnavailable('exact bodyless D13 retirement original required')
     control.verify_original_v1(original,'retirement_digest')
-    kind=original['kind'];phases={'draft','header','evidence'} if kind=='counter' else {'expected','observed_before_send'}
+    kind=original['kind']
+    if accounting:
+        from .d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3,TERMINAL_PHASE
+        phases=D13_ACCOUNTING_PHASES_V3
+        if (kind!='http' or original['counter_operation_id'] is not None or original['frame_intent_digest'] is not None
+                or (original['terminal_original_digest'] is None)!=(original['model_terminal_receipt_digest'] is None)
+                or (original['phase']==TERMINAL_PHASE and original['terminal_original_digest'] is None)):
+            raise AuthorityUnavailable('accounting retirement cannot borrow a Counter/Frame or incomplete terminal')
+        for field in ('lineage_original_digest','model_intent_digest','model_admission_digest',
+                'terminal_original_digest','model_terminal_receipt_digest'):
+            value=original[field]
+            if value is None and field in ('terminal_original_digest','model_terminal_receipt_digest'):continue
+            if type(value) is not str or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
+                raise AuthorityUnavailable('accounting retirement lost its actual original commitment: '+field)
+    else:
+        phases={'draft','header','evidence','pressure_mapping_v1'} if kind=='counter' else {'expected','observed_before_send'}
     expected_table='authority_d13_counter_originals_v1' if kind=='counter' else 'authority_d13_provider_http_bindings_v1'
     if (kind not in {'counter','http'} or original['phase'] not in phases or original['source_table']!=expected_table
             or original['authority_id']!=control.authority_id or original['installation_id']!=control.installation_id
@@ -51,7 +83,8 @@ def validate_retirement_original_v3(control,original):
             or original['graph_disposition_count']<1):
         raise AuthorityUnavailable('actual D13 retirement identity/source/facts disposition differs')
     for field in ('scope_digest','source_role_digest','physical_schema_digest','source_descriptor_digest',
-        'source_physical_row_commitment','source_payload_digest','frame_intent_digest','graph_disposition_root','facts_pin_digest'):
+        'source_physical_row_commitment','source_payload_digest','graph_disposition_root','facts_pin_digest',
+        *(() if accounting else ('frame_intent_digest',))):
         value=original[field]
         if type(value) is not str or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
             raise AuthorityUnavailable('actual D13 retirement complete commitment differs: '+field)
@@ -84,17 +117,14 @@ def require_not_retired_d13_source_v3(db,*,control,namespace,kind,item_id):
         raise AuthorityUnavailable('D13 retirement point gate requires actual Core transaction')
     if not require_retirement_schema_v3(db):return
     rows=db.execute('SELECT '+','.join(COLUMNS)+' FROM '+TABLE+
-        ' WHERE namespace=? AND kind=? AND item_id=? ORDER BY phase LIMIT 4',(namespace,kind,item_id)).fetchall()
+        ' WHERE namespace=? AND kind=? AND item_id=? ORDER BY phase LIMIT 5',(namespace,kind,item_id)).fetchall()
+    if len(rows)>4:raise AuthorityUnavailable('D13 retirement exceeds the complete registered phase cohort')
     if not rows:return
     if control is None:raise AuthorityUnavailable('actual installed Control must verify D13 Source retirement')
     for row in rows:
         raw=row[COLUMNS.index('retirement_json')]
         if len(raw.encode('utf8'))>65536:raise AuthorityUnavailable('actual bodyless D13 retirement exceeds fixed metadata bound')
-        original=validate_retirement_original_v3(control,json.loads(raw))
-        if (row[:6]!=(original['namespace'],original['kind'],original['item_id'],original['phase'],
-                original['counter_operation_id'],original['generation_call_id']) or row[6]!=original['retirement_digest']
-                or row[8:]!=(original['key_id'],original['signature'])):
-            raise AuthorityUnavailable('actual D13 Source retirement SQL row/original binding differs')
+        validate_retirement_row_v3(control,tuple(row))
     raise AuthorityUnavailable('D13 Source execution right was retired by actual C09 content disposition')
 
 
@@ -108,4 +138,46 @@ def issue_d13_source_retirement_v3(builder,qualified,*,meter):
     validate_retirement_original_v3(control,original)
     raw=canonical_serialize(original)
     if len(raw.encode('utf8'))>65536:raise AuthorityUnavailable('actual D13 bodyless retirement needs its fixed metadata profile')
+    return original
+
+
+def encode_counter_locator_v3(original):
+    if original['schema']==ACCOUNTING_SCHEMA:
+        if original['counter_operation_id'] is not None:
+            raise AuthorityUnavailable('accounting retirement counter absence is not exact')
+        return ''
+    if original['schema']!=SCHEMA:
+        raise AuthorityUnavailable('unknown registered D13 retirement schema')
+    return original['counter_operation_id']
+
+
+def retirement_row_v3(original):
+    return (original['namespace'],original['kind'],original['item_id'],original['phase'],
+        encode_counter_locator_v3(original),original['generation_call_id'],original['retirement_digest'],
+        canonical_serialize(original),original['key_id'],original['signature'])
+
+
+def validate_retirement_row_v3(control,row):
+    if type(row) is not tuple or len(row)!=len(COLUMNS):
+        raise AuthorityUnavailable('exact actual D13 retirement row required')
+    raw=row[COLUMNS.index('retirement_json')]
+    if type(raw) is not str or len(raw.encode('utf8'))>65536:
+        raise AuthorityUnavailable('actual D13 retirement exceeds fixed metadata bound')
+    original=validate_retirement_original_v3(control,json.loads(raw))
+    if row!=retirement_row_v3(original):
+        raise AuthorityUnavailable('D13 retirement SQL/original has another exact absence/identity encoding')
+    return original
+
+
+def issue_d13_accounting_source_retirement_v3(builder,qualified,*,meter):
+    from .c09_authority_storage_rebase_v2 import _InstalledAuthorityRoleBuilderV2
+    from .c09_d13_accounting_disposition_v3 import _D13AccountingDispositionReadV3
+    if type(builder) is not _InstalledAuthorityRoleBuilderV2 or type(qualified) is not _D13AccountingDispositionReadV3:
+        raise AuthorityUnavailable('actual private accounting Source disposition producer required')
+    body=qualified.require_accounting_retirement_body_v3(builder,meter=meter)
+    control=builder.session._control.maintenance.control
+    original=control.sign_original_v1(ACCOUNTING_SCHEMA,body,'retirement_digest')
+    validate_accounting_retirement_original_v3(control,original)
+    if len(canonical_serialize(original).encode('utf8'))>65536:
+        raise AuthorityUnavailable('accounting Source retirement exceeds actual reserved metadata bound')
     return original

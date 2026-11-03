@@ -59,14 +59,16 @@ def command_for(action, data, namespace):
             raise ValueError('exact signed Owner, original operation and registered package intent required')
         return 'd12_package_maintenance_v2', {'namespace': namespace,
             'action': 'accept' if action == 'package-accept' else 'status', **data}
-    extra = {"inspect": set(), "status": {"operation_id"}, "continue": {"operation_id"},
+    extra = {"reconcile-held-inspection":{"operation_id","input_data"},"inspection-reconciliation-status":{"operation_id"},"inspection-recovery-options":{"parent_workflow_operation_id"},"resume-completed-inspection":{"operation_id","input_data"},"inspection-recovery-status":{"operation_id"},"inspection-workflow-accept":{"operation_id","input_data"},"inspection-workflow-status":{"operation_id"},"inspect": set(), "status": {"operation_id"}, "continue": {"operation_id"},
         "resume": {"pause_operation_id", "operation_id", "expected_lifecycle_epoch"},
-        "upgrade-catalogue": {"operation_id", "pause_operation_id", "target_cohort_ref", "source_catalogue_hash"}}
+        "upgrade-catalogue": {"operation_id", "pause_operation_id", "target_cohort_ref", "source_catalogue_hash"},
+        "migrate-source-inspection": {"operation_id","pause_operation_id","scope_kind","target_refs",
+            "deadline_utc","interpretation_status_discovery"}}
     common = {"owner_actor_id", "owner_session_request", "owner_session_token"}
     if action not in extra or set(data) != common | extra[action]:
         raise ValueError("exact current signed Owner and lifecycle original fields required")
     return "d12_installation_control_v1", {"namespace": namespace,
-        "action": "upgrade_catalogue" if action == "upgrade-catalogue" else action, **data}
+        "action": {"reconcile-held-inspection":"reconcile_held_inspection_v1","inspection-reconciliation-status":"inspection_reconciliation_status","inspection-recovery-options":"read_inspection_recovery_options_v1","resume-completed-inspection":"resume_completed_inspection_v1","inspection-recovery-status":"inspection_recovery_status","inspection-workflow-accept":"inspection_workflow_accept","inspection-workflow-status":"inspection_workflow_status","upgrade-catalogue":"upgrade_catalogue","migrate-source-inspection":"migrate_source_inspection"}.get(action,action), **data}
 
 
 async def execute(args, data):
@@ -122,7 +124,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", required=True)
     parser.add_argument("--package-root", type=Path)
-    parser.add_argument("action", choices=("register-credential", "challenge", "accept", "logout", "inspect", "status", "continue", "resume", 'package-accept', 'package-status', 'first-owner-issue', 'upgrade-catalogue'))
+    parser.add_argument("action", choices=("register-credential", "challenge", "accept", "logout", "inspect", "status", "continue", "resume", 'package-accept', 'package-status', 'first-owner-issue', 'upgrade-catalogue', 'migrate-source-inspection', 'inspection-workflow-accept', 'inspection-workflow-status', 'resume-completed-inspection', 'inspection-recovery-status', 'reconcile-held-inspection', 'inspection-reconciliation-status', 'inspection-recovery-options'))
     args = parser.parse_args()
     raw = sys.stdin.buffer.read(65537)
     if len(raw) > 65536:

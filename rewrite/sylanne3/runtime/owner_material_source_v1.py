@@ -71,10 +71,12 @@ def stage_admit_owner_material_source_v1(db, *, frame, request, installed_reader
     return stage_result_v1(frame,'d06',OPERATION,request,
         writes=(GraphWrite(source_ref,source.to_dict()),GraphWrite(access_ref,access,(source_ref,))),
         provenance={'source_ref':source_ref.token,'source':source,'source_access':access},
-        proposal_schema='d06.proposal.v1',proposal_hash=provider.descriptor.request_schema_hash)
+        proposal_schema='d06.contract.v1',proposal_hash=provider.descriptor.request_schema_hash)
 
 
 def read_plan_owner_material_source_v1(db, *, namespace, operation_id, request):
     source_id = owner_material_source_id_v1(namespace,operation_id)
-    return production_read_plan_v1((),(owner_grant_key(*namespace.as_tuple),source_key(*namespace.as_tuple,source_id),
-        access_key(*namespace.as_tuple,source_id)),(),())
+    from ..domains.d06.inspection_metadata_v1 import inspection_key_v1
+    source = source_key(*namespace.as_tuple, source_id)
+    return production_read_plan_v1((), (owner_grant_key(*namespace.as_tuple), source,
+        inspection_key_v1(source, 1), access_key(*namespace.as_tuple, source_id)), (), ())

@@ -13,6 +13,7 @@ from sylanne3.runtime_contracts import CompletedTurnV1, ConversationWindowProjec
 from sylanne3.domains.d13.precompression import compile_deterministic_candidate
 from sylanne3.domains.d13.provider import block_graph_value
 from sylanne3.runtime.d13_precompression_job import prepare_precompression_intent_v1
+from sylanne3.domains.d13.precompression import D13CurrentMainPressureV2
 from sylanne3.runtime import installed_d13_natural_frame_v4 as frame
 
 
@@ -30,10 +31,15 @@ def case(monkeypatch):
     deps = tuple(r for t in turns for r in (t.raw_ref, t.source_ref, t.access_ref))
     window = ConversationWindowProjectionV1(plan.namespace, "owner", plan.audience_id,
         scene, audience, turns, 5, 100.0, deps, (scene, audience, *deps), 0, 0, 1)
+    from sylanne3.runtime_contracts import canonical_digest
+    pressure = D13CurrentMainPressureV2(
+        canonical_digest(window), "b" * 64, "install", "provider", "model",
+        "a" * 64, 2600, "exact-tokenizer")
     intent = prepare_precompression_intent_v1(window, history_token_budget=2000,
         background_capacity=True, outstanding_candidate=False,
         attempted_input_digests=frozenset(), parent_budget_lease_ref="budget:test",
-        resource_ref="resource:test", ceiling={"d13_compute_units": 1}, deadline_utc=150.0)
+        resource_ref="resource:test", ceiling={"d13_compute_units": 1}, deadline_utc=150.0,
+        pressure=pressure)
     assert intent is not None
     block = replace(compile_deterministic_candidate(window, intent.plan), status="standby")
     key = AtomKey(Owner("persona", "bot", "persona"), "d13.compressed_turn_block.v2", block.block_ref)

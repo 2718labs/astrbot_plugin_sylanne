@@ -1,10 +1,17 @@
-"""C02 v1 fixture: proof-bound D06 encoding through the D02/D11 coordinator path."""
+"""Typed unit graph fixture for proof-bound D06 encoding through D02/D11."""
+
+from dataclasses import asdict
 
 import pytest
 
 from sylanne3.contracts import Event, Scope, StaleRead
-from sylanne3.domains.d03.context import ContextProvider
+from sylanne3.domains.d03.context import ContextProvider, WorldEvent
+from sylanne3.domains.d03.self_perspective import (
+    SelfIdentityMapping, SelfPerspective, self_mapping_key,
+    self_perspective_id, self_perspective_key,
+)
 from sylanne3.domains.d04 import AffectProvider
+from sylanne3.domains.d04.encoding_baseline import decode_encoding_baseline
 from sylanne3.domains.d06 import (
     D06DomainAdapter, D06DomainProvider, EncodingContext, SourceAdmission,
 )
@@ -14,7 +21,9 @@ from sylanne3.graph_coordinator import GraphCoordinator
 from sylanne3.graph_store import GraphStore
 from sylanne3.graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, Owner, TypeRegistry, TypeSpec
 from sylanne3.memory_repository import MemoryRepository
-from sylanne3.memory_types import SourceRecord, access_key, source_key
+from sylanne3.memory_types import (
+    SourceRecord, access_key, episode_key, source_key, subjective_trace_v2_key,
+)
 from sylanne3.runtime.budget import BudgetLease, create_budget_lease, get_budget_lease
 from sylanne3.runtime.d11_types import (
     D11RuntimeProvider, D11_PROPOSAL_SCHEMA,
@@ -37,13 +46,23 @@ class EncodingHarness:
         self.registry = TypeRegistry()
         self.d06 = D06DomainProvider()
         self.d11_provider = D11RuntimeProvider()
+        self.d03_provider = ContextProvider()
+        self.d04_provider = AffectProvider()
         for provider in (self.d06, self.d11_provider):
             for spec in provider.type_specs():
                 self.registry.register(spec)
-        # Committed context is a v1 fixture. These types are not product D03/D04/D07 admission.
+        for spec in self.d03_provider.type_specs():
+            if spec.name in {
+                "d03.world_event", "d03.self_identity_mapping.v1",
+                "d03.self_perspective.v1",
+            }:
+                self.registry.register(spec)
+        for spec in self.d04_provider.type_specs():
+            if spec.name == "d04.encoding_baseline.v1":
+                self.registry.register(spec)
         for name, owner in (
-            ("d03.world_event", "event"), ("d03.role_binding", "scene"),
-            ("d04.feeling_state.v1", "persona"), ("d07.belief_revision.v1", "persona"),
+            ("d04.feeling_state.v1", "persona"),
+            ("d07.belief_revision.v1", "persona"),
         ):
             self.registry.register(TypeSpec(
                 name, (owner,), "state", lambda _: None,
@@ -67,8 +86,8 @@ class EncodingHarness:
         for domain, provider, schema in (
             ("d06", self.d06, "d06.contract.v1"),
             ("d11", self.d11_provider, D11_PROPOSAL_SCHEMA),
-            ("d03", ContextProvider(), "d03.proposal.v1"),
-            ("d04", AffectProvider(), "d04.proposal.v1"),
+            ("d03", self.d03_provider, "d03.proposal.v1"),
+            ("d04", self.d04_provider, "d04.proposal.v1"),
             ("d07", D07DomainProvider(), "d07.proposal.v1"),
         ):
             self.coordinator.register_provider(
@@ -82,7 +101,7 @@ class EncodingHarness:
         )
         self.authority = AuthorityContext(
             "host", "d06", capability, self.namespace,
-            ("event", "scene", "persona", "activity"),
+            ("activity", "event", "persona"),
             "context", ("owner",), "policy-1", 1,
         )
         for kind, ref, version in (
@@ -97,44 +116,99 @@ class EncodingHarness:
             )
         self.source = source_key("bot", "persona", "source-1")
         self.access = access_key("bot", "persona", "source-1")
-        self.event = AtomKey(Owner("event", "bot", "persona", "world-1"), "d03.world_event", "current")
-        self.perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
+        self.scene_ref = "scene:1"
+        self.event = AtomKey(Owner("event", "bot", "persona", "world:1"), "d03.world_event", "current")
+        self.mapping = self_mapping_key(self.namespace)
+        self.perspective = self_perspective_key(
+            self.namespace, self_perspective_id(
+                self.namespace, self.scene_ref, self.event.token,
+            ),
+        )
         self.feeling = AtomKey(Owner("persona", "bot", "persona"), "d04.feeling_state.v1", "current")
         self.interpretation = AtomKey(Owner("persona", "bot", "persona"), "d07.belief_revision.v1", "current")
+        self.baseline = AtomKey(self.source.owner, "d04.encoding_baseline.v1", "baseline-c02")
         self.repository.ingest(
             Event(Scope("bot", "persona", "session"), "ingress", 1.0, "ingress", {}),
             SourceRecord("source-1", "A reported promise", "alice", "reported",
                          "reported", None, 2.0, "family-1", ("owner",), ("context",)),
         )
-        context_keys = (self.event, self.perspective, self.feeling, self.interpretation)
+        context_keys = (self.event, self.mapping, self.perspective, self.feeling, self.interpretation)
+        world_event = WorldEvent(
+            "world:1", "message_received",
+            (("entity:account:1", "sender_account"),), None, None, 2.0,
+            self.scene_ref, (self.source.token,), "host_observed",
+        )
+        identity_mapping = SelfIdentityMapping(
+            "self-map:integration", "persona:persona", "entity:self",
+            "authority:self-identity:unit-fixture", "head-1", "incarnation-1", "active",
+        )
+        self_perspective = SelfPerspective(
+            self.perspective.name, "persona:persona", "entity:self", self.scene_ref,
+            self.mapping.token, self.event.token, "head-1",
+        )
         self.store.graph_commit(GraphCandidate(
             Event(Scope("bot", "persona", "session"), "context", 3.0, "context", {}),
             tuple(GraphVersion(key, 0) for key in context_keys),
-            tuple(GraphWrite(key, {"fixture": True}) for key in context_keys),
+            (
+                GraphWrite(self.event, {
+                    **asdict(world_event),
+                    "participant_roles": [list(item) for item in world_event.participant_roles],
+                    "source_refs": list(world_event.source_refs),
+                }),
+                GraphWrite(self.mapping, asdict(identity_mapping)),
+                GraphWrite(self.perspective, asdict(self_perspective)),
+                GraphWrite(self.feeling, {"fixture": True}),
+                GraphWrite(self.interpretation, {"fixture": True}),
+            ),
+        ))
+        baseline_value = {
+            "baseline_id": self.baseline.name,
+            "source_refs": [self.source.token],
+            "perspective_ref": self.perspective.token,
+            "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
+            "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
+            "as_known_at": 2.0,
+            "projection_policy_ref": "projection-policy:coordinator-unit-fixture",
+            "projection_policy_version": "policy-1",
+            "basis_version": "scheme-1",
+            "parameter_version": "params-1",
+            "salience_interval": None,
+            "tone_interval": None,
+            "unknown_reasons": [
+                "salience_interval:numeric_projection_uncertified",
+                "tone_interval:numeric_projection_uncertified",
+            ],
+        }
+        decode_encoding_baseline(baseline_value).verify_committed_refs(
+            self.store.graph_snapshot((self.source, *context_keys)),
+        )
+        self.store.graph_commit(GraphCandidate(
+            Event(Scope("bot", "persona", "session"), "baseline", 3.5, "baseline", {}),
+            (GraphVersion(self.baseline, 0),),
+            (GraphWrite(self.baseline, baseline_value),),
         ))
 
     def close(self):
         self.store.close()
 
     def bundle(self):
-        context_keys = (self.event, self.perspective, self.feeling, self.interpretation)
+        context_keys = (self.event, self.mapping, self.perspective, self.feeling, self.interpretation)
         context = EncodingContext(
             self.event.token, self.perspective.token, (self.feeling.token,),
             (self.interpretation.token,), (("promise", 0.9),),
-            tuple((key.token, 1) for key in (self.source, *context_keys)),
+            tuple((key.token, 1) for key in (self.source, *context_keys, self.baseline)),
         )
         prepared = self.pipeline.prepare_encoding(
             "source-1", context, audience="owner", purpose="context",
         )
         episode_id = prepared.proposal.episode.episode_id
         trace_id = prepared.proposal.trace.trace_id
-        from sylanne3.memory_types import episode_key, subjective_trace_key
         episode = episode_key("bot", "persona", episode_id)
-        trace = subjective_trace_key("bot", "persona", trace_id)
+        trace = subjective_trace_v2_key("bot", "persona", trace_id)
         job = runtime_job_key("bot", "persona", "activity-c02", "job-c02")
         snapshot = self.coordinator.read_snapshot(
             self.authority, self.lease,
-            (self.source, self.access, *context_keys, episode, trace, job),
+            (self.source, self.access, *context_keys, self.baseline, episode, trace, job),
         )
         inputs = (self.source.token,)
         envelope = CommandEnvelope(
@@ -157,7 +231,9 @@ class EncodingHarness:
             inputs, "parent", 4_102_444_800.0, 100.0, "character-1",
             ("source-1",),
         )
-        d06 = self.adapter.compile_encoding(envelope, prepared)
+        d06 = self.adapter.compile_encoding_v2(
+            envelope, prepared, encoding_baseline_ref=self.baseline.token,
+        )
         with self.store._lock:
             self.d02.issue_quote(self.store._db, ResourceQuote(
                 "quote-c02", 1, "bot", "persona", "activity-c02", "operation-c02",

@@ -44,3 +44,52 @@ class InstalledD12PackageWorkbenchPortV2:
 
     def read_session_package_operation_v2(self,*,session,scope,operation_id):
         return self._call(session=session,scope=scope,action='status',operation_id=operation_id)
+
+    def _inspection_call_v1(self, *, session, scope, action, operation_id=None, **extra):
+        from ..authority_service.d12_installation_lifecycle_rpc_v1 import CONTROL_METHOD
+        from ..workbench_api.source_inspection_migration_v1 import decode_inspection_view_v1
+        request = session.owner_session_request
+        if type(request) is not OwnerSessionLoginRequestV1 or not session.owner_session_token:
+            raise PermissionError('actual signed Owner inspection session required')
+        namespace = NamespaceId(*scope.split('/'))
+        async def call():
+            await self.port._mapped(namespace, request.authority_namespace)
+            handshake, grant = self.port._identity()
+            command = dict(namespace=request.authority_namespace, action=action, owner_actor_id=session.actor_id,
+                owner_session_token=session.owner_session_token, owner_session_request=session_to_wire(request), **extra)
+            if operation_id is not None:
+                command['operation_id'] = operation_id
+            response = await self.port._transport._content_rpc(
+                self.port._request, handshake, CONTROL_METHOD, command, protocol=SCHEMA)
+            field = 'inspection_access' if action == 'inspection_access' else 'inspection_workflow'
+            if set(response) != {field, 'channel_binding_sha256'}:
+                raise RuntimeError('inspection workflow actual response differs')
+            result = response[field]
+            if action == 'inspection_access':
+                if (type(result) is not dict or set(result) != {'schema', 'scope', 'installation_id', 'actor', 'owner_head',
+                        'capabilities', 'purposes', 'audiences', 'lifecycle_head'}
+                        or result['schema'] != 'd12.source-inspection-maintenance-access.v1'
+                        or result['scope'] != scope or result['installation_id'] != grant.installation_id
+                        or result['actor'] != session.actor_id):
+                    raise PermissionError('inspection access belongs to another current Owner/installation')
+            else:
+                decode_inspection_view_v1(result, scope=scope, operation_id=operation_id)
+                if result['installation_id'] != grant.installation_id:
+                    raise PermissionError('inspection workflow belongs to another paired installation')
+                if action == 'inspection_workflow_accept' and (
+                        result['request_digest'] != canonical_digest(extra['input_data'])
+                        or any(result[name] != value for name, value in extra['input_data'].items())):
+                    raise RuntimeError('inspection workflow acceptance differs from its actual submitted request')
+            return result
+        return self.port._submit(self.port._with_session_repair(call))
+
+    def read_session_inspection_access_v1(self, *, session, scope):
+        return self._inspection_call_v1(session=session, scope=scope, action='inspection_access')
+
+    def read_session_source_inspection_migration_v1(self, *, session, scope, operation_id):
+        return self._inspection_call_v1(session=session, scope=scope,
+            action='inspection_workflow_status', operation_id=operation_id)
+
+    def accept_session_source_inspection_migration_v1(self, *, session, scope, operation_id, input_data):
+        return self._inspection_call_v1(session=session, scope=scope,
+            action='inspection_workflow_accept', operation_id=operation_id, input_data=dict(input_data))

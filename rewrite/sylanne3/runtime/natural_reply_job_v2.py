@@ -277,8 +277,11 @@ def _review_frozen(
     raw: dict, generation: NaturalReplyGenerationOriginalSealV2, *, prepared_originals=None,
 ) -> FrozenNaturalReplyReviewV1:
     if prepared_originals is not None:
-        from .dispatch_initial_source_read_v3 import require_actual_authority_natural_original_v3
-        require_actual_authority_natural_original_v3(prepared_originals)
+        from .dispatch_initial_source_read_v3 import (require_actual_authority_natural_original_v3,
+            PreparedDispatchNaturalReviewOriginalsV3,require_dispatch_review_original_v3)
+        if type(prepared_originals)is PreparedDispatchNaturalReviewOriginalsV3:
+            require_dispatch_review_original_v3(prepared_originals)
+        else:require_actual_authority_natural_original_v3(prepared_originals)
         frozen=prepared_originals.frozen_v3(raw)
         if (prepared_originals.stage!='review' or frozen.generation_frozen_input_digest!=generation.frozen_input_digest
                 or frozen.qualified_units_digest!=generation.qualified_units_digest):
@@ -323,6 +326,67 @@ def _seal(stage: str, raw: dict):
     }
     cls = classes[(stage, data["schema"])]
     return cls(**data)
+
+
+
+def natural_semantic_original_version_v3(generation,review=None):
+    """Resolve the declared frozen/seal pair, without re-encoding paid Body.
+
+    Legacy V2/V3/V4 stays single-output. V5/V6/V7 already declare semantic
+    output at the model boundary; every downstream consumer uses that same
+    exact profile rather than treating later versions as legacy by a string.
+    """
+    from ..model_broker.natural_reply_history_v3 import NaturalReplyInputV3
+    from ..model_broker.natural_reply_history_v4 import NaturalReplyInputV4
+    from ..model_broker.natural_reply_history_v6 import NaturalReplyInputV6
+    from ..model_broker.natural_reply_history_v7 import NaturalReplyInputV7
+    if (type(generation)is not SavedNaturalPreparationV2 or generation.stage!='generation'
+            or generation.state!='terminal'):
+        raise NaturalReplyJobHold('actual terminal Natural generation original required')
+    frozen=generation.frozen
+    profiles={FrozenNaturalReplyRequestV2:(NaturalReplyInputV2,{None:2}),
+        FrozenNaturalReplyRequestV3:(NaturalReplyInputV3,{'sylanne.d09.frozen_natural_request.v3':3}),
+        FrozenNaturalReplyRequestV4:(NaturalReplyInputV4,{'sylanne.d09.frozen_natural_request.v4':4,'sylanne.d09.frozen_natural_request.v5':5}),
+        FrozenNaturalReplyRequestV6:(NaturalReplyInputV6,{'sylanne.d09.frozen_natural_request.v6':6}),
+        FrozenNaturalReplyRequestV7:(NaturalReplyInputV7,{'sylanne.d09.frozen_natural_request.v7':7})}
+    profile=profiles.get(type(frozen))
+    if profile is None or type(frozen.input)is not profile[0]:
+        raise NaturalReplyJobHold('unknown or crossed Natural frozen/input profile')
+    schema=None if type(frozen)is FrozenNaturalReplyRequestV2 else frozen.schema
+    version=profile[1].get(schema)
+    if version is None:raise NaturalReplyJobHold('unsupported Natural frozen schema')
+    if version>=3 and frozen.input.schema!='sylanne.d09.context_reply_input.v'+str(version):
+        raise NaturalReplyJobHold('Natural frozen and input schema profiles differ')
+    seal=generation.seal
+    try:actual_seal=_seal('generation',asdict(seal))
+    except (KeyError,TypeError,ValueError) as exc:
+        raise NaturalReplyJobHold('unknown Natural generation original profile')from exc
+    if (type(seal)is not type(actual_seal)or seal.schema!='sylanne.d09.natural_generation_seal.v'+str(version)
+            or generation.parent_original_id!=seal.c02_operation_id
+            or seal.namespace!=frozen.input.plan.namespace
+            or seal.frozen_input_digest!=frozen.frozen_input_digest
+            or seal.qualified_units_digest!=frozen.qualified_units_digest
+            or seal.model_request_digest!=frozen.model_request_digest):
+        raise NaturalReplyJobHold('Natural frozen and generation seal profiles differ')
+    if review is not None:
+        if(type(review)is not SavedNaturalPreparationV2 or review.stage!='review' or review.state!='terminal'
+                or review.parent_original_id!=generation.parent_original_id
+                or type(review.frozen)is not FrozenNaturalReplyReviewV1):
+            raise NaturalReplyJobHold('actual matching terminal semantic review required')
+        try:actual_review=_seal('review',asdict(review.seal))
+        except (KeyError,TypeError,ValueError)as exc:
+            raise NaturalReplyJobHold('unknown Natural review original profile')from exc
+        if (type(review.seal)is not type(actual_review)
+                or review.seal.schema!='sylanne.d09.natural_review_seal.v'+str(version)
+                or review.seal.namespace!=seal.namespace
+                or review.seal.generation_original_operation_id!=seal.original_operation_id
+                or review.seal.generation_call_id!=seal.call_id
+                or review.seal.generation_frozen_input_digest!=seal.frozen_input_digest
+                or review.seal.generation_output_digest!=generation.terminal_output_digest
+                or review.frozen.generation_frozen_input_digest!=seal.frozen_input_digest
+                or review.frozen.qualified_units_digest!=seal.qualified_units_digest):
+            raise NaturalReplyJobHold('Natural semantic review crossed its generation profile')
+    return version if version>=5 else None
 
 
 def save_original_preparation(
@@ -452,8 +516,11 @@ def read_original_preparation(
             namespace.as_tuple + (parent_original_id,),
         ).fetchone()
     else:
-        from .dispatch_initial_source_read_v3 import PreparedNaturalOriginalsV3
-        if type(prepared_originals)is not PreparedNaturalOriginalsV3:
+        from .dispatch_initial_source_read_v3 import (PreparedNaturalOriginalsV3,
+            PreparedDispatchNaturalReviewOriginalsV3,require_dispatch_review_original_v3)
+        if type(prepared_originals)is PreparedDispatchNaturalReviewOriginalsV3:
+            require_dispatch_review_original_v3(prepared_originals)
+        elif type(prepared_originals)is not PreparedNaturalOriginalsV3:
             from .dispatch_initial_source_read_v3 import require_actual_authority_natural_original_v3
             require_actual_authority_natural_original_v3(prepared_originals)
         row=prepared_originals.require_for_v3(db,namespace,parent_original_id,stage)
@@ -482,7 +549,9 @@ def read_original_preparation(
                 raise ValueError("generation original semantic version differs")
         else:
             original = read_original_preparation(
-                db, namespace, parent_original_id, "generation",
+                db, namespace, parent_original_id, "generation",prepared_originals=(
+                    prepared_originals.generation_original
+                    if prepared_originals is not None and type(prepared_originals)is PreparedDispatchNaturalReviewOriginalsV3 else None),
             )
             if original is None or original.state != "terminal":
                 raise ValueError("generation result missing")

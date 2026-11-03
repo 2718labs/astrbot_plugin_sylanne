@@ -464,8 +464,10 @@ async def _host_one_shot(case, final, expected_body, onebot_outcome,
             assert result.status == (
                 "unknown" if onebot_outcome == "observation_ack_lost"
                 else onebot_outcome), result.reason
-            assert result.original is not None
-            assert result.original.payload.payload.decode("utf-8") == expected_body
+            assert result.original_summary is not None
+            from sylanne3.domains.d09 import segment_payload_digest
+            assert result.original_summary.payload_digest == segment_payload_digest(expected_body, (), ())
+            assert not hasattr(result.original_summary, "payload")
             assert sends == [("send_private_msg", {
                 "self_id": "10001", "user_id": 123456,
                 "message": [{"type": "text", "data": {"text": expected_body}}],
@@ -474,7 +476,7 @@ async def _host_one_shot(case, final, expected_body, onebot_outcome,
                 case["port"].read_current_effect,
                 namespace=case["namespace"],
                 authority_namespace=case["authority_namespace"],
-                effect_id=result.original.effect_id)
+                effect_id=result.original_summary.effect_id)
             assert current.state == "observed"
             replay = await driver.run_once(operation_id=receipt.operation_id)
             assert replay.status == "hold"

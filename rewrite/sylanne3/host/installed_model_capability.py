@@ -120,6 +120,20 @@ class InstalledModelCapabilityPort:
             future.cancel()
             return None
 
+    def read_current_creation_model_capability(self, *, namespace: NamespaceId) -> VerifiedModelCapability | None:
+        """Read this installation's real main-model selector from a non-Host caller."""
+        bundle = self._installation_bundle
+        if (type(bundle) is not AdminInstallationBundle
+                or type(bundle.installation_policy) is not AdminInstallationPolicy
+                or namespace != self._installed_namespace
+                or bundle.installation_policy.namespace != namespace):
+            return None
+        workflow = bundle.ingress_model if bundle.model_workflows is None else bundle.model_workflows.reply
+        if type(workflow) not in (AdminIngressModelPolicy, AdminModelWorkflowV2):
+            return None
+        selector = model_capability_ref(workflow.provider_id, workflow.model_id)
+        return self.verify(namespace, selector)
+
     def resolve_current_model_capability(
         self, *, namespace: NamespaceId, capability_ref: str,
     ) -> VerifiedModelCapability | None:

@@ -256,11 +256,15 @@ def issue_prebatch_private_social_v1(
         return PrebatchSocialCandidateV1(
             "hold", (reason,), manifest, role, boundary, None, (), None)
 
+    from ...runtime.d08_commitment_communication_v1 import CommitmentLiteralExpressionV1, require_live_commitment_literal_v1
+    named = type(expression) is CommitmentLiteralExpressionV1
+    if named:
+        require_live_commitment_literal_v1(expression, intent.identity)
     if (not getattr(db, "in_transaction", False)
             or type(snapshot) is not GraphSnapshot or type(query) is not QueryEpoch
             or type(intent) is not ActionIntent
             or type(schema_record) is not ActionSchemaRecord
-            or type(expression) is not SourceReplyExpressionV1
+            or type(expression) not in (SourceReplyExpressionV1, CommitmentLiteralExpressionV1)
             or type(route) is not CurrentReplyRouteManifestV2
             or type(route_binding) is not CurrentReplyEntityRouteBindingV2
             or type(context) is not ContextProvider
@@ -290,7 +294,7 @@ def issue_prebatch_private_social_v1(
         return hold("social.staged_write_scope_or_single_reply")
     segment = expression.segments[0]
     if (segment.media_refs or segment.delay_seconds != 0.0
-            or segment.segment_id != "segment:" + expression.provenance_digest
+            or (not named and segment.segment_id != "segment:" + expression.provenance_digest)
             or segment_payload_digest(segment.body, segment.media_refs,
                                       segment.claim_uses) != expression.payload_digest
             or len(segment.body) > 2048
@@ -300,7 +304,7 @@ def issue_prebatch_private_social_v1(
                                  expression.result_read_request_digest,
                                  expression.observation_digest))
             or any(claim.source_refs != intent.source_refs
-                   or claim.kind is not ClaimKind.REPORTED_CLAIM
+                   or claim.kind is not (ClaimKind.INTERNAL_ACTIVITY if named else ClaimKind.REPORTED_CLAIM)
                    for claim in expression.claims)):
         return hold("social.source_reply_manifest_differs")
     try:
@@ -360,14 +364,15 @@ def issue_prebatch_private_social_v1(
             expression.payload_digest, expression.provenance_digest,
             route.route_digest,
         )
-        projection = read_current_dispatch_projection(
-            db, namespace, snapshot, query)
         request = RoleBindingRequest(
             f"persona:{namespace.persona_id}", intent.target_ref, None,
             scene_ref, intent.action_kind, intent.purpose, now_utc, True,
         )
+        policy_route=(account_ref,destination_ref,sender_ref,message_id,scene_ref)
+        projection = read_current_dispatch_projection(
+            db, namespace, snapshot, query,policy_request=request,policy_route=policy_route)
         role_read, boundary_read = derive_current_domain_reads(
-            db, projection, request, context)
+            db, projection, request, context,policy_route=policy_route)
         specs = {item.check_kind: item for item in intent.required_checks
                  if item.check_kind in {"role_binding", "boundary"}}
         if (len(specs) != 2

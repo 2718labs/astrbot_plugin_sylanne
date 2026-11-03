@@ -233,3 +233,84 @@ def test_opaque_p0_digest_and_ambiguous_or_wrong_business_namespace_hold():
         authority_dispatch_footprint_v2(NamespaceId("bot/a", "persona"), request)
     with pytest.raises(ValueError, match="trusted graph namespace"):
         authority_dispatch_footprint_v2(NamespaceId("other", "persona"), request)
+
+
+# Controlled-clock checks exercise the actual production time producer. They do
+# not claim an installed Source/Owner/P2 authorization or platform send.
+def _inventory_read_time_case(monkeypatch, *, upper_offset=0.0):
+    import sqlite3
+    from dataclasses import asdict
+    from threading import RLock
+    from types import SimpleNamespace
+    import sylanne3.runtime.dispatch_current_inventory_v3 as inventory
+    from sylanne3.host.authority_profile import AdminIngressClockPolicy
+    from sylanne3.host.v2_fence_port import VerifiedIngressClockV2
+    from sylanne3.authority_service.v2_clock import IngressClockSampleV2
+
+    receipt, request, permit = _fixture()
+    policy = AdminIngressClockPolicy("clock:one", 0.1, 0.5)
+    value = replace(receipt.admission,
+        utc_deadline=datetime.fromtimestamp(NOW+10,timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        clock_policy_digest=canonical_digest(asdict(policy)))
+    digest = canonical_digest({"admission_digest":value.digest,"graph_revision":8,"graph_epoch":9})
+    receipt = DispatchAdmissionReceiptV1(value,8,9,digest)
+    binding = build_non_authorizing_execution_binding_v2(namespace=NAMESPACE,
+        admission_receipt=receipt,recovered_request=request,original_dispatch_permit=permit,
+        adapter_ref="adapter:one",now_utc=NOW)
+    mono = [100.0]
+    monkeypatch.setattr(inventory,"monotonic",lambda:mono[0])
+    sample = IngressClockSampleV2("authority:one","installation:one","clock:one",NOW,30.0,"epoch:one",0.0)
+    reading = VerifiedIngressClockV2(sample,99.9,100.0,NOW+upper_offset)
+    db = sqlite3.connect(":memory:")
+    lock = RLock()
+    calls = []
+    def read_clock(actual_policy):
+        assert actual_policy is policy and not db.in_transaction and not lock._is_owned()
+        calls.append(actual_policy)
+        return reading
+    graph = SimpleNamespace(**{
+        "_GraphCoordinator__store":SimpleNamespace(_db=db,_lock=lock),
+        "_GraphCoordinator__dispatch_clock_policy":policy,
+        "_GraphCoordinator__content_fence_v2":SimpleNamespace(read_ingress_clock=read_clock)})
+    return inventory, graph, binding, mono, calls, db
+
+
+def test_actual_inventory_clock_advances_original_deadline_without_refresh(monkeypatch):
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    inventory,graph,binding,mono,calls,db = _inventory_read_time_case(monkeypatch)
+    try:
+        original = inventory._issue_dispatch_inventory_time_v3(graph,binding)
+        mono[0] = 109.0
+        assert NOW+9 <= original.require_current_v3(graph,binding) < NOW+10
+        mono[0] = 110.0
+        with pytest.raises(AuthorityUnavailable,match="original admission deadline expired"):
+            original.require_current_v3(graph,binding)
+        assert len(calls)==1 and original.deadline==NOW+10 and db.total_changes==0
+    finally:
+        db.close()
+
+
+def test_actual_inventory_clock_rejects_expiry_hidden_by_old_caller_time(monkeypatch):
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    inventory,graph,binding,mono,calls,db = _inventory_read_time_case(monkeypatch,upper_offset=11.0)
+    try:
+        with pytest.raises(AuthorityUnavailable,match="original admission deadline expired"):
+            inventory._issue_dispatch_inventory_time_v3(graph,binding)
+        assert len(calls)==1 and db.total_changes==0
+    finally:
+        db.close()
+
+
+def test_actual_inventory_time_cannot_move_to_new_binding_or_policy(monkeypatch):
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    inventory,graph,binding,mono,calls,db = _inventory_read_time_case(monkeypatch)
+    try:
+        original = inventory._issue_dispatch_inventory_time_v3(graph,binding)
+        altered = replace(binding,utc_deadline="2099-01-01T00:00:00Z")
+        with pytest.raises(AuthorityUnavailable,match="actual original dispatch inventory time"):
+            original.require_current_v3(graph,altered)
+        with pytest.raises(AuthorityUnavailable,match="installed clock policy differs"):
+            inventory._issue_dispatch_inventory_time_v3(graph,replace(binding,clock_policy_ref="foreign:clock"))
+        assert len(calls)==1 and original.binding is binding and db.total_changes==0
+    finally:
+        db.close()

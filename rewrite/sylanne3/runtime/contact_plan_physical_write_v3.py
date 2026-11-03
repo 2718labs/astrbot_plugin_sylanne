@@ -13,7 +13,7 @@ import json
 from ..authority_service.contract import AuthorityUnavailable
 from ..graph_types import GraphWrite, NamespaceEpoch
 from ..runtime_contracts import canonical_digest, canonical_serialize
-from ..runtime_storage_v3 import runtime_storage_v3, _operation, runtime_storage_quantum_v3
+from ..runtime_storage_v3 import runtime_storage_v3, _operation, runtime_storage_quantum_v3, runtime_source_identity_v4
 from .owner_material_source_storage_v3 import CanonicalValueStreamV3
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
 
@@ -62,9 +62,10 @@ class ContactPlanCellStreamV3:
         if self.phase == 'hash_complete':
             if prepared.event_digest is None:
                 return
+            identity=runtime_source_identity_v4(prepared.handle,meter=meter)
             self.origin = {'schema':'sylanne3.runtime-cell-origin.v3','selection_digest':prepared.operation.selection_digest,
-                'role':'graph','authority_id':prepared.handle.selected.basis.control.authority_id,
-                'installation_id':prepared.handle.selected.basis.control.installation_id,'namespace':prepared.namespace.as_tuple,
+                'role':'graph','authority_id':identity.authority_id,
+                'installation_id':identity.installation_id,'namespace':prepared.namespace.as_tuple,
                 'operation_id':prepared.operation_id,'event_digest':prepared.event_digest,'locator':self.locator,
                 'read_proof':{'schema':'sylanne.contact-plan-stream-origin.v3','stream_ref':prepared.stream_ref,
                     'request_digest':prepared.request_digest,'permit_digest':prepared.permit_digest,

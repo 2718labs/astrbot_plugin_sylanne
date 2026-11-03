@@ -210,6 +210,8 @@ class InstalledC09InstanceLeaseV1:
             if self._continuation_thread is not None:
                 raise AuthorityUnavailable("C09 lease cannot close during final continuation")
             if not self._stream.closed:
+                from .c09_storage_maintenance_v1 import revoke_actual_host_graph_custodies_for_instance_lease_v4
+                revoke_actual_host_graph_custodies_for_instance_lease_v4(self)
                 if os.name == "nt":
                     import msvcrt
                     self._stream.seek(0)
@@ -373,7 +375,12 @@ class InstalledC09StorageReaderV1:
             raise AuthorityUnavailable("C09 installed signature differs")
 
     def _manifest(self, manifest):
-        if manifest["schema"] == "sylanne3.c09.storage_manifest.v3":
+        if manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4':
+            from .c09_initial_segmented_genesis_v4 import require_initial_segmented_manifest_v4
+            require_initial_segmented_manifest_v4(manifest)
+            if manifest['control_store_id']!=self.control_store_id:
+                raise AuthorityUnavailable('initial segmented manifest belongs to another actual Control')
+        elif manifest["schema"] == "sylanne3.c09.storage_manifest.v3":
             from .c09_storage_manifest_v3 import require_manifest_provenance_shape_v3
             require_manifest_provenance_shape_v3(manifest)
         elif manifest["schema"] == "sylanne3.c09.storage_manifest.v2":
@@ -439,6 +446,9 @@ class InstalledC09StorageReaderV1:
                     row = db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name + "_no_" + action.lower(),)).fetchone()
                     if row is None or row[0] != expected:
                         raise AuthorityUnavailable("C09 control immutable trigger differs")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_initial_segmented_genesis_v4'").fetchone()is not None:
+            from .c09_initial_segmented_genesis_v4 import require_initial_genesis_control_schema_v4
+            require_initial_genesis_control_schema_v4(self,db)
         if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='c09_storage_operations_v2'").fetchone() is not None:
             from .c09_prepared_storage_v2 import validate_prepared_schema_v2
             validate_prepared_schema_v2(self, db)
@@ -715,6 +725,8 @@ class InstalledC09StorageReaderV1:
                     with c09_sql_meter_quantum_v2(actual):
                         return self.read_verified_current_storage_v3(meter=actual, verify_files=verify_files)
             return self.read_verified_current_storage_v3(meter=actual, verify_files=verify_files)
+        initial=self._read_current_initial_segmented_context_v4(meter=meter)
+        if initial is not None:return initial
         view = getattr(self, "_selected_history_read_v3", None)
         if type(view) is not VerifiedSelectedHistoryReadV3 or view.basis.control is not self:
             raise AuthorityUnavailable("actual V3 selected history read is not complete")
@@ -726,6 +738,8 @@ class InstalledC09StorageReaderV1:
 
     def read_verified_current_storage_v2(self, *, meter, verify_files=True):
         """Use only the actually streamed selected legacy header for V2 work."""
+        initial=self._read_current_initial_segmented_context_v4(meter=meter)
+        if initial is not None:return initial
         from .c09_prepared_storage_v2 import read_selected_prepared_v2
         if getattr(self, '_selected_history_read_v3', None) is not None:
             return self.read_verified_current_storage_v3(meter=meter, verify_files=verify_files)
@@ -755,7 +769,19 @@ class InstalledC09StorageReaderV1:
             manifest["manifest_digest"], manifest["generation"], current["stage"],
             manifest, prepared, self, self._capability)
 
+    def _read_current_initial_segmented_context_v4(self,*,meter=None):
+        from .c09_initial_segmented_genesis_v4 import has_current_initial_segmented_manifest_v4,read_initial_segmented_context_v4
+        if self._c09_control_chain_proof_v2 is None:return None
+        if meter is None:
+            with self._resource_sql_quantum_v3()as actual:
+                return self._read_current_initial_segmented_context_v4(meter=actual)
+        if has_current_initial_segmented_manifest_v4(self,meter=meter):
+            return read_initial_segmented_context_v4(self,meter=meter)
+        return None
+
     def read_verified_current_storage_v1(self, *, verify_files=True):
+        initial=self._read_current_initial_segmented_context_v4()
+        if initial is not None:return initial
         if getattr(self, "_selected_history_read_v3", None) is not None:
             return self.read_verified_current_storage_v3(verify_files=verify_files)
         from .c09_paged_recovery_facts_v2 import C09VerifiedLegacyPreparedSummaryV2
@@ -809,6 +835,9 @@ class InstalledC09StorageReaderV1:
         return observed
 
     def require_context_v1(self, context, *, action="maintenance"):
+        if type(context)is VerifiedStorageOpenContextV1 and context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4':
+            from .c09_initial_segmented_genesis_v4 import require_initial_segmented_context_v4
+            return require_initial_segmented_context_v4(self,context,action=action)
         if action not in {"business", "accounting", "recovery", "maintenance"}:
             raise AuthorityUnavailable("unknown C09 storage admission action")
         if (type(context) is not VerifiedStorageOpenContextV1 or context._reader is not self
@@ -988,7 +1017,7 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
 
     def _store_manifest(self, db, manifest):
         self._manifest(manifest)
-        if manifest['schema']!='sylanne3.c09.storage_manifest.v3':
+        if manifest['schema']not in {'sylanne3.c09.storage_manifest.v3','sylanne3.c09.initial-segmented-storage-manifest.v4'}:
             from ..segmented_sql_cell_v1 import require_legacy_storage_file_v3
             for member in manifest['members']:require_legacy_storage_file_v3(member['resolved_path'])
         from .c09_storage_manifest_v2 import manifest_signature_domain
@@ -1003,6 +1032,50 @@ class C09StorageControlV1(InstalledC09StorageReaderV1):
         db.execute("INSERT INTO c09_storage_manifests_v1 VALUES(?,?,?,?,?,?,?)", (
             manifest["manifest_digest"], self.installation_id, manifest["generation"],
             canonical(manifest), self.authority_id, self.key_id, signed["signature"]))
+
+    def bootstrap_initial_segmented_storage_v4(self,*,creation):
+        from .c09_initial_segmented_genesis_v4 import (_InitialGenesisCreationV4,INITIAL_GENESIS_DDL_V4,
+            require_initial_segmented_manifest_v4,read_initial_segmented_storage_v4)
+        from .daemon import _bootstrap_control_quantum_v3
+        if type(creation)is not _InitialGenesisCreationV4:
+            raise AuthorityUnavailable('actual O_EXCL initial-segmented creation proof required')
+        creation.require_current(self)
+        if self.path.exists():raise AuthorityUnavailable('initial segmented genesis refuses an existing Control')
+        manifest=creation.manifest;original=creation.original
+        require_initial_segmented_manifest_v4(manifest);self._manifest(manifest)
+        self.verify_original_v1(original,'genesis_digest')
+        if (original['plan']!=creation.plan or original['role_originals']!=creation.roles
+                or manifest['initial_genesis_original_digest']!=original['genesis_digest']):
+            raise AuthorityUnavailable('initial creation original/manifest binding changed')
+        for member in manifest['members']:self.verify_member_v1(member,prepared=True)
+        descriptor=os.open(self.path,os.O_CREAT|os.O_EXCL|os.O_RDWR,0o600)
+        os.close(descriptor)
+        with self._db(write=True,create=True)as db:
+            creation.require_current(self)
+            for ddl in _DDL.values():db.execute(ddl)
+            db.execute(INITIAL_GENESIS_DDL_V4)
+            db.executemany('INSERT INTO c09_storage_meta_v1 VALUES(?,?)',(
+                ('schema_version','1'),('installation_id',self.installation_id),('authority_id',self.authority_id),
+                ('control_store_id',self.control_store_id),('key_id',self.key_id)))
+            self._store_manifest(db,manifest)
+            db.execute('INSERT INTO c09_initial_segmented_genesis_v4 VALUES(?,?,?,?,?,?)',(
+                self.installation_id,creation.plan['genesis_id'],creation.plan['plan_digest'],original['genesis_digest'],
+                manifest['manifest_digest'],canonical(original)))
+            db.execute("INSERT INTO c09_storage_current_v1 VALUES(?,0,?,NULL,'READY',0,'genesis',?,?)",(
+                self.installation_id,manifest['manifest_digest'],0,manifest['cumulative_tombstone_root']))
+            for name in (*_DDL,'c09_initial_segmented_genesis_v4'):
+                if name!='c09_storage_current_v1':
+                    for action in ('UPDATE','DELETE'):db.execute(self._immutable_ddl(name,action))
+        with self._lock,closing(sqlite3.connect(self.path,isolation_level=None))as db:
+            if db.execute('PRAGMA wal_checkpoint(TRUNCATE)').fetchone()[0]!=0:
+                raise AuthorityUnavailable('initial Control publication checkpoint did not settle')
+        with self.path.open('rb')as committed:os.fsync(committed.fileno())
+        directory=os.open(self.path.parent,os.O_RDONLY)
+        try:os.fsync(directory)
+        finally:os.close(directory)
+        while self.read_verified_control_status_v3()['status']!='complete':creation.require_current(self)
+        with _bootstrap_control_quantum_v3(self)as meter:
+            return read_initial_segmented_storage_v4(self,meter=meter)
 
     def bootstrap_installed_storage_v1(self, *, manifest):
         if manifest['schema']=='sylanne3.c09.storage_manifest.v3':

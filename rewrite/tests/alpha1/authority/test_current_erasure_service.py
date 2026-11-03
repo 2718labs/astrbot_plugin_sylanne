@@ -5,8 +5,8 @@ from dataclasses import replace
 
 from sylanne3.authority_service.contract import AuthorityUnavailable, JournalHead
 from sylanne3.authority_service.current_erasure_service import (
-    CleanupAttestationV1, CleanupSurfaceReceiptV1, CurrentErasureAuthority,
-    GraphBarrierAttestationV1, MISSING_PORTS, REQUIRED_CLEANUP_SURFACES,
+    CurrentErasureAuthority,
+    GraphBarrierAttestationV1,
 )
 from sylanne3.authority_service.core import AuthorityServiceCore
 from sylanne3.authority_service.v2_contract import (
@@ -32,6 +32,121 @@ from sylanne3.runtime.deletion import DeletionJournal
 from sylanne3.runtime_contracts import NamespaceId, canonical_digest
 
 
+def _prepare_storage_fixture_pending(
+        erasure, *, credential, subject, holder, installation_id, owner_actor_id,
+        owner_session_token, owner_session_request, deletion_operation_id,
+        closure_roots, deletion_epoch, policy_ref):
+    """Fixture-only pending storage; no Graph plan or product admission claim."""
+    from dataclasses import asdict
+    from hashlib import sha256
+    from sylanne3.authority_service.contract import identifier
+    from sylanne3.authority_service.v2_contract import FencePermitV2
+
+    service, _, _, _, installed_id, scoped = erasure._prepare
+    namespace = erasure._recovery.namespace
+    for name, value in (
+            ("subject", subject), ("holder", holder),
+            ("installation_id", installation_id), ("owner_actor_id", owner_actor_id),
+            ("deletion_operation_id", deletion_operation_id), ("policy_ref", policy_ref)):
+        identifier(value, name)
+    if (scoped is None or installation_id != installed_id
+            or closure_roots != tuple(sorted(set(closure_roots)))
+            or len(closure_roots) != 1):
+        raise AuthorityUnavailable("fixture requires one canonical scoped storage root")
+    service.core._require(credential, "deletion", namespace, holder)
+    protocol = lambda kind: erasure._protocol_id(namespace, deletion_operation_id, kind)
+    issuer = "storage-fixture-owner-session-v1"
+    mutation_id = protocol("mutation")
+    prior_receipt = None
+    with service._frozen() as (db, deletion_head, execution_head, history):
+        prior = service.fences.mutation_locked(db, mutation_id)
+        if prior is not None:
+            kind, pending, prior_receipt, _ = service.fences._decode_mutation_row(prior)
+            if (kind != "deletion" or pending.permit.subject != subject
+                    or pending.permit.holder != holder
+                    or pending.deletion_operation_id != deletion_operation_id
+                    or pending.closure_roots != closure_roots
+                    or pending.deletion_epoch != deletion_epoch
+                    or pending.policy_ref != policy_ref
+                    or pending.evidence.issuer_id != issuer):
+                raise AuthorityUnavailable("fixture deletion request replay differs")
+        else:
+            request, session, guard, _, _ = erasure._current_plan_owner_locked_v1(
+                db, token=owner_session_token, request=owner_session_request,
+                actor=owner_actor_id)
+            anchor = service._current_locked(
+                db, deletion_head, execution_head, holder=holder)
+            if anchor.authority_id != request.authority_id:
+                raise AuthorityUnavailable("fixture Owner Authority differs")
+            permit = service.fences.begin_fence_locked(
+                db, subject=subject, holder=holder, operation="delete",
+                current_anchor=anchor, operation_id=protocol("fence"))
+            identity = dict(
+                schema="sylanne3.scoped-erasure-request.v2", namespace=namespace,
+                operation_id=deletion_operation_id, scope_kind="one_source",
+                roots=closure_roots, epoch=deletion_epoch,
+                policy_ref=policy_ref, policy_version=1)
+            request_digest = "sha256:" + canonical_digest(identity)
+            proof = dict(
+                request_digest=request_digest, owner_head=asdict(guard),
+                actor_id=owner_actor_id, session=asdict(session),
+                token_digest="sha256:" + sha256(owner_session_token.encode()).hexdigest(),
+                anchor=asdict(anchor))
+            evidence = DeletionEvidenceV1(
+                authority_id=anchor.authority_id, namespace=namespace,
+                deletion_operation_id=deletion_operation_id, kind="request_authorized",
+                issuer_id=issuer, evidence_id=protocol("evidence"),
+                bound_anchor=anchor, request_digest=request_digest,
+                scope_digest=deletion_scope_digest(
+                    closure_roots, deletion_epoch, policy_ref),
+                proof_digest="sha256:" + canonical_digest(proof))
+            draft = DeletionPendingV1(
+                permit=permit, mutation_id=mutation_id, request_digest=request_digest,
+                deletion_operation_id=deletion_operation_id,
+                source_phase="absent", target_phase="pending",
+                closure_roots=closure_roots, deletion_epoch=deletion_epoch,
+                policy_ref=policy_ref, before_anchor=anchor, evidence=evidence,
+                expected_append_id=protocol("append"),
+                expected_append_digest="sha256:" + "0" * 64)
+            pending = replace(
+                draft, expected_append_digest=service.deletion.expected_digest(draft))
+            scoped.reserve_locked(db, pending)
+            service.fences.record_deletion_pending_locked(
+                db, pending, subject=subject, current_anchor=anchor, core=service.core)
+    if prior_receipt is None:
+        service.deletion.append_pending(pending, core=service.core, fences=service.fences)
+    receipt = erasure._recovery.recover(
+        credential=credential, subject=subject, mutation_id=mutation_id)
+    kind, saved, committed, updated = service.fences.get_mutation(
+        mutation_id, subject=subject, namespace=namespace)
+    if (receipt is None or receipt.pending != pending or kind != "deletion"
+            or saved != pending or committed != receipt
+            or type(updated) is not FencePermitV2
+            or updated.pinned_anchor != receipt.after_anchor
+            or updated.revision != receipt.updated_revision):
+        raise AuthorityUnavailable("fixture pending storage recovery incomplete")
+    return receipt, updated
+
+
+def _apply_storage_fixture_head(scoped, *, credential, subject, receipt):
+    """Exercise the real scoped CAS; this synthetic DTO grants no Graph proof."""
+    from sylanne3.authority_service.contract import identifier
+
+    if type(receipt) is not VerifiedGraphAppliedHeadV2:
+        raise AuthorityUnavailable("typed fixture cumulative Graph claim required")
+    identifier(subject, "subject")
+    if receipt.namespace != scoped.namespace:
+        raise AuthorityUnavailable("fixture Graph application crosses namespace")
+    scoped.core._require(credential, "deletion", scoped.namespace)
+    with scoped.deletion.freeze_writes():
+        with scoped.execution.freeze_writes():
+            head = scoped.deletion.verified_head()
+            execution_head = scoped.execution.verified_head()
+            with scoped.core._tx() as db:
+                return scoped._apply_verified_head_locked_v1(
+                    db, head, execution_head, subject, receipt)
+
+
 def test_current_entry_requires_real_recovery_service():
     with pytest.raises(AuthorityUnavailable, match="real deletion pending recovery"):
         CurrentErasureAuthority(object())
@@ -39,7 +154,6 @@ def test_current_entry_requires_real_recovery_service():
 
 @pytest.mark.parametrize("method,phase,argument", [
     (CurrentErasureAuthority.accept, "accepted", "barrier"),
-    (CurrentErasureAuthority.close, "closed", "cleanup"),
 ])
 def test_unimplemented_transitions_hold_without_invoking_input(method, phase, argument):
     class Poison:
@@ -50,13 +164,14 @@ def test_unimplemented_transitions_hold_without_invoking_input(method, phase, ar
         method(**{argument: Poison()})
 
 
-def test_missing_ports_name_unverified_product_origins():
-    assert any("product D12 admission" in item for item in MISSING_PORTS)
-    assert any("cumulative C09 Graph application" in item for item in MISSING_PORTS)
-    assert any("cleanup surface" in item for item in MISSING_PORTS)
+def test_bare_cleanup_claim_is_not_a_current_cleanup_operation():
+    # Product close accepts only its operation_id and actual installed verifier.
+    # Caller supplied cleanup claims are rejected by the actual method signature.
+    with pytest.raises(TypeError, match="cleanup"):
+        CurrentErasureAuthority.close(None, cleanup=object())
 
 
-def test_owner_signed_request_prepares_real_pending_but_not_acceptance(tmp_path):
+def test_owner_signed_storage_fixture_does_not_grant_released_generation(tmp_path):
     from datetime import datetime, timedelta, timezone
 
     from cryptography.hazmat.primitives import serialization
@@ -178,7 +293,7 @@ def test_owner_signed_request_prepares_real_pending_but_not_acceptance(tmp_path)
             deletion_operation_id="erase-root-a", closure_roots=("root-a",),
             deletion_epoch=1, policy_ref="installed-policy-a")
         with pytest.raises(AuthorityUnavailable, match="actor"):
-            erasure._prepare_unbound_for_storage_test(**{
+            _prepare_storage_fixture_pending(erasure, **{
                 **args, "owner_actor_id": "imposter"})
         with service.deletion.freeze_writes():
             assert service.deletion.latest_phases().get((AUTH_NS, "erase-root-a")) is None
@@ -187,14 +302,14 @@ def test_owner_signed_request_prepares_real_pending_but_not_acceptance(tmp_path)
                 key: value for key, value in args.items()
                 if key not in {"closure_roots", "deletion_epoch", "policy_ref"}
             }, source_id="root-a")
-        receipt, updated = erasure._prepare_unbound_for_storage_test(**args)
+        receipt, updated = _prepare_storage_fixture_pending(erasure, **args)
         assert receipt.pending.evidence.kind == "request_authorized"
         assert receipt.pending.closure_roots == ("root-a",)
         assert updated.pinned_anchor == receipt.after_anchor
         assert updated.revision == receipt.updated_revision
-        assert erasure._prepare_unbound_for_storage_test(**args) == (receipt, updated)
+        assert _prepare_storage_fixture_pending(erasure, **args) == (receipt, updated)
         with pytest.raises(AuthorityUnavailable):
-            erasure._prepare_unbound_for_storage_test(**{
+            _prepare_storage_fixture_pending(erasure, **{
                 **args, "deletion_operation_id": "overlapping-erase",
                 "closure_roots": ("root-b",)})
 
@@ -248,21 +363,28 @@ def test_owner_signed_request_prepares_real_pending_but_not_acceptance(tmp_path)
             "sha256:" + "c" * 64)
         with pytest.raises(AuthorityUnavailable, match="pinned cumulative Graph"):
             scoped.apply_verified_head(
-                credential=WORKER, subject=SUBJECT, receipt=applied)
-        assert scoped._apply_controlled_head_for_storage_test(
+                credential=WORKER, subject=SUBJECT, operation_id=applied.deletion_operation_id)
+        assert _apply_storage_fixture_head(scoped,
             credential=WORKER, subject=SUBJECT,
             receipt=applied).aggregate_phase == "clear"
-        second, second_permit = erasure._prepare_unbound_for_storage_test(**{
-            **args, "deletion_operation_id": "erase-root-b",
-            "closure_roots": ("root-b",), "deletion_epoch": 2})
-        assert second.pending.deletion_epoch == 2
-        assert second.pending.before_anchor.deletion_seq == phase_receipt.after_anchor.deletion_seq
-        assert second_permit.pinned_anchor == second.after_anchor
+        # Synthetic storage completion does not install a verified RELEASED
+        # generation. A later business deletion still requires that real gate.
+        with pytest.raises(AuthorityUnavailable,
+                           match="installed current C09 storage verifier unavailable"):
+            _prepare_storage_fixture_pending(erasure, **{
+                **args, "deletion_operation_id": "erase-root-b",
+                "closure_roots": ("root-b",), "deletion_epoch": 2})
+        with service.deletion.freeze_writes():
+            assert service.deletion.latest_phases().get(
+                (AUTH_NS, "erase-root-b")) is None
+        with core._tx() as db:
+            assert service.fences.mutation_locked(
+                db, erasure._protocol_id(AUTH_NS, "erase-root-b", "mutation")) is None
         assert scoped.read_ancestor_receipt(
             credential=WORKER, subject=SUBJECT,
             mutation_id=receipt.pending.mutation_id) == receipt
         with pytest.raises(AuthorityUnavailable, match="replay differs"):
-            erasure._prepare_unbound_for_storage_test(**{
+            _prepare_storage_fixture_pending(erasure, **{
                 **args, "closure_roots": ("different-root",)})
         with pytest.raises(AuthorityUnavailable, match="accepted phase remains HOLD"):
             erasure.accept()
@@ -271,9 +393,12 @@ def test_owner_signed_request_prepares_real_pending_but_not_acceptance(tmp_path)
             resource.close()
 
 
-def test_signed_owner_graph_plan_is_bound_before_scoped_pending(tmp_path):
-    """A real W01 original, not caller scope or a fixture receipt, authorizes prepare."""
-    import sqlite3
+def test_legacy_owner_graph_fixture_requires_current_c09_installation(tmp_path):
+    """A real Owner and legacy plan cannot replace installed V2 resources.
+
+    Positive prepare/barrier/accepted coverage requires the genuine installed
+    daemon and paged capture resources; this engineering fixture has neither.
+    """
     from uuid import uuid4
 
     from rewrite.tests.alpha1.integration.test_owner_signed_chain import (
@@ -290,9 +415,6 @@ def test_signed_owner_graph_plan_is_bound_before_scoped_pending(tmp_path):
     from sylanne3.memory_types import SourceRecord, access_key
     from sylanne3.authority_service.v2_deletion_graph_read import (
         AuthorityV2DeletionGraphReadService,
-    )
-    from sylanne3.authority_service.erasure_closure_inventory import (
-        AuthorityErasureClosureInventory, SURFACES_V1, SurfaceTargetV1,
     )
 
     chain = _real_owner_chain(
@@ -371,6 +493,11 @@ def test_signed_owner_graph_plan_is_bound_before_scoped_pending(tmp_path):
             owner_session_request=login)
         try:
             operation_id = str(uuid4())
+            with pytest.raises(UnavailableGuard,
+                               match="installed C09 Owner paged plan unavailable"):
+                coordinator.issue_current_c09_erasure_plan_v2(
+                    authority, lease, operation_id=operation_id,
+                    source_ref=source.token)
             plan = coordinator.issue_current_c09_erasure_plan_v1(
                 authority, lease, operation_id=operation_id,
                 source_ref=source.token)
@@ -422,162 +549,21 @@ def test_signed_owner_graph_plan_is_bound_before_scoped_pending(tmp_path):
                     "SELECT count(*) FROM authority_v2_mutations WHERE namespace=? "
                     "AND mutation_kind='deletion'",
                     (chain.service.namespace,)).fetchone() == (0,)
-            receipt, permit = erasure.prepare_request(**args)
-            assert receipt.pending.request_digest != "sha256:" + plan.request_digest
-            assert receipt.pending.evidence.issuer_id == "authority-owner-graph-plan-v2"
-            assert receipt.pending.closure_roots == plan.root_source_ids
-            assert permit.pinned_anchor == receipt.after_anchor
-            assert erasure.prepare_request(**args) == (receipt, permit)
-            assert erasure.prepare_request(**{
-                **args, "owner_session_token": "renewed-session-token"}) == (
-                    receipt, permit)
-            with pytest.raises(AuthorityUnavailable, match="replay differs"):
-                erasure.prepare_request(**{
-                    **args, "source_id": "different-source"})
-            with pytest.raises(UnavailableGuard, match="current C09 Authority pending differs"):
-                erasure.accept_verified_graph_barrier(
-                    credential=WORKER, subject=SUBJECT,
-                    pending_mutation_id=receipt.pending.mutation_id)
-            from sylanne3.authority_service.current_accepted_erasure_read import (
-                CurrentAcceptedErasureReadService,
-            )
-            from sylanne3.authority_service.current_accepted_erasure_wire import (
-                accepted_from_wire, accepted_to_wire,
-            )
-            accepted_reader = CurrentAcceptedErasureReadService(
-                fence_service=chain.service, owner_tickets=tickets,
-                scoped_store=scoped)
-            read_args = dict(
-                credential=WORKER, subject=SUBJECT,
-                installation_id="installation",
-                deletion_operation_id=operation_id,
-                scope_digest=receipt.pending.evidence.scope_digest)
-            with pytest.raises(AuthorityUnavailable, match="accepted"):
-                accepted_reader.read_current_accepted_erasure_v1(
-                    **read_args, permit=permit)
-            barrier = coordinator.commit_current_c09_source_barrier_v1(
-                chain.bootstrap, namespace=ROLE,
-                deletion_operation_id=operation_id, permit=permit)
-            with pytest.raises(ValueError, match="graph barrier differs"):
-                GraphBarrierAttestationV1(
-                    receipt, replace(barrier, request_digest="f" * 64))
-            with graph._lock:
-                graph._db.execute("BEGIN IMMEDIATE")
-                graph._db.execute(
-                    "UPDATE graph_authority_epochs SET delete_epoch=delete_epoch+1 "
-                    "WHERE bot=? AND persona=?", ROLE.as_tuple)
-                graph._db.execute("COMMIT")
-            with pytest.raises(ValueError, match="current graph/rights head"):
-                erasure.accept_verified_graph_barrier(
-                    credential=WORKER, subject=SUBJECT,
-                    pending_mutation_id=receipt.pending.mutation_id)
+            # No plan table or selected storage identity is fabricated here.
+            with pytest.raises(AuthorityUnavailable,
+                               match="current pinned C09 Graph plan unavailable"):
+                erasure.prepare_request(**args)
             with chain.service.deletion.freeze_writes():
-                assert chain.service.deletion.latest_phases()[
-                    (chain.service.namespace, operation_id)] == "pending"
-            with graph._lock:
-                graph._db.execute("BEGIN IMMEDIATE")
-                graph._db.execute(
-                    "UPDATE graph_authority_epochs SET delete_epoch=delete_epoch-1 "
-                    "WHERE bot=? AND persona=?", ROLE.as_tuple)
-                graph._db.execute("COMMIT")
-            accepted, accepted_permit = erasure.accept_verified_graph_barrier(
-                credential=WORKER, subject=SUBJECT,
-                pending_mutation_id=receipt.pending.mutation_id)
-            assert accepted.pending.source_phase == "pending"
-            assert accepted.pending.target_phase == "accepted"
-            assert accepted.pending.evidence.proof_digest == (
-                "sha256:" + canonical_digest(barrier))
-            assert accepted_permit.pinned_anchor == accepted.after_anchor
-            original = accepted_reader.read_current_accepted_erasure_v1(
-                **read_args, permit=accepted_permit)
-            assert original.pending_receipt == receipt
-            assert original.accepted_receipt == accepted
-            assert original.graph_barrier_digest == "sha256:" + canonical_digest(barrier)
-            assert accepted_from_wire(accepted_to_wire(original)) == original
-            from sylanne3.authority_service.mtls_server import MtlsPeerCredential
-            from sylanne3.authority_service.v2_contract import to_wire
-            chain.server.install_current_erasure_prepare(
-                chain.service.namespace, "installation", erasure)
-            chain.server.install_current_accepted_erasure_read(
-                chain.service.namespace, "installation", accepted_reader)
-            peer = MtlsPeerCredential("a" * 64)
-            prior_authorizer = core._authorize_callback
-            core._authorize_callback = lambda credential, action, namespace, holder: (
-                credential == peer and action == "delete"
-                and namespace == chain.service.namespace
-                and holder == "administrator"
-            ) or prior_authorizer(credential, action, namespace, holder)
-            command = dict(
-                namespace=chain.service.namespace,
-                deletion_operation_id=operation_id,
-                scope_digest=read_args["scope_digest"],
-                permit=to_wire(accepted_permit))
-            wire_result = chain.server._v2_command(
-                "read_current_accepted_erasure_v1", peer, "installed",
-                "c" * 64, command)
-            assert accepted_from_wire(wire_result["original"]) == original
-            with pytest.raises(RuntimeError, match="unavailable"):
-                chain.server._v2_command(
-                    "read_current_accepted_erasure_v1", peer, "installed",
-                    "c" * 64, {**command, "scope_digest": "sha256:" + "0" * 64})
-            with pytest.raises(AuthorityUnavailable):
-                accepted_reader.read_current_accepted_erasure_v1(
-                    **read_args, permit=permit)
-            with pytest.raises(AuthorityUnavailable):
-                accepted_reader.read_current_accepted_erasure_v1(
-                    **{**read_args, "scope_digest": "sha256:" + "f" * 64},
-                    permit=accepted_permit)
-            with pytest.raises(AuthorityUnavailable):
-                accepted_reader.read_current_accepted_erasure_v1(
-                    **{**read_args, "deletion_operation_id": str(uuid4())},
-                    permit=accepted_permit)
-            with pytest.raises(AuthorityUnavailable):
-                accepted_reader.read_current_accepted_erasure_v1(
-                    **{**read_args, "installation_id": "wrong-installation"},
-                    permit=accepted_permit)
-            with chain.service.deletion.freeze_writes():
-                assert chain.service.deletion.latest_phases()[
-                    (chain.service.namespace, operation_id)] == "accepted"
-            assert erasure.accept_verified_graph_barrier(
-                credential=WORKER, subject=SUBJECT,
-                pending_mutation_id=receipt.pending.mutation_id) == (
-                    accepted, accepted_permit)
-            closure = AuthorityErasureClosureInventory(
-                scoped=scoped, installation_id="installation")
-            targets = tuple(SurfaceTargetV1(
-                surface, "sqlite_execution_journal" if surface ==
-                "execution_journal_payloads" else "unresolved_inventory",
-                str(chain.service.execution.path.resolve()) if surface ==
-                "execution_journal_payloads" else "unresolved",
-                "inventory-v1" if surface == "execution_journal_payloads"
-                else "unavailable", chain.service.execution.journal_id if
-                surface == "execution_journal_payloads" else "unbound",
-                "installed" if surface == "execution_journal_payloads"
-                else "unresolved_hold") for surface in SURFACES_V1)
-            with pytest.raises(AuthorityUnavailable):
-                closure.install_registry(credential=WORKER, targets=targets)
-            registry = closure.install_registry(credential=ADMIN, targets=targets)
-            assert registry.surfaces == SURFACES_V1
-            run = closure.begin_run(
-                credential=WORKER, subject=SUBJECT,
-                accepted_mutation_id=accepted.pending.mutation_id)
-            assert run.graph_barrier_receipt_digest == canonical_digest(barrier)
-            assert run.status == "inventory_open_hold"
-            inventory = closure.issue_execution_payload_inventory(
-                credential=WORKER, subject=SUBJECT,
-                operation_id=operation_id)
-            assert inventory.status == "inventory_only_hold"
-            independent_reader = AuthorityErasureClosureInventory(
-                scoped=scoped, installation_id="installation")
-            assert independent_reader.read_execution_payload_inventory(
-                credential=WORKER, subject=SUBJECT,
-                operation_id=operation_id) == inventory
+                assert chain.service.deletion.latest_phases().get(
+                    (chain.service.namespace, operation_id)) is None
             with core._tx() as db:
-                with pytest.raises(sqlite3.IntegrityError, match="immutable"):
-                    db.execute(
-                        "UPDATE authority_erasure_execution_inventory_v1 "
-                        "SET receipt_json='{}' WHERE operation_id=?",
-                        (operation_id,))
+                assert db.execute(
+                    "SELECT count(*) FROM authority_v2_fences WHERE namespace=? "
+                    "AND state='active'", (chain.service.namespace,)).fetchone() == (0,)
+                assert db.execute(
+                    "SELECT count(*) FROM authority_v2_mutations WHERE namespace=? "
+                    "AND mutation_kind='deletion'",
+                    (chain.service.namespace,)).fetchone() == (0,)
         finally:
             coordinator.release_current_owner_lease(chain.bootstrap, lease)
     finally:
@@ -794,20 +780,8 @@ def test_internal_phase_ledger_replays_each_head_after_cold_open(tmp_path):
                         credential="ok", subject="subject-a",
                         pending_mutation_id=prior_receipt.pending.mutation_id)
             if ordinal == 3:
-                scope = deletion_scope_digest(
-                    pending.closure_roots, pending.deletion_epoch, pending.policy_ref)
-                surfaces = tuple(
-                    CleanupSurfaceReceiptV1(
-                        surface, pending.deletion_operation_id, scope, "purged",
-                        "sha256:" + "e" * 64)
-                    for surface in sorted(REQUIRED_CLEANUP_SURFACES))
-                cleanup = CleanupAttestationV1(
-                    prior_receipt, surfaces, pending.evidence)
-                with pytest.raises(AuthorityUnavailable, match="closed phase remains HOLD"):
-                    CurrentErasureAuthority.close(cleanup=cleanup)
-                with pytest.raises(ValueError, match="all unique cleanup surfaces"):
-                    CleanupAttestationV1(
-                        prior_receipt, surfaces[:-1], pending.evidence)
+                with pytest.raises(TypeError, match="cleanup"):
+                    CurrentErasureAuthority.close(None, cleanup=object())
             with core._tx() as db:
                 fences.record_deletion_pending_locked(
                     db, pending, subject="subject-a", current_anchor=anchor)

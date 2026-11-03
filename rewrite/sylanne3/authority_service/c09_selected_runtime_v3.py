@@ -37,16 +37,30 @@ class SelectedRuntimePhysicalProofV3:
         return self
 
 
+def _legacy_initial_owner_v3(qualification):
+    from .c09_source_physical_read_v3 import InitialOwnerSourceReadQualificationV3
+    return type(qualification) is InitialOwnerSourceReadQualificationV3
+
+
 class SelectedRuntimePhysicalReadV3:
     def __init__(self, token, basis, scope, *, roles=('core','deletion','execution','graph'), source_scope=None, initial_qualification=None):
         if token is not _ISSUER:
             raise AuthorityUnavailable('actual private selected runtime physical factory required')
         self.initial_qualification=initial_qualification;self.initial_source_anchor=None
         if initial_qualification is not None:
-            from .c09_source_physical_read_v3 import InitialOwnerSourceReadQualificationV3,_INITIAL_OWNER_SOURCE
-            if (type(initial_qualification) is not InitialOwnerSourceReadQualificationV3 or initial_qualification not in _INITIAL_OWNER_SOURCE
-                    or basis is not None or initial_qualification.scope is not source_scope or roles!=('graph',)):
-                raise AuthorityUnavailable('actual initial Graph Source mode is distinct from selected runtime')
+            from .c09_source_physical_read_v3 import (
+                InitialOwnerSourceReadQualificationV3,_INITIAL_OWNER_SOURCE,
+                InitialPhysicalSourceReadQualificationV3,_INITIAL_PHYSICAL_SOURCE)
+            if _legacy_initial_owner_v3(initial_qualification):
+                if initial_qualification not in _INITIAL_OWNER_SOURCE or roles!=('graph',):
+                    raise AuthorityUnavailable('actual legacy initial Owner Graph Source required')
+            elif (type(initial_qualification) is not InitialPhysicalSourceReadQualificationV3
+                    or initial_qualification not in _INITIAL_PHYSICAL_SOURCE
+                    or initial_qualification.origin_kind!='initial_segmented_v4'
+                    or roles!=(initial_qualification.role,)):
+                raise AuthorityUnavailable('actual initial segmented physical Source qualification required')
+            if basis is not None or initial_qualification.scope is not source_scope:
+                raise AuthorityUnavailable('actual initial Source mode is distinct from selected runtime')
             self.initial_source_anchor=(initial_qualification.initial_manifest_digest,initial_qualification.initial_pointer,
                 initial_qualification.source_original_digest,scope.scope_digest)
         self.basis, self.scope, self.roles, self.source_scope = basis, scope, roles, source_scope
@@ -64,7 +78,10 @@ class SelectedRuntimePhysicalReadV3:
         _READERS.add(self)
         self.control.register_c09_retained_state_v3(self)
     @property
-    def control(self):return self.basis.control if self.initial_qualification is None else self.initial_qualification.control
+    def control(self):
+        if self.initial_qualification is None:return self.basis.control
+        if _legacy_initial_owner_v3(self.initial_qualification):return self.initial_qualification.control
+        return self.initial_qualification.scope.session._control.maintenance.control
     def _require_current(self,meter):
         if self.initial_qualification is None:self.basis.require_current(meter=meter)
         else:self.initial_qualification.require_current(meter=meter)
@@ -116,10 +133,17 @@ class SelectedRuntimePhysicalReadV3:
         if header is None or header[1] not in CODECS:
             raise AuthorityUnavailable('actual selected logical cell lacks its registered complete header')
         if self.initial_qualification is not None:
-            from .c09_source_physical_read_v3 import _initial_owner_cell_values_read_v3
-            producer=_initial_owner_cell_values_read_v3(self.initial_qualification,cell_id,tuple(header[1:]),meter)
-            if producer is None or (published and producer['phase']!='committed'):
-                raise AuthorityUnavailable('initial Source cell has no qualified Owner producer at this visibility')
+            if _legacy_initial_owner_v3(self.initial_qualification):
+                from .c09_source_physical_read_v3 import _initial_owner_cell_values_read_v3
+                producer=_initial_owner_cell_values_read_v3(self.initial_qualification,cell_id,tuple(header[1:]),meter)
+                if producer is None or (published and producer['phase']!='committed'):
+                    raise AuthorityUnavailable('initial Source cell has no qualified Owner producer at this visibility')
+            else:
+                from ..runtime_storage_v3 import read_initial_runtime_cell_origin_for_capture_v4
+                producer=read_initial_runtime_cell_origin_for_capture_v4(db,qualification=self.initial_qualification,
+                    role=self.role,cell_id=cell_id,header=tuple(header[1:]),meter=meter)
+                if producer is None or (published and producer.get('producer_kind')=='owner_material_source_prepared_v3' and producer['phase']!='committed'):
+                    raise AuthorityUnavailable('initial segmented Source cell lacks its actual producer at this visibility')
             return tuple(header),producer
         if header[8] == self.basis.prepared['capture_scope_digest']:
             with self.basis.control._db() as control_db:
@@ -150,7 +174,7 @@ class SelectedRuntimePhysicalReadV3:
         import re
         from ..graph_store import GraphStore
         from .c09_selected_history_v3 import _read_one
-        if self.initial_qualification is None or shape.table not in ('graph_atoms','graph_history'):
+        if not _legacy_initial_owner_v3(self.initial_qualification) or shape.table not in ('graph_atoms','graph_history'):
             raise AuthorityUnavailable('only the actual initial Graph Source may qualify inline physical references')
         catalogue=tuple(value for value in GraphStore._create_graph_schema.__code__.co_consts if type(value) is str)
         pattern=r'CREATE TABLE IF NOT EXISTS '+shape.table+r' \(.*?;'
@@ -166,7 +190,9 @@ class SelectedRuntimePhysicalReadV3:
 
     def _refs(self):
         if self.role == 'graph':return (('graph_atoms','value_cell_id'),('graph_history','value_cell_id'))
-        if self.role == 'core':return (('authority_d13_counter_originals_v1','payload_cell_id'),('authority_d13_provider_http_bindings_v1','payload_cell_id'))
+        if self.role == 'core':
+            from .c09_platform_observation_fact_storage_v3 import TABLE,CELL_COLUMNS
+            return (('authority_d13_counter_originals_v1','payload_cell_id'),('authority_d13_provider_http_bindings_v1','payload_cell_id'))+tuple((TABLE,column)for column in CELL_COLUMNS)
         return ()
     def advance(self, meter):
         from .c09_selected_history_v3 import _read_one
@@ -174,7 +200,7 @@ class SelectedRuntimePhysicalReadV3:
         self._require_current(meter)
         self.control.require_c09_retained_arena_v3(meter=meter)
         if self.complete:return True
-        if self.initial_qualification is not None and self.phase=='writes' and self.pending is not None:
+        if self.initial_qualification is not None and self.role=='graph' and self.phase=='writes' and self.pending is not None:
             self.pending=self.pending.advance(meter)
             if self.pending.complete:
                 self._link('pending_prefix',(self.pending.cell_id,self.pending.cursor,self.pending.hash.hexdigest()))
@@ -245,14 +271,26 @@ class SelectedRuntimePhysicalReadV3:
                     self._link('writes_eof',(self.after,self.counts[2]));self.phase='refs';self.after=None;return False
                 header=_read_one(db,'SELECT '+','.join(_HEADER)+' FROM segmented_cells_v1 WHERE cell_id=?',(row[0],),meter)
                 if self.initial_qualification is not None:
+                    if not _legacy_initial_owner_v3(self.initial_qualification) and header is not None:
+                        header,_=self._header(db,row[0],meter)
+                        if (row[3:7]!=(header[1],header[3],header[2],'sealed')
+                                or row[7:11]!=(header[5],header[4],header[7],header[6])
+                                or row[12:17]!=(header[4],header[5],header[4],header[7],header[6])):
+                            raise AuthorityUnavailable('actual initial segmented write cursor differs from its complete sealed header')
+                        self._link('write',tuple(row));self.after=row[0];self.counts[2]+=1;return False
+                    if self.role!='graph':
+                        raise AuthorityUnavailable('actual incomplete initial Core cursor has no registered physical producer')
                     locator=json.loads(row[2])
                     if type(locator)is dict and locator.get('schema')=='d10.contact-plan-cell-locator.v3':
                         from ..runtime.c09_contact_plan_stage_v3 import begin_frozen_contact_plan_stage_prefix_v3
                         self.pending=begin_frozen_contact_plan_stage_prefix_v3(self.source_scope,row,meter=meter)
                         if self.pending is None:raise AuthorityUnavailable('actual Contact prefix producer is absent')
                     else:
-                        from .c09_source_physical_read_v3 import begin_initial_owner_source_cursor_read_v3
-                        self.pending=begin_initial_owner_source_cursor_read_v3(self.initial_qualification,row,meter=meter)
+                        from .c09_source_physical_read_v3 import (
+                            begin_initial_owner_source_cursor_read_v3,_initial_owner_source_qualification_v3)
+                        owner=(self.initial_qualification if _legacy_initial_owner_v3(self.initial_qualification)
+                            else _initial_owner_source_qualification_v3(self.source_scope,meter))
+                        self.pending=begin_initial_owner_source_cursor_read_v3(owner,row,meter=meter)
                     return False
                 if row[1] == self.basis.prepared['capture_scope_digest']:
                     if header is None and self.role=='graph':
@@ -280,17 +318,24 @@ class SelectedRuntimePhysicalReadV3:
                     self._link('refs_eof',self.counts[3]);self.phase='origins';self.after='';return False
                 table,column=families[self.ref_index]
                 if self.ref_shape is None:
+                    if self.role=='core' and table=='authority_platform_observation_facts_v3':
+                        from .c09_platform_observation_fact_storage_v3 import NATIVE_DDL,PHYSICAL_DDL
+                        actual=_read_one(db,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,),meter)
+                        if actual is None or actual==(NATIVE_DDL,):
+                            self._link('native_fact_profile',(table,actual));self.ref_index+=1;self.after=None;return False
+                        if actual!=(PHYSICAL_DDL,):raise AuthorityUnavailable('unknown actual Fact physical profile')
+
                     self.ref_shape=read_c09_table_shape_v2(db,table,meter=meter)
                     if column not in self.ref_shape.columns:
                         self._require_initial_inline_refs_v3(db,self.ref_shape,meter)
-                    elif self.initial_qualification is not None:
+                    elif _legacy_initial_owner_v3(self.initial_qualification):
                         raise AuthorityUnavailable('initial Graph Source must retain its actual legacy inline reference schema')
                     return False
                 found=read_c09_next_row_metadata_v2(db,self.ref_shape,self.after)
                 if found is None:
                     self._link('ref_table_eof',(table,self.ref_shape.schema_digest,self.after));self.ref_index+=1;self.ref_shape=None;self.after=None;return False
                 key=found[0]
-                if self.initial_qualification is not None:
+                if _legacy_initial_owner_v3(self.initial_qualification):
                     from ..graph_types import AtomKey
                     atom=AtomKey.from_token(key[0])
                     if ((atom.owner.bot,atom.owner.persona)!=tuple(json.loads(self.source_scope.session.scope.graph_namespace))
@@ -301,6 +346,10 @@ class SelectedRuntimePhysicalReadV3:
                 where=' AND '.join(name+'=?' for name in self.ref_shape.primary_key_columns)
                 value=_read_one(db,'SELECT '+column+' FROM '+table+' WHERE '+where,key,meter)
                 if value is None:raise AuthorityUnavailable('actual selected logical reference disappeared')
+                if table=='authority_platform_observation_facts_v3' and value[0] is None and column in ('receipt_cell_id','updated_fact_permit_cell_id'):
+                    state=_read_one(db,'SELECT state FROM '+table+' WHERE '+where,key,meter)
+                    if state!=('pending',):raise AuthorityUnavailable('committed selected Fact lacks its exact cell references')
+                    self._link('null_fact_ref',(table,key,column,found[1]));self.after=key;self.counts[3]+=1;return False
                 header,producer=self._header(db,value[0],meter,published=True)
                 if self.role=='graph':
                     from ..graph_types import AtomKey
@@ -308,13 +357,29 @@ class SelectedRuntimePhysicalReadV3:
                     if (atom.owner.bot,atom.owner.persona)!=tuple(json.loads(self.source_scope.session.scope.graph_namespace if self.source_scope is not None else self.scope.graph_namespace)) or header[2]!=atom.token:
                         raise AuthorityUnavailable('actual runtime logical reference crossed its erasure owner or namespace')
                 else:
-                    if key[0]!=self.basis.prepared['namespace']:
+                    if self.initial_qualification is None:
+                        authority_namespace=self.basis.prepared['namespace']
+                    else:
+                        from .c09_initial_segmented_genesis_v4 import require_initial_segmented_physical_metadata_v4
+                        authority_namespace=require_initial_segmented_physical_metadata_v4(
+                            self.initial_qualification,db=db,meter=meter).authority_namespace
+                    if table=='authority_platform_observation_facts_v3':
+                        from .c09_platform_observation_fact_storage_v3 import PHYSICAL_DDL,require_fact_cell_binding_v3
+                        actual=_read_one(db,"SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(table,),meter)
+                        row=_read_one(db,'SELECT namespace,fact_operation_id,mutation_id FROM '+table+' WHERE '+where,key,meter)
+                        if actual!=(PHYSICAL_DDL,) or self.ref_shape.primary_key_columns!=('fact_operation_id',) or row!=(authority_namespace,key[0],key[0]):
+                            raise AuthorityUnavailable('selected Fact physical profile/PK/namespace differs')
+                        require_fact_cell_binding_v3(namespace=authority_namespace,operation_id=key[0],column=column[:-8],header=header)
+                        self._link('ref',(table,key,value[0],found[1]));self.after=key;self.counts[3]+=1;return False
+                    if key[0]!=authority_namespace:
                         raise AuthorityUnavailable('actual runtime Core reference crossed its authority namespace')
                     if table=='authority_d13_counter_originals_v1':
-                        if key[2] not in ('draft','header','evidence'):raise AuthorityUnavailable('actual Core counter phase is unregistered')
+                        if key[2] not in ('draft','header','evidence','pressure_mapping_v1'):raise AuthorityUnavailable('actual Core counter phase is unregistered')
                         family='d13-counter-source' if key[2]=='draft' else 'd13-counter-history'
                     else:
-                        if key[2] not in ('expected','observed_before_send'):raise AuthorityUnavailable('actual Core provider phase is unregistered')
+                        from .d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+                        if key[2] not in {'expected','observed_before_send'} | D13_ACCOUNTING_PHASES_V3:
+                            raise AuthorityUnavailable('actual Core provider/accounting phase is unregistered')
                         family='d13-provider-http-history'
                     if header[2]!=canonical_serialize((family,key[0],key[1])):
                         raise AuthorityUnavailable('actual Core runtime reference crossed its erasure owner')
@@ -325,7 +390,7 @@ class SelectedRuntimePhysicalReadV3:
                 if row is None:
                     self._link('origins_eof',(self.after,self.counts[4]))
                     self.phase='prepared';self.after='';return False
-                if self.initial_qualification is not None:
+                if _legacy_initial_owner_v3(self.initial_qualification):
                     raise AuthorityUnavailable('initial Owner Source does not qualify another runtime-origin producer')
                 cell=_read_one(db,'SELECT cell_id FROM segmented_cells_v1 WHERE origin_scope_digest=? ORDER BY cell_id LIMIT 1',(row[0],),meter)
                 if cell is None:raise AuthorityUnavailable('actual runtime producer original has no committed immutable cell')
@@ -455,8 +520,16 @@ class SelectedRuntimePhysicalReadV3:
                     found=read_c09_next_row_metadata_v2(db,self.ref_shape,self.after)
                     if found is not None:
                         key=found[0]
-                        from .d13_provider_http_admission_v1 import read_selected_runtime_counter_index_v3
-                        reader=read_selected_runtime_counter_index_v3(db,basis=self.basis,selection_digest=key[0],namespace=key[1],counter_operation_id=key[2],meter=meter)
+                        if self.initial_qualification is None:
+                            from .d13_provider_http_admission_v1 import read_selected_runtime_counter_index_v3
+                            reader=read_selected_runtime_counter_index_v3(db,basis=self.basis,selection_digest=key[0],namespace=key[1],counter_operation_id=key[2],meter=meter)
+                        else:
+                            from .c09_source_physical_read_v3 import InitialPhysicalSourceReadQualificationV3
+                            from .d13_provider_http_admission_v1 import read_initial_runtime_counter_index_v4
+                            if type(self.initial_qualification) is not InitialPhysicalSourceReadQualificationV3:
+                                raise AuthorityUnavailable('actual initial Core physical Source qualification required for Counter index')
+                            reader=read_initial_runtime_counter_index_v4(db,qualification=self.initial_qualification,
+                                selection_digest=key[0],namespace=key[1],counter_operation_id=key[2],meter=meter)
                         if reader is None:raise AuthorityUnavailable('actual counter index disappeared')
                         if type(reader) is dict:
                             from .c09_selected_core_source_v3 import require_selected_retired_counter_source_v3, VerifiedSelectedRetiredCounterSourceV3
@@ -482,8 +555,16 @@ class SelectedRuntimePhysicalReadV3:
                         self.ref_shape=read_c09_table_shape_v2(db,'runtime_d13_counter_index_cursor_v3',meter=meter);return False
                     found=read_c09_next_row_metadata_v2(db,self.ref_shape,self.after)
                     if found is not None:
-                        from .d13_provider_http_admission_v1 import begin_selected_runtime_counter_cutoff_read_v3
-                        self.counter_reader=begin_selected_runtime_counter_cutoff_read_v3(db,basis=self.basis,selection_digest=found[0][0],meter=meter)
+                        if self.initial_qualification is None:
+                            from .d13_provider_http_admission_v1 import begin_selected_runtime_counter_cutoff_read_v3
+                            self.counter_reader=begin_selected_runtime_counter_cutoff_read_v3(db,basis=self.basis,selection_digest=found[0][0],meter=meter)
+                        else:
+                            from .c09_source_physical_read_v3 import InitialPhysicalSourceReadQualificationV3
+                            from .d13_provider_http_admission_v1 import begin_initial_runtime_counter_empty_prefix_read_v4
+                            if type(self.initial_qualification) is not InitialPhysicalSourceReadQualificationV3:
+                                raise AuthorityUnavailable('actual initial Core physical Source qualification required for Counter prefix')
+                            self.counter_reader=begin_initial_runtime_counter_empty_prefix_read_v4(db,
+                                qualification=self.initial_qualification,selection_digest=found[0][0],meter=meter)
                         if self.counter_reader is None:raise AuthorityUnavailable('actual counter cutoff cursor disappeared')
                         return False
                 self._link('counter_cutoffs_eof',(self.after,self.counts[10]));self.phase='counter_seals';self.ref_shape=None;self.after=None;return False

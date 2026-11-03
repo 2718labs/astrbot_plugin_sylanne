@@ -17,7 +17,6 @@ from ..authority_service.d04_numeric_contract_v3 import D04NumericBindingV3, WOR
 from ..domains.d04.joint_state_output_v1 import JointStateFrozenPredecessorsV1, JointStatePredecessorV1
 from ..host.installed_d04_numeric_build_v3 import read_installed_d04_numeric_identity_v3
 from .budget import get_budget_lease, require_budget_family_admissible, reserve_budget
-from .c02_bundle_codec import c02_bundle_from_wire
 from .d04_appraisal_driver_v3 import record_d04_original_in_transaction_v3
 from .d04_current_joint_replay_input_v2 import read_current_joint_replay_input_in_transaction_v2
 from .d04_installed_stage_fence_v3 import run_installed_d04_stage_v3, TABLE as STAGE_TABLE
@@ -64,7 +63,7 @@ def _drive_original(db, namespace, c02_operation_id):
     return raw, clock
 
 
-def _advance_numeric_job_observation_v3(graph, db, verifier, before, before_epoch, after, after_epoch, job, receipt, identity):
+def _require_numeric_job_commit_v3(graph, db, verifier, before, before_epoch, after, after_epoch, job, receipt, identity):
     """Derive a target-location scope only from this transaction's sole job CAS."""
     from .d04_owner_initialization_v3 import InstalledD04AuthoredTopologyVerifierV3
     from .jobs import get_job
@@ -79,9 +78,19 @@ def _advance_numeric_job_observation_v3(graph, db, verifier, before, before_epoc
     event = db.execute("SELECT reads,epoch_reads,revisions,invalidated,epoch_revision FROM graph_events "
         "WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*scope.namespace.as_tuple, identity["activity"], operation)).fetchone()
-    current = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
-    history = db.execute("SELECT value,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=1",
-        (write.key.token,)).fetchone()
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3,begin_runtime_cell_read_v3,read_runtime_cell_origin_v3
+    with runtime_storage_quantum_v3(db)as meter:
+        current=meter.read_fixed_row(db,'graph_atoms',('revision','valid','value_cell_id'),'token=?',(write.key.token,))
+        history=meter.read_fixed_row(db,'graph_history',('value_cell_id','valid','event_bot','event_persona','event_session','event_id'),
+            'token=? AND revision=?',(write.key.token,1))
+        if current is None or current[:2]!=(1,1)or history is None or history[1:]!=(1,*scope.namespace.as_tuple,identity['activity'],operation):
+            raise ValueError('D04 own job current/history fixed headers differ')
+        header=tuple(begin_runtime_cell_read_v3(db,current[2],erasure_owner_ref=write.key.token).header)
+        prior_header=tuple(begin_runtime_cell_read_v3(db,history[0],erasure_owner_ref=write.key.token).header)
+        if(header!=prior_header or header[1]!=write.key.token or header[5]!=canonical_digest(write.value)):
+            raise ValueError('D04 own job whole value commitment differs')
+        read_runtime_cell_origin_v3(db,current[2],header=header,meter=meter)
+        read_runtime_cell_origin_v3(db,history[0],header=prior_header,meter=meter)
     if (scope.graph_revision != before.graph_revision or scope.graph_epoch != before_epoch
             or before.requirements != after.requirements or after.graph_revision != before.graph_revision + 1
             or after_epoch.revision != before_epoch.revision + 1 or receipt.epoch != after_epoch
@@ -91,8 +100,6 @@ def _advance_numeric_job_observation_v3(graph, db, verifier, before, before_epoc
             or event is None or json.loads(event[0]) != [[write.key.token, 0]]
             or json.loads(event[1]) != [[*scope.namespace.as_tuple, before_epoch.revision]]
             or json.loads(event[2]) != [[write.key.token, 1]] or json.loads(event[3]) != [] or event[4] != after_epoch.revision
-            or current is None or current[0] != 1 or current[2] != 1 or json.loads(current[1]) != write.value
-            or history != (current[1], 1, *scope.namespace.as_tuple, identity["activity"], operation)
             or get_job(db, job.job_id) != job or job.phase != "running" or job.cancel_epoch != 0 or job.fence != 1
             or job.lease_holder != identity["worker"] or job.operation_id != identity["operation"]
             or job.continuation.get("input_original_ref") != identity["input"]):
@@ -103,10 +110,20 @@ def _advance_numeric_job_observation_v3(graph, db, verifier, before, before_epoc
     if (semantic is None or semantic[0] != scope or semantic[1] != observed.guard
             or reader._location.get() != observed):
         raise ValueError("D04 numeric job requires the same independently observed semantic location")
+    return scope, observed, derived_scope, header, current[2]
+
+
+def _advance_numeric_job_observation_v3(graph, db, verifier, before, before_epoch, after, after_epoch, job, receipt, identity):
+    scope, observed, derived_scope, header, cell = _require_numeric_job_commit_v3(
+        graph, db, verifier, before, before_epoch, after, after_epoch, job, receipt, identity)
+    reader = graph._GraphCoordinator__d04_semantic_mapping_reader
+    semantic = reader._fence.get()
     # Both readers consume only this narrowly proven one-job CAS. Their
     # surrounding contexts discard this derived scope on rollback or exit.
     reader._fence.set((derived_scope, semantic[1], semantic[2]))
     verifier._location_observation = (derived_scope, observed)
+    from .d04_source_work_v3 import record_installed_d04_numeric_job_projection_v3
+    record_installed_d04_numeric_job_projection_v3(graph,db,job,stamp=(after,after_epoch),header=header,cell=cell)
 
 
 def _freeze_product(graph, db, bundle, identity, *, metadata, epoch, clock, root_ref,
@@ -137,17 +154,22 @@ def _freeze_product(graph, db, bundle, identity, *, metadata, epoch, clock, root
         raise ValueError("D04 numeric actual CPU already has a Graph settlement")
     keys[cost_key] = 0
     projected_job = job_graph_write(job)
-    job_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (projected_job.key.token,)).fetchone()
-    if job_row is None or job_row[2] != 1 or json.loads(job_row[1]) != projected_job.value:
+    from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
+    def source_atom(key):
+        handled,atom=read_bound_installed_d04_component_atom_v3(db,namespace,key.token)
+        if not handled:
+            raise ValueError('installed numeric freeze requires its actual completed D04 Source Work')
+        return atom
+    job_atom=source_atom(projected_job.key)
+    if not job_atom.valid or job_atom.value!=projected_job.value:
         raise ValueError("D04 numeric running job projection is missing")
-    keys[projected_job.key] = job_row[0]
-    atoms = []
-    for key, revision in sorted(keys.items(), key=lambda row: row[0].token):
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
-        if (0 if row is None else row[0]) != revision:
+    keys[projected_job.key]=job_atom.revision
+    atoms=[]
+    for key,revision in sorted(keys.items(),key=lambda row:row[0].token):
+        atom=source_atom(key)
+        if atom.revision!=revision:
             raise ValueError("D04 actual numeric read changed during prepare")
-        atoms.append(GraphAtom(key, 0, {}, False) if row is None
-            else GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
+        atoms.append(atom)
     snapshot = GraphSnapshot(tuple(atoms), (epoch,))
     predecessors = []
     for block, checkpoint in zip(current.component.block_drives, current.checkpoints):
@@ -206,7 +228,10 @@ def prepare_post_c02_joint_numeric_v3(graph, bootstrap, bundle, *, c02_operation
                 or policy.cpu_ceiling_ms > grant.max_ceiling.get("cpu_ms", 0)):
             raise ValueError("D04 current numeric CPU authority differs")
         require_budget_family_admissible(db, lease.lease_id)
-        deadline = min(now + policy.job_lifetime_seconds, grant.valid_until_utc)
+        from .d04_source_work_v3 import require_bound_installed_d04_source_v3
+        source_work=require_bound_installed_d04_source_v3(graph,db,namespace,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,epoch=epoch,now_utc=now)
+        deadline = min(now + policy.job_lifetime_seconds, grant.valid_until_utc,source_work.operation.deadline_utc)
         snapshot_ref = "d04-numeric-input:" + canonical_digest((identity["operation"], source_ref, drive["mapping_digest"], asdict(clock)))[:48]
         continuation = {"schema": "d04.installed-numeric-continuation.v3", "c02_operation_id": c02_operation_id,
             "source_ref": source_ref, "input_original_ref": identity["input"], "execution_id": identity["execution"],
@@ -239,21 +264,22 @@ def prepare_post_c02_joint_numeric_v3(graph, bootstrap, bundle, *, c02_operation
         metadata, epoch = graph._v2_graph_stamp(namespace)
         _advance_numeric_job_observation_v3(graph, db, topology, before_metadata, before_epoch,
             metadata, epoch, job, receipt, identity)
-        original = db.execute("SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?",
-            (*namespace.as_tuple, c02_operation_id)).fetchone()
-        if original is None:
-            raise ValueError("D04 numeric source has no actual C02 original")
-        qualification = c02_bundle_from_wire(original[0]).envelope.source_qualification
+        from .d04_source_work_v3 import require_bound_installed_d04_source_v3
+        actual_source=require_bound_installed_d04_source_v3(graph,db,namespace,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+        qualification=actual_source.source_qualification
         preparation = _freeze_product(graph, db, bundle, identity, metadata=metadata, epoch=epoch, clock=clock,
             root_ref=drive["root_ref"], qualification=qualification, conversation=current[1].conversation_ref,
             deadline=deadline, job=job, topology_verifier=topology)
         evidence = freeze_current_d04_joint_evidence_inputs_v3(db, preparation, clock=clock,
             installed_output_policy=output_policy, installed_mapping_reader=reader)
         grant_ref = owner_grant_key(*namespace.as_tuple).token
-        owner_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (grant_ref,)).fetchone()
-        if owner_row is None or owner_row[2] != 1:
+        from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
+        handled,owner_atom=read_bound_installed_d04_component_atom_v3(db,namespace,grant_ref)
+        if not handled or not owner_atom.valid:
             raise ValueError("D04 numeric current Owner Graph grant is missing")
-        owner_digest = canonical_digest(json.loads(owner_row[1]))
+        owner_row=(owner_atom.revision,canonical_serialize(owner_atom.value),int(owner_atom.valid))
+        owner_digest=canonical_digest(owner_atom.value)
         payload, _ = build_d04_numeric_input_payload_v3(preparation, evidence,
             installation_id=installation.installation_id, owner_grant_ref=grant_ref,
             owner_grant_revision=owner_row[0], owner_grant_digest=owner_digest, **installed,
@@ -278,17 +304,26 @@ def prepare_post_c02_joint_numeric_v3(graph, bootstrap, bundle, *, c02_operation
         record_d04_original_in_transaction_v3(db, namespace, "numeric_prepared", binding.operation_id, asdict(prepared))
         from .d04_numeric_accounting_prepared_v3 import record_numeric_accounting_prepared_v3
         record_numeric_accounting_prepared_v3(db, prepared)
+        from .d04_source_work_v3 import issue_installed_d04_numeric_rows_seal_v3
+        issue_installed_d04_numeric_rows_seal_v3(graph,db,evidence.read_rows,prepared=prepared)
         prepared_result.append(D04PreparedExecutionV3(prepared, preparation, evidence, job.lease_holder, job.fence))
         return {"status": "numeric_prepared", "operation_id": identity["operation"], "prepared_digest": prepared.digest,
             "binding_digest": binding.digest, "job_id": job.job_id, "worker_fence": job.fence}
-    run_installed_d04_stage_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref,
+    result = run_installed_d04_stage_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref,
         operation_id="d04-numeric-prepare:" + identity["operation"], stage="numeric_prepare",
         request_digest=canonical_digest(("d04.numeric-prepare.v3", namespace, c02_operation_id, source_ref, asdict(policy), installed)),
         commit=commit, semantic=True, fence_observer=lambda scope: topology.observe_current_location_for_fence_v3(
             graph._GraphCoordinator__content_fence_v2, scope))
-    if len(prepared_result) != 1:
-        raise ValueError("D04 numeric original requires current installed original recovery")
-    return prepared_result[0]
+    def prepared(_result):
+        if len(prepared_result) != 1:
+            raise ValueError("D04 numeric original requires current installed original recovery")
+        return prepared_result[0]
+    from ..graph_worker import GraphStorageWorkV3
+    if type(result) is GraphStorageWorkV3:
+        def failed(error):
+            raise error
+        return result.map_terminal_v3("issuer", prepared, failed)
+    return prepared(result)
 
 
 @dataclass(frozen=True, slots=True)

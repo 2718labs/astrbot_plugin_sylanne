@@ -49,6 +49,10 @@ class ObservedLifeTerminalV1:
 
 
 def require_observed_life_terminal_v1(observation):
+    from .current_character_labor_adoption_v1 import (
+        ObservedCharacterLaborAdoptionV1, require_current_character_labor_adoption_observation_v1)
+    if type(observation)is ObservedCharacterLaborAdoptionV1:
+        return require_current_character_labor_adoption_observation_v1(observation)
     from ..host.d11_life_port_v1 import InstalledD11LifePortV1
     registered = _OBSERVATIONS.get(id(observation))
     if (type(observation) is not ObservedLifeTerminalV1 or registered is None or registered[0]() is not observation
@@ -65,7 +69,10 @@ def observe_current_life_terminal_v1(port, prepared):
     from ..host.d11_life_port_v1 import InstalledD11LifePortV1
     if type(port) is not InstalledD11LifePortV1 or type(prepared) not in {D11LifePreparedV1, D11DraftPreparedV1}:
         raise TypeError("actual installed Life port and signed prepared original required")
-    claim, terminal = port.read_d11_life_original_v1(binding=prepared.binding)
+    if type(prepared)is D11LifePreparedV1:
+        claim, terminal = port.read_own_d11_life_execution_original_v1(binding=prepared.binding)
+    else:
+        claim, terminal = port.read_own_d11_draft_execution_original_v1(binding=prepared.binding)
     if claim is None or terminal is None:
         raise MissingProductionOriginalV1("actual_independent_life_terminal_after_once_claim")
     if (type(claim) not in LIFE_CLAIM_TYPES or type(terminal) not in LIFE_TERMINAL_TYPES
@@ -101,6 +108,27 @@ class LifeTerminalBundleV1:
     source_refs: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class CharacterLaborTerminalBundleV1:
+    envelope: object
+    memory_stage: object
+    runtime_stage: object
+    body_stage: object
+    terminal: object
+    prepared: object
+    source_refs: tuple[str, ...]
+    body_result: object
+    adoption_inputs: object
+
+
+def life_terminal_stages_v1(staged):
+    if type(staged)is LifeTerminalBundleV1:
+        return staged.memory_stage,staged.runtime_stage
+    if type(staged)is CharacterLaborTerminalBundleV1:
+        return staged.memory_stage,staged.runtime_stage,staged.body_stage
+    raise TypeError("exact installed Life terminal bundle required")
+
+
 def read_plan_current_life_terminal_v1(db, *, namespace, activity_id, operation_kind, request):
     from .domain_background_read_v3 import background_json_loads_v3
     from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
@@ -131,14 +159,47 @@ def read_plan_current_life_terminal_v1(db, *, namespace, activity_id, operation_
 
 
 def stage_current_life_terminal_in_transaction_v1(db, *, frame, request, installed_readers):
-    if type(installed_readers) is not InstalledLifeTerminalReadersV1:
-        raise TypeError("Life adoption needs its actual sealed installed terminal reader")
+    if (type(installed_readers)is not InstalledLifeTerminalReadersV1
+            or type(installed_readers.observation)is not ObservedLifeTerminalV1):
+        raise TypeError("legacy Life terminal requires its exact installed observation")
+    return _stage_current_life_terminal_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+
+
+def stage_current_character_labor_terminal_in_transaction_v1(db,*,frame,request,installed_readers,inputs):
+    from .current_character_labor_adoption_v1 import (
+        ObservedCharacterLaborAdoptionV1, require_character_labor_adoption_body_readers_v1)
+    from .d02_character_labor_rebuild_v1 import prepare_character_labor_terminal_body_v1
+    if (type(installed_readers)is not InstalledLifeTerminalReadersV1
+            or type(installed_readers.observation)is not ObservedCharacterLaborAdoptionV1
+            or installed_readers.observation.inputs is not inputs):
+        raise TypeError("labor terminal requires its actual same-Work private observation and inputs")
+    inputs.require_inputs_v1(inputs.graph,gate=inputs.gate,db=db,scope=inputs.scope,owner=inputs.owner.owner_binding)
+    inputs.require_frame_v1(frame)
+    base=_stage_current_life_terminal_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+    body=prepare_character_labor_terminal_body_v1(db,frame=frame,prepared=inputs.prepared,
+        segment=inputs.segment,census=inputs.census,
+        body_readers=require_character_labor_adoption_body_readers_v1(inputs,db=db,frame=frame),
+        adoption_inputs=inputs)
+    return CharacterLaborTerminalBundleV1(base.envelope,base.memory_stage,base.runtime_stage,
+        body.stage,base.terminal,base.prepared,base.source_refs,body,inputs)
+
+
+def _stage_current_life_terminal_v1(db, *, frame, request, installed_readers):
     read = CurrentDomainReadV1(frame)
     read.check(db)
     observation = require_observed_life_terminal_v1(installed_readers.observation)
     p, terminal = observation.prepared, observation.terminal
     b = p.binding
-    if (request.prepared_original_ref != b.prepared_original_ref or read_prepared_life_v1(db, binding=b, issuer=installed_readers.issuer) != p
+    adoption_inputs=None
+    from .current_character_labor_adoption_v1 import ObservedCharacterLaborAdoptionV1
+    if type(observation)is ObservedCharacterLaborAdoptionV1:
+        inputs=adoption_inputs=observation.inputs
+        inputs.require_inputs_v1(inputs.graph,gate=inputs.gate,db=db,scope=inputs.scope,owner=inputs.owner.owner_binding)
+        inputs.require_frame_v1(frame)
+        current=inputs.prepared
+    else:
+        current=read_prepared_life_v1(db,binding=b,issuer=installed_readers.issuer)
+    if (request.prepared_original_ref != b.prepared_original_ref or current != p
             or frame.envelope.identity.operation_id != life_adoption_operation_id_v1(b)
             or (frame.envelope.identity.activity_id, frame.envelope.identity.effect_id) != (b.activity_id, b.effect_id)
             or frame.owner_guard.grant_ref != b.owner_grant_ref or frame.owner_guard.grant_revision != b.owner_grant_revision
@@ -162,7 +223,7 @@ def stage_current_life_terminal_in_transaction_v1(db, *, frame, request, install
             or (job.operation_id, job.activity_id, job.effect_id, job.work_kind, job.fence, job.cancel_epoch) !=
                 (b.operation_id, b.activity_id, b.effect_id, life_work_kind_v1(b), b.job_fence, b.job_cancel_epoch)):
         raise ValueError("Life adopted original job differs from actual claim")
-    fact_writes = life_fact_writes_v1(p, observation.claim, terminal, artifact)
+    fact_writes = life_fact_writes_v1(p, observation.claim, terminal, artifact,adoption_inputs=adoption_inputs)
     job_result = None
     if terminal.status == "completed":
         artifact_write = next(w for w in fact_writes if w.key.token == b.artifact_ref)
@@ -199,8 +260,20 @@ def stage_current_life_terminal_in_transaction_v1(db, *, frame, request, install
     return LifeTerminalBundleV1(frame.envelope, goal, runtime, terminal, p, sources)
 
 
-def record_life_terminal_after_cas_v1(db, *, issuer, staged, graph_receipt):
-    if not db.in_transaction or type(staged) is not LifeTerminalBundleV1 or type(graph_receipt) is not CommitReceipt:
+def life_terminal_prepared_digest_v1(staged):
+    if type(staged)is CharacterLaborTerminalBundleV1:
+        from .current_character_labor_adoption_v1 import require_character_labor_adoption_prepared_digest_v1
+        if staged.adoption_inputs.prepared is not staged.prepared:
+            raise ValueError("labor terminal changed its actual sealed Prepared")
+        return require_character_labor_adoption_prepared_digest_v1(staged.prepared)
+    if type(staged)is not LifeTerminalBundleV1:
+        raise TypeError("exact installed Life terminal bundle required")
+    return staged.prepared.digest
+
+
+def record_life_terminal_after_cas_v1(db, *, issuer, staged, graph_receipt, frame=None, witness=None):
+    if (not db.in_transaction or type(staged)not in {LifeTerminalBundleV1,CharacterLaborTerminalBundleV1}
+            or type(graph_receipt)is not CommitReceipt):
         raise TypeError("actual Life W01 terminal receipt required")
     b = staged.prepared.binding
     if graph_receipt.operation_id != life_adoption_operation_id_v1(b) or graph_receipt.status != "committed":
@@ -209,14 +282,23 @@ def record_life_terminal_after_cas_v1(db, *, issuer, staged, graph_receipt):
         (*b.namespace.as_tuple, graph_receipt.operation_id)).fetchone()
     if actual != (graph_receipt.operation_digest, graph_receipt.commit_seq):
         raise ValueError("Life terminal receipt is not its actual W01 operation")
-    writes = tuple(w for s in (staged.memory_stage, staged.runtime_stage) for p in s.proposals for w in p.typed_writes)
+    if type(staged)is CharacterLaborTerminalBundleV1:
+        from .current_character_labor_adoption_v1 import require_character_labor_adoption_after_cas_v1
+        require_character_labor_adoption_after_cas_v1(staged.adoption_inputs,db=db,
+            frame=frame,receipt=graph_receipt)
+    writes = tuple(w for s in life_terminal_stages_v1(staged) for p in s.proposals for w in p.typed_writes)
     versions = {v.key.token: v.revision for v in graph_receipt.write_versions}
     if set(versions) != {w.key.token for w in writes}:
         raise ValueError("Life terminal bundle has another member set")
-    for write in writes:
-        row = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (write.key.token, versions[write.key.token])).fetchone()
-        if row != (graph_receipt.operation_id, canonical_serialize(write.value), 1):
-            raise ValueError("Life terminal/job/cost/artifact/D08 are not one actual bundle")
+    if type(staged)is CharacterLaborTerminalBundleV1:
+        from .character_labor_adoption_metadata_v1 import require_character_labor_committed_members_v1
+        require_character_labor_committed_members_v1(staged.adoption_inputs.graph,db,
+            witness=witness,staged=staged,receipt=graph_receipt)
+    else:
+        for write in writes:
+            row = db.execute("SELECT event_id,value,valid FROM graph_history WHERE token=? AND revision=?", (write.key.token, versions[write.key.token])).fetchone()
+            if row != (graph_receipt.operation_id, canonical_serialize(write.value), 1):
+                raise ValueError("Life terminal/job/cost/artifact/D08 are not one actual bundle")
     job_result_binding = None
     if staged.terminal.status == "completed":
         artifact_write = next(w for w in writes if w.key.token == b.artifact_ref)
@@ -232,7 +314,7 @@ def record_life_terminal_after_cas_v1(db, *, issuer, staged, graph_receipt):
     value = {"schema": "d11.adopted-life-original.v4", "namespace": plain_v1(b.namespace),
         "result_ref": b.artifact_ref, "producing_operation_id": graph_receipt.operation_id,
         "job_result_binding": job_result_binding,
-        "prepared_digest": staged.prepared.digest, "terminal": life_to_wire_v1(staged.terminal),
+        "prepared_digest": life_terminal_prepared_digest_v1(staged), "terminal": life_to_wire_v1(staged.terminal),
         "source_refs": list(staged.source_refs), "graph_receipt_json": canonical_serialize(plain_v1(graph_receipt)),
         "write_commitments": [{"ref": w.key.token, "revision": versions[w.key.token], "digest": canonical_digest(w.value)} for w in writes]}
     return _record(db, issuer=issuer, namespace=b.namespace, kind="adopted_life", ref=b.artifact_ref,

@@ -85,8 +85,12 @@ def commit_post_c02_semantic_drive_v3(graph, bootstrap, bundle, *, c02_operation
             dose_grant_version=grant.version, clock=clock, audience=(conversation,), purpose="expression", interpretation_level=interpretation_level)
         if not stage.writes:
             raise ValueError("D04 mapping provides no qualified source drive")
+        from .d04_ordinary_readout_v3 import d04_role_manifest_versions_v3,require_bound_d04_role_readout_v3
+        require_bound_d04_role_readout_v3(db,namespace,frozen=frozen,manifest=original.role_support_manifest)
+        support_versions=d04_role_manifest_versions_v3(original.role_support_manifest,namespace)
+        current_reads={v.key:v for v in (*stage.read_versions,*support_versions)}
         written = _commit(graph, db, metadata, epoch, op, identity["activity"], now,
-            stage.writes, stage.read_versions, "d04.semantic_drive_adopted.v3")
+            stage.writes, tuple(current_reads.values()), "d04.semantic_drive_adopted.v3")
         written_keys = {write.key for write in stage.writes}
         for write in stage.writes:
             for version in stage.read_versions:
@@ -94,6 +98,11 @@ def commit_post_c02_semantic_drive_v3(graph, bootstrap, bundle, *, c02_operation
                     db.execute("INSERT INTO graph_dependency_edges(dependent_token,dependency_token,"
                         "dependency_revision,edge_kind,operation_id) VALUES(?,?,?,?,?)",
                         (write.key.token, version.key.token, version.revision, "historical_provenance", op))
+        for write in stage.writes:
+            for version in support_versions:
+                db.execute('INSERT INTO graph_dependency_edges(dependent_token,dependency_token,'
+                    'dependency_revision,edge_kind,operation_id) VALUES(?,?,?,?,?)',
+                    (write.key.token,version.key.token,version.revision,'current_invalidation',op))
         record_d04_mapping_acceptance_after_cas_v3(db, stage)
         return {"status": "drive_adopted", "operation_id": op, "mapping_ref": stage.original_ref,
             "mapping_digest": stage.original_digest, "clock": json.loads(stage.original_payload_json)["clock"], "root_ref": refs[0],

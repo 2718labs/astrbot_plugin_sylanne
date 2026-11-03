@@ -12,12 +12,20 @@ STAGE_DDL = "CREATE TABLE graph_d11_life_artifact_stage_v1 (bot TEXT NOT NULL,pe
 
 
 def artifact_value_v1(prepared):
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    from .d11_life_contract_v1 import RegisteredCharacterLaborLifePlanV1
     b, plan = prepared.binding, prepared.plan
+    version = 1
+    if type(prepared) is D11CharacterLaborLifePreparedV1:
+        if (type(plan) is not RegisteredCharacterLaborLifePlanV1 or plan.recipe_version != 2
+                or plan.executor_protocol != "source_note_nonpreemptible_segment.v1"):
+            raise ValueError("labor source-note artifact requires its exact nonpreemptible recipe v2")
+        version = plan.recipe_version
     source = json.loads(prepared.source_record_json)
     SourceRecord.from_dict(source)
     if len(source["text"].encode("utf-8")) > 65536 or len(prepared.source_record_json.encode("utf-8")) > 131072:
         raise ValueError("source-note input exceeds the fixed complete-input bound")
-    return {"schema": ARTIFACT_SCHEMA, "recipe_id": RECIPE_ID, "recipe_version": 1,
+    return {"schema": ARTIFACT_SCHEMA, "recipe_id": RECIPE_ID, "recipe_version": version,
         "activity_id": b.activity_id, "effect_id": b.effect_id, "attempt_id": b.attempt_id,
         "source_ref": plan.input_source.ref, "source_revision": plan.input_source.revision,
         "source_digest": plan.input_source.digest, "source_record": source}
@@ -58,6 +66,13 @@ def verify_durable_life_artifact_v1(db, prepared, *, digest=None, length=None):
     if not db.in_transaction:
         raise ValueError("Life postcondition requires a new pinned durable read")
     b = prepared.binding
+    from .current_character_labor_adoption_v1 import read_bound_character_labor_adoption_artifact_v1
+    labor,row=read_bound_character_labor_adoption_artifact_v1(db,prepared)
+    if labor:
+        if (row is None or row[:2]!=(b.digest,b.artifact_ref)
+                or digest is not None and row[3]!=digest or length is not None and row[4]!=length):
+            raise ValueError("labor artifact differs from its actual same-Work canonical EOF and terminal")
+        return row[2],row[3],row[4]
     from .current_life_numeric_native_read_v3 import read_bound_native_life_artifact_v3
     handled,row=read_bound_native_life_artifact_v3(db,prepared)
     if not handled:

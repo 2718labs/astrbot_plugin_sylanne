@@ -29,6 +29,58 @@ from .v2_contract import PendingMutationV2, decode_bytes
 from .v2_fence_store import AuthorityV2FenceStore
 
 
+def _actual_observation_fact_entry_v3(core, reader, row, *, namespace):
+    from dataclasses import replace
+    from .observation_refinement_contract_v3 import ENTRY_PREFIX, decode_fact_row_v3
+    from .observation_refinement_v3 import DDL as FACT_DDL, COLUMNS as FACT_COLUMNS, decode_fact_record_v3, TABLE as FACT_TABLE
+    from .v2_contract import PendingMutationV2, decode_bytes, canonical_digest as v2_digest
+    from .v2_fence_store import AuthorityV2FenceStore
+    if not row[4].startswith(ENTRY_PREFIX): raise C09RecoveryFactsHold(('observation_fact_prefix',))
+    fact=decode_fact_row_v3(reader,row)
+    if fact.fact_write_permit.namespace!=namespace or fact.expected_execution_journal_id!=reader.journal_id:
+        raise C09RecoveryFactsHold(('observation_fact_namespace',))
+    schema=core.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?",(FACT_TABLE,)).fetchone()
+    columns=tuple(x[1] for x in core.execute('PRAGMA table_info('+FACT_TABLE+')')) if schema is not None else ()
+    from .c09_platform_observation_fact_storage_v3 import PHYSICAL_DDL,PHYSICAL_COLUMNS
+    if schema==(PHYSICAL_DDL,) and columns==PHYSICAL_COLUMNS:
+        from .observation_refinement_v3 import fact_row_locked_v3
+        source=fact_row_locked_v3(core,fact.mutation_id)
+    elif schema==(FACT_DDL,) and columns==FACT_COLUMNS:
+        source=core.execute('SELECT '+','.join(FACT_COLUMNS)+' FROM '+FACT_TABLE+' WHERE mutation_id=?',(fact.mutation_id,)).fetchone()
+    else:raise C09RecoveryFactsHold(('observation_fact_schema',))
+    if source is None: raise C09RecoveryFactsHold(('observation_fact_row',))
+    pending,receipt,updated=decode_fact_record_v3(source)
+    if (pending!=fact or receipt is None or source[5]!='committed'
+            or receipt.pending!=fact or updated!=replace(fact.fact_write_permit,revision=receipt.updated_revision,pinned_anchor=receipt.after_anchor)):
+        raise C09RecoveryFactsHold(('observation_fact_receipt',))
+    effect=core.execute('SELECT execution_seq FROM authority_effects WHERE namespace=? AND effect_id=?',
+        (namespace,fact.original_claimed_receipt.pending.permit.effect_id)).fetchone()
+    if effect!=(row[0],): raise C09RecoveryFactsHold(('observation_fact_effect_index',))
+    predecessor=reader._db.execute('SELECT seq,mutation_id,request_digest,append_id,pending,previous_digest,chain_digest FROM authority_v2_execution_entries WHERE mutation_id=?',
+        (fact.predecessor_mutation_id,)).fetchone()
+    prefix=reader._db.execute('SELECT chain_digest FROM authority_v2_execution_entries WHERE seq=?',
+        (fact.before_anchor.execution_seq,)).fetchone()
+    if (predecessor is None or predecessor[1]!=fact.predecessor_mutation_id
+            or predecessor[0]>fact.before_anchor.execution_seq or prefix!=(fact.before_anchor.execution_digest,)):
+        raise C09RecoveryFactsHold(('observation_fact_predecessor_row',))
+    previous=decode_bytes(predecessor[4])
+    if (type(previous) is not PendingMutationV2 or previous.phase!='observed'
+            or previous.claimed_receipt!=fact.original_claimed_receipt
+            or previous.permit.effect_id!=fact.original_claimed_receipt.pending.permit.effect_id):
+        raise C09RecoveryFactsHold(('observation_fact_predecessor_identity',))
+    previous_row=AuthorityV2FenceStore.mutation_locked(core,previous.mutation_id)
+    kind,stored,previous_receipt,_=AuthorityV2FenceStore._decode_mutation_row(previous_row)
+    if kind!='execution' or stored!=previous or previous_receipt is None or v2_digest(previous_receipt)!=fact.predecessor_receipt_digest:
+        raise C09RecoveryFactsHold(('observation_fact_predecessor_receipt',))
+    from .observation_refinement_v3 import _refinement_v3
+    _refinement_v3(previous.platform_observation,fact.platform_observation)
+    fact_fence=AuthorityV2FenceStore._row(core,fact.fact_write_permit.operation_id)
+    if (fact_fence is None or fact_fence[6]!='finished' or AuthorityV2FenceStore._permit(fact_fence)!=updated
+            or fact_fence[10] is not None or fact_fence[8:10]!=('finish:'+fact.mutation_id,v2_digest(receipt))):
+        raise C09RecoveryFactsHold(('observation_fact_fence',))
+    return fact,receipt,updated,tuple(source),tuple(predecessor)
+
+
 def _plain_digest(value: str) -> str:
     return value.removeprefix("sha256:")
 
@@ -84,6 +136,7 @@ class InstalledC09RecoveryOriginalsV4:
             self.graph_path = Path(row[2]).resolve(strict=True)
         self._snapshot = None
         self._original_cache = None
+        self._observation_facts_v3 = {}
         self._model_cache = None
         self._contact_registry = graph._registry
         self._contact_control = core._c09_storage_reader_v1
@@ -161,6 +214,7 @@ class InstalledC09RecoveryOriginalsV4:
         terminals = {}
         phases = {}
         row_by_mutation = {}
+        self._observation_facts_v3 = {}
         for row in rows:
             from .d11_life_journal_v1 import ENTRY_PREFIX as LIFE_ENTRY_PREFIX
             if row[4].startswith(LIFE_ENTRY_PREFIX):
@@ -178,6 +232,19 @@ class InstalledC09RecoveryOriginalsV4:
             if row[4].startswith(ENTRY_PREFIX):
                 # Dedicated numeric originals are read below with their own
                 # installed verifier, never decoded as dispatch or C04 Body work.
+                continue
+            from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_ENTRY_PREFIX
+            if row[4].startswith(FACT_ENTRY_PREFIX):
+                fact,receipt,updated,source_fact,predecessor_row=_actual_observation_fact_entry_v3(
+                    control,old,row,namespace=namespace)
+                permit=fact.original_claimed_receipt.pending.permit
+                prior=phases.get(permit.effect_id)
+                if (prior is None or prior.phase!='observed' or prior.claimed_receipt!=fact.original_claimed_receipt
+                        or prior.mutation_id!=fact.predecessor_mutation_id):
+                    raise C09RecoveryFactsHold(('observation_fact_dispatch_join',))
+                if permit.effect_id in self._observation_facts_v3:
+                    raise C09RecoveryFactsHold(('duplicate_observation_fact',))
+                self._observation_facts_v3[permit.effect_id]=(fact,receipt,updated,source_fact,predecessor_row,row)
                 continue
             if row[4].startswith(b'{"binding":'):
                 binding, claim, terminal = old._decode_internal_row(row)
@@ -247,8 +314,10 @@ class InstalledC09RecoveryOriginalsV4:
         from .c09_life_recovery_originals_v1 import read_life_recovery_originals_v1
         _, old, rows, _, business, control = self._current(namespace, operation_id)
         service = self._installed_verifier("life", namespace)
+        from .c09_paged_recovery_facts_v2 import _OneExecutionOriginalsV2
+        context=((self.producer.session,self.producer.pair) if type(self) is _OneExecutionOriginalsV2 else None)
         return read_life_recovery_originals_v1(business=business, core_db=control,
-            journal=old, rows=rows, service=service, namespace=namespace)
+            journal=old, rows=rows, service=service, namespace=namespace,labor_context=context)
 
     def _offline_originals(self, namespace, operation_id):
         from .c09_offline_recovery_originals_v1 import read_offline_recovery_originals_v1
@@ -351,6 +420,11 @@ class InstalledC09RecoveryOriginalsV4:
             else:
                 originals[binding.execution_id] = (binding, claim, terminal, prepared)
         return tuple(originals[key] for key in sorted(originals))
+
+    def observation_refinement_fact_for_effect_v3(self,effect_id):
+        if self._original_cache is None:
+            raise C09RecoveryFactsHold(('observation_fact_requires_actual_execution_originals',))
+        return self._observation_facts_v3.get(effect_id)
 
     def read_current_execution_originals_v4(self, *, namespace, operation_id):
         (_seal, claims, terminals, _proofs, phases, row_by_mutation,

@@ -1270,7 +1270,10 @@ def prepare_conditioned_owner_entry_v3(reader):
     require_conditioned_self_work_v3(reader)
     if reader.session_proof is not None:
         from ..authority_service.owner_location_read_v3 import prepare_current_host_method_owner_read_entry_v3
-        if reader.general_owner_entry is None:reader.general_owner_entry=prepare_current_host_method_owner_read_entry_v3(reader)
+        if reader.general_owner_entry is None:
+            if reader.general_owner_task is None:reader.general_owner_task=prepare_current_host_method_owner_read_entry_v3(reader)
+            if not reader.general_owner_task.advance():return False
+            reader.general_owner_entry=reader.general_owner_task.take_result_v3();reader.general_owner_task=None
         reader.general_owner_entry.require_permission_v3(reader)
         with reader.store._lock:reader.general_owner_entry.require_for_v3(reader)
         pin_conditioned_owner_entry_v3(reader)
@@ -2664,3 +2667,114 @@ def record_conditioned_followup_child_disposition_after_cas_v3(witness,db,*,fram
         (value['state'],child_id,canonical_serialize(value),*reader.namespace.as_tuple,prepared.dedupe_key,*header,old_wire))
     if cursor.rowcount!=1:raise AuthorityUnavailable('conditioned durable event changed before same-TX postCAS maintenance')
     return value
+
+
+# FullWriter is a distinct same-Method metadata caller. It neither registers a
+# Beta1 Work nor receives a Conditioned Self projection or business Body grant.
+_FULL_WRITER_CONDITIONED_COPIES_V1=WeakKeyDictionary()
+
+
+class _FullWriterConditionedCopySelectorV1:
+    def __init__(self,state,block,producer):
+        from .current_full_persona_writer_v1 import require_current_full_persona_writer_metadata_state_v1
+        if require_current_full_persona_writer_metadata_state_v1(state.reader)is not state:
+            raise AuthorityUnavailable('actual same-Method full writer metadata state required')
+        self.state,self.block,self.producer=state,block,producer
+        row,column,receipt=state.origin.producer_v1(producer[1])
+        if row[0]!='d01'or row[1]!=producer[0]or producer[2].plan_ref not in receipt.write_versions:
+            raise AuthorityUnavailable('conditioned copy selector has another actual last-changing producer')
+        self.column,self.receipt,self.original_digest=column,receipt,row[2]
+        self.identity=(state.reader.work,state.reader.operation,state.reader.fence,state.reader.graph_stamp,
+            state.reader.owner_binding,state.reader.request_digest,block,producer,row[2])
+        self.allowed_versions=frozenset(receipt.read_versions)
+        self.life_facts=[]
+    def require_v1(self):
+        from .current_full_persona_writer_v1 import require_current_full_persona_writer_metadata_state_v1
+        state=self.state;reader=state.reader
+        if(require_current_full_persona_writer_metadata_state_v1(reader)is not state
+                or _FULL_WRITER_CONDITIONED_COPIES_V1.get(state,{}).get(self.block.block_id)is not self
+                or self.identity!=(reader.work,reader.operation,reader.fence,reader.graph_stamp,
+                    reader.owner_binding,reader.request_digest,self.block,self.producer,self.original_digest)):
+            raise AuthorityUnavailable('conditioned copy metadata selector left its actual private Method/producer')
+        return self
+
+
+def _full_writer_conditioned_life_metadata_v1(selector,ref):
+    selector.require_v1();state=selector.state;owner=state.origin
+    from .life_prepared_source_metadata_v3 import life_prepared_locator_spec_v3,finish_life_prepared_locator_v3
+    from .current_full_persona_writer_v1 import _LIFE_PROFILE
+    table,column,key_columns,key,header_columns,_paths,_kind=life_prepared_locator_spec_v3(owner.namespace,ref)
+    header=owner.fixed_v1(table,header_columns,'bot=? AND persona=? AND kind=? AND original_ref=?',key)
+    if header is None:raise AuthorityUnavailable('conditioned copy Life preparation metadata is absent')
+    original=owner.column_v1(table,column,key_columns,key,_LIFE_PROFILE)
+    facts=finish_life_prepared_locator_v3(namespace=owner.namespace,original_ref=ref,header=header,
+        projection=original.metadata,fields_seen=original.fields[()],whole_digest=original.semantic_digest,
+        signer=owner.origin_signer)
+    row,producer,receipt=owner.producer_v1(facts.producing_operation_id)
+    if row[0]!='d11'or receipt.operation_id!=facts.producing_operation_id:
+        raise AuthorityUnavailable('conditioned copy prepared original has another actual W01 producer')
+    return facts
+
+
+def prepare_full_persona_conditioned_copy_metadata_v1(state,block,producer):
+    from .current_full_persona_writer_v1 import(copy_metadata_from_actual_producer_v1,
+        issue_full_persona_copy_metadata_v1)
+    if producer[0]not in {'adopt_current_conditioned_self_v1','rollback_current_conditioned_strategy_v1'}:
+        raise AuthorityUnavailable('conditioned copied block has no actual dedicated registered adopter')
+    selectors=_FULL_WRITER_CONDITIONED_COPIES_V1.setdefault(state,{})
+    selector=selectors.get(block.block_id)
+    if selector is None:
+        selector=_FullWriterConditionedCopySelectorV1(state,block,producer);selectors[block.block_id]=selector
+    selector.require_v1();owner=state.origin;p=selector.column.metadata['provenance']
+    request=selector.column.metadata['request']
+    if(p['conditioned_candidate_ref']!=request['candidate_ref']
+            or p['rollback']!=(producer[0]=='rollback_current_conditioned_strategy_v1')):
+        raise AuthorityUnavailable('conditioned copy candidate/rollback metadata differs from actual producer')
+    from .full_persona_method_writer_metadata_v1 import full_writer_frozen_graph_metadata_v1
+    candidate_key=AtomKey.from_token(p['conditioned_candidate_ref'])
+    candidates=tuple(v for v in selector.allowed_versions if v.key==candidate_key)
+    if len(candidates)!=1:raise AuthorityUnavailable('conditioned copied candidate is absent from its complete actual producer read set')
+    candidate,_,candidate_digest=full_writer_frozen_graph_metadata_v1(selector,candidates[0])
+    if candidate_digest!=p['conditioned_candidate_digest']:
+        raise AuthorityUnavailable('conditioned copied candidate whole value commitment differs')
+    roots=set(p['conditioned_source_roots']);groups=[];facts_by_ref={}
+    for version in sorted(selector.allowed_versions,key=lambda v:(v.key.token,v.revision)):
+        if version.revision<1 or version.key.type_name in {'d01.persona_plan.v1','d01.persona_activation.v1',
+                'd11.owner_grant.v1','memory.source','memory.access','d06.source_correction_head.v1'}:
+            continue
+        metadata,_ref,_digest=full_writer_frozen_graph_metadata_v1(selector,version)
+        terminal=metadata.get('terminal_provenance')
+        if type(terminal)is dict and type(terminal.get('binding'))is dict:
+            binding=terminal['binding']
+            if binding.get('namespace')!={'bot_id':owner.namespace.bot_id,'persona_id':owner.namespace.persona_id}:
+                raise AuthorityUnavailable('conditioned copied Life binding crossed namespace')
+            ref=binding['prepared_original_ref']
+            facts=_full_writer_conditioned_life_metadata_v1(selector,ref)
+            if not set(facts.read_versions)<=set(selector.receipt.read_versions):
+                raise AuthorityUnavailable('conditioned copied Life preparation has another actual producer read-set binding')
+            facts_by_ref[ref]=facts
+    from .life_prepared_source_metadata_v3 import life_prepared_source_groups_v3
+    for facts in facts_by_ref.values():
+        groups.extend(life_prepared_source_groups_v3(facts));roots.update(facts.source_roots)
+    selector.life_facts=tuple(facts_by_ref.values())
+    groups.insert(0,('consolidation',tuple(state.reader.authority.audience),tuple(sorted(roots))))
+    base=copy_metadata_from_actual_producer_v1(state,block,producer)
+    return issue_full_persona_copy_metadata_v1(state,block,producer,tuple(groups),base.dependencies,base.original_digest)
+
+
+def finish_full_persona_conditioned_copy_v1(evidence,claim):
+    evidence.require_v1(evidence.state)
+    selectors=_FULL_WRITER_CONDITIONED_COPIES_V1.get(evidence.state,{})
+    selector=selectors.get(evidence.block.block_id)
+    if selector is None:raise AuthorityUnavailable('actual conditioned full writer metadata selector is unavailable')
+    selector.require_v1()
+    from ..domains.d01.conditioned_self_v1 import decode_conditioned_self_claim_v1
+    value=decode_conditioned_self_claim_v1(claim)
+    if value is None:raise AuthorityUnavailable('conditioned copied full Body changed its dedicated protocol')
+    from ..domains.d01.production_operations_v1 import plain_v1
+    if canonical_digest(plain_v1(value))!=selector.column.metadata['provenance']['conditioned_candidate_digest']:
+        raise AuthorityUnavailable('conditioned copied Body differs from its actual signed producer candidate')
+
+
+def release_full_persona_conditioned_copy_metadata_v1(state):
+    _FULL_WRITER_CONDITIONED_COPIES_V1.pop(state,None)

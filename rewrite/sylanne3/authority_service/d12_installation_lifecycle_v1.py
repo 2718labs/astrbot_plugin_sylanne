@@ -10,7 +10,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import asdict, fields
 import json
-import logging
 import traceback
 from pathlib import Path
 import sqlite3
@@ -18,6 +17,7 @@ import threading
 import time
 from uuid import UUID
 
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from ..domains.d12.backend_operation_contracts_v1 import D12BackendOperationOriginalV1, D12ControlPayloadV1, backend_original_digest_v1
 from ..graph_store import GraphStore
 from ..runtime.lifecycle_operations_v1 import decode_original, digest
@@ -134,6 +134,12 @@ class InstalledD12InstallationLifecycleV1:
                 or guard.pending_revoke_operation_id is not None
                 or guard.minimum_revocation_revision or guard.minimum_revocation_epoch):
             raise AuthorityUnavailable("installation control initiating Owner has changed")
+        if row[4].startswith("d12inspectioncontrol:") and row[13] not in {"active","paused"}:
+            from .source_inspection_migration_v1 import InstalledSourceInspectionMigrationV1
+            migration=getattr(self,"_source_inspection_migration_service_v1",None)
+            if type(migration) is not InstalledSourceInspectionMigrationV1:
+                raise AuthorityUnavailable("native inspection control awaits its installed workflow service")
+            migration.workflow.require_control_continuation_v1(db,row)
         return guard
 
     def _constraints_in_tx(self, db, deletion, execution, storage, *, require_current_graph=False, qualified_context=None):
@@ -268,6 +274,67 @@ class InstalledD12InstallationLifecycleV1:
         return self.status_service.read_current_operation_original_v1(credential=credential,actor=actor,
             session_token=session_token,session_request=session_request,original_ref=original_ref,refresh=True)
 
+
+    def accept_maintenance_pause_in_tx_v1(self,phase):
+        return self._accept_inspection_control_in_tx_v1(phase,"pause")
+
+    def submit_accepted_maintenance_resume_in_tx_v1(self,phase):
+        return self._accept_inspection_control_in_tx_v1(phase,"resume")
+
+    def _accept_inspection_control_in_tx_v1(self,phase,action):
+        from .source_inspection_workflow_v1 import _InspectionWorkflowPhaseV1,native_inspection_control_original_v1
+        from .graph_catalogue_upgrade_v1 import require_selected_catalogue_target_in_tx_v1
+        from .source_inspection_recovery_v1 import _InspectionRecoveryPhaseV1,native_recovery_control_original_v1
+        if type(phase) is _InspectionRecoveryPhaseV1:
+            if action!="resume":raise AuthorityUnavailable("fresh inspection recovery only resumes")
+            build_native=native_recovery_control_original_v1
+        elif type(phase) is _InspectionWorkflowPhaseV1:
+            build_native=native_inspection_control_original_v1
+        else:
+            raise AuthorityUnavailable("actual accepted inspection workflow control phase required")
+        phase.require_v1(self,action)
+        db=self.core._db
+        original=phase.original
+        if action=="resume":
+            require_selected_catalogue_target_in_tx_v1(db,self,inspection_workflow_phase=phase)
+        observed=self.supervisor.read_current_host_state_v1()
+        process=None if observed.main_pid==0 else read_process_identity_v1(observed.main_pid)
+        if action=="pause" and (observed.active_state!="active" or process is None):
+            raise AuthorityUnavailable("inspection workflow pause requires the actual original Host")
+        if action=="resume" and not observed.stopped_and_drained:
+            raise AuthorityUnavailable("inspection workflow resume requires the actual original Host retirement")
+        intent=D12InstallationControlIntentV1(self.installation_id,action,phase.expected_lifecycle_epoch,
+            None if action=="pause" else original["input"]["pause_operation_id"])
+        native=build_native(phase,intent)
+        source_ref="d12inspectioncontrol:"+native["original_digest"]
+        prior=db.execute(f"SELECT * FROM {OPS} WHERE namespace=? AND operation_id=?",(self.namespace,phase.operation_id)).fetchone()
+        if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='authority_c09_consumed_execution_v1'").fetchone():
+            if db.execute("SELECT 1 FROM authority_c09_consumed_execution_v1 WHERE namespace=? AND kind='d12_lifecycle_operation' AND item_id=?",
+                    (self.namespace,phase.operation_id)).fetchone():
+                raise AuthorityUnavailable("retired inspection lifecycle phase cannot be replayed")
+        if prior is not None:
+            if prior[2]!=native["request_digest"] or prior[4]!=source_ref:
+                raise AuthorityUnavailable("inspection native control retry changes its original")
+            return prior[1]
+        head=read_lifecycle_head_in_tx_v1(db,self.namespace)
+        state="quiescing" if action=="pause" else "resuming"
+        request=original["public_session_request"]
+        values=(self.namespace,phase.operation_id,native["request_digest"],action,source_ref,
+            canonical_serialize(native),canonical_serialize(asdict(intent)),original["actor"],
+            canonical_serialize(request).encode(),original["owner_head"],canonical_serialize(original["storage"]),
+            canonical_serialize(asdict(observed)),canonical_serialize(process),state,None,None)
+        db.execute(f"INSERT INTO {OPS} VALUES({','.join('?' for _ in values)})",values)
+        material=(self.namespace,self.installation_id,state,head.epoch+1,phase.operation_id)
+        if db.execute("UPDATE authority_d12_lifecycle_heads_v1 SET state=?,epoch=?,operation_id=?,head_digest=? WHERE namespace=? AND epoch=? AND head_digest=?",
+                (state,head.epoch+1,phase.operation_id,digest(material),self.namespace,head.epoch,head.head_digest)).rowcount!=1:
+            raise AuthorityUnavailable("inspection native lifecycle accepted head CAS changed")
+        changed=read_lifecycle_head_in_tx_v1(db,self.namespace)
+        self._receipt(db,values,head=changed,stage=state,
+            anchor=phase.anchor,
+            supervisor=observed,process=process)
+        return phase.operation_id
+
+
     def _start_worker(self, operation_id):
         with self._condition:
             prior=self._workers.get(operation_id)
@@ -372,7 +439,7 @@ class InstalledD12InstallationLifecycleV1:
                     for frame in diagnostic.stack]})
                 diagnostic = diagnostic.__cause__ or (
                     None if diagnostic.__suppress_context__ else diagnostic.__context__)
-            logging.getLogger(__name__).error(
+            diagnostic_channel_v1(__name__).error(
                 "Sylanne D12 lifecycle worker cause metadata: " +
                 json.dumps(chain, separators=(",", ":")))
             self._record_hold(operation_id, "original_stage_reconciliation_required")
@@ -580,7 +647,10 @@ class InstalledD12InstallationLifecycleV1:
         # Package maintenance owns this shared exclusion through its separate
         # external supervisor; a lifecycle worker cannot finish that operation.
         if owned and head.state not in {"active","paused"}:
-            self._start_worker(head.operation_id)
+            with self.core._tx() as db:
+                original=self._operation(db,head.operation_id)
+            if not original[4].startswith("d12inspectioncontrol:"):
+                self._start_worker(head.operation_id)
 
     def close(self):
         self._closed.set()
@@ -592,6 +662,9 @@ class InstalledD12InstallationLifecycleV1:
                 worker.join(timeout=timeout)
                 if worker.is_alive():
                     raise AuthorityUnavailable("original supervisor action must settle before Authority closes")
+        migration=getattr(self,"_source_inspection_migration_service_v1",None)
+        if migration is not None:
+            migration.close()
 
 
 __all__=("InstalledD12InstallationLifecycleV1","OPS","RECEIPTS","BOOTS")

@@ -93,6 +93,18 @@ def test_generation_mechanical_and_review_share_exact_basis_and_output():
         )
 
 
+def _json_safe_values(value):
+    """Model-bound fixtures carry enum members; their JSON value is the durable form."""
+    from enum import Enum
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, dict):
+        return {key: _json_safe_values(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_values(item) for item in value]
+    return value
+
+
 def _semantic_basis_case(bubble_count):
     from sylanne3.model_broker.natural_reply_history_v3 import D13NaturalHistorySelectionV1
     from sylanne3.model_broker.natural_reply_history_v4 import (
@@ -159,9 +171,10 @@ def test_v5_generation_d09_and_v2_review_bind_one_complete_semantic_manifest(bub
     )
 
     plan, reads, generation, output, ranges, seal, review, review_seal = _semantic_basis_case(bubble_count)
+    output = _json_safe_values(output)
     assert generation.schema == FROZEN_SCHEMA_V5
     assert json.loads(generation.messages[2].content)["schema"] == TEMPLATE_VERSION_V5
-    cold_generation = thaw_natural_reply_request_v4(json.loads(json.dumps(asdict(generation))))
+    cold_generation = thaw_natural_reply_request_v4(json.loads(json.dumps(_json_safe_values(asdict(generation)))))
     parsed = parse_natural_reply_output_v4(json.dumps(output), cold_generation)
     mechanical = mechanically_verify_natural_reply_v2(
         parsed.d09_payload(), plan=plan, current_reads=reads, now_utc=110.0)

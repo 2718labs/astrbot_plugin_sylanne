@@ -57,7 +57,8 @@ class _D07AuthorityFrozenMetadataReadV3:
         if len(path)==1:return True
         permitted={"namespace","activity_id","work_kind","question_key","target_ref","causal_depth",
             "c02_operation_id","cycle_job_ref","need_ref","need_digest","cue","known_sources","sources",
-            "context_sources","support_sources","ordinary_block_id","scope","target_original_digest"}
+            "context_sources","support_sources","ordinary_block_id","scope","target_original_digest",
+            "phase","question_original","causal_parent_executions","review_step","target_original_kind"}
         if path[1]not in permitted:return False
         if path[1]in {"sources","known_sources","context_sources","support_sources"}:
             return len(path)<=3 or path[3]=="source_ref"
@@ -137,6 +138,8 @@ class _D07AuthorityPreparedHeaderReadV3:
             D07RelationshipPreparedV2,D07ReflectionPreparedV3,D07IngressRecallPreparedV1)
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
         from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         work=self.work;self.reader.require_current_v3(meter)
         if self.phase=="identity":
@@ -147,7 +150,7 @@ class _D07AuthorityPreparedHeaderReadV3:
                 raise AuthorityUnavailable("D07 Source header lost its exact signed prepared original")
             retained=frozenset().union(*(frozenset(item.name for item in fields(cls))for cls in (
                 D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,
-                D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)))
+                D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1,D07ArtifactObservationPreparedV3)))
             retained=retained-{"frozen_json","external_content_originals_json"}
             self.column=_D07AuthorityLocatorColumnV3(work,kind="prepared",original_ref=self.job_id,
                 retained_fields=retained)
@@ -161,7 +164,7 @@ class _D07AuthorityPreparedHeaderReadV3:
         raw=self.column.require_v3(work)
         classes={cls.__dataclass_fields__["schema"].default:cls for cls in (
             D07PreparedExecutionV1,D07RelationshipPreparedV2,D07ReflectionPreparedV3,
-            D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07ArtifactObservationPreparedV3)}
+            D07IngressRecallPreparedV1,D07MethodGrowthPreparedV2,D07GeneralGrowthPreparedV1,D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1,D07ArtifactObservationPreparedV3)}
         cls=classes.get(raw.get("schema"))
         if (cls is None or self.column.fields_seen!={field.name for field in fields(cls)}
                 or raw["namespace"]!={"bot_id":work.namespace.bot_id,"persona_id":work.namespace.persona_id}
@@ -190,7 +193,7 @@ class _D07AuthorityPreparedHeaderReadV3:
             raise AuthorityUnavailable("D07 frozen metadata changed its signed namespace/activity identity")
         selected=([frozen_metadata["cue"],*frozen_metadata["known_sources"]]
             if cls is D07IngressRecallPreparedV1 else
-            (*frozen_metadata["context_sources"],*frozen_metadata["support_sources"])if cls is D07GeneralGrowthPreparedV1
+            (*frozen_metadata["context_sources"],*frozen_metadata["support_sources"])if cls in {D07GeneralGrowthPreparedV1,D07OrdinaryContinuityPreparedV1}
             else frozen_metadata["sources"])
         declared={(row["ref"],row["revision"])for row in source_rows}
         if (not selected or any(set(item["source_ref"])!={"ref","version"}
@@ -354,6 +357,10 @@ class D07AuthorityModelSourceReadV3:
             if "semantic_question_ref"in raw:allowed.add(("semantic_question",raw["semantic_question_ref"]))
             if raw["schema"]=="d07.general-growth-prepared.v1":
                 allowed.add(("general_growth_attention_v1",raw["general_growth_attention_ref"]))
+            if raw["schema"]=="d07.single-event-review-prepared.v1":
+                allowed.add(("single_event_review_attention_v1",raw["review_attention_ref"]))
+            if raw["schema"]=="d07.ordinary-continuity-prepared.v1":
+                allowed.add(("ordinary_continuity_attention_v1",raw["continuity_attention_ref"]))
             if raw["schema"]=="d07.reflection-prepared.v3":
                 for kind,name in (("reflection_continuation","reflection_continuation_ref"),
                         ("reflection_request","reflection_request_ref"),("execution","parent_execution_ref")):
@@ -489,6 +496,8 @@ class D07AuthorityModelSourceReadV3:
         raise AuthorityUnavailable("unregistered D07 Authority Source read phase")
 
     def release_v3(self):
+        from ..runtime.d07_single_event_review_v1 import release_single_event_review_parent_metadata_v1
+        release_single_event_review_parent_metadata_v1(self.work)
         self.work.operation.unregister_retained_state_v3(self)
         _READERS.pop(self,None)
         if _WORK_SOURCE_READERS.get(self.work)is self:_WORK_SOURCE_READERS.pop(self.work,None)
@@ -537,6 +546,17 @@ class _D07AuthoritySourceQualificationV3:
                 if prior is not None and prior!=row["revision"]:
                     raise AuthorityUnavailable("D07 original parent chain has conflicting Source versions")
                 self.expected[row["ref"]]=row["revision"]
+        from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+        self.purposes=(reader.effective_source_authority.purpose,)
+        if reader.header.prepared_class is D07SingleEventReviewPreparedV1:
+            require_current_single_event_review_authority_metadata_v1(self.work)
+            raw=reader.header.value
+            roots=set(raw["context_source_refs"])|set(raw["consolidation_source_refs"])
+            if(not roots or len(roots)>16 or set(raw["context_source_refs"])!=roots
+                    or set(raw["consolidation_source_refs"])!=roots or not roots<=set(self.expected)):
+                raise AuthorityUnavailable("review Source metadata omitted its exact original two purpose groups")
+            self.expected={ref:rev for ref,rev in self.expected.items()if ref in roots}
+            self.purposes=("context","consolidation")
         if not self.expected or len(self.expected)>256:
             raise AuthorityUnavailable("D07 Authority Source roots exceed the declared original bound")
         self.pending=list(self.expected)
@@ -598,12 +618,19 @@ class _D07AuthoritySourceQualificationV3:
         current_correction=work.heads.get(correction.token)
         correction_atom=(GraphAtom(correction,0,{},False)if current_correction is None
             else GraphAtom(correction,current_correction[0],{},bool(current_correction[1])))
+        if self.purposes==("context","consolidation"):
+            from .owner_location_read_v3 import require_current_authority_d07_single_event_review_owner_binding_v3
+            binding=require_current_authority_d07_single_event_review_owner_binding_v3(work,r)
+            if(not set(self.purposes)<=set(binding.purposes)
+                    or not set(r.effective_source_authority.audience)<=set(binding.audiences)):
+                raise AuthorityUnavailable("review two Source groups exceed the actual current full Owner grant")
         record=None
-        for audience in r.effective_source_authority.audience:
-            record=_qualify_source_rights_values_v3(work.namespace,ref,witness,access_atom,correction_atom,
-                audience=audience,purpose=r.effective_source_authority.purpose,metadata_only=True)
-            if record is None:
-                raise AuthorityUnavailable("D07 current Source metadata ACL/purpose/audience/correction is denied")
+        for purpose in self.purposes:
+            for audience in r.effective_source_authority.audience:
+                record=_qualify_source_rights_values_v3(work.namespace,ref,witness,access_atom,correction_atom,
+                    audience=audience,purpose=purpose,metadata_only=True)
+                if record is None:
+                    raise AuthorityUnavailable("D07 current Source metadata ACL/purpose/audience/correction is denied")
         self.qualified[ref]=(witness,record)
         for atom in (access_atom,correction_atom):self.versions[atom.key]=GraphVersion(atom.key,atom.revision)
         self.versions[key]=GraphVersion(key,witness.revision)
@@ -854,6 +881,8 @@ def read_current_d07_content_scope_basis_v3(db,*,issuer,prepared,request,frozen,
         read_original_d07_request_v1,read_d07_original_v1,require_current_d07_content_reads_v1)
     from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
     from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+    from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
     from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
     from ..runtime.foreground_call_plan_v1 import require_current_named_c3_cycle_v2
     if (not db.in_transaction or type(owner_acl_authority)is not AuthorityContext
@@ -931,6 +960,24 @@ def read_current_d07_content_scope_basis_v3(db,*,issuer,prepared,request,frozen,
         kind="method_growth_self"
         originals.append(ProductionOriginalRefV1("d01.actual-method-proposal",prepared.proposal_head.key.token,prepared.proposal_digest))
         originals.append(ProductionOriginalRefV1("d07.semantic_question",prepared.semantic_question_ref,prepared.semantic_question_digest))
+    elif type(prepared)is D07SingleEventReviewPreparedV1:
+        from ..runtime.d07_single_event_review_v1 import require_current_single_event_review_prepared_v1
+        question,attention,_=require_current_single_event_review_prepared_v1(db,issuer=issuer,prepared=prepared,
+            installed_bundle=bundle,now=now,frozen=frozen)
+        source=decode_typed_production_value_v1(background_json_loads_v3(prepared.owner_authority_json),AuthorityContext)
+        kind="single_event_review_owner"
+        originals.extend((ProductionOriginalRefV1("d07.semantic_question",prepared.semantic_question_ref,
+            prepared.semantic_question_digest),ProductionOriginalRefV1("d07.single_event_review_attention_v1",
+            prepared.review_attention_ref,prepared.review_attention_digest),prepared.review_case_original))
+    elif type(prepared)is D07OrdinaryContinuityPreparedV1:
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import require_current_ordinary_continuity_prepared_v1
+        question,attention,_=require_current_ordinary_continuity_prepared_v1(db,issuer=issuer,prepared=prepared,
+            installed_bundle=bundle,now=now,frozen=frozen)
+        source=decode_typed_production_value_v1(background_json_loads_v3(prepared.owner_authority_json),AuthorityContext)
+        kind="ordinary_continuity_owner"
+        originals.extend((ProductionOriginalRefV1("d07.semantic_question",prepared.semantic_question_ref,
+            prepared.semantic_question_digest),ProductionOriginalRefV1("d07.ordinary_continuity_attention_v1",
+            prepared.continuity_attention_ref,prepared.continuity_attention_digest)))
     elif type(prepared)is D07GeneralGrowthPreparedV1:
         from ..runtime.d07_general_growth_execution_v1 import require_current_general_growth_prepared_v1
         question,attention,_=require_current_general_growth_prepared_v1(db,issuer=issuer,prepared=prepared,
@@ -1025,6 +1072,9 @@ class _D07ParentMetadataColumnV3(DispatchOriginalJSONReadV3):
     def _retain_v3(self,path):
         if not path:return True
         mode=self.mode
+        if mode.startswith("single_event_review_"):
+            from ..runtime.d07_single_event_review_v1 import single_event_review_parent_metadata_retains_path_v1
+            return single_event_review_parent_metadata_retains_path_v1(mode,path)
         if mode in {"graph_job","graph_proposal","checkpoint"}:
             fields={
                 "graph_job":{"bot_id","persona_id","activity_id","operation_id","effect_id","job_id","snapshot_ref",
@@ -1048,6 +1098,9 @@ class _D07ParentMetadataColumnV3(DispatchOriginalJSONReadV3):
             if path[0]in {"schema","namespace","identity","authority","request"}:return True
             return path[0]=="provenance"and(len(path)==1 or
                 path[1]in {"artifact_observation_basis","artifact_observation_ticket"})
+        if mode=="ordinary_continuity_question":
+            from ..runtime.d07_ordinary_continuity_cognition_v1 import ordinary_continuity_metadata_retains_path_v1
+            return ordinary_continuity_metadata_retains_path_v1("semantic_question",path)
         if mode=="semantic_question":return path[0]!="question"
         if mode=="reflection_request":return path[0]not in {"question","unresolved_slots"}
         if mode=="execution":
@@ -1087,7 +1140,8 @@ class _D07ParentMetadataColumnV3(DispatchOriginalJSONReadV3):
         if self._retain_v3(event.path):super()._emit(event)
 
 class _D07SignedParentMetadataReadV3:
-    def __init__(self,reader,*,family,kind,ref,expected_digest=None):
+    def __init__(self,reader,*,family,kind,ref,expected_digest=None,mode=None):
+        self.mode=mode
         self.reader,self.work=reader,reader.work
         self.family,self.kind,self.ref,self.expected_digest=family,kind,ref,expected_digest
         self.phase="identity";self.complete=False;self.column=None;self.value=None
@@ -1106,7 +1160,7 @@ class _D07SignedParentMetadataReadV3:
             mode=("artifact_file"if self.family=="life"and self.kind=="adopted_life"else
                 self.kind if self.kind in {"semantic_question","reflection_request","execution"}else"metadata")
             self.column=_D07ParentMetadataColumnV3(w,table=table,column="payload_json",
-                key_columns=("bot","persona","kind","original_ref"),key=(*w.namespace.as_tuple,self.kind,self.ref),mode=mode)
+                key_columns=("bot","persona","kind","original_ref"),key=(*w.namespace.as_tuple,self.kind,self.ref),mode=self.mode or mode)
             self.phase="bytes";return
         if self.phase=="bytes":
             if not self.column.advance(meter):return
@@ -1288,7 +1342,9 @@ def _d07_parent_source_authority_v3(reader,header):
     if source.actor==reader.owner_acl_authority.actor:return source
     from ..runtime.d07_execution_v1 import D07PreparedExecutionV1,D07ReflectionPreparedV3
     from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
-    if header.prepared_class in {D07PreparedExecutionV1,D07GeneralGrowthPreparedV1}:
+    from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+    if header.prepared_class in {D07PreparedExecutionV1,D07GeneralGrowthPreparedV1,D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1}:
         raise AuthorityUnavailable("ordinary Owner Source authority has no exact current Owner pairing")
     if header.prepared_class is D07ReflectionPreparedV3 and header.value["cycle_ref"]is None:
         raise AuthorityUnavailable("ordinary Reflection Source authority cannot introduce an unregistered Self parent")
@@ -1341,6 +1397,8 @@ class _D07SpecialParentMetadataReadV3:
         from ..runtime.d07_execution_v1 import D07IngressRecallPreparedV1,D07ReflectionPreparedV3,D07RelationshipPreparedV2
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
         from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         r=self.reader;w=self.work;r.require_current_v3(meter)
         if _PARENT_TASKS_V3.get(self)!=(r,w,w.operation,w.scope,w.graph_stamp):
@@ -1391,6 +1449,8 @@ class _D07SpecialParentMetadataReadV3:
             if kind is D07ReflectionPreparedV3:self.phase="reflection"
             elif kind is D07IngressRecallPreparedV1:self.phase="need"
             elif kind in {D07MethodGrowthPreparedV2,D07RelationshipPreparedV2}:self.phase="question"
+            elif kind is D07SingleEventReviewPreparedV1:self.phase="single_event_review"
+            elif kind is D07OrdinaryContinuityPreparedV1:self.phase="ordinary_continuity"
             elif kind is D07GeneralGrowthPreparedV1:self.phase="general_question"
             elif kind is D07ArtifactObservationPreparedV3:self.phase="artifact_observation"
             else:self.phase="ordinary_job"
@@ -1402,6 +1462,12 @@ class _D07SpecialParentMetadataReadV3:
             self.artifact_observation=leaf.basis
             self.cycle_ref=leaf.basis.request.selector.task.cycle_job_ref
             self.phase="cycle";return
+        if self.phase=="single_event_review":
+            from ..runtime.d07_single_event_review_v1 import advance_single_event_review_parent_metadata_v3
+            advance_single_event_review_parent_metadata_v3(self,meter,side="authority");return
+        if self.phase=="ordinary_continuity":
+            from ..runtime.d07_ordinary_continuity_cognition_v1 import advance_ordinary_continuity_parent_metadata_v3
+            advance_ordinary_continuity_parent_metadata_v3(self,meter,side="authority");return
         if self.phase=="general_question":
             from ..runtime.d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1,QUESTION_SCHEMA
             leaf=self._leaf_v3(("general-question",header.job_id),_D07SignedParentMetadataReadV3(r,
@@ -1501,15 +1567,18 @@ class _D07SpecialParentMetadataReadV3:
             if leaf is None:return
             if "d07.cognition"not in leaf.grant.allowed_work_kinds or w.controller.clock()>=leaf.grant.valid_until_utc:
                 raise AuthorityUnavailable("D07 ordinary current original grant no longer permits cognition")
+            if kind in {D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1} and self.ordinary_job["budget_ref"]!=raw["original_parent_budget_lease_ref"]:
+                raise AuthorityUnavailable("ordinary continuity cannot replace its actual original parent lease")
             if kind is D07GeneralGrowthPreparedV1:
                 if (self.ordinary_job["budget_ref"]!=self.general_attention.original_parent_budget_lease_ref
                         or canonical_digest(leaf.grant)!=self.general_attention.original_parent_grant_digest):
                     raise AuthorityUnavailable("General cognition replaced its actual original parent budget/grant")
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
                 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+                from ..host.model_workflows_v10 import AdminModelWorkflowsV10
                 from ..model_broker.general_growth_cognition_v1 import TEMPLATE_VERSION
                 policy=r.bundle.model_workflows
-                workflow=policy.general_growth_cognition if type(policy) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) else None
+                workflow=policy.general_growth_cognition if type(policy) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10) else None
                 installed=header.column.frozen_metadata.value["installation"]
                 if (workflow is None or workflow.template_version!=TEMPLATE_VERSION
                         or workflow.purpose!="consolidation" or workflow.work_kind!="d07.cognition"
@@ -1918,7 +1987,7 @@ class _D07SpecialParentMetadataReadV3:
             source_versions=tuple(sorted({(row["ref"],row["revision"])for item in self.headers for row in item.source_rows}))
             names={D07IngressRecallPreparedV1:"ingress_recall_self",D07MethodGrowthPreparedV2:"method_growth_self",
                 D07ReflectionPreparedV3:"reflection",D07RelationshipPreparedV2:"relationship_self",
-                D07GeneralGrowthPreparedV1:"general_growth_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
+                D07GeneralGrowthPreparedV1:"general_growth_owner",D07OrdinaryContinuityPreparedV1:"ordinary_continuity_owner",D07SingleEventReviewPreparedV1:"single_event_review_owner",D07ArtifactObservationPreparedV3:"artifact_observation_self"}
             self.complete=True
             self.result=D07AuthorityParentMetadataQualifiedV3(_ISSUER,self,kind=names.get(original.prepared_class,"ordinary_owner"),
                 authority=source,parent_originals=self.originals,deadline=deadline,source_versions=source_versions)
@@ -2145,3 +2214,22 @@ def read_bound_d07_authority_complete_row_v3(work,attachment,meter):
     if attachment.table in {"graph_atoms","graph_history","graph_dependencies"}:
         reader.require_selected_graph_body_v3(attachment.request)
     return True,attachment.row
+
+
+def require_current_single_event_review_authority_metadata_v1(work):
+    """The exact signed Case parent chain, retained by this originating Authority Work."""
+    from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+    reader=_WORK_SOURCE_READERS.get(work)
+    if type(reader)is not D07AuthorityModelSourceReadV3:
+        raise AuthorityUnavailable("review Owner binding needs its actual Authority Source reader")
+    reader.require_registered_v3()
+    header=reader.header.require_v3(reader)
+    if header.prepared_class is not D07SingleEventReviewPreparedV1:
+        raise AuthorityUnavailable("review Owner binding cannot qualify another prepared family")
+    task=reader.parent_task
+    proof=qualify_d07_authority_special_parent_metadata_v3(reader,task)
+    if proof is not reader.metadata_qualified or proof.kind!="single_event_review_owner":
+        raise AuthorityUnavailable("review Owner binding needs its complete private signed Case chain")
+    if work.controller.clock()>=proof.original_deadline_utc:
+        raise AuthorityUnavailable("review Owner binding cannot renew the original Case deadline")
+    return reader

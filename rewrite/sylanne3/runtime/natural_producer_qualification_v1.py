@@ -1311,6 +1311,7 @@ class _HostProducerAttachmentV3:
     def __init__(self,owner,request):
         from .current_graph_full_read_v3 import _OrdinaryFullReadV3
         if type(owner)is _OrdinaryFullReadV3:
+            owner.prefinal.require_body_projection_v3();owner.source_material.require_rights_seal_v3()
             owner.prefinal._actual()
             if owner.work.state is not owner or owner.work.operation is not owner.operation:
                 raise ValueError('actual same-Work host attachment owner required')
@@ -1347,6 +1348,22 @@ class _HostProducerAttachmentV3:
         owner=self.owner;owner.prefinal.require_current(meter=meter)
         if self.phase=='metadata':
             mapped=self.table in ('graph_atoms','graph_history') and 'value' in self.columns
+            if mapped:
+                from .current_graph_full_read_v3 import _OrdinaryFullReadV3
+                if type(owner)is _OrdinaryFullReadV3:
+                    owner.source_material.require_rights_seal_v3()
+                    located=dict(zip(self.key_columns,self.key));key=AtomKey.from_token(located['token'])
+                    if key.type_name=='memory.source':
+                        identities=owner.source_material.rights_done;audience=owner.source_material.conversation_ref
+                        if ((key.token,'expression',audience,False)not in identities
+                                and(key.token,'expression',audience,True)not in identities):
+                            raise ValueError('producer Source Body is outside this actual R SourceALL closure')
+                    else:
+                        selected={key.token for key in owner.producer_metadata.keys}|set(owner.metadata_selection.keys)|set(owner.body_keys)
+                        if key.token not in selected:raise ValueError('producer graph Body was not selected by its actual metadata locator')
+                    head=owner.prefinal.heads.get(key.token)
+                    if head is None or self.table=='graph_history'and located['revision']!=head[0]:
+                        raise ValueError('producer graph Body differs from its actual selected current metadata head')
             json_names=tuple(name for name in self.columns if name.endswith('_json') or name in
                 ('value','reads','revisions','invalidated','dependencies','typed_request_wire'))
             self.json_names=json_names
@@ -1559,6 +1576,7 @@ class _HostNaturalProducerPreparationV3:
                 or phase not in ('prepare','frozen') or type(parent_original_id)is not str or not parent_original_id
                 or reader.prefinal.actual_entry.c02_operation_id!=parent_original_id):
             raise ValueError('actual originating natural producer Work/census/entry required')
+        reader.prefinal.require_body_projection_v3();reader.source_material.require_rights_seal_v3()
         reader.prefinal._actual()
         self.reader,self.parent_original_id,self.request_phase=reader,parent_original_id,phase
         self.phase='saved';self.complete=False;self.prepared=None;self.saved_reader=None;self.saved=None
@@ -1631,6 +1649,7 @@ def advance_host_natural_producer_preparation_v3(progress,*,meter=None):
     if type(progress)is not _HostNaturalProducerPreparationV3 or progress not in _HOST_PRODUCER_READERS_V3 or progress.complete:
         raise ValueError('actual unfinished natural producer Work required')
     reader=progress.reader;reader.prefinal._actual()
+    from .dispatch_initial_source_read_v3 import bind_host_natural_roster_metadata_v3
     if progress.phase=='protected_observation':
         if meter is not None or reader.db.in_transaction:raise ValueError('protected producer RPC must run outside local SQL quantum')
         if not progress.selectors.empty:progress.observation=_observe_prepared_host_natural_producers_v3(progress)
@@ -1641,7 +1660,8 @@ def advance_host_natural_producer_preparation_v3(progress,*,meter=None):
     if progress.attachment is not None:
         if reader.db.in_transaction:raise ValueError('producer attachment retained a SQL transaction')
         reader.db.execute('BEGIN')
-        try:progress.attachment.advance(meter)
+        try:
+            with bind_host_natural_roster_metadata_v3(reader):progress.attachment.advance(meter)
         finally:reader.db.rollback()
         if progress.attachment.complete:
             progress.attachments[progress.attachment.request]=progress.attachment;progress.attachment=None
@@ -1649,9 +1669,10 @@ def advance_host_natural_producer_preparation_v3(progress,*,meter=None):
     if progress.c04_decode is not None:
         reader.db.execute('BEGIN')
         try:
-            original=progress.c04_decode.wire_original
-            original.attachment.require_row_v3(reader,meter)
-            progress.c04_decode.advance(meter=meter)
+            with bind_host_natural_roster_metadata_v3(reader):
+                original=progress.c04_decode.wire_original
+                original.attachment.require_row_v3(reader,meter)
+                progress.c04_decode.advance(meter=meter)
         finally:reader.db.rollback()
         if progress.c04_decode.complete:
             progress.c04_decodes.append(progress.c04_decode);progress.c04_decode=None
@@ -1663,70 +1684,71 @@ def advance_host_natural_producer_preparation_v3(progress,*,meter=None):
     token=_HOST_PRODUCER_READING_V3.set(progress)
     try:
         reader.db.execute('BEGIN')
-        if progress.phase=='saved':
-            from .dispatch_initial_source_read_v3 import begin_host_natural_saved_original_read_v3
-            if progress.saved_reader is None:
-                progress.saved_reader=begin_host_natural_saved_original_read_v3(reader,parent_original_id=progress.parent_original_id)
-            elif progress.saved_reader.advance(meter):
-                progress.saved=progress.saved_reader.require_v3(reader)
-                if progress.request_phase=='frozen' and progress.saved is None:raise ValueError('frozen producer has no actual saved generation')
-                progress.phase='selectors'
-        elif progress.phase=='selectors':
-            issuer=reader.graph._GraphCoordinator__d11_issuer
-            progress.selectors=(fresh_natural_producer_selectors_v1(reader.db,namespace=reader.namespace,
-                parent_original_id=progress.parent_original_id,issuer=issuer) if progress.saved is None else
-                frozen_natural_producer_selectors_v1(reader.db,namespace=reader.namespace,frozen=progress.saved.frozen))
-            progress.phase='c04'
-        elif progress.phase=='c04':
-            if progress.selectors.c04_ref is not None:
-                progress.c04=_c04_locator(reader.db,reader.namespace,progress.parent_original_id,progress.selectors.c04_ref)
-                progress.roots.update(progress.c04[0].value['source_refs'])
-                semantic=progress.c04[4]['interpretation'].get('adoption_original')
-                if semantic is not None:progress.roots.update((*semantic['supporting_refs'],*semantic['counter_refs']))
-                progress.keys.update((progress.c04[0].key,AtomKey.from_token(progress.c04[5]['payload']['provenance']['child_job_ref'])))
-            progress.phase='c04_costs'
-        elif progress.phase=='c04_costs':
-            if progress.c04 is not None:
-                from .d11_c04_internal_cost import read_c04_cpu_cost_original_v1
-                from ..domains.d02.c04_fixed_component_cost import read_c04_body_cost_original_v1
-                from .c04_interpretation_policy_v3 import read_installed_c04_interpretation_policy_v3
-                prepared,work=progress.c04[1:3]
-                cpu=read_c04_cpu_cost_original_v1(reader.db,reader.namespace,prepared.binding.operation_id)
-                body=read_c04_body_cost_original_v1(reader.db,reader.namespace,prepared.binding.operation_id)
-                if cpu is None or body is None:raise ValueError('C04 actual settled cost originals absent')
-                read_installed_c04_interpretation_policy_v3(reader.db,reader.namespace,prepared,
-                    installation_id=work.direct_selection.installation_id,manifest_digest=work.direct_selection.manifest_digest)
-            progress.phase='draft'
-        elif progress.phase=='draft':
-            if progress.selectors.draft_result_ref is not None:
+        with bind_host_natural_roster_metadata_v3(reader):
+            if progress.phase=='saved':
+                from .dispatch_initial_source_read_v3 import begin_host_natural_saved_original_read_v3
+                if progress.saved_reader is None:
+                    progress.saved_reader=begin_host_natural_saved_original_read_v3(reader,parent_original_id=progress.parent_original_id)
+                elif progress.saved_reader.advance(meter):
+                    progress.saved=progress.saved_reader.require_v3(reader)
+                    if progress.request_phase=='frozen' and progress.saved is None:raise ValueError('frozen producer has no actual saved generation')
+                    progress.phase='selectors'
+            elif progress.phase=='selectors':
                 issuer=reader.graph._GraphCoordinator__d11_issuer
-                progress.draft=_draft_locator(reader.db,reader.namespace,progress.parent_original_id,progress.selectors.draft_result_ref,issuer)
-                prepared,terminal,adopted,_,_=progress.draft
-                progress.roots.update((*adopted['source_refs'],*prepared.plan.content.source_refs))
-                from .d11_life_fact_provenance_v1 import life_fact_auxiliary_key_v1,life_current_fact_reads_v1,PROVENANCE_TYPE,ELIGIBILITY_TYPE
-                from .d11_life_graph_types_v1 import life_role_segment_key_v1
-                from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
-                for fact in (AtomKey.from_token(terminal.binding.artifact_ref),life_role_segment_key_v1(terminal.binding,'start'),life_role_segment_key_v1(terminal.binding,'end')):
-                    progress.keys.update((fact,life_fact_auxiliary_key_v1(fact,PROVENANCE_TYPE),life_fact_auxiliary_key_v1(fact,ELIGIBILITY_TYPE)))
-                progress.keys.update(life_outcome_read_keys_v1(terminal.binding,prepared.plan.action_intent.ref))
-                progress.keys.update(AtomKey.from_token(row.ref) for row in life_current_fact_reads_v1(prepared) if AtomKey.from_token(row.ref).type_name!='memory.source')
-            from ..domains.d03.self_perspective import self_mapping_key
-            if not progress.selectors.empty:progress.keys.add(self_mapping_key(reader.namespace))
-            progress.key_queue=list(sorted(progress.keys,key=lambda key:key.token));progress.phase='members'
-        elif progress.phase=='members':
-            if progress.key_queue:
-                _head(reader.db,reader.namespace,progress.key_queue[0]);progress.key_queue.pop(0)
-            else:
-                progress.key_queue=list(sorted(progress.keys,key=lambda key:key.token));progress.phase='dependencies'
-        elif progress.phase=='dependencies':
-            if progress.key_queue:
-                _producer_original_many_v3(reader.db,table='graph_dependencies',columns=('dependency_token','dependency_revision'),
-                    key_columns=('dependent_token',),key=(progress.key_queue[0].token,),order_column='dependency_token',legacy_reader=None)
-                progress.key_queue.pop(0)
-            else:progress.phase='protected_observation'
-        elif progress.phase=='publish':
-            progress.prepared=PreparedHostNaturalProducersV3(_KEY,progress);progress.complete=True
-        else:raise ValueError('natural producer preparation phase differs')
+                progress.selectors=(fresh_natural_producer_selectors_v1(reader.db,namespace=reader.namespace,
+                    parent_original_id=progress.parent_original_id,issuer=issuer) if progress.saved is None else
+                    frozen_natural_producer_selectors_v1(reader.db,namespace=reader.namespace,frozen=progress.saved.frozen))
+                progress.phase='c04'
+            elif progress.phase=='c04':
+                if progress.selectors.c04_ref is not None:
+                    progress.c04=_c04_locator(reader.db,reader.namespace,progress.parent_original_id,progress.selectors.c04_ref)
+                    progress.roots.update(progress.c04[0].value['source_refs'])
+                    semantic=progress.c04[4]['interpretation'].get('adoption_original')
+                    if semantic is not None:progress.roots.update((*semantic['supporting_refs'],*semantic['counter_refs']))
+                    progress.keys.update((progress.c04[0].key,AtomKey.from_token(progress.c04[5]['payload']['provenance']['child_job_ref'])))
+                progress.phase='c04_costs'
+            elif progress.phase=='c04_costs':
+                if progress.c04 is not None:
+                    from .d11_c04_internal_cost import read_c04_cpu_cost_original_v1
+                    from ..domains.d02.c04_fixed_component_cost import read_c04_body_cost_original_v1
+                    from .c04_interpretation_policy_v3 import read_installed_c04_interpretation_policy_v3
+                    prepared,work=progress.c04[1:3]
+                    cpu=read_c04_cpu_cost_original_v1(reader.db,reader.namespace,prepared.binding.operation_id)
+                    body=read_c04_body_cost_original_v1(reader.db,reader.namespace,prepared.binding.operation_id)
+                    if cpu is None or body is None:raise ValueError('C04 actual settled cost originals absent')
+                    read_installed_c04_interpretation_policy_v3(reader.db,reader.namespace,prepared,
+                        installation_id=work.direct_selection.installation_id,manifest_digest=work.direct_selection.manifest_digest)
+                progress.phase='draft'
+            elif progress.phase=='draft':
+                if progress.selectors.draft_result_ref is not None:
+                    issuer=reader.graph._GraphCoordinator__d11_issuer
+                    progress.draft=_draft_locator(reader.db,reader.namespace,progress.parent_original_id,progress.selectors.draft_result_ref,issuer)
+                    prepared,terminal,adopted,_,_=progress.draft
+                    progress.roots.update((*adopted['source_refs'],*prepared.plan.content.source_refs))
+                    from .d11_life_fact_provenance_v1 import life_fact_auxiliary_key_v1,life_current_fact_reads_v1,PROVENANCE_TYPE,ELIGIBILITY_TYPE
+                    from .d11_life_graph_types_v1 import life_role_segment_key_v1
+                    from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+                    for fact in (AtomKey.from_token(terminal.binding.artifact_ref),life_role_segment_key_v1(terminal.binding,'start'),life_role_segment_key_v1(terminal.binding,'end')):
+                        progress.keys.update((fact,life_fact_auxiliary_key_v1(fact,PROVENANCE_TYPE),life_fact_auxiliary_key_v1(fact,ELIGIBILITY_TYPE)))
+                    progress.keys.update(life_outcome_read_keys_v1(terminal.binding,prepared.plan.action_intent.ref))
+                    progress.keys.update(AtomKey.from_token(row.ref) for row in life_current_fact_reads_v1(prepared) if AtomKey.from_token(row.ref).type_name!='memory.source')
+                from ..domains.d03.self_perspective import self_mapping_key
+                if not progress.selectors.empty:progress.keys.add(self_mapping_key(reader.namespace))
+                progress.key_queue=list(sorted(progress.keys,key=lambda key:key.token));progress.phase='members'
+            elif progress.phase=='members':
+                if progress.key_queue:
+                    _head(reader.db,reader.namespace,progress.key_queue[0]);progress.key_queue.pop(0)
+                else:
+                    progress.key_queue=list(sorted(progress.keys,key=lambda key:key.token));progress.phase='dependencies'
+            elif progress.phase=='dependencies':
+                if progress.key_queue:
+                    _producer_original_many_v3(reader.db,table='graph_dependencies',columns=('dependency_token','dependency_revision'),
+                        key_columns=('dependent_token',),key=(progress.key_queue[0].token,),order_column='dependency_token',legacy_reader=None)
+                    progress.key_queue.pop(0)
+                else:progress.phase='protected_observation'
+            elif progress.phase=='publish':
+                progress.prepared=PreparedHostNaturalProducersV3(_KEY,progress);progress.complete=True
+            else:raise ValueError('natural producer preparation phase differs')
     except PreparedC04DecodeRequiredV4 as needed:
         from .c04_direct_seed_v4 import begin_prepared_c04_decode_v4
         original=_actual_host_c04_wire_v3(progress,needed.wire)
@@ -1777,6 +1799,10 @@ _HOST_ATTACHMENT_SHAPES_V3=_HOST_ATTACHMENT_SHAPES_V3|frozenset({
 
 
 def _producer_original_point_v3(db,*,table,columns,key_columns,key,legacy_reader):
+    from .d06_life_numeric_joint_v1 import read_bound_life_joint_new_original_v1
+    life, row = read_bound_life_joint_new_original_v1(db, table=table, columns=columns,
+        key_columns=key_columns, key=key)
+    if life:return row
     from ..authority_service.owner_stop_reply_metadata_v1 import read_bound_owner_stop_reply_metadata_point_v1
     bound,row=read_bound_owner_stop_reply_metadata_point_v1(db,table=table,columns=columns,key_columns=key_columns,key=key)
     if bound:return row
@@ -2000,10 +2026,12 @@ def _renew_prepared_host_natural_producer_scope_v3(graph,*,scope,prepared,phase)
         if db.in_transaction:raise ValueError('producer handoff must precede business SQL')
         db.execute('BEGIN')
         try:
-            _current_host_producer_full_v3(db,scope.namespace)
-            from ..runtime_storage_v3 import runtime_storage_quantum_v3
-            with runtime_storage_quantum_v3(db)as meter:
-                for task in prepared.attachments.values():task.require_row_v3(prepared.reader,meter)
+            from .dispatch_initial_source_read_v3 import bind_host_natural_roster_metadata_v3
+            with bind_host_natural_roster_metadata_v3(prepared.reader):
+                _current_host_producer_full_v3(db,scope.namespace)
+                from ..runtime_storage_v3 import runtime_storage_quantum_v3
+                with runtime_storage_quantum_v3(db)as meter:
+                    for task in prepared.attachments.values():task.require_row_v3(prepared.reader,meter)
         finally:db.rollback()
     observed=None if prepared.selectors.empty else _observe_prepared_host_natural_producers_v3(prepared,scope=scope)
     if observed is not None:_LIVE[id(observed)]=observed
@@ -2106,3 +2134,283 @@ _HOST_ATTACHMENT_SHAPES_V3 = _HOST_ATTACHMENT_SHAPES_V3 | frozenset({
 _HOST_ATTACHMENT_SCANS_V3 = _HOST_ATTACHMENT_SCANS_V3 | frozenset({
     ('graph_dependencies', ('dependency_token','dependency_revision'), ('dependent_token',), 'dependency_token'),
 })
+
+
+# Metadata locators precede FULL's SourceALL; complete producer values stay in
+# the existing preparation below that boundary.
+_HOST_PRODUCER_METADATA_V3=WeakKeyDictionary()
+_HOST_PRODUCER_METADATA_COLUMNS_V3=WeakKeyDictionary()
+_HOST_PRODUCER_METADATA_PATHS_V3={
+ 'saved':(('schema',),('input','plan','namespace'),('input','plan','plan_ref'),('input','plan','scene_ref'),('input','plan','audience_ref'),
+    ('input','plan','units','*','d06_claim_kind'),('input','plan','units','*','purpose'),('input','plan','units','*','audience_ref'),('input','plan','units','*','qualification_ref'),
+    ('input','plan','units','*','source_refs'),('input','plan','units','*','access_refs'),
+    ('input','plan','units','*','correction_refs')),
+ 'versions':(('*',),),
+ 'c03':(('namespace',),('identity',),('provenance','selection','schema'),
+    ('provenance','selection','namespace'),('provenance','selection','c02_operation_id'),
+    ('provenance','selection','selected_source_ref')),
+ 'c04':(('namespace',),('identity',),('provenance','child_job_ref'),
+    ('provenance','interpretation','adoption_original','supporting_refs'),
+    ('provenance','interpretation','adoption_original','counter_refs')),
+ 'receipt':(('schema',),('operation_id',),('write_versions',),('read_versions',)),
+ 'draft_content':(('schema',),('selector',),('adoption_operation_id',),('content','source_refs'),('task_source',)),
+ 'adopted_life':(('schema',),('namespace',),('result_ref',),('source_refs',),('terminal','binding')),
+ 'prepared_life':(('schema',),('binding',),('plan','content','source_refs'),('plan','input_source'),
+    ('plan','action_intent'),('read_rows','*','ref'),('read_rows','*','revision'),('read_rows','*','valid'),('plan','activity_scope_ref')),
+}
+
+
+class _HostProducerMetadataColumnV3:
+    def __init__(self,task,kind,*,ref=None):
+        from .dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3
+        from .current_graph_full_read_v3 import _full_metadata_event_v3
+        task.require_current_v3();reader=task.reader;ns=reader.namespace
+        if kind=='saved':
+            spec=('graph_natural_generation_preparations_v2','frozen_json',('bot','persona','parent_original_id'),(*ns.as_tuple,task.parent))
+        elif kind=='versions':
+            spec=('graph_natural_generation_preparations_v2','read_versions_json',('bot','persona','parent_original_id'),(*ns.as_tuple,task.parent))
+        elif kind in ('c03','c04','receipt'):
+            spec=('graph_domain_production_originals_v1','receipt_json'if kind=='receipt'else'original_payload_json',
+                ('bot','persona','operation_id'),(*ns.as_tuple,ref))
+        elif kind in ('draft_content','adopted_life','prepared_life'):
+            actual_kind={'draft_content':'c4_adopted','adopted_life':'adopted_life','prepared_life':'prepared'}[kind]
+            spec=('graph_d11_life_originals_v1','payload_json',('bot','persona','kind','original_ref'),(*ns.as_tuple,actual_kind,ref))
+        else:raise ValueError('unknown fixed producer metadata profile')
+        paths=_HOST_PRODUCER_METADATA_PATHS_V3[kind]
+        class Column(DispatchOriginalJSONReadV3):
+            def _emit(self,event):
+                if _full_metadata_event_v3(event,paths):super()._emit(event)
+            def require_v3(self,owner):
+                raise ValueError('metadata selector is not a producer Body original')
+        self.task,self.kind,self.ref=task,kind,ref
+        self.column=Column(reader,table=spec[0],column=spec[1],key_columns=spec[2],key=spec[3])
+        self.header=None;self.complete=False;self.value=None
+        _HOST_PRODUCER_METADATA_COLUMNS_V3[self]=(task,kind,ref,self.column)
+    def advance_v3(self,meter):
+        task=self.task;task.require_current_v3();reader=task.reader
+        if self.header is None:
+            table=self.column.table
+            columns=('domain','operation_kind','original_digest','bundle_digest','receipt_digest')if self.kind in('c03','c04','receipt')else(
+                ('producing_operation_id','payload_digest','signature')if table=='graph_d11_life_originals_v1'else('parent_original_id',))
+            self.header=meter.read_fixed_row(reader.db,table,columns,self.column.where,self.column.key)
+            if self.header is None:raise ValueError('fixed producer metadata original is absent')
+            if self.kind in('c03','c04','receipt'):
+                expected='adopt_ingress_c04_v1'
+                if self.kind=='c03':
+                    from .d06_ingress_c03_selection_v1 import OPERATION
+                    expected=OPERATION
+                if self.header[:2]!=('d06',expected):raise ValueError('producer metadata operation profile differs')
+                bundle=meter.read_fixed_row(reader.db,'graph_bundle_operations',('digest','activity_id'),
+                    'bot=? AND persona=? AND operation_id=?',(*reader.namespace.as_tuple,self.ref))
+                if bundle is None or bundle[0]!=self.header[3]:raise ValueError('producer metadata lost actual W01 adoption')
+                event=meter.read_fixed_row(reader.db,'graph_events',('digest',),
+                    'bot=? AND persona=? AND session=? AND event_id=?',(*reader.namespace.as_tuple,bundle[1],self.ref))
+                if event is None:raise ValueError('producer metadata lost actual W01 event')
+                self.event_metadata=event
+        if not self.column.advance(meter):return False
+        from .dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3
+        self.value=DispatchOriginalJSONReadV3.require_v3(self.column,reader)
+        if self.kind in('c03','c04')and self.column.sha256!=self.header[2]:
+            raise ValueError('producer metadata whole original commitment differs')
+        if self.column.table=='graph_d11_life_originals_v1':
+            from .d11_life_preparation_v1 import SIGN_KIND
+            from ..runtime_contracts import canonical_serialize
+            issuer=reader.graph._GraphCoordinator__d11_issuer
+            if self.column.sha256!=self.header[1]:raise ValueError('Life metadata original SHA differs')
+            issuer._signer.verify(SIGN_KIND,canonical_serialize((reader.namespace,self.column.key[2],self.ref,self.header[1])),self.header[2])
+        self.complete=True;return True
+    def require_metadata_v3(self,task):
+        if (_HOST_PRODUCER_METADATA_COLUMNS_V3.get(self)!=(task,self.kind,self.ref,self.column)
+                or self.task is not task or not self.complete):raise ValueError('actual complete producer metadata required')
+        task.require_current_v3();return self.value
+
+
+class HostNaturalProducerMetadataReadV3:
+    def __init__(self,reader):
+        from .current_graph_full_read_v3 import _OrdinaryFullReadV3
+        if type(reader)is not _OrdinaryFullReadV3 or reader.producer_phase not in('prepare','frozen'):
+            raise ValueError('actual natural FULL producer metadata caller required')
+        reader.prefinal._actual();self.reader=reader;self.parent=reader.source_locator.c02_operation_id
+        self.phase='saved';self.column=None;self.columns=[];self.roots=set();self.keys=set();self.versions={}
+        self.life_cursor='';self.draft_refs=[];self.c04_ref=None;self.draft_result_ref=None;self.complete=False
+        self.c03_digest=None;self.adopt_operation=None
+        _HOST_PRODUCER_METADATA_V3[self]=(reader,reader.work,reader.operation,reader.prefinal,self.parent)
+    def require_current_v3(self):
+        reader=self.reader
+        if (_HOST_PRODUCER_METADATA_V3.get(self)!=(reader,reader.work,reader.operation,reader.prefinal,self.parent)
+                or reader.operation.closed):raise ValueError('natural metadata caller changed its actual Work')
+        reader.prefinal._actual();return self
+    def _source_v3(self,ref):
+        ref=ref['ref']if type(ref)is dict else ref
+        key=AtomKey.from_token(ref)
+        if NamespaceId.from_key(key)!=self.reader.namespace or key.type_name!='memory.source':
+            raise ValueError('producer metadata Source crossed its canonical namespace')
+        self.roots.add(ref)
+    def _ref_v3(self,raw):
+        if type(raw)is not dict:return
+        if set(raw)=={'ref','version'}:
+            key=AtomKey.from_token(raw['ref']);revision=raw['version']
+        elif set(raw)=={'key','revision'}:
+            from ..graph_types import Owner
+            value=raw['key'];key=AtomKey.from_token(value)if type(value)is str else AtomKey(Owner(**value['owner']),value['type_name'],value['name'])
+            revision=raw['revision']
+        else:return
+        if NamespaceId.from_key(key)!=self.reader.namespace:raise ValueError('producer metadata version crossed namespace')
+        if key.type_name=='memory.source':self._source_v3(key.token)
+        else:self.keys.add(key)
+        if type(revision)is not int or revision<0:raise ValueError('producer metadata revision differs')
+        old=self.versions.setdefault(key.token,revision)
+        if old!=revision:raise ValueError('producer metadata carries inconsistent revisions')
+    def _collect_refs_v3(self,value):
+        if type(value)is dict:
+            self._ref_v3(value)
+            for part in value.values():self._collect_refs_v3(part)
+        elif type(value)in(tuple,list):
+            for part in value:self._collect_refs_v3(part)
+    def advance_v3(self,meter):
+        self.require_current_v3();r=self.reader;ns=r.namespace
+        if self.complete:return self
+        if self.column is not None:
+            if not self.column.advance_v3(meter):return self
+            column=self.column;value=column.require_metadata_v3(self);self.columns.append(column);self.column=None
+            if column.kind=='saved':
+                plan=value['input']['plan']
+                if plan['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id}:raise ValueError('saved producer changed namespace')
+                self._collect_refs_v3({name:plan[name]for name in ('plan_ref','scene_ref','audience_ref')})
+                for unit in plan['units']:
+                    if (not {'d06_claim_kind','purpose','audience_ref','source_refs','qualification_ref','access_refs','correction_refs'}<=set(unit)
+                            or unit['d06_claim_kind']not in _SOURCE_KINDS|{C04_KIND,DRAFT_KIND}
+                            or unit['purpose']!='expression' or unit['audience_ref']!=r.source_material.conversation_ref
+                            or not unit['source_refs']):
+                        raise ValueError('saved producer metadata has no exact supported Source/audience recipe')
+                    for ref in unit.get('source_refs',()):self._source_v3(ref)
+                    self._collect_refs_v3(unit)
+                    if unit.get('d06_claim_kind')==C04_KIND:
+                        ref=unit['qualification_ref'];self.c04_ref=VersionedRef(ref['ref'],ref['version'])
+                self.phase='versions'
+            elif column.kind=='versions':
+                for raw in value:
+                    key=AtomKey.from_token(raw['key'])
+                    if key in self.keys or key.token in self.roots:self._ref_v3(raw)
+                self.phase='saved_c04'if self.c04_ref is not None else'life_scan'
+            elif column.kind=='c03':
+                selection=value['provenance']['selection']
+                if selection['c02_operation_id']!=self.parent:raise ValueError('C03 metadata changed parent')
+                if selection['selected_source_ref'] is None:self.phase='life_scan'
+                else:
+                    from .c04_self_scope_v4 import ingress_c04_ids_v4
+                    self._source_v3(selection['selected_source_ref']);self.c03_digest=column.header[2]
+                    self.adopt_operation=ingress_c04_ids_v4(ns,self.parent,self.c03_digest)['adopt'];self.phase='c04'
+            elif column.kind=='c04':
+                if column.header[:2]!=('d06','adopt_ingress_c04_v1'):raise ValueError('C04 metadata kind differs')
+                p=value['provenance'];self.keys.add(AtomKey.from_token(p['child_job_ref']))
+                semantic=p.get('interpretation',{}).get('adoption_original')
+                if semantic is not None:
+                    for ref in (*semantic['supporting_refs'],*semantic['counter_refs']):self._source_v3(ref)
+                self.phase='c04_receipt'
+            elif column.kind=='receipt':
+                versions=value['write_versions'];matches=[]
+                for token,revision in versions:
+                    key=AtomKey.from_token(token);self._ref_v3({'key':token,'revision':revision})
+                    if key.type_name=='d07.current_interpretation.v1':matches.append((key,revision))
+                if len(matches)!=1:raise ValueError('C04 metadata lacks unique interpretation')
+                key,revision=matches[0];self.c04_ref=VersionedRef(key.token,revision)
+                metadata=r.prefinal.metadata_value_v3(key,revision=revision,meter=meter)
+                for ref in metadata['source_refs']:self._source_v3(ref)
+                self.phase='life_scan'
+            elif column.kind=='draft_content':
+                selector=value['selector']
+                if selector['c02_operation_id']==self.parent:
+                    self.draft_refs.append(column.ref)
+                    if len(self.draft_refs)>1:raise ValueError('producer metadata has duplicate artifact tasks')
+                    from ..model_broker.artifact_draft_v1 import artifact_draft_file_ids_v1
+                    from .d11_life_contract_v1 import draft_artifact_ref_v1
+                    ids=artifact_draft_file_ids_v1(ns,c02_operation_id=self.parent,root_registration_ref=selector['root_registration_ref'])
+                    self.draft_result_ref=draft_artifact_ref_v1(ns,ids['effect'])
+                    for ref in value['content']['source_refs']:self._source_v3(ref)
+                    self._collect_refs_v3(value.get('task_source'))
+                self.phase='life_scan'
+            elif column.kind=='adopted_life':
+                if value['result_ref']!=self.draft_result_ref:raise ValueError('Life metadata result differs')
+                for ref in value['source_refs']:self._source_v3(ref)
+                binding=value['terminal']['binding'];self.draft_binding=binding
+                from .d11_life_contract_v1 import life_from_wire_v1,D11LifeExecutionBindingV1
+                from .d11_life_graph_types_v1 import life_role_segment_key_v1
+                from .d11_life_fact_provenance_v1 import life_fact_auxiliary_key_v1,PROVENANCE_TYPE,ELIGIBILITY_TYPE
+                actual_binding=life_from_wire_v1(binding,D11LifeExecutionBindingV1)
+                for fact in (AtomKey.from_token(binding['artifact_ref']),life_role_segment_key_v1(actual_binding,'start'),life_role_segment_key_v1(actual_binding,'end')):
+                    self.keys.update((fact,life_fact_auxiliary_key_v1(fact,PROVENANCE_TYPE),life_fact_auxiliary_key_v1(fact,ELIGIBILITY_TYPE)))
+                self.prepared_ref=binding['prepared_original_ref'];self.phase='prepared_life'
+            elif column.kind=='prepared_life':
+                if value['binding']!=self.draft_binding:raise ValueError('Life metadata preparation binding differs')
+                for ref in value['plan']['content']['source_refs']:self._source_v3(ref)
+                self._collect_refs_v3(value['plan'])
+                from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
+                from .d11_life_contract_v1 import life_from_wire_v1,D11LifeExecutionBindingV1
+                self.keys.update(life_outcome_read_keys_v1(life_from_wire_v1(value['binding'],D11LifeExecutionBindingV1),value['plan']['action_intent']['ref']))
+                from .d11_life_fact_provenance_v1 import CURRENT_PERMISSION_TYPES,SOURCE_FAMILY_TYPES
+                from ..graph_types import owner_grant_key
+                owner=owner_grant_key(*ns.as_tuple).token
+                for row in value['read_rows']:
+                    key=AtomKey.from_token(row['ref'])
+                    if row['ref']==owner or key.type_name in SOURCE_FAMILY_TYPES|CURRENT_PERMISSION_TYPES:
+                        self._ref_v3({'ref':row['ref'],'version':row['revision']})
+                self.phase='seal'
+            return self
+        if self.phase=='saved':
+            saved=meter.read_fixed_row(r.db,'graph_natural_generation_preparations_v2',('parent_original_id',),
+                'bot=? AND persona=? AND parent_original_id=?',(*ns.as_tuple,self.parent))
+            if saved is not None:self.column=_HostProducerMetadataColumnV3(self,'saved')
+            elif r.producer_phase=='frozen':raise ValueError('frozen producer metadata has no actual original')
+            else:self.phase='c03'
+        elif self.phase=='versions':self.column=_HostProducerMetadataColumnV3(self,'versions')
+        elif self.phase=='c03':
+            from .d06_ingress_c03_selection_v1 import ingress_c03_selection_operation_id_v1
+            op=ingress_c03_selection_operation_id_v1(ns,self.parent)
+            row=meter.read_fixed_row(r.db,'graph_domain_production_originals_v1',('operation_id',),
+                'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,op))
+            if row is None:self.phase='life_scan'
+            else:self.column=_HostProducerMetadataColumnV3(self,'c03',ref=op)
+        elif self.phase=='saved_c04':
+            row=meter.read_fixed_row(r.db,'graph_history',('event_id','valid','event_bot','event_persona'),
+                'token=? AND revision=?',(self.c04_ref.ref,self.c04_ref.version))
+            if row is None or row[1:]!=(1,*ns.as_tuple):raise ValueError('saved C04 metadata lost actual producer history')
+            self.adopt_operation=row[0];self.phase='c04'
+        elif self.phase=='c04':self.column=_HostProducerMetadataColumnV3(self,'c04',ref=self.adopt_operation)
+        elif self.phase=='c04_receipt':self.column=_HostProducerMetadataColumnV3(self,'receipt',ref=self.adopt_operation)
+        elif self.phase=='life_scan':
+            row=meter.read_fixed_row(r.db,'graph_d11_life_originals_v1',('original_ref',),
+                "bot=? AND persona=? AND kind='c4_adopted' AND original_ref>? ORDER BY original_ref",(*ns.as_tuple,self.life_cursor))
+            if row is not None:
+                self.life_cursor=row[0];self.column=_HostProducerMetadataColumnV3(self,'draft_content',ref=row[0])
+            elif self.draft_result_ref is not None:self.phase='adopted_life'
+            else:self.phase='seal'
+        elif self.phase=='adopted_life':self.column=_HostProducerMetadataColumnV3(self,'adopted_life',ref=self.draft_result_ref)
+        elif self.phase=='prepared_life':self.column=_HostProducerMetadataColumnV3(self,'prepared_life',ref=self.prepared_ref)
+        elif self.phase=='seal':
+            if self.c04_ref is not None or self.draft_result_ref is not None:
+                from ..domains.d03.self_perspective import self_mapping_key
+                self.keys.add(self_mapping_key(ns))
+            for token,revision in self.versions.items():
+                head=r.prefinal.heads.get(token)
+                if revision==0:
+                    if head is not None:raise ValueError('producer negative metadata became a head')
+                elif head is None or head[:2]!=(revision,1):raise ValueError('producer metadata version is not current')
+            self.complete=True
+        else:raise ValueError('producer metadata locator phase differs')
+        return self
+    def require_prepared_v3(self,progress):
+        self.require_current_v3()
+        if not self.complete or progress.reader is not self.reader or not progress.complete:
+            raise ValueError('actual producer metadata and complete Body preparation required')
+        if not set(progress.roots)<=self.roots or not {key.token for key in progress.keys}<={key.token for key in self.keys}:
+            raise ValueError('producer Body introduced roots/keys outside metadata SourceALL selection')
+        return self
+    def release_v3(self):
+        _HOST_PRODUCER_METADATA_V3.pop(self,None)
+        for column in (*self.columns,*(()if self.column is None else(self.column,))):_HOST_PRODUCER_METADATA_COLUMNS_V3.pop(column,None)
+        self.columns.clear();self.column=None;self.roots.clear();self.keys.clear()
+
+
+def begin_host_natural_producer_metadata_v3(reader):
+    return HostNaturalProducerMetadataReadV3(reader)

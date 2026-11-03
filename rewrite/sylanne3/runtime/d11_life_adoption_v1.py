@@ -26,7 +26,7 @@ from .d11_life_terminal_v1 import (
     LifeTerminalBundleV1, life_adoption_operation_id_v1,
     observe_current_life_terminal_v1, read_plan_current_life_terminal_v1,
     stage_current_life_terminal_in_transaction_v1,
-    record_life_terminal_after_cas_v1, read_adopted_life_original_v1,
+    record_life_terminal_after_cas_v1, read_adopted_life_original_v1, life_terminal_prepared_digest_v1,
 )
 from .d11_life_preparation_v1 import TABLE, SIGN_KIND, read_prepared_life_by_ref_v1
 from .d11_life_preparation_v1 import life_read_matches_v1
@@ -76,7 +76,9 @@ def _bundle(staged):
     runtime_writes = tuple(write for proposal in staged.runtime_stage.proposals for write in proposal.typed_writes)
     job = next(write for write in runtime_writes if write.key.type_name == "runtime.job")
     cost = next(write for write in runtime_writes if write.key.type_name == "runtime.cost_settlement")
-    return DomainBundle(staged.envelope, (*staged.memory_stage.proposals, *staged.runtime_stage.proposals),
+    from .d11_life_terminal_v1 import life_terminal_stages_v1
+    proposals=tuple(proposal for stage in life_terminal_stages_v1(staged)for proposal in stage.proposals)
+    return DomainBundle(staged.envelope, proposals,
         (), (), (), (cost.key.token,),
         (life_adoption_operation_id_v1(binding),), (job.key.token,), ())
 
@@ -175,7 +177,7 @@ def require_life_commit_v1(witness, graph, db, bundle, v2_write):
             or v2_write is None or v2_write[:2] != (witness.before_metadata, witness.before_epoch)
             or graph._v2_graph_stamp(witness.bridge.binding.namespace) != v2_write[:2]
             or witness.staged.terminal != witness.bridge.terminal
-            or witness.staged.prepared.digest != witness.bridge.prepared_digest
+            or life_terminal_prepared_digest_v1(witness.staged) != witness.bridge.prepared_digest
             or not graph._anchor_matches(witness.before_metadata.requirements, witness.bridge.before_anchor)
             or not graph._anchor_matches(witness.target_requirements, witness.bridge.after_anchor)
             or witness.bridge.permit.pinned_anchor != witness.bridge.after_anchor
@@ -282,7 +284,126 @@ def _frame(graph, db, bridge, prepared, scope, authority, owner, observation, no
     return enrich_life_adoption_frame_v1(db,frame=frame,prepared=prepared,issuer=graph._GraphCoordinator__d11_issuer), request
 
 
+def commit_current_character_labor_adoption_v1(graph,bootstrap,inputs):
+    """Consume the retained Source Work in its actual terminal mapper ticket."""
+    from ..authority_service.contract import AuthorityUnavailable
+    from .current_character_labor_adoption_v1 import (
+        PreparedCharacterLaborAdoptionV1, prepare_character_labor_adoption_frame_v1,
+        observe_current_character_labor_adoption_terminal_v1,
+        bind_character_labor_adoption_inputs_v1,
+        require_character_labor_adoption_body_readers_v1,
+        require_character_labor_adoption_execution_inventory_v1)
+    from .d08_life_admission_v1 import InstalledLifeAdmissionReaderV1
+    from .d11_life_terminal_v1 import stage_current_character_labor_terminal_in_transaction_v1
+    from .d11_character_work_segment_v1 import record_character_labor_segment_after_cas_v1
+    from .character_labor_adoption_metadata_v1 import (record_character_labor_adoption_metadata_after_cas_v1,
+        release_character_labor_adoption_metadata_v1)
+    from ..runtime_storage_v3 import bind_runtime_storage_operation_v3
+    graph._admin(bootstrap)
+    if type(inputs)is not PreparedCharacterLaborAdoptionV1 or inputs.graph is not graph:
+        raise AuthorityUnavailable("labor adoption requires the actual retained same-Work inputs")
+    r=inputs._actual_v1()
+    r.work._require_invocation(graph)
+    store=graph._GraphCoordinator__store
+    if r.db is not store._db or r.db.in_transaction or store._lock._is_owned():
+        raise AuthorityUnavailable("labor final mapper must begin outside Graph SQL and lock")
+    gate=inputs.gate;b=gate.binding;port=r.life_port
+    port.life_adoption_bridge_v1(binding=b,action="validate",gate=gate)
+    now=trusted_upper(port.port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    observation=observe_current_character_labor_adoption_terminal_v1(inputs)
+    witness=None;committed=False;commit_attempted=False;rolled_back=False;transaction_error=None
+    try:
+        with bind_runtime_storage_operation_v3(inputs.operation,r.db):
+            with store._lock:
+                db=r.db;db.execute("BEGIN IMMEDIATE")
+                try:
+                    inputs.require_inputs_v1(graph,gate=gate,db=db,scope=inputs.scope,owner=r.owner_binding)
+                    before,epoch=graph._v2_graph_stamp(b.namespace)
+                    saved=db.execute("SELECT requirements_json FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",
+                        b.namespace.as_tuple).fetchone()
+                    if (saved!=(gate.before_requirements_json,)or before.graph_revision!=gate.before_graph_revision
+                            or epoch.revision!=gate.before_graph_epoch
+                            or not graph._anchor_matches(before.requirements,gate.before_anchor)):
+                        raise AuthorityUnavailable("labor final business snapshot changed after its actual Source EOF")
+                    target=replace(before.requirements,execution_seq=gate.after_anchor.execution_seq,
+                        execution_digest=gate.after_anchor.execution_digest)
+                    if not graph._anchor_matches(target,gate.after_anchor):
+                        raise AuthorityUnavailable("labor original bridge changed another recovery field")
+                    frame,request=prepare_character_labor_adoption_frame_v1(inputs,graph=graph,db=db,
+                        observation=observation,now_utc=now)
+                    with bind_character_labor_adoption_inputs_v1(inputs,graph=graph,db=db,
+                            scope=inputs.scope,owner=r.owner_binding,frame=frame):
+                        body_readers=require_character_labor_adoption_body_readers_v1(inputs,db=db,frame=frame)
+                        inventory=require_character_labor_adoption_execution_inventory_v1(inputs,db=db,frame=frame)
+                        admission_reader=InstalledLifeAdmissionReaderV1(issuer=r.issuer,
+                            resource_issuer=graph._GraphCoordinator__d02_issuer,
+                            body_quote_authority=graph._GraphCoordinator__body_quote_authority,
+                            execution_inventory=inventory,scope=inputs.scope,labor_body_readers=body_readers)
+                        readers=InstalledLifeTerminalReadersV1(issuer=r.issuer,observation=observation,
+                            admission_reader=admission_reader)
+                        staged=stage_current_character_labor_terminal_in_transaction_v1(db,frame=frame,
+                            request=request,installed_readers=readers,inputs=inputs)
+                        bundle=_bundle(staged)
+                        for proposal in staged.runtime_stage.proposals:
+                            for write in proposal.typed_writes:
+                                if write.key.type_name.startswith("runtime."):reconcile_runtime_write(db,write)
+                        witness=_LifeCommitWitnessV1(graph,gate,frame,staged,bundle,before,epoch,target)
+                        _ACTIVE[id(witness)]=witness
+                        finish_id=gate.permit.operation_id+":committed"
+                        finish_digest="sha256:"+canonical_digest((gate.qualification_digest,"committed"))
+                        receipt=graph._commit_domain_bundle_fenced(bundle,r.lease,in_transaction=True,now_utc=now,
+                            v2_write=(before,epoch,finish_id,finish_digest,canonical_serialize(to_wire(gate.permit))),
+                            domain_production_issuance_v1=witness)
+                        segment_original=record_character_labor_segment_after_cas_v1(db,frame=frame,
+                            inputs=inputs,receipt=receipt,issuer=r.issuer)
+                        original=record_life_terminal_after_cas_v1(db,issuer=r.issuer,staged=staged,
+                            graph_receipt=receipt,frame=frame,witness=witness)
+                        result={"schema":"d11.life-tick-adoption-receipt.v1","operation_id":receipt.operation_id,
+                            "binding_digest":b.digest,"terminal_digest":canonical_digest(plain_v1(gate.terminal)),
+                            "bridge_digest":gate.qualification_digest,"original_ref":original.original_ref,
+                            "original_digest":original.original_digest,"graph_receipt_digest":canonical_digest(receipt),
+                            "status":gate.terminal.status,"source_refs":list(staged.source_refs),
+                            "actual_cpu_ms":gate.terminal.actual_cpu_ms}
+                        _record_signed(db,b,"adoption_bridge",life_bridge_to_wire_v1(gate),r.issuer)
+                        _record_signed(db,b,"adoption_receipt",result,r.issuer)
+                        record_character_labor_adoption_metadata_after_cas_v1(graph,db,witness=witness,
+                            staged=staged,receipt=receipt,adopted_original=original,
+                            segment_original=segment_original,result=result)
+                        commit_attempted=True
+                        db.commit();committed=True
+                except BaseException as error:
+                    transaction_error=error
+                    if db.in_transaction:
+                        try:db.rollback();rolled_back=True
+                        except BaseException as later:error.add_note("labor transaction rollback failed: "+type(later).__name__)
+                    raise
+                finally:
+                    try:
+                        if witness is not None:release_character_labor_adoption_metadata_v1(witness)
+                    except BaseException as later:
+                        if transaction_error is None:raise
+                        transaction_error.add_note("labor commit metadata release failed: "+type(later).__name__)
+                    finally:
+                        if witness is not None:_ACTIVE.pop(id(witness),None)
+        port.life_adoption_bridge_v1(binding=b,action="finish",gate=gate,outcome="committed")
+        return result
+    except BaseException as first:
+        # An uncertain commit or an ACK failure retains the original gate and
+        # durable obligations for the independent metadata recovery consumer.
+        if not committed and not r.db.in_transaction and (not commit_attempted or rolled_back):
+            try:port.life_adoption_bridge_v1(binding=b,action="finish",gate=gate,outcome="abandoned")
+            except BaseException as later:first.add_note("labor bridge abandonment failed: "+type(later).__name__)
+        raise
+
+
 def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref):
+    from .current_character_labor_adoption_v1 import begin_current_character_labor_adoption_entry_v1
+    return begin_current_character_labor_adoption_entry_v1(
+        graph, bootstrap, namespace=namespace,
+        prepared_original_ref=prepared_original_ref)
+
+
+def _adopt_legacy_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref):
     from ..host.v2_fence_port import V2FencePort
     from ..host.d11_life_port_v1 import InstalledD11LifePortV1
     graph._admin(bootstrap)
@@ -324,7 +445,7 @@ def adopt_current_life_v1(graph, bootstrap, *, namespace, prepared_original_ref)
             authority_namespace=binding.authority_namespace, actor_id=gate.owner_actor_id)
         if pairing is None or pairing.installation_id != binding.installation_id:
             raise ValueError("life recovery current Owner pairing differs")
-        claim, terminal = life_port.read_d11_life_original_v1(binding=binding)
+        claim, terminal = life_port.read_own_d11_life_execution_original_v1(binding=binding)
         if terminal != gate.terminal or claim != gate.terminal.claim:
             raise ValueError("life prior composite receipt lost its actual terminal")
         if port.current_owner_actor_binding(namespace=namespace,

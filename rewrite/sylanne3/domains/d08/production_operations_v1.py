@@ -1,15 +1,16 @@
 """Evidence-bound D08 bilateral acknowledgement and joint-plan adoption."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from ...graph_types import AtomKey, GraphWrite, Owner
+from ...graph_types import AtomKey, GraphAtom, GraphWrite, Owner
 from ...runtime.domain_production_contracts_v1 import ProductionOriginalRefV1, StagedDomainOperationV1
 from ..d01.production_operations_v1 import plain_v1, require_locator_v1, stage_result_v1
 from .commitment_acknowledgement import (
     BilateralAcknowledgementReadV1, prepare_coordinator_bilateral_acknowledgement_write_v1,
 )
-from .execution import ActionOutcome, GoalExecutionProvider, JointPlan, OutcomeSettlement, RequiredCheckSpec
+from .commitment_fulfillment_v1 import AcknowledgeCurrentCommitmentTermsRequestV1, SettleCurrentCommitmentFulfillmentRequestV1
+from .execution import ActionOutcome, Commitment, GoalExecutionProvider, JointPlan, OutcomeSettlement, RequiredCheckSpec, _decode
 from ...runtime_contracts import canonical_digest
 
 
@@ -20,6 +21,18 @@ class RecheckCurrentActionRequestV1:
     def __post_init__(self):
         if AtomKey.from_token(self.action_intent_ref).type_name != "d08.action_intent.v1":
             raise ValueError("D08 recheck needs an actual current action intent")
+
+
+@dataclass(frozen=True, slots=True)
+class CancelCurrentActionRequestV1:
+    action_intent_ref: str
+    expected_action_revision: int
+
+    def __post_init__(self):
+        key = AtomKey.from_token(self.action_intent_ref)
+        if (key.type_name != "d08.action_intent.v1" or key.owner.kind != "activity"
+                or type(self.expected_action_revision) is not int or self.expected_action_revision < 1):
+            raise ValueError("action cancellation requires its exact current activity action/version")
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,19 +54,43 @@ def observed_action_outcome_key_v1(action_key, intent):
 
 
 def compile_settle_current_observed_action_v1(frame, request, *, intent, outcome_key,
-        outcome, observation_original, cost_original):
+        outcome, observation_original, cost_original, commitment_heads=()):
     if (type(request) is not SettleCurrentObservedActionRequestV1
             or type(outcome) is not ActionOutcome or outcome_key.name != outcome.outcome_id
             or observation_original.original_ref != request.outbound_receipt_ref
             or cost_original.original_ref != request.cost_settlement_ref):
         raise ValueError("action outcome differs from its actual settlement originals")
+    if (type(commitment_heads) is not tuple or any(type(atom) is not GraphAtom
+            or atom.key.type_name != "d08.commitment.v1" or not atom.valid
+            or atom.revision < 1 for atom in commitment_heads)):
+        raise TypeError("observed communication requires exact current commitment heads")
+    writes = [GraphWrite(outcome_key, plain_v1(outcome), ())]
+    communicated = []
+    for atom in commitment_heads:
+        current = _decode("d08.commitment.v1", atom.value)
+        if (current.commitment_id not in intent.commitment_refs
+                and atom.key.token not in intent.commitment_refs):
+            raise ValueError("observed action did not carry this exact commitment")
+        if (intent.action_kind not in {"message", "communication"}
+                or current.counterparty_ref != intent.target_ref):
+            raise ValueError("commitment communication differs from actual action target")
+        if (outcome.result_level in {"accepted", "partially_observed"}
+                and current.establishment_state in {"private_intention", "offered", "communicated"}
+                and request.outbound_receipt_ref not in current.communicated_refs):
+            revised = replace(current, revision=current.revision + 1,
+                establishment_state="communicated",
+                parent_revision_ref=f"{current.commitment_id}@{current.revision}",
+                communicated_refs=(*current.communicated_refs, request.outbound_receipt_ref))
+            writes.append(GraphWrite(atom.key, plain_v1(revised), (outcome_key,)))
+            communicated.append(revised)
     settlement = OutcomeSettlement.from_outcome(intent, outcome)
     provider = GoalExecutionProvider()
     stage = stage_result_v1(frame, "d08", "settle_observed_action", request,
-        writes=(GraphWrite(outcome_key, plain_v1(outcome), ()),),
+        writes=tuple(writes),
         provenance={"conditioned_source_roots":frame.envelope.source_qualification.source_refs,"conditioned_original_deadline_utc":frame.envelope.deadline_utc,
             "action_outcome": outcome, "outcome_settlement": settlement,
-            "observation_original": observation_original, "cost_original": cost_original},
+            "observation_original": observation_original, "cost_original": cost_original,
+            "communicated_commitments": tuple(communicated)},
         contribution_keys=("d08-observed-outcome:" + canonical_digest((outcome.outcome_id,
             observation_original.original_digest, cost_original.original_digest)),),
         receiver_events=(("d10", "action_outcome_observed_requires_current_life_qualification"),
@@ -206,7 +243,7 @@ def compile_adopt_current_joint_plan_v1(frame, request, inputs):
 
 def verify_d08_production_stage_v1(stage):
     if type(stage) is not StagedDomainOperationV1 or stage.domain != "d08" or stage.operation_kind not in {
-            "acknowledge_bilateral", "adopt_joint_plan", "recheck_action", "settle_observed_action"}:
+            "acknowledge_bilateral", "adopt_joint_plan", "recheck_action", "settle_observed_action", "cancel_action", "acknowledge_commitment_terms", "settle_current_commitment_fulfillment"}:
         raise ValueError("unregistered D08 current operation")
     provider = GoalExecutionProvider()
     specs = {spec.name: spec for spec in provider.register_types()}
@@ -214,16 +251,35 @@ def verify_d08_production_stage_v1(stage):
         if (proposal.proposal_schema != "d08.proposal.v1"
                 or proposal.proposal_schema_hash != provider.descriptor.request_schema_hash):
             raise ValueError("D08 current proposal schema differs")
-        if stage.operation_kind == "acknowledge_bilateral":
+        if stage.operation_kind in {"acknowledge_commitment_terms","settle_current_commitment_fulfillment"}:
+            from .commitment_fulfillment_v1 import ACCEPTANCE_TYPE,EVIDENCE_TYPE
+            companion=ACCEPTANCE_TYPE if stage.operation_kind=="acknowledge_commitment_terms"else EVIDENCE_TYPE
+            writes=proposal.typed_writes
+            if len(writes)!=2 or {w.key.type_name for w in writes}!={"d08.commitment.v1",companion}:
+                raise ValueError("terms transition requires its exact commitment and immutable evidence pair")
+            for write in writes:specs[write.key.type_name].validator(write.value)
+            value=next(w.value for w in writes if w.key.type_name=="d08.commitment.v1")
+            if stage.operation_kind=="acknowledge_commitment_terms" and value["establishment_state"]!="acknowledged" or stage.operation_kind=="settle_current_commitment_fulfillment" and value["fulfillment_state"]!="fulfilled":
+                raise ValueError("terms transition changed its exact objective state")
+        elif stage.operation_kind == "acknowledge_bilateral":
             if len(proposal.typed_writes) != 1:
                 raise ValueError("bilateral sanctioned transition must write exactly one commitment")
             write = proposal.typed_writes[0]
             if write.key.type_name != "d08.commitment.v1" or write.value["establishment_state"] != "acknowledged":
                 raise ValueError("bilateral transition contains another write")
             specs[write.key.type_name].validator(write.value)
+        elif stage.operation_kind == "cancel_action":
+            if (len(proposal.typed_writes) != 1 or proposal.typed_writes[0].key.type_name != "d08.action_cancellation.v1"
+                    or proposal.typed_writes[0].value["state"] != "cancelled" or proposal.typed_writes[0].value["cancel_epoch"] != 1):
+                raise ValueError("action cancellation writes only its exact cancelled head")
+            specs["d08.action_cancellation.v1"].validator(proposal.typed_writes[0].value)
         elif stage.operation_kind == "settle_observed_action":
-            if len(proposal.typed_writes) != 1 or proposal.typed_writes[0].key.type_name != "d08.action_outcome.v1":
-                raise ValueError("observed action settlement must write its one actual outcome")
+            writes = proposal.typed_writes
+            if (not writes or writes[0].key.type_name != "d08.action_outcome.v1"
+                    or any(write.key.type_name != "d08.commitment.v1"
+                        or write.value["establishment_state"] != "communicated"
+                        for write in writes[1:])):
+                raise ValueError("observed settlement requires its outcome and exact communicated revisions")
             provider.validate(proposal)
         else:
             if len(proposal.typed_writes) != 1 or proposal.typed_writes[0].key.type_name != "d08.joint_plan.v1":
@@ -232,4 +288,4 @@ def verify_d08_production_stage_v1(stage):
     return stage
 
 
-D08_PRODUCTION_WRITE_TYPES_V1 = frozenset({"d08.commitment.v1", "d08.joint_plan.v1", "d08.action_outcome.v1"})
+D08_PRODUCTION_WRITE_TYPES_V1 = frozenset({"d08.commitment.v1", "d08.joint_plan.v1", "d08.action_outcome.v1", "d08.commitment_terms_acceptance.v1", "d08.commitment_fulfillment_evidence.v1"})

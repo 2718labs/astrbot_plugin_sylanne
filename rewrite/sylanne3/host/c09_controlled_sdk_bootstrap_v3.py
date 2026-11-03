@@ -23,8 +23,13 @@ _ACTIVATION_SCHEMA='sylanne3.c09.writer-peer-registry-activation.controlled-sdk.
 _DESCRIPTORS=WeakSet()
 _CLOSED=WeakSet()
 _PROOFS=WeakSet()
+_INSTALLER_BINDINGS=WeakKeyDictionary()
 _CENSUSES=WeakSet()
 _CENSUS_BINDINGS=WeakKeyDictionary()
+_CENSUS_RELEASES_V4=WeakKeyDictionary()
+_CENSUS_CLOCKS_V4=WeakKeyDictionary()
+_SDK_ROOT_RESOURCES_V4=WeakKeyDictionary()
+_ACTIVATION_RETIREMENTS_V4=WeakKeyDictionary()
 _ISSUER=object()
 
 
@@ -163,6 +168,8 @@ class VerifiedControlledSDKProcessCensusV3:
         self.authority_process_original=read_process_identity_v1(os.getpid())
         self.closed=False
         self.digest=canonical_digest(original)
+        wall=time.time();monotonic=time.monotonic_ns()
+        _CENSUS_CLOCKS_V4[self]=(wall,monotonic,wall+(original['run_deadline_monotonic_ns']-monotonic)/1_000_000_000)
         _CENSUSES.add(self)
         _CENSUS_BINDINGS[self]=(channel,descriptor,self.digest)
     def require_installed_cohort_v3(self):
@@ -201,10 +208,47 @@ class VerifiedControlledSDKProcessCensusV3:
         if threading.get_ident()!=self.owner_thread or self.closed or self.channel.fileno()<0 or select.select([self.channel],[],[],0)[0]:
             raise AuthorityUnavailable('continuous Root SDK role-start exclusion ended')
         return self
+    def read_core_authority_retirement_v4(self,*,birth):
+        """Use the already held Root channel; the issuer owns genuine prior-phase receipts."""
+        from dataclasses import asdict
+        from ..authority_service.d13_cache_use_contract_v2 import validate_core_authority_retirement_original_v4
+        from ..authority_service.d13_core_authority_retirement_v4 import core_authority_retirement_common_v4
+        self.require_current()
+        request=dict(schema='sylanne.root-controlled-sdk-core-retirement-request.v4',command='retire_core_authority_v4',
+            held_request_digest=self.original['request_digest'],hold_token=self.original['hold_token'],birth_original=asdict(birth))
+        self.channel.sendall(canonical_serialize(request).encode())
+        raw=self.channel.recv(65537)
+        if not raw or len(raw)>65536:raise AuthorityUnavailable('bounded actual Root Core retirement reply required')
+        reply=json.loads(raw)
+        if reply==dict(status='progress',phase='core_authority_retirement_v4'):return None
+        if type(reply)is not dict or set(reply)!={'status','original'}or reply['status']!='core_authority_retired_v4':
+            raise AuthorityUnavailable('actual Root Core retirement result is unknown')
+        original=reply['original'];validate_core_authority_retirement_original_v4(original,birth_profile='controlled_sdk')
+        common=core_authority_retirement_common_v4(birth,original['observer_hold_nonce']);old=birth.root_observation_original
+        if (any(original[name]!=value for name,value in common.items())
+                or (original['old_root_process_original']['pid'],original['old_root_process_original']['birth'])!=
+                    (old['root_process']['pid'],old['root_process']['birth'])
+                or original['source_process_identity']!=old['authority_process']
+                or original['old_pid_namespace_identity']!=old['authority_process']['pid_namespace']
+                or original['old_mount_namespace_identity']!=old['authority_process']['mount_namespace']
+                or original['current_root_census_digest']!=self.digest or original['root_process_original']!=self.root_process_original
+                or original['resource_operation_id']!=self.original['resource_operation_id']
+                or original['source_setup_sha256']!=old['setup_sha256']or original['source_phase']!=old['phase']
+                or original['source_node']!=old['node']):
+            raise AuthorityUnavailable('actual Root Core retirement crossed its signed old/current process scope')
+        self.require_current()
+        return original
+
     def close(self):
         if self.closed:return
         if threading.get_ident()!=self.owner_thread:
             raise AuthorityUnavailable('actual Root SDK census must close on its owner thread')
+        from .c09_storage_admission_v1 import transfer_actual_controlled_sdk_host_graph_custody_v4
+        transferred=transfer_actual_controlled_sdk_host_graph_custody_v4(self)
+        if transferred is not None:
+            _CENSUS_RELEASES_V4[self]=canonical_digest(transferred)
+            self.closed=True
+            return
         request=dict(schema='sylanne.root-controlled-sdk-census-request.v3',command='release',
             held_request_digest=self.original['request_digest'])
         try:
@@ -216,9 +260,67 @@ class VerifiedControlledSDKProcessCensusV3:
                     or result.get('hold_token')!=self.original['hold_token']
                     or result.get('channel_nonce')!=self.original['channel_nonce']):
                 raise AuthorityUnavailable('Root SDK census release differs from its actual hold')
+            _CENSUS_RELEASES_V4[self]=canonical_digest(result)
         finally:
             self.closed=True
             self.channel.close()
+
+
+def validate_controlled_sdk_root_census_original_v4(original):
+    """Validate only the closed historical Root wire; this pure codec grants no live authority."""
+    fields={'schema','command','phase','resource_operation_id','root_process','authority_process','app_cgroup',
+        'processes','cohort_eof','continuous_start_exclusion','descriptor_sha256','node','node_sha256',
+        'package_sha256','manifest_sha256','dependency_sha256','setup_sha256','selection_scope','request_digest',
+        'observed_monotonic_ns','root_uid','authority_uid','socket','run_cgroup','cohort_count',
+        'cohort_root','channel_nonce','hold_token','profile_digest','run_deadline_monotonic_ns'}
+    if (type(original)is not dict or set(original)!=fields
+            or original['schema']!='sylanne.root-controlled-sdk-census.v3' or original['command']!='held'
+            or original['root_uid']!=0 or original['authority_uid']!=1000
+            or original['cohort_count']!=1 or original['cohort_eof']is not True
+            or original['continuous_start_exclusion']is not True):
+        raise AuthorityUnavailable('closed historical controlled SDK Root census wire required')
+    process_fields={'pid','birth','mount_namespace','pid_namespace'}
+    for process in (original['root_process'],original['authority_process']):
+        if (type(process)is not dict or set(process)!=process_fields or type(process['pid'])is not int or process['pid']<1
+                or any(type(process[name])is not str or not process[name]for name in process_fields-{'pid'})):
+            raise AuthorityUnavailable('historical SDK Root census has no exact process/namespace identity')
+    if (original['processes']!=[original['authority_process']]
+            or original['cohort_root']!=hashlib.sha256(canonical_serialize(original['processes']).encode()).hexdigest()):
+        raise AuthorityUnavailable('historical SDK Root complete process census differs')
+    for name in ('descriptor_sha256','node_sha256','package_sha256','manifest_sha256','dependency_sha256',
+            'setup_sha256','request_digest','cohort_root','profile_digest'):
+        value=original[name]
+        if type(value)is not str or len(value)!=64 or any(c not in '0123456789abcdef'for c in value):
+            raise AuthorityUnavailable('historical SDK Root source commitment is incomplete')
+    scope=original['selection_scope']
+    if (type(scope)is not dict or set(scope)!={'authority_id','installation_id','control_store_id','namespace',
+            'sdk_peer_descriptor','manifest_digest','inventory_manifest_digest','descriptor_digest'}
+            or type(scope['sdk_peer_descriptor'])is not list or len(scope['sdk_peer_descriptor'])!=2):
+        raise AuthorityUnavailable('historical SDK Root exact installed selection scope required')
+    for name in ('authority_id','installation_id','control_store_id','namespace'):
+        if type(scope[name])is not str or not scope[name]:
+            raise AuthorityUnavailable('historical SDK Root installed identity is incomplete')
+    for name in ('manifest_digest','inventory_manifest_digest','descriptor_digest'):
+        value=scope[name]
+        if type(value)is not str or len(value)!=64 or any(c not in '0123456789abcdef'for c in value):
+            raise AuthorityUnavailable('historical SDK Root installed scope commitment differs')
+    for name in ('phase','resource_operation_id','node','channel_nonce','hold_token'):
+        if type(original[name])is not str or not original[name]:
+            raise AuthorityUnavailable('historical SDK Root phase/channel scope is incomplete')
+    for name in ('observed_monotonic_ns','run_deadline_monotonic_ns'):
+        if type(original[name])is not int or original[name]<1:
+            raise AuthorityUnavailable('historical SDK Root original monotonic resource window required')
+    for name in ('run_cgroup','app_cgroup'):
+        group=original[name]
+        if (type(group)is not dict or set(group)!={'path','device','inode'}
+                or type(group['path'])is not str or not Path(group['path']).is_absolute()
+                or any(type(group[key])is not int or group[key]<0 for key in ('device','inode'))):
+            raise AuthorityUnavailable('historical SDK Root resource group identity differs')
+    endpoint=original['socket']
+    if (type(endpoint)is not dict or set(endpoint)!={'path','device','inode','owner_uid','mode'}
+            or endpoint['owner_uid']!=0 or endpoint['mode']&0o007):
+        raise AuthorityUnavailable('historical SDK Root protected channel identity differs')
+    return original
 
 
 def hold_controlled_sdk_process_census_v3(*,root_descriptor,config,inventory,peer):
@@ -315,7 +417,7 @@ class VerifiedControlledSDKClosedServicesOriginalV3:
         return self
 
 
-async def close_controlled_sdk_authority_services_v3(*,server,core,execution,deletion,control):
+def _controlled_sdk_close_snapshot_v3(*,server,core,execution,deletion,control):
     from ..authority_service.mtls_server import AuthorityRpcServer
     from ..authority_service.core import AuthorityServiceCore
     from ..authority_service.v2_execution_journal import AuthorityV2ExecutionJournal
@@ -337,9 +439,10 @@ async def close_controlled_sdk_authority_services_v3(*,server,core,execution,del
         for index,(owner,connection) in enumerate(zip(owners,connections)))
     lease_stat=os.fstat(control.lease._stream.fileno())
     lease_original=dict(path=str(control.lease.path),device=lease_stat.st_dev,inode=lease_stat.st_ino)
-    await server.aclose()
-    for owner in owners:owner.close()
-    control.lease.close()
+    return owners,connections,before,authority,lease_original
+
+
+def _issue_controlled_sdk_closed_services_v3(*,server,control,owners,connections,before,authority,lease_original):
     originals=tuple(dict(schema='sylanne3.c09.controlled-sdk-closed-service.v3',
         authority_process_original=authority,service=item,disposition='actual_connection_closed') for item in before)
     originals=(dict(schema='sylanne3.c09.controlled-sdk-closed-server.v3',authority_process_original=authority,
@@ -351,22 +454,85 @@ async def close_controlled_sdk_authority_services_v3(*,server,core,execution,del
     return proof.require_current()
 
 
+async def close_controlled_sdk_authority_services_v3(*,server,core,execution,deletion,control):
+    snapshot=_controlled_sdk_close_snapshot_v3(server=server,core=core,execution=execution,deletion=deletion,control=control)
+    owners,connections,before,authority,lease_original=snapshot
+    await server.aclose()
+    for owner in owners:owner.close()
+    control.lease.close()
+    return _issue_controlled_sdk_closed_services_v3(server=server,control=control,owners=owners,connections=connections,
+        before=before,authority=authority,lease_original=lease_original)
+
+
 def require_controlled_sdk_registry_assets_v3(*,root_descriptor,closed_services,inventory,peer):
     if (type(root_descriptor) is not VerifiedControlledSDKRootDescriptorV3 or root_descriptor not in _DESCRIPTORS
             or root_descriptor.payload['inventory_manifest_digest']!=inventory.manifest_digest
             or root_descriptor.payload['sdk_peer_descriptor']!=list(peer)):
         raise AuthorityUnavailable('actual Root-protected SDK installer descriptor required')
     if closed_services is not None:
-        if type(closed_services) is not VerifiedControlledSDKClosedServicesOriginalV3:
+        from ..authority_service.c09_initial_segmented_genesis_v4 import VerifiedControlledSDKInitialGenesisOriginalV4
+        if type(closed_services)not in {VerifiedControlledSDKClosedServicesOriginalV3,VerifiedControlledSDKInitialGenesisOriginalV4}:
             raise AuthorityUnavailable('actual closed SDK service original required')
         closed_services.require_current()
 
 
+class _VerifiedControlledSDKActivationRetirementV4:
+    def __init__(self,issuer,*,census,activation,original):
+        if issuer is not _ISSUER:raise AuthorityUnavailable('actual held Root activation-retirement issuer required')
+        self.census,self.activation,self.original=census,activation,original
+        _ACTIVATION_RETIREMENTS_V4[self]=(census,canonical_digest(activation),canonical_digest(original))
+    def require_v4(self,*,activation,census,control):
+        if (_ACTIVATION_RETIREMENTS_V4.get(self)!=(census,canonical_digest(activation),canonical_digest(self.original))
+                or self.census is not census or canonical_digest(self.activation)!=canonical_digest(activation)):
+            raise AuthorityUnavailable('actual SDK activation retirement private original changed')
+        control.verify_original_v1(activation,'activation_digest');census.require_installed_cohort_v3()
+        if census.closed:
+            expected=dict(census.original,command='released')
+            if _CENSUS_RELEASES_V4.get(census)!=canonical_digest(expected):
+                raise AuthorityUnavailable('SDK activation retirement lost its actual Root held/released channel')
+        else:census.require_current()
+        old=activation['activation_basis']['controlled_sdk_root_census_original'];o=self.original
+        if (o['activation_digest']!=activation['activation_digest']or o['activation_selector_digest']!=canonical_digest(activation)
+                or o['old_root_census_digest']!=canonical_digest(old)or o['current_root_census_digest']!=census.digest
+                or o['source_process_identity']!=old['authority_process']or o['source_phase']!=old['phase']
+                or o['source_node']!=old['node']or o['source_setup_sha256']!=old['setup_sha256']
+                or o['root_process']!=census.original['root_process']or o['resource_operation_id']!=census.original['resource_operation_id']
+                or o['channel_nonce']!=census.channel_nonce or o['hold_token']!=census.original['hold_token']):
+            raise AuthorityUnavailable('actual SDK retirement crossed its original old/current Root cohort')
+        return self
+
+
+def _read_controlled_sdk_activation_retirement_v4(*,control,census,activation):
+    control.verify_original_v1(activation,'activation_digest');census.require_current()
+    if census.descriptor.payload['manifest_digest']!=activation['activation_basis']['controlled_sdk_root_census_original']['selection_scope']['manifest_digest']:
+        raise AuthorityUnavailable('SDK activation retirement selected package lineage differs')
+    request=dict(schema='sylanne.root-controlled-sdk-activation-retirement-request.v4',command='retire_sdk_activation_v4',
+        held_request_digest=census.original['request_digest'],hold_token=census.original['hold_token'],activation_original=activation)
+    census.channel.sendall(canonical_serialize(request).encode());raw=census.channel.recv(65537)
+    if not raw or len(raw)>65536:raise AuthorityUnavailable('actual Root SDK activation-retirement response is absent or oversized')
+    reply=json.loads(raw)
+    if type(reply)is not dict or set(reply)!={'status','original'}or reply['status']!='sdk_activation_retired_v4':
+        raise AuthorityUnavailable('actual prior-phase SDK activation retirement remains unknown')
+    o=reply['original']
+    fields={'schema','activation_digest','activation_selector_digest','old_root_census_digest','current_root_census_digest',
+        'prior_receipt_digest','source_process_identity','source_phase','source_node','source_setup_sha256','actual_exit_code',
+        'original_pidfd_ready','waitpid_reaped','recursive_populated','resource_operation_id','root_process','channel_nonce','hold_token'}
+    if (type(o)is not dict or set(o)!=fields or o['schema']!='sylanne3.c09.controlled-sdk-root-phase-retirement.v4'
+            or type(o['actual_exit_code'])is not int or o['original_pidfd_ready']is not True
+            or o['waitpid_reaped']is not True or o['recursive_populated']is not False
+            or type(o['prior_receipt_digest'])is not str or len(o['prior_receipt_digest'])!=64):
+        raise AuthorityUnavailable('actual Root SDK activation-retirement closed original differs')
+    proof=_VerifiedControlledSDKActivationRetirementV4(_ISSUER,census=census,activation=activation,original=o)
+    return proof.require_v4(activation=activation,census=census,control=control)
+
+
 class VerifiedControlledSDKInstallerOriginalV3:
-    def __init__(self,issuer,*,gate,control,config,descriptor,summary,process_census,original=None,closed=None):
+    def __init__(self,issuer,*,gate,control,config,descriptor,summary,process_census,original=None,closed=None,fresh_finalization=None,retirement=None):
         if issuer is not _ISSUER:raise AuthorityUnavailable('actual controlled SDK installer issuer required')
         self.gate,self.control,self.config=gate,control,config
         self.descriptor,self.summary,self.original,self.closed=descriptor,summary,original,closed
+        self.fresh_finalization=fresh_finalization
+        self.retirement=retirement
         self.process_census=process_census
         if type(process_census) is not VerifiedControlledSDKProcessCensusV3 or process_census not in _CENSUSES:
             raise AuthorityUnavailable('actual Root SDK complete process census required')
@@ -375,8 +541,14 @@ class VerifiedControlledSDKInstallerOriginalV3:
         if self.current_authority_original is None:
             raise AuthorityUnavailable('actual current controlled SDK Authority process required')
         _PROOFS.add(self)
+        _INSTALLER_BINDINGS[self]=self._binding_v3()
+    def _binding_v3(self):
+        return (id(self.gate),id(self.control),id(self.config),id(self.descriptor),id(self.process_census),
+            canonical_digest(self.summary),canonical_digest(self.original),id(self.closed),id(self.fresh_finalization),
+            canonical_digest(self.current_authority_original),id(self.hold_token),id(self.retirement))
     def require_current(self,*,gate,control,config,meter):
-        if (self not in _PROOFS or self.gate is not gate or self.control is not control or self.config is not config):
+        if (self not in _PROOFS or _INSTALLER_BINDINGS.get(self)!=self._binding_v3()
+                or self.gate is not gate or self.control is not control or self.config is not config):
             raise AuthorityUnavailable('actual controlled SDK installer qualification scope changed')
         gate.require_peer_registry_activation_hold_v3(self.hold_token)
         self.process_census.require_current()
@@ -386,14 +558,45 @@ class VerifiedControlledSDKInstallerOriginalV3:
             peer=config.c09_maintenance_factory.peer)
         control.lease.require_held()
         if self.closed is not None:self.closed.require_current()
+        if self.fresh_finalization is not None:
+            self.fresh_finalization.require_current_v3(gate=gate,control=control,config=config,meter=meter)
         if self.original is not None:
+            if type(self.retirement)is not _VerifiedControlledSDKActivationRetirementV4:
+                raise AuthorityUnavailable('cold SDK activation requires actual Root phase retirement original')
+            self.retirement.require_v4(activation=self.original,census=self.process_census,control=control)
             require_process_retired_v1(self.original['authority_process_original'])
         return self
+    def require_consumer_disposition_root_v4(self,*,closed):
+        if (self not in _PROOFS or _INSTALLER_BINDINGS.get(self)!=self._binding_v3()
+                or closed is not self.closed):
+            raise AuthorityUnavailable('actual SDK consumer disposition changed its originating installer proof')
+        self.process_census.require_installed_cohort_v3()
+        if self.original is None:
+            from ..authority_service.c09_initial_segmented_genesis_v4 import VerifiedControlledSDKInitialGenesisOriginalV4
+            if type(closed)is VerifiedControlledSDKInitialGenesisOriginalV4:
+                closed.require_current()
+                return ('actual_never_started_initial_genesis',closed.root,canonical_digest(()))
+            if type(closed)is not VerifiedControlledSDKClosedServicesOriginalV3:
+                raise AuthorityUnavailable('same-PID SDK fresh consumer requires its actual closed-services original')
+            closed.require_current()
+            closure_root=canonical_digest(())
+            if self.fresh_finalization is not None:
+                final=self.fresh_finalization
+                with self.control._resource_sql_quantum_v3()as meter:
+                    final.require_admission_v3(final.persisted_activation,control=self.control,gate=self.gate,meter=meter)
+                closure_root=canonical_digest(tuple(item.original for item in final.closures))
+            return ('actual_service_close',closed.root,closure_root)
+        if closed is not None or type(self.retirement)is not _VerifiedControlledSDKActivationRetirementV4:
+            raise AuthorityUnavailable('cold SDK consumer requires its actual prior Root phase retirement original')
+        self.retirement.require_v4(activation=self.original,census=self.process_census,control=self.control)
+        return ('root_observed_authority_retirement',canonical_digest(self.retirement.original))
+
     def activation_summary_v3(self,*,control,gate,meter):
         self.require_current(gate=gate,control=control,config=self.config,meter=meter)
         return self.summary
     def require_activation_original_for_gate_v3(self,original,*,control,gate,meter):
-        if (self not in _PROOFS or self.gate is not gate or self.control is not control
+        if (self not in _PROOFS or _INSTALLER_BINDINGS.get(self)!=self._binding_v3()
+                or self.gate is not gate or self.control is not control
                 or original['schema']!=_ACTIVATION_SCHEMA
                 or original['activation_basis']!=self.summary):
             raise AuthorityUnavailable('controlled SDK activation changed its actual finite installer proof')
@@ -402,7 +605,13 @@ class VerifiedControlledSDKInstallerOriginalV3:
             peer=self.config.c09_maintenance_factory.peer)
         if read_process_identity_v1(os.getpid())!=self.current_authority_original:
             raise AuthorityUnavailable('controlled SDK admission changed its current actual Authority PID/birth')
-        if self.original is not None:require_process_retired_v1(self.original['authority_process_original'])
+        if self.fresh_finalization is not None:
+            self.fresh_finalization.require_admission_v3(original,control=control,gate=gate,meter=meter)
+        if self.original is not None:
+            if type(self.retirement)is not _VerifiedControlledSDKActivationRetirementV4:
+                raise AuthorityUnavailable('cold SDK admission has no actual prior-phase Root retirement')
+            self.retirement.require_v4(activation=self.original,census=self.process_census,control=control)
+            require_process_retired_v1(self.original['authority_process_original'])
         elif read_process_identity_v1(os.getpid())!=self.summary['authority_process_original']:
             raise AuthorityUnavailable('actual current controlled SDK Authority process changed')
 
@@ -418,6 +627,12 @@ def issue_controlled_sdk_genesis_v3(*,gate,control,config,closed_services,root_d
     require_controlled_sdk_registry_assets_v3(root_descriptor=root_descriptor,closed_services=closed_services,
         inventory=factory.inventory,peer=factory.peer)
     if closed_services is None:raise AuthorityUnavailable('SDK genesis requires actual old service close originals')
+    from ..authority_service.c09_initial_segmented_genesis_v4 import VerifiedControlledSDKInitialGenesisOriginalV4,INITIAL_MANIFEST_SCHEMA_V4
+    initial_genesis=type(closed_services)is VerifiedControlledSDKInitialGenesisOriginalV4
+    if initial_genesis:
+        closed_services.require_current()
+        if closed_services.initial.manifest['schema']!=INITIAL_MANIFEST_SCHEMA_V4 or closed_services.initial.control is not control:
+            raise AuthorityUnavailable('actual never-started SDK initial genesis differs from its current Control')
     old=closed_services.control
     if ((old.authority_id,old.installation_id,old.control_store_id,old.key_id,old.path,old.key_path)!=
             (control.authority_id,control.installation_id,control.control_store_id,control.key_id,control.path,control.key_path)):
@@ -425,7 +640,7 @@ def issue_controlled_sdk_genesis_v3(*,gate,control,config,closed_services,root_d
     actual_paths={str(Path(item['service']['path']).resolve()) for item in closed_services.originals if 'service' in item}
     expected_paths={str(Path(config.authority_db).resolve()),str(Path(config.deletion_db).resolve()),
         *(str(Path(item.path).resolve()) for item in config.execution_journals.values())}
-    if actual_paths!=expected_paths:
+    if not initial_genesis and actual_paths!=expected_paths:
         raise AuthorityUnavailable('actual closed SDK service cohort differs from the selected installed role paths')
     root_descriptor.require_current(config=config,inventory=factory.inventory,peer=factory.peer)
     gate.require_peer_registry_activation_hold_v3(gate._peer_registry_activation_hold_v3)
@@ -459,7 +674,77 @@ def issue_controlled_sdk_genesis_v3(*,gate,control,config,closed_services,root_d
     return proof.require_current(gate=gate,control=control,config=config,meter=meter)
 
 
-def read_controlled_sdk_activation_original_v3(*,gate,control,config,root_descriptor,process_census,original,meter):
+class VerifiedControlledSDKRootResourceV4:
+    """Actual retained Root resource and one original, non-sliding clock binding."""
+    def __init__(self,issuer,*,daemon,qualification,service,census):
+        if issuer is not _ISSUER:raise AuthorityUnavailable('actual controlled SDK Root resource issuer required')
+        from ..authority_service.d13_original_owner_v3 import require_actual_d13_core_birth_v4
+        self.daemon,self.qualification,self.service,self.census=daemon,qualification,service,census
+        self.control,self.gate=daemon.c09_control,daemon.c09_gate
+        self.birth=require_actual_d13_core_birth_v4(service)
+        wall,monotonic,deadline=_CENSUS_CLOCKS_V4[census]
+        self.deadline_utc=deadline
+        self.approval_digest=census.digest
+        self.spec_digest=census.descriptor.payload['descriptor_digest']
+        self.original=dict(schema='sylanne3.controlled-sdk.actual-root-resource.v4',
+            root_census_original=census.original,captured_wall_utc=wall,captured_monotonic_ns=monotonic,
+            deadline_utc=deadline,approval_digest=self.approval_digest,spec_digest=self.spec_digest,
+            authority_id=self.control.authority_id,installation_id=self.control.installation_id,
+            control_store_id=self.control.control_store_id,namespace=service.authority_namespace,
+            core_birth_original_ref=self.birth.operation_id,core_birth_original_digest=self.birth.birth_digest,
+            selected_manifest_digest=self.birth.selected_manifest_digest,pointer_version=self.birth.pointer_version,
+            storage_generation=self.birth.storage_generation)
+        self.binding_digest=canonical_digest(self.original)
+        self.original['binding_digest']=self.binding_digest
+        _SDK_ROOT_RESOURCES_V4[self]=(id(daemon),id(qualification),id(service),id(census),canonical_digest(self.birth),id(self.control),id(self.gate),
+            wall,monotonic,deadline,self.approval_digest,self.spec_digest,self.binding_digest)
+    def require_current_v4(self,*,daemon):
+        from ..authority_service.daemon import AuthorityDaemon
+        from ..authority_service.d13_original_owner_v3 import require_actual_d13_core_birth_v4
+        q,census=self.qualification,self.census
+        clock=_CENSUS_CLOCKS_V4.get(census)
+        if (type(daemon)is not AuthorityDaemon or daemon is not self.daemon or clock is None
+                or _SDK_ROOT_RESOURCES_V4.get(self)!=(id(daemon),id(q),id(self.service),id(census),canonical_digest(self.birth),id(self.control),id(self.gate),
+                    *clock,self.approval_digest,self.spec_digest,self.binding_digest)
+                or daemon._closed or daemon.core is not self.service.core or daemon.c09_control is not self.control
+                or daemon.c09_gate is not self.gate or self.gate._controlled_sdk_activation_v3.qualification is not q
+                or self.service is not daemon.core._d13_cache_use_controls_v2.get(self.service.authority_namespace)
+                or q.process_census is not census or canonical_digest({k:v for k,v in self.original.items()if k!='binding_digest'})!=self.binding_digest
+                or self.original['binding_digest']!=self.binding_digest or self.deadline_utc!=clock[2]
+                or require_actual_d13_core_birth_v4(self.service)!=self.birth
+                or self.birth.birth_profile!='controlled_sdk'or self.birth.root_process_census_digest!=census.digest):
+            raise AuthorityUnavailable('SDK workflow resource lost its exact actual current Root/Core/clock binding')
+        census.require_installed_cohort_v3()
+        if not census.closed or _CENSUS_RELEASES_V4.get(census)!=canonical_digest(dict(census.original,command='released')):
+            raise AuthorityUnavailable('SDK current resource requires its actual completed Root startup release acknowledgement')
+        q.require_consumer_disposition_root_v4(closed=q.closed)
+        self.control.lease.require_held()
+        return self
+    def as_original_v4(self):
+        self.require_current_v4(daemon=self.daemon)
+        return json.loads(canonical_serialize(self.original))
+
+
+def read_actual_controlled_sdk_root_resource_v4(*,daemon):
+    from ..authority_service.daemon import AuthorityDaemon
+    from ..authority_service.d13_cache_use_control_v2 import InstalledD13CacheUseControlServiceV2
+    if type(daemon)is not AuthorityDaemon or daemon._closed or daemon.c09_gate is None:
+        raise AuthorityUnavailable('actual current SDK daemon resource producer required')
+    activation=daemon.c09_gate._controlled_sdk_activation_v3
+    q=None if activation is None else activation.qualification
+    if (type(q)is not VerifiedControlledSDKInstallerOriginalV3 or q.control is not daemon.c09_control
+            or q.gate is not daemon.c09_gate or q.config is not daemon.config
+            or type(q.process_census)is not VerifiedControlledSDKProcessCensusV3
+            or q.process_census not in _CENSUS_CLOCKS_V4):
+        raise AuthorityUnavailable('current SDK resource requires its exact retained installed Root census')
+    services=tuple(item for item in daemon.core._d13_cache_use_controls_v2.values()
+        if type(item)is InstalledD13CacheUseControlServiceV2 and item.authority_namespace==q.descriptor.payload['namespace'])
+    if len(services)!=1:raise AuthorityUnavailable('current SDK resource has no unique actual installed Core service')
+    proof=VerifiedControlledSDKRootResourceV4(_ISSUER,daemon=daemon,qualification=q,service=services[0],census=q.process_census)
+    return proof.require_current_v4(daemon=daemon)
+
+
+def _require_controlled_sdk_activation_identity_v3(*,gate,control,config,root_descriptor,process_census,original,meter):
     factory=config.c09_maintenance_factory
     root_descriptor.require_current(config=config,inventory=factory.inventory,peer=factory.peer)
     control.verify_original_v1(original,'activation_digest')
@@ -498,9 +783,162 @@ def read_controlled_sdk_activation_original_v3(*,gate,control,config,root_descri
             or basis['authority_process_original']!=original['authority_process_original']
             or basis['closed_service_original_count']<1):
         raise AuthorityUnavailable('cold SDK original does not commit to the same protected descriptor and physical close originals')
+    return original
+
+
+def read_controlled_sdk_activation_original_v3(*,gate,control,config,root_descriptor,process_census,original,meter):
+    _require_controlled_sdk_activation_identity_v3(gate=gate,control=control,config=config,
+        root_descriptor=root_descriptor,process_census=process_census,original=original,meter=meter)
     require_process_retired_v1(original['authority_process_original'])
     current=read_process_identity_v1(os.getpid())
     if current is None:raise AuthorityUnavailable('actual current sole controlled SDK Authority process unavailable')
+    retirement=_read_controlled_sdk_activation_retirement_v4(control=control,census=process_census,activation=original)
     proof=VerifiedControlledSDKInstallerOriginalV3(_ISSUER,gate=gate,control=control,config=config,
-        descriptor=root_descriptor,summary=original['activation_basis'],process_census=process_census,original=original)
+        descriptor=root_descriptor,summary=original['activation_basis'],process_census=process_census,original=original,retirement=retirement)
     return proof.require_current(gate=gate,control=control,config=config,meter=meter)
+
+
+_FRESH_FINALIZATIONS=WeakKeyDictionary()
+
+
+class VerifiedControlledSDKFreshFinalizationOriginalV3:
+    def __init__(self,issuer,*,gate,control,config,descriptor,census,original,closed,closures,request):
+        if issuer is not _ISSUER:raise AuthorityUnavailable('actual named SDK fresh-finalization producer required')
+        self.gate,self.control,self.config,self.descriptor,self.census=gate,control,config,descriptor,census
+        import weakref
+        self.persisted_activation,self.closed,self.closures,self.request=original,closed,closures,weakref.ref(request)
+        self.activation_digest=original['activation_digest']
+        _FRESH_FINALIZATIONS[self]=self._identity_v3()
+    def _identity_v3(self):
+        return (id(self.gate),id(self.control),id(self.config),id(self.descriptor),id(self.census),self.activation_digest,
+            canonical_digest(self.persisted_activation),id(self.closed),tuple(id(v)for v in self.closures),self.request)
+    def _physical_v3(self):
+        from ..runtime.d13_consumer_manifest_v3 import require_actual_controlled_sdk_consumer_closure_v3
+        if _FRESH_FINALIZATIONS.get(self)!=self._identity_v3():
+            raise AuthorityUnavailable('SDK fresh-finalization changed its actual persisted activation/close originals')
+        self.closed.require_current();self.census.require_installed_cohort_v3()
+        self.descriptor.require_current(config=self.config,inventory=self.config.c09_maintenance_factory.inventory,
+            peer=self.config.c09_maintenance_factory.peer)
+        historical=self.persisted_activation['activation_basis']['controlled_sdk_root_census_original']
+        current=self.census.original
+        if (read_process_identity_v1(os.getpid())!=self.persisted_activation['authority_process_original']
+                or self.closed.authority!=self.persisted_activation['authority_process_original']
+                or any(current[name]!=historical[name]for name in
+                    ('resource_operation_id','run_deadline_monotonic_ns','run_cgroup','app_cgroup','root_process'))
+                or current['selection_scope']!=historical['selection_scope']
+                or not self.closures):
+            raise AuthorityUnavailable('same-PID fresh finalize changed original Root resource/deadline or actual closed cohort')
+        for closure in self.closures:
+            require_actual_controlled_sdk_consumer_closure_v3(closure,descriptor=self.descriptor,
+                resource_operation_id=current['resource_operation_id'])
+        self.control.verify_original_v1(self.persisted_activation,'activation_digest')
+        return self
+    def require_current_v3(self,*,gate,control,config,meter):
+        from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+        self._physical_v3()
+        request=self.request()
+        _require_fresh_d13_request_v3(request,config=config)
+        if (request.mode!='finalize' or request.consumer_mode!='controlled_sdk'
+                or gate is not self.gate or control is not self.control or config is not self.config):
+            raise AuthorityUnavailable('named same-PID SDK proof is limited to its original explicit fresh finalization')
+        gate.require_peer_registry_activation_hold_v3(gate._peer_registry_activation_hold_v3)
+        self.census.require_current()
+        # A signed business peer admission can never be erased or ignored here.
+        from ..authority_service.c09_writer_peer_originals_v3 import require_writer_peer_schema_v3
+        with control._db()as db:
+            require_writer_peer_schema_v3(control,db)
+            if db.execute('SELECT 1 FROM c09_writer_peer_admissions_v3 LIMIT 1').fetchone()is not None:
+                raise AuthorityUnavailable('SDK fresh finalize observed prior business peer admission; migration census HOLD')
+        return self
+    def require_admission_v3(self,original,*,control,gate,meter):
+        self._physical_v3()
+        if (control is not self.control or gate is not self.gate
+                or original!=self.persisted_activation or original['activation_digest']!=self.activation_digest):
+            raise AuthorityUnavailable('SDK peer admission crossed its actual fresh-finalized persisted activation')
+        return self
+
+
+def read_controlled_sdk_fresh_finalization_original_v3(*,gate,control,config,root_descriptor,
+        process_census,original,closed_services,consumer_closures,fresh_request,meter):
+    from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+    _require_fresh_d13_request_v3(fresh_request,config=config)
+    if (fresh_request.mode!='finalize' or fresh_request.consumer_mode!='controlled_sdk'
+            or type(closed_services)is not VerifiedControlledSDKClosedServicesOriginalV3
+            or type(consumer_closures)is not tuple):
+        raise AuthorityUnavailable('named SDK fresh finalization requires actual closed prior consumers')
+    _require_controlled_sdk_activation_identity_v3(gate=gate,control=control,config=config,
+        root_descriptor=root_descriptor,process_census=process_census,original=original,meter=meter)
+    from ..runtime.d13_consumer_manifest_v3 import require_no_live_controlled_sdk_consumers_v3
+    require_no_live_controlled_sdk_consumers_v3(resource_operation_id=process_census.original['resource_operation_id'])
+    finalization=VerifiedControlledSDKFreshFinalizationOriginalV3(_ISSUER,gate=gate,control=control,config=config,
+        descriptor=root_descriptor,census=process_census,original=original,closed=closed_services,
+        closures=consumer_closures,request=fresh_request)
+    finalization.require_current_v3(gate=gate,control=control,config=config,meter=meter)
+    proof=VerifiedControlledSDKInstallerOriginalV3(_ISSUER,gate=gate,control=control,config=config,
+        descriptor=root_descriptor,summary=original['activation_basis'],process_census=process_census,
+        closed=closed_services,fresh_finalization=finalization)
+    return proof.require_current(gate=gate,control=control,config=config,meter=meter)
+
+
+async def close_controlled_sdk_fresh_preparation_v3(plan):
+    from ..authority_service.daemon import _AuthorityBootstrapPlanV3
+    from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+    if type(plan)is not _AuthorityBootstrapPlanV3:
+        raise AuthorityUnavailable('actual bootstrap-thread fresh SDK close owner required')
+    request=plan.fresh_installation
+    _require_fresh_d13_request_v3(request,config=plan.composition.config)
+    if (request.consumer_mode!='controlled_sdk' or request.mode!='prepare'
+            or plan.phase!='fresh_prepared_unpublished' or request.sdk_consumers.phase!='closed'):
+        raise AuthorityUnavailable('fresh SDK preparation must drain and stop its actual worker before Authority close')
+    daemon=plan.business;control=daemon.c09_control
+    from ..runtime.d13_consumer_manifest_v3 import require_actual_controlled_sdk_consumers_stopped_v3
+    require_actual_controlled_sdk_consumers_stopped_v3(request.sdk_consumers,daemon=daemon)
+    control.lease.require_held()
+    gate=daemon.c09_gate
+    gate.require_peer_registry_activation_hold_v3(gate._peer_registry_activation_hold_v3)
+    snapshot=_controlled_sdk_close_snapshot_v3(server=daemon.server,core=daemon.core,
+        execution=daemon.execution,deletion=daemon.deletion,control=control)
+    owners,connections,before,authority,lease_original=snapshot
+    await daemon.server.aclose()
+    for owner in owners:owner.close()
+    daemon.c09_maintenance.graph.close()
+    plan.config.c09_maintenance_factory.finish_fresh_d13_peer_registry_v3(request)
+    request.close_v3()
+    control.lease.close()
+    daemon._closed=True
+    daemon._lock_handle=None
+    plan.business=None;plan.lease=None
+    return _issue_controlled_sdk_closed_services_v3(server=daemon.server,control=control,owners=owners,connections=connections,
+        before=before,authority=authority,lease_original=lease_original)
+
+
+async def publish_controlled_sdk_d13_fresh_installation_v3(prepared,*,closed_services,consumer_closure):
+    """Ask the original protected Root driver to publish one fixed D13 file cohort."""
+    import asyncio,base64
+    from ..runtime.d13_consumer_manifest_v3 import require_controlled_sdk_fresh_publication_material_v3
+    original,profile_bytes,assets_bytes=require_controlled_sdk_fresh_publication_material_v3(prepared,
+        closed_services=closed_services,consumer_closure=consumer_closure)
+    payload=dict(schema='sylanne.root-controlled-sdk-fresh-publication-request.v3',
+        command='publish_fresh_d13_cohort_v3',phase=os.environ['SYLANNE_QUAL_ROOT_CENSUS_PHASE'],
+        witness=original,profile_base64=base64.b64encode(profile_bytes).decode(),
+        assets_base64=base64.b64encode(assets_bytes).decode())
+    raw=canonical_serialize(payload).encode()
+    if len(raw)>196608:raise AuthorityUnavailable('fixed fresh publication packet exceeds its exact metadata file bounds')
+    def publish():
+        with socket.socket(socket.AF_UNIX,socket.SOCK_SEQPACKET)as channel:
+            channel.settimeout(60)
+            channel.connect(os.environ['SYLANNE_QUAL_ROOT_CENSUS_SOCKET'])
+            pid,uid,_=struct.unpack('3i',channel.getsockopt(socket.SOL_SOCKET,socket.SO_PEERCRED,12))
+            census=original['root_census_original']
+            if uid!=0 or pid!=census['root_process']['pid']:
+                raise AuthorityUnavailable('fresh publisher is not the original actual Root supervisor')
+            channel.sendall(raw);reply=channel.recv(65537)
+        value=json.loads(reply)
+        if (len(reply)>65536 or value.get('schema')!='sylanne.root-controlled-sdk-fresh-publication.v3'
+                or value.get('status')!='published_closed' or value.get('request_sha256')!=hashlib.sha256(raw).hexdigest()
+                or value.get('profile_sha256')!=hashlib.sha256(profile_bytes).hexdigest()
+                or value.get('assets_sha256')!=hashlib.sha256(assets_bytes).hexdigest()
+                or value.get('prepared_receipt_digest')!=original['prepared_receipt_digest']):
+            raise AuthorityUnavailable('Root fresh publication acknowledgement differs from the actual prepared cohort')
+        return value
+    return await asyncio.to_thread(publish)

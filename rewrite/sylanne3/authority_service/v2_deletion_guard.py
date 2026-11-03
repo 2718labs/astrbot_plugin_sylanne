@@ -71,7 +71,7 @@ class VerifiedDeletionAppendV2:
 
 
 class AuthorityV2DeletionGuard:
-    def __init__(self, path, *, selected_storage=None, storage_context=None, maintenance_basis=None):
+    def __init__(self, path, *, selected_storage=None, storage_context=None, maintenance_basis=None,initial_storage=None,initial_maintenance=None):
         self.path = Path(path)
         if not self.path.is_file():
             raise AuthorityUnavailable("independent deletion journal is absent")
@@ -91,9 +91,17 @@ class AuthorityV2DeletionGuard:
             if self._db.execute("PRAGMA synchronous").fetchone()[0] < 2:
                 raise AuthorityUnavailable("deletion journal is not FULL synchronous")
             self._runtime_storage_v3 = None
-            if selected_storage is not None and maintenance_basis is not None:
-                raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
-            if maintenance_basis is not None:
+            if sum(value is not None for value in (selected_storage,maintenance_basis,initial_storage,initial_maintenance))>1:
+                raise AuthorityUnavailable("one exact runtime storage origin required")
+            if initial_maintenance is not None:
+                from ..runtime_storage_v3 import install_initial_maintenance_runtime_storage_v4
+                self._runtime_storage_v3=install_initial_maintenance_runtime_storage_v4(
+                    self._db,role='deletion',composition=initial_maintenance,context=storage_context)
+            elif initial_storage is not None:
+                from ..runtime_storage_v3 import install_initial_runtime_storage_v4
+                self._runtime_storage_v3=install_initial_runtime_storage_v4(
+                    self._db,role='deletion',initial=initial_storage,context=storage_context)
+            elif maintenance_basis is not None:
                 from ..runtime_storage_v3 import install_selected_maintenance_storage_v3
                 from .daemon import _bootstrap_control_quantum_v3
                 with _bootstrap_control_quantum_v3(maintenance_basis.basis.control):
@@ -119,8 +127,12 @@ class AuthorityV2DeletionGuard:
             if type(selected) is not SelectedC09JournalProofV3:
                 raise AuthorityUnavailable('actual private selected deletion schema proof required')
             return selected.require_schema_locked(self,'deletion',meter=current_c09_sql_meter_v2())
-        objects = {(kind, name): ddl for kind, name, ddl in self._db.execute(
-            "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
+        if self._runtime_storage_v3 is not None and self._runtime_storage_v3.source_kind=="initial_segmented_v4":
+            from .c09_initial_segmented_genesis_v4 import initial_journal_schema_objects_v4
+            objects=initial_journal_schema_objects_v4(self,"deletion")
+        else:
+            objects = {(kind, name): ddl for kind, name, ddl in self._db.execute(
+                "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
         legacy = {
             ("table", "deletion_meta"), ("table", "deletion_events"),
             ("index", "deletion_intent_once"),

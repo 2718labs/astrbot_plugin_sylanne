@@ -163,7 +163,7 @@ def require_draft_action_root_v1(db, *, namespace, action_intent_ref, issuer):
     return root
 
 class InstalledLifeAdmissionReaderV1:
-    def __init__(self, *, issuer, resource_issuer, body_quote_authority, execution_inventory, scope):
+    def __init__(self, *, issuer, resource_issuer, body_quote_authority, execution_inventory, scope, labor_body_readers=None):
         from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
         if (type(issuer) is not D11BudgetJobIssuer or type(resource_issuer) is not D02ResourceIssuer
                 or type(body_quote_authority) is not D02BodyQuoteAuthority
@@ -175,6 +175,7 @@ class InstalledLifeAdmissionReaderV1:
             raise ValueError("Life mixed inventory differs from actual frozen fence")
         self.issuer,self.resource_issuer,self.body_quote_authority=issuer,resource_issuer,body_quote_authority
         self.execution_inventory,self.scope=execution_inventory,scope
+        self.labor_body_readers=labor_body_readers
 
 @dataclass(frozen=True, slots=True)
 class LifeActionAdmissionOriginalV1:
@@ -249,8 +250,8 @@ def _source_rights(db,read,refs,audiences):
             for audience in audiences: read.source_family(db,tuple(refs),purpose=purpose,audience=audience)
 
 
-def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
-    from .d11_life_preparation_v1 import _plan_current,_verify_life_current_budget_v1
+def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work,labor_candidate=None):
+    from .d11_life_preparation_v1 import _plan_current,_verify_life_current_budget_v1,D11CharacterLaborLifePreparedV1
     from ..domains.d03.context import EntityAnchor,RoleBinding,RoleBindingRequest,_tuple_payload
     from ..domains.d05.relationship import BoundaryRule,RelationshipProvider,_tuple_payload as d05_payload
     from ..domains.d08.execution import _decode,ActionSchemaRecord,ActionSchema
@@ -258,7 +259,7 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
     from .d02_life_effect_v1 import require_life_body_quote_v1
     from ..domains.d02 import BodyState,BodyProfile,_reservation
     from .d02_production_operations_v1 import SettledBodyEffectPolicyV1
-    from .d11_life_contract_v1 import life_work_kind_v1
+    from .d11_life_contract_v1 import life_work_kind_v1,RegisteredCharacterLaborLifePlanV1
     from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
     if type(reader) is not InstalledLifeAdmissionReaderV1 or not db.in_transaction: raise TypeError("actual installed Life admission reader required")
     read=CurrentDomainReadV1(frame);read.check(db)
@@ -292,7 +293,11 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
     if any(s.criteria_version!=life_criterion_ref_v1(s.check_kind, recipe_id=p.recipe_id) or s.subject_ref!="persona:"+ns.persona_id
             or s.action_ref!=action.action_id or s.purpose!=action.purpose for s in action.required_checks):
         raise ValueError("Life Action does not name installed fixed source-note criteria")
-    inventories={kind:read.complete_inventory(db,kind) for kind in LIFE_ADMISSION_TYPES_V1}
+    if type(prepared)is D11CharacterLaborLifePreparedV1:
+        from .d02_character_labor_read_v1 import complete_labor_scope_inventory_v1
+        inventories={kind:complete_labor_scope_inventory_v1(db,read,kind) for kind in LIFE_ADMISSION_TYPES_V1}
+    else:
+        inventories={kind:read.complete_inventory(db,kind) for kind in LIFE_ADMISSION_TYPES_V1}
     from .d11_life_scope_v1 import DraftLifeSemanticScopeV1
     scope_kind=DraftLifeSemanticScopeV1 if type(p) is RegisteredDraftFilePlanV3 else LifeSemanticScopeV1
     scope=scope_kind(ns,p.project.ref,p.input_source.ref,root.target_entity_ref,
@@ -397,29 +402,38 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
         elif e.status in {"claimed","unknown","dispatch_unresolved"}:
             raise MissingProductionOriginalV1("actual_unresolved_mixed_execution:"+e.execution_id)
     _verify_life_current_budget_v1(db,prepared,reader.issuer,reader.resource_issuer,frame.now_utc,for_execution=not own)
-    contract,quote,body=require_life_body_quote_v1(db,prepared=prepared,issuer=reader.issuer,resource_issuer=reader.resource_issuer,body_quote_authority=reader.body_quote_authority)
-    reservation=_reservation(read.head(db,contract.reservation_ref,required=True).value)
-    part=next(c for c in body.components if c.component_id==contract.component_id)
-    if (reservation.quote_id!=body.quote_id or reservation.effect_id!=b.effect_id or reservation.status!="reserved"
-            or any(item.startswith(part.component_id+"|") for item in reservation.settled_components) or reservation.remaining_cost<part.fixed_cost
-            or read.head(db,contract.settlement_ref).revision!=0): raise MissingProductionOriginalV1("current_unsettled_life_body_reservation")
-    states=tuple(a for a in inventories["d02.body_state.v1"] if a.valid and a.value["profile_id"]==body.profile_id)
-    profiles=tuple(a for a in inventories["d02.body_profile.v1"] if a.valid and a.value["profile_id"]==body.profile_id)
-    if len(states)!=1 or len(profiles)!=1: raise MissingProductionOriginalV1("current_life_body_profile_state")
-    state=BodyState(**states[0].value);raw=dict(profiles[0].value);raw["namespace"]=NamespaceId(**raw["namespace"])
-    raw["applicable_axes"],raw["work_kinds"]=tuple(raw["applicable_axes"]),tuple(raw["work_kinds"]);profile=BodyProfile(**raw)
-    if state.version!=states[0].revision or profile.version!=profiles[0].revision or profile.namespace!=ns or work_kind not in profile.work_kinds:
-        raise ValueError("current Life Body qualification changed")
-    policy=db.execute("SELECT revision,payload_json,payload_digest,signature FROM graph_d02_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND kind='effect' ORDER BY revision DESC LIMIT 1",
-        (*ns.as_tuple,contract.effect_policy_ref)).fetchone()
-    if policy is None: raise MissingProductionOriginalV1("current_installed_life_body_effect_policy")
-    reader.issuer._signer.verify("d11.d02-production-policy.v1",policy[1],policy[3]);raw=json.loads(policy[1])
-    if canonical_digest(raw)!=policy[2] or canonical_serialize(raw)!=policy[1]: raise ValueError("Life Body policy original changed")
-    raw["namespace"]=NamespaceId(**raw["namespace"]);policy_value=SettledBodyEffectPolicyV1(**raw)
-    if ((policy_value.profile_id,policy_value.work_kind,policy_value.component_id)!=(body.profile_id,work_kind,part.component_id)
-            or not any(pin.policy_ref==contract.effect_policy_ref and pin.revision==policy[0] and pin.policy_digest==policy[2] for pin in frame.installed_policy_refs)):
-        raise MissingProductionOriginalV1("pinned_current_life_body_effect_policy")
-    deadline=min(frame.envelope.deadline_utc,attention.ticket.valid_until,quote.valid_until_utc,
+    labor_evidence={}
+    if type(p)is RegisteredCharacterLaborLifePlanV1:
+        admission,labor_body=_evaluate_character_labor_body_v1(db,frame=frame,prepared=prepared,
+            reader=reader,read=read,candidate=labor_candidate)
+        body_valid_until=admission.expires_at_utc
+        labor_evidence={'labor_admission':plain_v1(admission),
+            'labor_body_preparation_digest':canonical_digest(plain_v1(labor_body))}
+    else:
+        contract,quote,body=require_life_body_quote_v1(db,prepared=prepared,issuer=reader.issuer,resource_issuer=reader.resource_issuer,body_quote_authority=reader.body_quote_authority)
+        reservation=_reservation(read.head(db,contract.reservation_ref,required=True).value)
+        part=next(c for c in body.components if c.component_id==contract.component_id)
+        if (reservation.quote_id!=body.quote_id or reservation.effect_id!=b.effect_id or reservation.status!="reserved"
+                or any(item.startswith(part.component_id+"|") for item in reservation.settled_components) or reservation.remaining_cost<part.fixed_cost
+                or read.head(db,contract.settlement_ref).revision!=0): raise MissingProductionOriginalV1("current_unsettled_life_body_reservation")
+        states=tuple(a for a in inventories["d02.body_state.v1"] if a.valid and a.value["profile_id"]==body.profile_id)
+        profiles=tuple(a for a in inventories["d02.body_profile.v1"] if a.valid and a.value["profile_id"]==body.profile_id)
+        if len(states)!=1 or len(profiles)!=1: raise MissingProductionOriginalV1("current_life_body_profile_state")
+        state=BodyState(**states[0].value);raw=dict(profiles[0].value);raw["namespace"]=NamespaceId(**raw["namespace"])
+        raw["applicable_axes"],raw["work_kinds"]=tuple(raw["applicable_axes"]),tuple(raw["work_kinds"]);profile=BodyProfile(**raw)
+        if state.version!=states[0].revision or profile.version!=profiles[0].revision or profile.namespace!=ns or work_kind not in profile.work_kinds:
+            raise ValueError("current Life Body qualification changed")
+        policy=db.execute("SELECT revision,payload_json,payload_digest,signature FROM graph_d02_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? AND kind='effect' ORDER BY revision DESC LIMIT 1",
+            (*ns.as_tuple,contract.effect_policy_ref)).fetchone()
+        if policy is None: raise MissingProductionOriginalV1("current_installed_life_body_effect_policy")
+        reader.issuer._signer.verify("d11.d02-production-policy.v1",policy[1],policy[3]);raw=json.loads(policy[1])
+        if canonical_digest(raw)!=policy[2] or canonical_serialize(raw)!=policy[1]: raise ValueError("Life Body policy original changed")
+        raw["namespace"]=NamespaceId(**raw["namespace"]);policy_value=SettledBodyEffectPolicyV1(**raw)
+        if ((policy_value.profile_id,policy_value.work_kind,policy_value.component_id)!=(body.profile_id,work_kind,part.component_id)
+                or not any(pin.policy_ref==contract.effect_policy_ref and pin.revision==policy[0] and pin.policy_digest==policy[2] for pin in frame.installed_policy_refs)):
+            raise MissingProductionOriginalV1("pinned_current_life_body_effect_policy")
+        body_valid_until=quote.valid_until_utc
+    deadline=min(frame.envelope.deadline_utc,attention.ticket.valid_until,body_valid_until,
         resolution.valid_until if resolution.valid_until is not None else frame.envelope.deadline_utc)
     if deadline<=frame.now_utc: raise MissingProductionOriginalV1("current_life_admission_validity")
     versions=tuple(VersionedRef(a.key.token,a.revision) for a in frame.snapshot.atoms)
@@ -428,7 +442,8 @@ def evaluate_life_admission_v1(db,*,frame,prepared,reader,new_work):
         VersionedRef(b.quote_id,b.quote_version))
     specs=tuple(replace(s,required_input_versions=(*current,VersionedRef(life_criterion_ref_v1(s.check_kind, recipe_id=p.recipe_id),1))) for s in action.required_checks)
     checks=tuple(CheckReceipt(s.check_kind,s.subject_ref,s.action_ref,s.purpose,s.required_input_versions,"full","pass",deadline,s.provider_id) for s in specs)
-    return {"schema":"d08.life-admission-evidence.v1","checks":plain_v1(checks),"effective_specs":plain_v1(specs),
+    return {"schema":("d08.character-labor-action-admission-evidence.v1" if labor_evidence else "d08.life-admission-evidence.v1"),
+        **labor_evidence,"checks":plain_v1(checks),"effective_specs":plain_v1(specs),
         "focus_ref":attention.focus_version.key.token,"ticket_ref":attention.ticket_version.key.token,
         "execution_inventory":life_execution_inventory_to_wire_v1(reader.execution_inventory),
         "criteria_build_digest":b.algorithm_build_digest,"valid_until_utc":deadline}
@@ -471,13 +486,21 @@ def record_life_action_admission_after_cas_v1(db,*,preparation,prepared,receipt)
     if _receipt(db,prepared.binding.namespace,prepared.prepare_operation_id)!=receipt:
         raise ValueError("Life admission receipt is not the actual same-transaction CAS")
     template=_frame_template(preparation.frame)
-    frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=template,now_utc=preparation.frame.now_utc)
-    evidence=evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=preparation.admission_reader,new_work=True)
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    proof=None
+    if type(prepared)is D11CharacterLaborLifePreparedV1:
+        proof,evidence=_character_labor_action_evidence_after_cas_v1(db,preparation,prepared,receipt)
+        frame=preparation.frame
+    else:
+        frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=template,now_utc=preparation.frame.now_utc)
+        evidence=evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=preparation.admission_reader,new_work=True)
     value=LifeActionAdmissionOriginalV1(prepared.binding.digest,prepared.binding.plan_digest,prepared.binding.operation_id,
         prepared.prepare_operation_id,canonical_digest(receipt),prepared.graph_revision,prepared.graph_epoch,
         tuple(a.key.token for a in frame.snapshot.atoms),template,canonical_serialize(evidence))
-    return _record(db,issuer=preparation.admission_reader.issuer,namespace=prepared.binding.namespace,kind="action_admission",
+    result=_record(db,issuer=preparation.admission_reader.issuer,namespace=prepared.binding.namespace,kind="action_admission",
         ref="d08-life-admission:"+prepared.binding.execution_id,operation_id=prepared.prepare_operation_id,value=value)
+    if proof is not None:consume_character_labor_action_evidence_v1(proof)
+    return result
 
 
 def require_current_life_action_admission_v1(db,*,prepared,reader,now_utc,frame=None):
@@ -495,12 +518,29 @@ def require_current_life_action_admission_v1(db,*,prepared,reader,now_utc,frame=
         raise ValueError("Life admission lost its actual E+1 commit receipt")
     from ..authority_service.d11_life_execution_inventory_v1 import life_execution_inventory_from_wire_v1
     evidence=json.loads(value.evidence_json)
-    if set(evidence)!={"schema","checks","effective_specs","focus_ref","ticket_ref","execution_inventory","criteria_build_digest","valid_until_utc"} or evidence["schema"]!="d08.life-admission-evidence.v1":
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    labor=type(prepared)is D11CharacterLaborLifePreparedV1
+    expected={"schema","checks","effective_specs","focus_ref","ticket_ref","execution_inventory","criteria_build_digest","valid_until_utc"}
+    if labor:expected|={'labor_admission','labor_body_preparation_digest'}
+    schema='d08.character-labor-action-admission-evidence.v1' if labor else 'd08.life-admission-evidence.v1'
+    if set(evidence)!=expected or evidence['schema']!=schema:
         raise ValueError("Life signed admission evidence fields differ")
+    if labor:
+        from .d11_character_work_segment_v1 import require_committed_character_labor_admission_v1
+        admission,body=require_committed_character_labor_admission_v1(db,prepared=prepared,issuer=reader.issuer)
+        if (evidence['labor_admission']!=plain_v1(admission)
+                or evidence['labor_body_preparation_digest']!=canonical_digest(plain_v1(body))):
+            raise ValueError('Life action evidence is not its actual independent signed labor C')
     verify_life_execution_inventory_v1(life_execution_inventory_from_wire_v1(evidence["execution_inventory"]),reader.issuer)
     if evidence["criteria_build_digest"]!=prepared.binding.algorithm_build_digest or {(c["check_kind"],c["issuer"]) for c in evidence["checks"]}!=set(PAIRS) or any(c["coverage"]!="full" or c["result"]!="pass" for c in evidence["checks"]):
         raise ValueError("Life signed admission is not the installed five-provider pass")
-    if frame is None: frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=value.frame_template_json,now_utc=now_utc)
+    if frame is None:
+        if labor:
+            from ..authority_service.character_labor_source_read_v1 import current_authority_character_labor_admission_frame_v1
+            frame=current_authority_character_labor_admission_frame_v1(db,prepared=prepared,
+                template_json=value.frame_template_json,now_utc=now_utc)
+        else:
+            frame=rebuild_life_admission_frame_v1(db,prepared=prepared,template_json=value.frame_template_json,now_utc=now_utc)
     evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=reader,new_work=False)
     return value
 
@@ -517,3 +557,192 @@ def enrich_life_adoption_frame_v1(db,*,frame,prepared,issuer):
     return replace(frame,snapshot=snapshot,query_coverage=current.query_coverage,installed_policy_refs=current.installed_policy_refs,
         envelope=replace(frame.envelope,version_guard=replace(frame.envelope.version_guard,read_versions=snapshot.versions,
             query_epochs=tuple(p.epoch for p in current.query_coverage))))
+
+
+def _require_character_labor_reader_v1(reader,*,db):
+    from .d02_production_operations_v1 import InstalledD02ProductionReadersV1
+    from ..authority_service.character_labor_body_readers_v1 import (
+        InstalledAuthorityCharacterLaborBodyReadersV1,require_authority_character_labor_body_readers_v1)
+    body=reader.labor_body_readers
+    if type(body)is InstalledAuthorityCharacterLaborBodyReadersV1:
+        return require_authority_character_labor_body_readers_v1(body,issuer=reader.issuer,
+            body_quote_authority=reader.body_quote_authority,db=db)
+    if type(body)is not InstalledD02ProductionReadersV1:
+        raise MissingProductionOriginalV1('actual_installed_character_labor_Body_reader')
+    if body.issuer is not reader.issuer or body.body_quote_authority is not reader.body_quote_authority:
+        raise ValueError('character-labor Body reader differs from actual admission installation')
+    return body
+
+
+def _evaluate_character_labor_body_v1(db,*,frame,prepared,reader,read,candidate):
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    from .d11_character_work_segment_v1 import (require_character_labor_admission_candidate_v1,
+        require_committed_character_labor_admission_v1,_policy,_recipe,character_labor_census_duration_root_v1)
+    from ..domains.d02 import _reservation
+    from .d11_offline_originals_v1 import _utc
+    from ..domains.d02.character_labor_v1 import character_labor_rebuild_key_v1
+    if type(prepared)is not D11CharacterLaborLifePreparedV1:
+        raise TypeError('old Fixed Prepared cannot be interpreted as a character-labor contract')
+    if candidate is None:
+        admission,body=require_committed_character_labor_admission_v1(db,prepared=prepared,issuer=reader.issuer)
+    else:
+        admission,body=require_character_labor_admission_candidate_v1(candidate,db=db,frame=frame,prepared=prepared)
+    installed=_require_character_labor_reader_v1(reader,db=db)
+    policy=_policy(installed,read,db,body.policy.policy_ref,body.policy.revision)
+    if policy!=body.policy:raise ValueError('current labor policy changed from the actual signed B')
+    _recipe(read,db,policy)
+    profile,state,reservations=installed._current_body(db,read,body.quote.profile_id)
+    census=installed.require_labor_census_v1(db,read,state)
+    atom=read.head(db,body.reservation_ref,required=True);reservation=_reservation(atom.value)
+    rebuild=read.head(db,character_labor_rebuild_key_v1(prepared.binding.namespace,state.profile_id),required=True)
+    settlement=read.head(db,body.settlement_ref)
+    if ((atom.revision,canonical_digest(atom.value))!=(body.reservation_revision,body.reservation_digest)
+            or reservation.status!='reserved' or reservation.effect_id!=prepared.binding.effect_id
+            or reservation.quote_id!=body.quote.quote_ref or settlement.revision!=0
+            or state.version!=body.quote.state_version or policy.work_kind not in profile.work_kinds
+            or rebuild.value['status']!='current' or rebuild.value['processed_cursor']!=state.cursor
+            or rebuild.value['body_state_version']!=state.version or rebuild.value['body_state_digest']!=canonical_digest(state)
+            or rebuild.value['originals_root']!=character_labor_census_duration_root_v1(census)
+            or (rebuild.value['source_epoch'],rebuild.value['deletion_epoch'])!=
+               (frame.envelope.version_guard.access_epoch,frame.envelope.version_guard.delete_epoch)
+            or admission.binding_digest!=prepared.binding.digest
+            or admission.clock_original_digest!=canonical_digest(json.loads(prepared.clock_original_json))
+            or admission.owner_guard_digest!=canonical_digest(frame.owner_guard)
+            or (admission.source_epoch,admission.deletion_epoch)!=
+               (frame.envelope.version_guard.access_epoch,frame.envelope.version_guard.delete_epoch)
+            or frame.now_utc>=admission.expires_at_utc):
+        raise MissingProductionOriginalV1('current_confirmed_character_labor_reservation_clock_Owner')
+    quote=reader.resource_issuer.original_signed_quote(db,body.quote.technical_quote_ref,body.quote.technical_quote_version)
+    if (canonical_digest(quote)!=body.quote.technical_quote_digest
+            or prepared.binding.cpu_ceiling_ms>quote.ceiling.get('cpu_ms',0)
+            or admission.expires_at_utc>min(body.quote.valid_until_utc,frame.envelope.deadline_utc,
+                _utc(prepared.binding.deadline_utc).timestamp())):
+        raise ValueError('character-labor admission exceeds its actual first B quote/deadline')
+    return admission,body
+
+
+# A volatile witness of the actual five-provider check. It is consumed in the
+# same C transaction and never serialized as an execution or Body capability.
+from weakref import WeakSet
+from threading import get_ident
+_LABOR_ACTION_EVIDENCE = WeakSet()
+_LABOR_ACTION_EVIDENCE_ISSUER = object()
+
+
+class _CharacterLaborActionEvidenceV1:
+    def __init__(self, issuer, *, frame, prepared, reader, candidate, wire, operation):
+        if issuer is not _LABOR_ACTION_EVIDENCE_ISSUER:
+            raise TypeError("actual private character-labor action evidence required")
+        self.frame, self.prepared, self.reader, self.candidate = frame, prepared, reader, candidate
+        self.wire, self.operation, self.before = wire, operation, None
+        _LABOR_ACTION_EVIDENCE.add(self)
+        operation.register_retained_state_v3(self)
+        operation.transfer_payload_release_v3(self.release_payload_v3)
+
+    def release_payload_v3(self):
+        _LABOR_ACTION_EVIDENCE.discard(self)
+        self.frame=self.prepared=self.reader=self.candidate=None
+        self.wire=self.before=None
+
+    def _runtime_retained_heap_bytes_v3(self):
+        import sys
+        # Frame/Prepared/reader/candidate are borrowed from the same live Stage.
+        # Only this independently retained metadata wire is newly allocated.
+        return sys.getsizeof(self) + sys.getsizeof(self.wire) + 1024
+
+
+def prepare_character_labor_action_evidence_v1(db, *, frame, prepared, reader, candidate):
+    from ..runtime_storage_v3 import _OPERATION, RuntimeStorageOperationV3, runtime_storage_v3
+    from .d11_character_work_segment_v1 import require_character_labor_admission_candidate_v1
+    operation, handle = _OPERATION.get(), runtime_storage_v3(db)
+    if (type(operation) is not RuntimeStorageOperationV3 or handle is None or operation.closed
+            or operation.pool is not handle.pool or operation.selection_digest != handle.selection_digest
+            or operation.operation_id != frame.envelope.identity.operation_id):
+        raise MissingProductionOriginalV1("actual_retained_character_labor_C_operation")
+    require_character_labor_admission_candidate_v1(candidate, db=db, frame=frame, prepared=prepared)
+    evidence = evaluate_life_admission_v1(db, frame=frame, prepared=prepared, reader=reader,
+        new_work=True, labor_candidate=candidate)
+    wire = canonical_serialize(evidence)
+    return _CharacterLaborActionEvidenceV1(_LABOR_ACTION_EVIDENCE_ISSUER,
+        frame=frame, prepared=prepared, reader=reader, candidate=candidate, wire=wire, operation=operation)
+
+
+def require_character_labor_action_evidence_before_cas_v1(db, preparation):
+    proof = preparation.labor_action_evidence
+    if (type(proof) is not _CharacterLaborActionEvidenceV1 or proof not in _LABOR_ACTION_EVIDENCE
+            or proof.frame is not preparation.frame or proof.prepared is not preparation.prepared
+            or proof.reader is not preparation.admission_reader
+            or proof.candidate is not preparation.labor_admission_candidate or proof.operation.closed):
+        raise ValueError("labor C lost its actual private pre-CAS five-provider evidence")
+    actual = evaluate_life_admission_v1(db, frame=preparation.frame, prepared=preparation.prepared,
+        reader=preparation.admission_reader, new_work=True, labor_candidate=preparation.labor_admission_candidate)
+    if canonical_serialize(actual) != proof.wire:
+        raise ValueError("labor C five-provider evidence changed before the actual CAS")
+    proof.before = (db, get_ident())
+
+
+def _character_labor_action_evidence_after_cas_v1(db, preparation, prepared, receipt):
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    from .d11_character_work_segment_v1 import require_committed_character_labor_admission_v1
+    from .d04_root_original_store_v1 import _receipt
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    proof = preparation.labor_action_evidence
+    if (type(prepared) is not D11CharacterLaborLifePreparedV1
+            or type(proof) is not _CharacterLaborActionEvidenceV1 or proof not in _LABOR_ACTION_EVIDENCE
+            or proof.before != (db, get_ident()) or proof.operation.closed
+            or proof.frame is not preparation.frame or proof.prepared is not preparation.prepared
+            or proof.reader is not preparation.admission_reader
+            or _receipt(db, prepared.binding.namespace, prepared.prepare_operation_id) != receipt):
+        raise ValueError("labor C after-CAS evidence is not its actual validated Stage/transaction/receipt")
+    initial = replace(prepared, requirements_json=None, graph_revision=None, graph_epoch=None,
+        job_projection_json=None, job_projection_revision=None, admission_ref=None, admission_digest=None,
+        labor_admission_ref=None, labor_admission_digest=None)
+    if initial != proof.prepared:
+        raise ValueError("labor C changed frozen inputs outside its actual committed output fields")
+    ns = prepared.binding.namespace
+    before = {v.key.token:v.revision for v in proof.frame.envelope.version_guard.read_versions}
+    reads = {v.key.token:v.revision for v in receipt.read_versions}
+    if (reads != before or len(reads) != len(receipt.read_versions)
+            or len(receipt.write_versions) != 1 or len(preparation.writes) != 1
+            or receipt.write_versions[0].key != preparation.writes[0].key
+            or receipt.write_versions[0].key.type_name != "runtime.job"
+            or receipt.write_versions[0].revision != before[receipt.write_versions[0].key.token] + 1
+            or receipt.invalidated_epochs != (NamespaceEpoch(*ns.as_tuple, proof.frame.snapshot.epochs[0].revision + 1),)
+            or prepared.graph_epoch != receipt.invalidated_epochs[0].revision):
+        raise ValueError("labor C pre-CAS evidence does not cover its exact job-only E+1 transition")
+    written = receipt.write_versions[0]
+    history = _producer_original_point_v3(db, table="graph_history",
+        columns=("valid", "event_bot", "event_persona", "event_session", "event_id"),
+        key_columns=("token", "revision"), key=(written.key.token, written.revision),
+        legacy_reader=lambda: db.execute("SELECT valid,event_bot,event_persona,event_session,event_id "
+            "FROM graph_history WHERE token=? AND revision=?", (written.key.token, written.revision)).fetchone())
+    if history != (1, *ns.as_tuple, prepared.binding.activity_id, prepared.prepare_operation_id):
+        raise ValueError("labor C output lacks its actual valid same-operation history")
+    admission, body = require_committed_character_labor_admission_v1(db, prepared=prepared, issuer=proof.reader.issuer)
+    evidence = json.loads(proof.wire)
+    if (evidence["labor_admission"] != plain_v1(admission)
+            or evidence["labor_body_preparation_digest"] != canonical_digest(plain_v1(body))):
+        raise ValueError("labor five-provider evidence differs from the actual independently signed C admission")
+    epoch = receipt.invalidated_epochs[0].revision
+    write_map = {v.key.token:v.revision for v in receipt.write_versions}
+    for family in ("checks", "effective_specs"):
+        for item in evidence[family]:
+            for version in item["required_input_versions"]:
+                ref = version["ref"]
+                if ref in write_map:
+                    if version["version"] != before[ref]:
+                        raise ValueError("labor evidence output read did not name its real pre-CAS version")
+                    version["version"] = write_map[ref]
+                elif ref.startswith("life-query:"):
+                    if version["version"] != proof.frame.snapshot.epochs[0].revision:
+                        raise ValueError("labor evidence query did not name its real pre-CAS epoch")
+                    version["version"] = epoch
+    return proof, evidence
+
+
+def consume_character_labor_action_evidence_v1(proof):
+    if type(proof) is not _CharacterLaborActionEvidenceV1 or proof not in _LABOR_ACTION_EVIDENCE:
+        raise ValueError("actual single-use labor C action evidence required")
+    _LABOR_ACTION_EVIDENCE.remove(proof)
+    proof.operation.unregister_retained_state_v3(proof)
+    proof.release_payload_v3()

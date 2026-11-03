@@ -41,8 +41,11 @@ def validate_d07_behavior_provenance_v1(kind, raw):
         raise ValueError("D07 fixed behavior scope/state differs")
     refs = set()
     execution = None
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityExecutionOriginalV1
     if raw["execution"] is not None:
-        _fields(raw["execution"], D07ExecutionOriginalV1)
+        cls=(D07OrdinaryContinuityExecutionOriginalV1 if raw["execution"].get("schema")=="d07.ordinary-continuity-execution.v1"
+            else D07ExecutionOriginalV1)
+        _fields(raw["execution"], cls)
         execution = decode_d07_execution_original_v1(raw["execution"])
         if execution.work_kind != work_kind or execution.input_digest != raw["input_digest"]:
             raise ValueError("D07 adopted behavior differs from real execution identity")
@@ -54,7 +57,9 @@ def validate_d07_behavior_provenance_v1(kind, raw):
         raise ValueError("D07 fixed behavior input must be structured")
     if work_kind == "concern":
         expected = {"trigger", "policy", "tickets", "issuance_originals", "prior_round", "focus_epoch", "choice", "current_admission_digest"}
-        if set(behavior) not in (expected, expected | {"semantic_question", "semantic_target"}):
+        allowed=(expected,expected|{"semantic_question","semantic_target"})
+        if type(execution)is D07OrdinaryContinuityExecutionOriginalV1:allowed+=((expected|{"semantic_question"}),)
+        if set(behavior) not in allowed:
             raise ValueError("D07 concern stage original fields differ")
         _fields(behavior["policy"], AttentionPolicy)
         AttentionPolicy(**behavior["policy"])
@@ -84,7 +89,9 @@ def validate_d07_behavior_provenance_v1(kind, raw):
             from .d07_execution_v1 import D07RelationshipSemanticQuestionV2
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
             from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
-            kind = (D07MethodGrowthSemanticQuestionV2 if q.get("schema") == "d07.method-growth-semantic-question.v2" else
+            from .d07_ordinary_continuity_attention_v1 import D07OrdinaryContinuityQuestionV1
+            kind = (D07OrdinaryContinuityQuestionV1 if q.get("schema")=="d07.ordinary-continuity-question.v1" else
+                D07MethodGrowthSemanticQuestionV2 if q.get("schema") == "d07.method-growth-semantic-question.v2" else
                 D07RelationshipSemanticQuestionV2 if q.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
             _fields(q, kind)
             question = decode_typed_production_value_v1(q, kind)
@@ -92,22 +99,37 @@ def validate_d07_behavior_provenance_v1(kind, raw):
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
             import json
             from ..runtime_contracts import canonical_digest, canonical_serialize
-            target = decode_typed_production_value_v1(behavior["semantic_target"], D07SemanticTargetOriginalV1)
-            value = json.loads(target.value_json)
-            if (target.original_ref != question.target_ref.ref or target.revision != question.target_ref.version
-                    or canonical_serialize(value) != target.value_json or canonical_digest(value) != target.original_digest):
-                raise ValueError("D07 semantic target differs from frozen exact question")
-            if target.kind == "graph_head":
-                refs.add(target.original_ref)
-            elif target.kind == "d08_joint_plan_intent":
-                from .d08_production_operations_v1 import JointPlanIntentOriginalV1
-                actual = decode_typed_production_value_v1(value, JointPlanIntentOriginalV1)
-                if actual.source_refs != target.source_refs or actual.revision != target.revision:
-                    raise ValueError("D07 semantic target terms/source closure differs")
-                refs.update(target.source_refs)
+            if kind is D07OrdinaryContinuityQuestionV1:
+                if(type(execution)is not D07OrdinaryContinuityExecutionOriginalV1 or "semantic_target"in behavior
+                        or execution.phase!=question.phase or execution.basis_original!=question.basis_original
+                        or execution.question_original.original_digest!=canonical_digest(_json(question))):
+                    raise ValueError("ordinary behavior left its exact independent phase/question")
+                refs.add(question.target_ref.ref)
             else:
-                raise ValueError("D07 semantic target kind is not installed")
-            refs.update(v.key.token for v in target.read_versions)
+                target = decode_typed_production_value_v1(behavior["semantic_target"], D07SemanticTargetOriginalV1)
+                value = json.loads(target.value_json)
+                if (target.original_ref != question.target_ref.ref or target.revision != question.target_ref.version
+                        or canonical_serialize(value) != target.value_json or canonical_digest(value) != target.original_digest):
+                    raise ValueError("D07 semantic target differs from frozen exact question")
+                if target.kind == "graph_head":
+                    refs.add(target.original_ref)
+                elif target.kind=="single_event_review_case_v1":
+                    from ..domains.d01.single_event_review_case_v1 import RegisteredSingleEventReviewCaseV1
+                    actual=decode_typed_production_value_v1(value,RegisteredSingleEventReviewCaseV1)
+                    roots=tuple(dict.fromkeys((*actual.support_source_refs,*actual.context_source_refs)))
+                    if(actual.case_ref!=target.original_ref or actual.case_revision!=target.revision
+                            or roots!=target.source_refs or actual.namespace!=execution.namespace):
+                        raise ValueError("single-event review target differs from its signed Case scope")
+                    refs.update(target.source_refs)
+                elif target.kind == "d08_joint_plan_intent":
+                    from .d08_production_operations_v1 import JointPlanIntentOriginalV1
+                    actual = decode_typed_production_value_v1(value, JointPlanIntentOriginalV1)
+                    if actual.source_refs != target.source_refs or actual.revision != target.revision:
+                        raise ValueError("D07 semantic target terms/source closure differs")
+                    refs.update(target.source_refs)
+                else:
+                    raise ValueError("D07 semantic target kind is not installed")
+                refs.update(v.key.token for v in target.read_versions)
     elif work_kind == "simulation":
         expected = {"registered_request_ref", "request", "trigger", "dedicated_budget", "dedicated_budget_original", "content_reality",
             "external_evidence_eligibility", "current_admission_digest"}

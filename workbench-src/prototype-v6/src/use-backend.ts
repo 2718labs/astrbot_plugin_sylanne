@@ -1,5 +1,8 @@
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, reactive, ref, toRaw, watch } from 'vue'
 import { createManagement } from './use-management.ts'
+import { operationIdV1 } from './api/browser-crypto.ts'
+import { UUID4 } from './api/contract.ts'
+import { validateSourceInspectionWorkflowInput, sourceInspectionWorkflowInput, sameSourceInspectionWorkflowInput, type SourceInspectionWorkflowInput, type SourceInspectionWorkflowView } from './api/source-owner-read.ts'
 import {pendingBeta1Attempts} from './api/beta1-owner.ts'
 import { createSetup } from './use-setup.ts'
 import { createConfiguration } from './use-configuration.ts'
@@ -28,8 +31,47 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
     view: { status: enabled ? 'idle' : 'disabled', data: null, message: enabled ? '还没有读取角色内容。' : '离线预览，未读取真实角色内容。' } })
   const networkAvailable = ref(typeof navigator === 'undefined' || navigator.onLine !== false)
   const viewPaging = reactive({ page: 0 })
+  const sourceReadGeneration = ref(0)
+  const pendingOnboardingRecovery=ref<import('./api/client.ts').PendingOnboardingAttempt|null>(null)
+  const onboardingRecovery={pending:pendingOnboardingRecovery}
+  const laborRebuild={pending:ref<import('./api/character-labor-rebuild.ts').LaborRebuildAttempt|null>(null)}
   const pendingProjectControl = ref<import('./api/project-control.ts').PendingProjectControl | null>(null)
   const pendingSourceCorrection = ref<import('./api/source-correction.ts').PendingSourceCorrection | null>(null)
+  const commitmentAttempts=reactive(new Map<string,import('./api/commitment-communication.ts').CommitmentCommandAttempt>())
+  const commitmentApprovals=reactive(new Map<string,import('./api/commitment-communication.ts').ApprovedCommitmentScope>())
+  const preparedCommitmentActions=reactive(new Map<string,import('./api/commitment-communication.ts').CommitmentPreparedAction>())
+  const fulfillmentAttempts=reactive(new Map<string,import('./api/commitment-fulfillment.ts').FulfillmentAttempt>())
+  const fulfillmentViews=reactive(new Map<string,import('./api/commitment-fulfillment.ts').CommitmentTransitionView>())
+  const fulfillmentApprovals=reactive(new Map<string,import('./api/commitment-fulfillment.ts').ApprovedTermsScope>())
+  const pendingFulfillment=computed({get:()=>fulfillmentAttempts.get(state.scope)??null,set:(value:import('./api/commitment-fulfillment.ts').FulfillmentAttempt|null)=>{if(value)fulfillmentAttempts.set(value.scope,value);else fulfillmentAttempts.delete(state.scope)}})
+  const currentFulfillment=computed({get:()=>fulfillmentViews.get(state.scope)??null,set:(value:import('./api/commitment-fulfillment.ts').CommitmentTransitionView|null)=>{if(value)fulfillmentViews.set(state.scope,value);else fulfillmentViews.delete(state.scope)}})
+  const approvedTerms=computed({get:()=>fulfillmentApprovals.get(state.scope)??null,set:(value:import('./api/commitment-fulfillment.ts').ApprovedTermsScope|null)=>{if(value)fulfillmentApprovals.set(state.scope,value);else fulfillmentApprovals.delete(state.scope)}})
+  const preparedCommitmentAction=computed(()=>preparedCommitmentActions.get(state.scope)??null)
+  const pendingCommitment=computed({get:()=>commitmentAttempts.get(state.scope)??null,set:(value:import('./api/commitment-communication.ts').CommitmentCommandAttempt|null)=>{if(value)commitmentAttempts.set(value.scope,value);else commitmentAttempts.delete(state.scope)}})
+  const approvedCommitment=computed({get:()=>commitmentApprovals.get(state.scope)??null,set:(value:import('./api/commitment-communication.ts').ApprovedCommitmentScope|null)=>{if(value)commitmentApprovals.set(state.scope,value);else commitmentApprovals.delete(state.scope)}})
+  const singleEventAttempts=reactive(new Map<string,import('./api/single-event-growth.ts').SingleEventGrowthAttempt>())
+  const singleEventViews=reactive(new Map<string,import('./api/single-event-growth.ts').SingleEventGrowthView>())
+  const pendingSingleEvent=computed(()=>singleEventAttempts.get(state.scope)??null)
+  const currentSingleEvent=computed(()=>singleEventViews.get(state.scope)??null)
+  let singleEventGeneration=0
+  watch(()=>[state.scope,state.auth,state.owner],()=>{++singleEventGeneration;singleEventAttempts.clear();singleEventViews.clear()},{flush:'sync'})
+  const growthReviewAttempts = reactive(new Map<string, import('./api/growth-review.ts').GrowthReviewAttempt>())
+  const pendingGrowthReview = computed({
+    get: () => growthReviewAttempts.get(state.scope) ?? null,
+    set: (value: import('./api/growth-review.ts').GrowthReviewAttempt | null) => {
+      if (value) growthReviewAttempts.set(value.scope,value)
+      else growthReviewAttempts.delete(state.scope)
+    },
+  })
+  watch(()=>[state.scope,state.auth,state.owner],()=>{commitmentAttempts.clear();commitmentApprovals.clear();preparedCommitmentActions.clear();fulfillmentAttempts.clear();fulfillmentViews.clear();fulfillmentApprovals.clear()},{flush:'sync'})
+  const sourceErasureAttempts = reactive(new Map<string, import('./api/source-erasure.ts').SourceErasureAttempt>())
+  const pendingSourceErasure = computed({
+    get: () => sourceErasureAttempts.get(state.scope) ?? null,
+    set: (value: import('./api/source-erasure.ts').SourceErasureAttempt | null) => {
+      if (value) sourceErasureAttempts.set(value.scope,value)
+      else sourceErasureAttempts.delete(state.scope)
+    },
+  })
   const ownerTaskAttempts = reactive(new Map<string, import('./api/owner-source-note-task.ts').PendingOwnerTask>())
   const ownerMaterialAttempts = reactive(new Map<string, import('./api/owner-source-note-task.ts').PendingOwnerTask>())
   const requiresHttps = computed(() => enabled && state.errorCode==='https_required')
@@ -47,6 +89,7 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
   const workspaceJobs = new Map<string, { revision: number; workspaceRevision: number; promise: Promise<void> }>()
   const viewJobs = new Set<string>()
   function invalidateView(preserveRuntime = false) {
+    ++sourceReadGeneration.value
     if (!preserveRuntime) { setup.invalidate(); configuration.invalidate(); creator.invalidate() }
     management.invalidate(preserveRuntime)
     ++viewRevision; ++workspaceRevision; activeView = null; state.viewType = null; viewPaging.page = 0
@@ -62,7 +105,7 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
     const token = ++authRevision; state.busy = true; state.authOperation = operation; state.error = ''; state.errorCode = ''; return token
   }
   function revokeLocal(owner: BackendState['owner'] = 'locked') {
-    ++revision; ++authRevision; api.clearSession(); clearContent(); state.challenge = null; pendingSourceCorrection.value = null; pendingProjectControl.value = null
+    ++revision; ++authRevision; api.clearSession(); clearContent(); state.challenge = null; pendingSourceCorrection.value = null; sourceErasureAttempts.clear(); growthReviewAttempts.clear(); commitmentAttempts.clear(); commitmentApprovals.clear(); preparedCommitmentActions.clear(); fulfillmentAttempts.clear(); fulfillmentViews.clear(); fulfillmentApprovals.clear(); pendingProjectControl.value = null
     state.auth = enabled ? requiresHttps.value?'https_required':'locked' : 'offline'; state.owner = owner; state.busy = false; state.authOperation = 'none'
   }
   function fail(error: unknown) {
@@ -173,7 +216,7 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
       if (viewCurrent !== viewRevision) return
       if (!state.workspace.data || !canRead.value) { state.view = { status: state.workspace.status === 'ready' ? 'disabled' : state.workspace.status, data: null, message: state.workspace.message }; return }
     }
-    if (!state.workspace.data.views.some(v => v.view_type === viewType && v.status === 'available')) { state.view = { status: 'unavailable', data: null, message: '当前账户暂时无法查看此项信息。' }; return }
+    if (!state.workspace.data.views.some(v => v.view_type === viewType && v.status === 'readable_not_loaded')) { state.view = { status: 'unavailable', data: null, message: '当前账户暂时无法查看此项信息。' }; return }
     const current = revision, scope = state.scope, key = `${scope}:${viewType}`
     if (viewJobs.has(key)) { state.view = { status: 'stale', data: null, message: '上一页的相同字段请求尚未结束，旧响应不会回填。结束后请手动重试。' }; return }
     state.error = ''; state.view = { status: 'loading', data: null, message: '正在读取角色信息。', pending: true }; viewJobs.add(key)
@@ -208,6 +251,77 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
     leavePage(); document.removeEventListener('visibilitychange', visibility); window.removeEventListener('pagehide', leavePage); window.removeEventListener('popstate', leavePage)
     window.removeEventListener('offline', networkLost); window.removeEventListener('online', networkRestored)
   })
+  type InspectionAttempt = { scope: string; operation_id: string; input: SourceInspectionWorkflowInput | null;
+    request_digest: string | null; view: SourceInspectionWorkflowView | null; status: 'unknown' | SourceInspectionWorkflowView['state'] }
+  const inspectionAttempts = reactive(new Map<string, InspectionAttempt>())
+  const inspectionActive = ref(false), inspectionMessage = ref('')
+  let inspectionGeneration = 0
+  const inspectionAttempt = computed(() => inspectionAttempts.get(state.scope) ?? null)
+  const inspectionCanRequest = computed(() => transportReady() && scopeValid.value && !state.busy && !inspectionActive.value)
+  watch(() => [state.scope, state.auth, state.owner], () => {
+    ++inspectionGeneration; inspectionMessage.value = ''
+    for (const attempt of inspectionAttempts.values()) attempt.view = null
+  }, { flush: 'sync' })
+  async function inspectionRequest(kind: 'accept' | 'read', originalId: string) {
+    if (!inspectionCanRequest.value) return
+    if (!UUID4.test(originalId)) { inspectionMessage.value = '请填写原维护操作的规范 UUID4。'; return }
+    const scope = state.scope, token = inspectionGeneration
+    let attempt = inspectionAttempts.get(scope)
+    if (attempt && attempt.operation_id !== originalId && attempt.status !== 'completed') {
+      inspectionMessage.value = '当前原维护尚未确认完成，须先查询此原操作。'; return
+    }
+    if (!attempt || attempt.operation_id !== originalId) {
+      inspectionAttempts.set(scope, { scope, operation_id: originalId, input: null, request_digest: null, view: null, status: 'unknown' })
+      attempt = inspectionAttempts.get(scope)!
+    }
+    if (kind === 'accept' && !attempt.input) return
+    inspectionActive.value = true; inspectionMessage.value = kind === 'read' ? '正在只读查询原维护；不会重发受理或推进操作。'
+      : '正在一次受理所选范围、暂停与恢复选择。受理后 Host 暂停可能使本页断开。'
+    try {
+      const view = kind === 'read' ? await api.readSourceInspectionMigration(scope, originalId)
+        : await api.acceptSourceInspectionMigration(scope, originalId, attempt.input!)
+      if (token !== inspectionGeneration || scope !== state.scope) { attempt.status = 'unknown'; return }
+      if (!view) { attempt.status = 'unknown'; attempt.view = null; inspectionMessage.value = '受理结果待确认。保留三个原 ID 与完整输入；恢复连接后只查询原操作，不重发受理。'; return }
+      if (attempt.request_digest && attempt.request_digest !== view.request_digest
+          || attempt.input && !sameSourceInspectionWorkflowInput(attempt.input, sourceInspectionWorkflowInput(view))) {
+        throw new WorkbenchApiError('原维护输入或摘要变化。', { code: 'invalid_response' })
+      }
+      attempt.input = sourceInspectionWorkflowInput(view); attempt.request_digest = view.request_digest; attempt.view = view; attempt.status = view.state
+      inspectionMessage.value = view.state === 'completed' ? view.resume_on_complete ? '迁移 EOF 与 Host active 均已由后端确认；可另行独立重读来源。'
+        : '迁移 EOF 已确认，按原选择保持暂停。本页不代替正式恢复控制面。'
+        : view.state === 'held' ? '原维护已 HOLD。后台不会自动重试；暂停期间本页可能离线，需要正式运维恢复入口。'
+        : '后台按已受理的原范围与期限有界执行。预计暂停期间断开；网络恢复后请手动查询此原操作。'
+    } catch (error) {
+      attempt.status = 'unknown'; attempt.view = null
+      if (token !== inspectionGeneration || scope !== state.scope) return
+      if (error instanceof WorkbenchApiError && [401, 403].includes(error.status)) fail(error)
+      inspectionMessage.value = error instanceof WorkbenchApiError && error.code === 'inspection_migration_not_found'
+        ? '尚未找到此原维护。保留原 UUID 与三个 ID，只查询原操作；不会换号或重新受理。'
+        : '连接或受理结果尚未确认。Host 可能正在暂停；保留原 UUID 与完整输入，恢复连接后只查询原操作。'
+    } finally { inspectionActive.value = false }
+  }
+  const inspectionMaintenance = {
+    attempt: inspectionAttempt, active: inspectionActive, message: inspectionMessage, canRequest: inspectionCanRequest,
+    async accept(selection: Omit<SourceInspectionWorkflowInput, 'pause_operation_id' | 'resume_operation_id'>) {
+      if (!inspectionCanRequest.value || inspectionAttempt.value) return
+      const originalId = operationIdV1(), input: SourceInspectionWorkflowInput = { ...selection, target_refs: [...selection.target_refs],
+        pause_operation_id: operationIdV1(), resume_operation_id: selection.resume_on_complete ? operationIdV1() : null }
+      try {
+        validateSourceInspectionWorkflowInput(input, state.scope, originalId)
+        const now = Date.now() / 1000
+        if (input.deadline_utc <= now || input.deadline_utc > now + 3600) throw new Error('维护期限应在未来一小时内。')
+      } catch (error) { inspectionMessage.value = error instanceof Error ? error.message : '请核对维护受理输入。'; return }
+      inspectionAttempts.set(state.scope, { scope: state.scope, operation_id: originalId, input, request_digest: null, view: null, status: 'unknown' })
+      await inspectionRequest('accept', originalId)
+    },
+    read: (originalId: string) => inspectionRequest('read', originalId.trim()),
+    newOperation() { if (inspectionCanRequest.value && inspectionAttempt.value?.status === 'completed') { inspectionAttempts.delete(state.scope); inspectionMessage.value = '' } },
+  }
+  const sources = {
+    generation: sourceReadGeneration,
+    async page(scope: string, cursor: string | null = null, pageSize = 32) { try { return await api.readOwnerSourcePage(scope, cursor, pageSize) } catch (error) { fail(error); throw error } },
+    async detail(scope: string, selected: import('./api/source-owner-read.ts').OwnerSourceMetadata) { try { return await api.readOwnerSourceDetail(scope, selected) } catch (error) { fail(error); throw error } },
+  }
   const relations = {
     async read(scope: string, cursor: string | null = null) { try { return await api.readRelationsView(scope, cursor) } catch (error) { fail(error); throw error } },
   }
@@ -225,11 +339,19 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
       try { return await api.submitProjectControl(scope, action, input, operationId) } catch (error) { fail(error); throw error }
     },
   }
+  const sourceErasures = {
+    pending: pendingSourceErasure,
+    async submit(attempt: import('./api/source-erasure.ts').SourceErasureAttempt) {
+      invalidateView(true)
+      try { return await api.eraseSource(attempt) } catch (error) { fail(error); throw error } finally { ++sourceReadGeneration.value }
+    },
+  }
   const sourceCorrections = {
     pending: pendingSourceCorrection,
     async read(scope: string, sourceId: string) { try { return await api.readSourceCorrectionContext(scope, sourceId) } catch (error) { fail(error); throw error } },
     async submit(scope: string, input: import('./api/source-correction.ts').SourceCorrectionInput, operationId: string) {
-      try { return await api.submitSourceCorrection(scope, input, operationId) } catch (error) { fail(error); throw error }
+      ++sourceReadGeneration.value
+      try { return await api.submitSourceCorrection(scope, input, operationId) } catch (error) { fail(error); throw error } finally { ++sourceReadGeneration.value }
     },
   }
   const ownerMaterials = {
@@ -254,13 +376,32 @@ export function useBackend(options: { enabled?: boolean; fetchImpl?: FetchLike; 
   }
   const replyControls = { read: (scope: string, cursor: string | null = null) => api.readReplyControls(scope, cursor), stop: (request: import('./api/reply-controls.ts').StopReplyRequest) => api.stopReply(request), status: (scope: string, originalRef: string) => api.readReplyControlStatus(scope, originalRef) }
   async function ownerRequest<T>(request:()=>Promise<T>):Promise<T>{try{return await request()}catch(error){fail(error);throw error}}
+  const commitments={pending:pendingCommitment,approval:approvedCommitment,lastAction:preparedCommitmentAction,async run(attempt:import('./api/commitment-communication.ts').CommitmentCommandAttempt){const result=await ownerRequest(()=>api.runCommitmentCommand(attempt));if(result.kind==='submit'&&attempt.scope===state.scope&&canRead.value)preparedCommitmentActions.set(attempt.scope,result.action);return result}}
+  const fulfillment={pending:pendingFulfillment,current:currentFulfillment,approval:approvedTerms,readAction:(scope:string,refs:string[])=>ownerRequest(()=>api.readCurrentCommitmentAction(scope,refs)),async run(attempt:import('./api/commitment-fulfillment.ts').FulfillmentAttempt){const result=await ownerRequest(()=>api.runCommitmentFulfillment(attempt));if(attempt.scope===state.scope&&canRead.value){if(result.kind==='transition'){fulfillmentViews.set(attempt.scope,result.view);fulfillmentApprovals.delete(attempt.scope)}else if(result.kind==='approval'){if(result.approval)fulfillmentApprovals.set(attempt.scope,result.approval);else fulfillmentApprovals.delete(attempt.scope)}}return result}}
   const beta1 = { prepareCommand:(scope:string,input:import('./api/beta1-owner.ts').JointCommandSelectionInput,operationId:string)=>ownerRequest(()=>api.prepareJointCommand(scope,input,operationId)), freezeCommand:(scope:string,input:import('./api/beta1-owner.ts').PreparedJointCommand,operationId:string)=>ownerRequest(()=>api.freezeNamedJointCommand(scope,input,operationId)), prepareNode:(scope:string,windowRef:string,nodeId:string,operationId:string)=>ownerRequest(()=>api.prepareNamedJointNode(scope,windowRef,nodeId,operationId)), submit:(scope:string,kind:import('./api/beta1-owner.ts').Beta1Kind,input:import('./api/beta1-owner.ts').Beta1Input,operationId:string)=>ownerRequest(()=>api.submitBeta1Owner(scope,kind,input,operationId)), read:(scope:string,domain:Exclude<import('./api/beta1-owner.ts').Beta1Domain,'self'>,refs:string[])=>ownerRequest(()=>api.readBeta1OwnerState(scope,domain,refs)) }
+  const growthReviews = { pending:pendingGrowthReview,
+    read:(scope:string,refs:string[])=>ownerRequest(()=>api.readGrowthReviewState(scope,refs)),
+    submit:(scope:string,kind:import('./api/growth-review.ts').GrowthReviewKind,input:import('./api/growth-review.ts').GrowthReviewInput,operationId:string)=>ownerRequest(()=>api.submitGrowthReview(scope,kind,input,operationId)) }
   const selfView = { read: (scope:string,blockIds:string[]=[]) => ownerRequest(()=>api.readCurrentSelfView(scope,blockIds)) }
+  const singleEventGrowth={pending:pendingSingleEvent,view:currentSingleEvent,
+    submit:async(attempt:import('./api/single-event-growth.ts').SingleEventGrowthAttempt)=>{
+      if(attempt.scope!==state.scope||!canRead.value)throw new Error('当前 Owner 或角色范围已变化。')
+      const generation=singleEventGeneration
+      const prior=singleEventAttempts.get(attempt.scope)
+      if(prior&&(prior.operationId!==attempt.operationId||JSON.stringify(prior.input)!==JSON.stringify(attempt.input)))
+        throw new Error('请先核验原 UUID 的结果，不能替换待确认输入。')
+      singleEventAttempts.set(attempt.scope,structuredClone(toRaw(attempt)))
+      const receipt=await api.submitSingleEventGrowth(attempt.scope,attempt.kind,attempt.input,attempt.operationId)
+      if(generation!==singleEventGeneration||attempt.scope!==state.scope)throw new Error('Owner 会话已变化，旧回执未合入当前页面。')
+      singleEventAttempts.delete(attempt.scope)
+      if(receipt.view)singleEventViews.set(attempt.scope,receipt.view)
+      return receipt
+    }}
   const generalGrowth = { submit: (scope:string,kind:import('./api/general-growth.ts').GeneralGrowthKind,
     input:import('./api/general-growth.ts').GeneralGrowthInput,operationId:string) => api.submitGeneralGrowth(scope,kind,input,operationId) }
   const projectContext = { read: (scope:string) => api.readOwnerProjectContexts(scope),
     adopt: (scope:string,options:import('./api/project-context.ts').ProjectContextOptions,item:import('./api/project-context.ts').ProjectContextItem,
       role:string,norms:string[],operationId:string) => api.adoptOwnerProjectContext(scope,options,item,role,norms,operationId) }
-  return { state, setup, configuration, creator, management, relations, artifacts, projectControls, sourceCorrections, ownerTasks, ownerMaterials, replyControls, projectContext, generalGrowth, selfView, beta1, requiresHttps, canRead, canNextView, viewPaging, nextView: () => state.viewType ? readView(state.viewType, true) : Promise.resolve(), runtimeReadable, scopeValid, canSignedLogin, checkSession, connect: checkSession, setScope, beginOwnerLogin, completeOwnerLogin, cancelChallenge, dismissLogin, logout, openWorkspace, readView, selectArchive, invalidateView, invalidateNavigation }
+  return { state, setup, configuration, creator, onboardingRecovery, laborRebuild, management, inspectionMaintenance, sources, relations, artifacts, projectControls, sourceCorrections, sourceErasures, ownerTasks, ownerMaterials, replyControls, projectContext, singleEventGrowth, generalGrowth, selfView, beta1, growthReviews, commitments, fulfillment, requiresHttps, canRead, canNextView, viewPaging, nextView: () => state.viewType ? readView(state.viewType, true) : Promise.resolve(), runtimeReadable, scopeValid, canSignedLogin, checkSession, connect: checkSession, setScope, beginOwnerLogin, completeOwnerLogin, cancelChallenge, dismissLogin, logout, openWorkspace, readView, selectArchive, invalidateView, invalidateNavigation }
 }
 export type BackendController = ReturnType<typeof useBackend>

@@ -14,7 +14,7 @@ from ..graph_types import AtomKey, GraphWrite, GraphVersion, Owner, owner_grant_
 from ..memory_types import SourceRecord, access_key
 from ..runtime_contracts import canonical_digest, canonical_serialize, VersionedRef
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1
-from .d11_life_contract_v1 import (RegisteredLifePlanV2, D11LifeExecutionBindingV1, D11LifeTerminalV1, life_from_wire_v1,
+from .d11_life_contract_v1 import (RegisteredLifePlanV2, RegisteredCharacterLaborLifePlanV1, D11LifeExecutionBindingV1, D11LifeTerminalV1, life_from_wire_v1,
     life_to_wire_v1, life_artifact_ref_v1, WORK_KIND, ALGORITHM_ID, POSTCONDITION_ID, RECIPE_ID)
 from .d10_offline_tick_execution_v1 import (OfflineTickGraphReadV1, _decode_json, read_current_offline_clock_reference_v1)
 from .d11_life_source_note_v1 import install_life_artifact_stage_schema_v1
@@ -71,31 +71,88 @@ class D11LifePreparedV1:
                 or not self.read_rows or len(self.read_rows) > 1024
                 or any(type(row) is not OfflineTickGraphReadV1 for row in self.read_rows)):
             raise ValueError("Life immutable preparation requires its closed complete inputs")
-        b, p = self.binding, self.plan
-        if (b.plan_digest != canonical_digest(plain_v1(p)) or b.input_digest != life_input_digest_v1(p, self.source_record_json, self.read_rows)
-                or (p.activity_id, p.effect_id, p.attempt_id, p.operation_id, p.parent_budget_lease_ref, p.cpu_ceiling_ms,
-                    p.algorithm_build_digest, p.postcondition_build_digest) !=
-                (b.activity_id, b.effect_id, b.attempt_id, b.operation_id, b.parent_budget_lease_ref, b.cpu_ceiling_ms,
-                    b.algorithm_build_digest, b.postcondition_build_digest)
-                or canonical_digest(json.loads(self.source_record_json)) != p.input_source.digest
-                or self.prepare_operation_id != b.prepare_operation_id):
-            raise ValueError("Life prepared binding/source/plan commitments differ")
-        _utc(self.prepared_at_utc)
-        SourceRecord.from_dict(json.loads(self.source_record_json))
-        if canonical_serialize(json.loads(self.source_record_json)) != self.source_record_json:
-            raise ValueError("Life source bytes must be canonical")
-        from ..runtime_contracts import OperationIdentity
-        from .d10_offline_tick_execution_v1 import _decode_json
-        command = _decode_json(self.prepare_command_identity_json, OperationIdentity)
-        if (command.operation_id,command.phase,command.attempt_id,command.activity_id,command.effect_id) != (b.prepare_operation_id,"prepare_life",b.prepare_operation_id,b.activity_id,b.effect_id):
-            raise ValueError("Life prepared command identity is not its real prepare command")
-        from .d11_offline_originals_v1 import _digest,_text
-        _digest(self.owner_prepare_request_digest);_text(self.owner_prepare_attempt_id)
-        if (self.admission_ref is None)!=(self.admission_digest is None): raise ValueError("Life admission locator and commitment must be paired")
-        if self.admission_digest is not None: _digest(self.admission_digest)
-        final = (self.requirements_json, self.graph_revision, self.graph_epoch, self.job_projection_json, self.job_projection_revision)
-        if any(x is not None for x in final) and any(x is None for x in final):
-            raise ValueError("Life post-CAS original requires one complete Graph stamp")
+        _validate_life_prepared_inputs_v1(self)
+
+    @property
+    def digest(self):
+        return canonical_digest(plain_v1(self))
+
+
+def _validate_life_prepared_inputs_v1(self):
+    b, p = self.binding, self.plan
+    if (b.plan_digest != canonical_digest(plain_v1(p)) or b.input_digest != life_input_digest_v1(p, self.source_record_json, self.read_rows)
+            or (p.activity_id, p.effect_id, p.attempt_id, p.operation_id, p.parent_budget_lease_ref, p.cpu_ceiling_ms,
+                p.algorithm_build_digest, p.postcondition_build_digest) !=
+            (b.activity_id, b.effect_id, b.attempt_id, b.operation_id, b.parent_budget_lease_ref, b.cpu_ceiling_ms,
+                b.algorithm_build_digest, b.postcondition_build_digest)
+            or canonical_digest(json.loads(self.source_record_json)) != p.input_source.digest
+            or self.prepare_operation_id != b.prepare_operation_id):
+        raise ValueError("Life prepared binding/source/plan commitments differ")
+    _utc(self.prepared_at_utc)
+    SourceRecord.from_dict(json.loads(self.source_record_json))
+    if canonical_serialize(json.loads(self.source_record_json)) != self.source_record_json:
+        raise ValueError("Life source bytes must be canonical")
+    from ..runtime_contracts import OperationIdentity
+    from .d10_offline_tick_execution_v1 import _decode_json
+    command = _decode_json(self.prepare_command_identity_json, OperationIdentity)
+    if (command.operation_id,command.phase,command.attempt_id,command.activity_id,command.effect_id) != (b.prepare_operation_id,"prepare_life",b.prepare_operation_id,b.activity_id,b.effect_id):
+        raise ValueError("Life prepared command identity is not its real prepare command")
+    from .d11_offline_originals_v1 import _digest,_text
+    _digest(self.owner_prepare_request_digest);_text(self.owner_prepare_attempt_id)
+    if (self.admission_ref is None)!=(self.admission_digest is None): raise ValueError("Life admission locator and commitment must be paired")
+    if self.admission_digest is not None: _digest(self.admission_digest)
+    final = (self.requirements_json, self.graph_revision, self.graph_epoch, self.job_projection_json, self.job_projection_revision)
+    if any(x is not None for x in final) and any(x is None for x in final):
+        raise ValueError("Life post-CAS original requires one complete Graph stamp")
+
+
+@dataclass(frozen=True, slots=True)
+class D11CharacterLaborLifePreparedV1:
+    binding: D11LifeExecutionBindingV1
+    prepare_operation_id: str
+    plan: RegisteredCharacterLaborLifePlanV1
+    source_record_json: str
+    clock_mapping_json: str
+    clock_original_json: str
+    quote_json: str
+    signed_grant_json: str
+    signed_grant_signature: str
+    parent_budget_json: str
+    reserve_receipt_json: str
+    owner_guard_json: str
+    owner_grant_json: str
+    read_rows: tuple[OfflineTickGraphReadV1, ...]
+    prepared_at_utc: str
+    prepare_command_identity_json: str
+    owner_prepare_request_digest: str
+    owner_prepare_attempt_id: str
+    admission_ref: str | None = None
+    admission_digest: str | None = None
+    requirements_json: str | None = None
+    graph_revision: int | None = None
+    graph_epoch: int | None = None
+    job_projection_json: str | None = None
+    job_projection_revision: int | None = None
+    labor_admission_ref: str | None = None
+    labor_admission_digest: str | None = None
+    schema: str = 'd11.character-labor-life-prepared.v1'
+
+    def __post_init__(self):
+        if (self.schema!='d11.character-labor-life-prepared.v1' or type(self.binding)is not D11LifeExecutionBindingV1
+                or type(self.plan)is not RegisteredCharacterLaborLifePlanV1 or type(self.read_rows)is not tuple
+                or not self.read_rows or len(self.read_rows)>1024
+                or any(type(row)is not OfflineTickGraphReadV1 for row in self.read_rows)):
+            raise ValueError('character-labor preparation requires its exact independent plan and complete inputs')
+        _validate_life_prepared_inputs_v1(self)
+        if (self.labor_admission_ref is None)!=(self.labor_admission_digest is None):
+            raise ValueError('labor admission locator and digest must be paired')
+        if self.labor_admission_ref is not None:
+            from .d11_offline_originals_v1 import _digest
+            if self.labor_admission_ref!='character-labor-admission:'+self.binding.execution_id:
+                raise ValueError('labor admission belongs to another actual execution')
+            _digest(self.labor_admission_digest)
+        if self.requirements_json is not None and self.labor_admission_ref is None:
+            raise ValueError('committed labor preparation requires its actual reverse-bound admission')
 
     @property
     def digest(self):
@@ -182,13 +239,15 @@ class D11DraftPreparedV1(D11LifePreparedV1):
 class LifePreparationStageV1:
     frame: object
     stage: object
-    prepared: D11LifePreparedV1
+    prepared: D11LifePreparedV1 | D11CharacterLaborLifePreparedV1
     job: PersistentJob
     writes: tuple[GraphWrite, ...]
     read_versions: tuple[GraphVersion, ...]
     admission_reader: object
     before_capture_stage: object | None = None
     habit_occurrence_transition: "HabitLifeOccurrenceTransitionV1 | None" = None
+    labor_admission_candidate: object | None = None
+    labor_action_evidence: object | None = None
 
 
 def life_ids_v1(plan):
@@ -203,6 +262,9 @@ def life_ids_from_binding_v1(binding):
 
 
 def life_input_digest_v1(plan, source_json, rows):
+    if type(plan)is RegisteredCharacterLaborLifePlanV1:
+        return canonical_digest({'schema':'d11.character-labor-frozen-input.v1','plan':plain_v1(plan),
+            'source_record_digest':canonical_digest(json.loads(source_json)),'rows':plain_v1(rows)})
     if type(plan) is RegisteredDraftFilePlanV3:
         if source_json is not None:
             raise ValueError("draft input commitment must not embed Source body bytes")
@@ -253,6 +315,9 @@ def _record(db, *, issuer, namespace, kind, ref, operation_id, value):
 
 
 def _read_signed_life_payload_v1(db, *, issuer, namespace, kind, ref):
+    from .current_character_labor_adoption_v1 import read_bound_character_labor_adoption_original_v1
+    handled,saved=read_bound_character_labor_adoption_original_v1(db,namespace=namespace,kind=kind,ref=ref,issuer=issuer)
+    if handled:return saved
     from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .natural_producer_qualification_v1 import _producer_original_point_v3
     row = _producer_original_point_v3(db, table='graph_d11_life_originals_v1', columns=('producing_operation_id', 'payload_json', 'payload_digest', 'signature'), key_columns=('bot', 'persona', 'kind', 'original_ref'), key=(lambda _producer_params_v3: (_producer_params_v3[0],_producer_params_v3[1],_producer_params_v3[2],_producer_params_v3[3]))((*namespace.as_tuple, kind, ref)), legacy_reader=lambda: _artifact_receipt_sql_v1(db,"SELECT producing_operation_id,payload_json,payload_digest,signature FROM " + TABLE +
@@ -296,6 +361,9 @@ def _plan_current(db, read, plan):
     if type(plan) is RegisteredDraftFilePlanV3:
         return _draft_plan_current_v1(db, read, plan)
     from .d08_source_note_action_v1 import source_note_attempt_id_v1
+    labor=type(plan)is RegisteredCharacterLaborLifePlanV1
+    expected_recipe={"recipe_id":RECIPE_ID,"version":2 if labor else 1,"reality":"real_execution",
+        "allowed_steps":["source_note"],"preemptible":not labor}
     if plan.attempt_id != source_note_attempt_id_v1(read.frame.envelope.authority.namespace,
             plan.project.ref, plan.operation_id):
         raise ValueError('Life current plan lacks its exact installed typed source-note attempt')
@@ -309,7 +377,7 @@ def _plan_current(db, read, plan):
     action = _decode_intent(action_atom.value)
     if (project.key.type_name != "d10.life_project.v1" or project.value["reality"] != "real_execution"
             or project.value["next_step"] != "source_note" or recipe.key.type_name != "d10.activity_recipe.v1"
-            or recipe.value != {"recipe_id": RECIPE_ID, "version": 1, "reality": "real_execution", "allowed_steps": ["source_note"], "preemptible": True}
+            or recipe.value != expected_recipe
             or action_atom.key.type_name != "d08.action_intent.v1"
             or (action.identity.activity_id, action.identity.effect_id, action.identity.attempt_id, action.identity.operation_id) !=
                 (plan.activity_id, plan.effect_id, plan.attempt_id, plan.operation_id)
@@ -524,7 +592,7 @@ def record_registered_draft_observation_admission_v1(db, *, frame, issuer, origi
 
 def record_registered_life_plan_v2(db, *, frame, issuer, original_ref, producing_operation_id, plan, installed_build, body_quote_authority=None):
     from .foreground_command_writer_outputs_v3 import record_foreground_writer_life_v3
-    if type(plan) not in {RegisteredLifePlanV2, RegisteredDraftFilePlanV3}:
+    if type(plan) not in {RegisteredLifePlanV2, RegisteredDraftFilePlanV3, RegisteredCharacterLaborLifePlanV1}:
         raise TypeError('actual RegisteredLifePlanV2 required')
     read = CurrentDomainReadV1(frame)
     read.check(db)
@@ -543,19 +611,43 @@ def record_registered_life_plan_v2(db, *, frame, issuer, original_ref, producing
         quote = issuer.resource_issuer.original_signed_quote(db, actual_body.resource_quote_ref, actual_body.resource_quote_version)
         if plan.cpu_ceiling_ms > quote.ceiling.get('cpu_ms', 0) or _utc(plan.deadline_utc).timestamp() > quote.valid_until_utc:
             raise ValueError('draft final plan CPU/deadline exceeds its actual Body B quote')
+    if type(plan)is RegisteredCharacterLaborLifePlanV1:
+        if (frame.envelope.identity.phase!='input:register_character_labor_life_plan_v1'
+                or producing_operation_id!=frame.envelope.identity.operation_id):
+            raise ValueError('recipe2 labor plan requires its explicit independent registration operation')
+        body=_registered_labor_body_v1(db,plan=plan,namespace=frame.envelope.authority.namespace,issuer=issuer)
+        technical=issuer.resource_issuer.original_signed_quote(db,body.quote.technical_quote_ref,body.quote.technical_quote_version)
+        if (canonical_digest(technical)!=body.quote.technical_quote_digest
+                or plan.cpu_ceiling_ms>technical.ceiling.get('cpu_ms',0)
+                or _utc(plan.deadline_utc).timestamp()>body.quote.valid_until_utc):
+            raise ValueError('new labor plan exceeds its actual first B CPU/absolute deadline')
     if any((getattr(plan, name) != installed_build[name] for name in ('algorithm_build_digest', 'postcondition_build_digest'))):
         raise ValueError('Life plan build differs from actual installed file closure')
     read.committed_operation(db, producing_operation_id)
-    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind='plan', ref=original_ref, operation_id=producing_operation_id, value=plan, recorder=record_registered_life_plan_v2, frame=frame, actual_receipt=None)
+    return record_foreground_writer_life_v3(db, issuer=issuer, namespace=frame.envelope.authority.namespace, kind=('character_labor_plan_v1' if type(plan)is RegisteredCharacterLaborLifePlanV1 else 'plan'), ref=original_ref, operation_id=producing_operation_id, value=plan, recorder=record_registered_life_plan_v2, frame=frame, actual_receipt=None)
 
 
 def read_registered_life_plan_v2(db, *, namespace, issuer, original_ref):
-    original = _read(db, issuer=issuer, namespace=namespace, kind="plan", ref=original_ref)
-    return None if original is None else life_from_wire_v1(original[0], RegisteredLifePlanV2)
+    selected=_read_life_variant_v1(db,issuer=issuer,namespace=namespace,ref=original_ref,
+        kinds=('plan','character_labor_plan_v1'))
+    if selected is None:return None
+    kind,original=selected
+    cls=RegisteredCharacterLaborLifePlanV1 if kind=='character_labor_plan_v1' else RegisteredLifePlanV2
+    return life_from_wire_v1(original[0],cls)
 
 
 def life_prepared_from_wire_v1(raw):
     from dataclasses import fields
+    if type(raw)is dict and raw.get('schema')=='d11.character-labor-life-prepared.v1':
+        if set(raw)!={field.name for field in fields(D11CharacterLaborLifePreparedV1)}:
+            raise ValueError('closed character-labor prepared fields differ')
+        value=dict(raw)
+        value['binding']=life_from_wire_v1(value['binding'],D11LifeExecutionBindingV1)
+        value['plan']=life_from_wire_v1(value['plan'],RegisteredCharacterLaborLifePlanV1)
+        value['read_rows']=tuple(OfflineTickGraphReadV1(**row)for row in value['read_rows'])
+        result=D11CharacterLaborLifePreparedV1(**value)
+        if plain_v1(result)!=raw:raise ValueError('character-labor prepared original is noncanonical')
+        return result
     if type(raw) is not dict or set(raw) != {f.name for f in fields(D11LifePreparedV1)}:
         raise ValueError("Life prepared fields differ")
     value = dict(raw)
@@ -571,10 +663,13 @@ def life_prepared_from_wire_v1(raw):
 
 
 def read_prepared_life_v1(db, *, binding, issuer):
-    original = _read(db, issuer=issuer, namespace=binding.namespace, kind="prepared", ref=binding.prepared_original_ref)
-    if original is None:
-        return None
-    value = life_prepared_from_wire_v1(original[0])
+    selected=_read_life_variant_v1(db,issuer=issuer,namespace=binding.namespace,ref=binding.prepared_original_ref,
+        kinds=('prepared','character_labor_prepared_v1'))
+    if selected is None:return None
+    kind,original=selected
+    value=life_prepared_from_wire_v1(original[0])
+    if (kind=='character_labor_prepared_v1')!=(type(value)is D11CharacterLaborLifePreparedV1):
+        raise ValueError('Life Prepared schema cannot alias another registered original kind')
     if value.binding != binding or value.prepare_operation_id != original[1] or value.requirements_json is None:
         raise ValueError("Life signed preparation lacks its exact actual CAS")
     from ..authority_service.life_model_original_family_read_v3 import register_life_model_prepared_body_v3
@@ -583,10 +678,13 @@ def read_prepared_life_v1(db, *, binding, issuer):
 
 
 def read_prepared_life_by_ref_v1(db, *, namespace, prepared_original_ref, issuer):
-    original = _read(db, issuer=issuer, namespace=namespace, kind="prepared", ref=prepared_original_ref)
-    if original is None:
-        return None
-    value = life_prepared_from_wire_v1(original[0])
+    selected=_read_life_variant_v1(db,issuer=issuer,namespace=namespace,ref=prepared_original_ref,
+        kinds=('prepared','character_labor_prepared_v1'))
+    if selected is None:return None
+    kind,original=selected
+    value=life_prepared_from_wire_v1(original[0])
+    if (kind=='character_labor_prepared_v1')!=(type(value)is D11CharacterLaborLifePreparedV1):
+        raise ValueError('Life Prepared schema cannot alias another registered original kind')
     if (value.binding.namespace != namespace or value.binding.prepared_original_ref != prepared_original_ref
             or value.prepare_operation_id != original[1] or value.requirements_json is None):
         raise ValueError("Life signed preparation current selector differs")
@@ -607,6 +705,8 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
     if plan is None:
         raise MissingProductionOriginalV1("actual_registered_life_plan_v2")
     action, source = _plan_current(db, read, plan)
+    labor=type(plan)is RegisteredCharacterLaborLifePlanV1
+    labor_body=_registered_labor_body_v1(db,plan=plan,namespace=ns,issuer=issuer)if labor else None
     from .joint_node_execution_v1 import require_joint_bound_action_gate_v1
     require_joint_bound_action_gate_v1(db, namespace=ns, action_ref=plan.action_intent.ref, issuer=issuer, frame=frame)
     expected_prepare_operation='d11-life-prepare:'+plan.operation_id
@@ -642,6 +742,7 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
             or plan.cpu_ceiling_ms > grant.max_ceiling.get("thread_cpu_ms", 0)):
         raise MissingProductionOriginalV1("actual_signed_life_thread_cpu_budget")
     deadline = min(frame.envelope.deadline_utc, _utc(plan.deadline_utc).timestamp(), grant.valid_until_utc, _utc(mapping.valid_until_utc).timestamp())
+    if labor:deadline=min(deadline,labor_body.quote.valid_until_utc)
     if deadline - frame.now_utc < 1:
         raise MissingProductionOriginalV1("actual_life_execution_deadline")
     draft = type(plan) is RegisteredDraftFilePlanV3
@@ -694,17 +795,28 @@ def prepare_current_life_in_transaction_v1(db, *, frame, request, issuer, resour
         (*ns.as_tuple, request.prepare_operation_id)).fetchone()
     if attempt is None or attempt[1] != admission_reader.scope.operation_id:
         raise ValueError("Life prepare requires actual current Owner command attempt")
-    prepared_cls = D11DraftPreparedV1 if draft else D11LifePreparedV1
+    prepared_cls = D11CharacterLaborLifePreparedV1 if labor else D11DraftPreparedV1 if draft else D11LifePreparedV1
     prepared = prepared_cls(binding, request.prepare_operation_id, plan, source_json,
         canonical_serialize(plain_v1(mapping)), clock_json, canonical_serialize(plain_v1(quote)), *signed,
         canonical_serialize(plain_v1(parent)), reserve[0], canonical_serialize(plain_v1(frame.owner_guard)), canonical_serialize(owner.value),
         rows, datetime.fromtimestamp(frame.now_utc, timezone.utc).isoformat().replace("+00:00", "Z"),
         canonical_serialize(plain_v1(frame.envelope.identity)), attempt[0], attempt[1])
-    from .d08_life_admission_v1 import evaluate_life_admission_v1
-    evaluate_life_admission_v1(db, frame=frame, prepared=prepared, reader=admission_reader, new_work=True)
+    labor_candidate=None
+    if labor:
+        from .d11_character_work_segment_v1 import prepare_character_labor_admission_v1
+        labor_candidate=prepare_character_labor_admission_v1(db,frame=frame,prepared=prepared,
+            body_preparation=labor_body,installed_readers=admission_reader.labor_body_readers)
+    from .d08_life_admission_v1 import evaluate_life_admission_v1,prepare_character_labor_action_evidence_v1
+    labor_action_evidence=None
+    if labor:
+        labor_action_evidence=prepare_character_labor_action_evidence_v1(db,frame=frame,
+            prepared=prepared,reader=admission_reader,candidate=labor_candidate)
+    else:
+        evaluate_life_admission_v1(db,frame=frame,prepared=prepared,reader=admission_reader,new_work=True)
     stage = stage_result_v1(frame, "d10", "prepare_life", request, provenance={"prepared_binding": binding,
         "execution": "requires_actual_d11_once_claim_and_durable_artifact_postcondition"})
-    preparation=LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader, before_stage)
+    preparation=LifePreparationStageV1(frame, stage, prepared, job, (job_graph_write(job),), frame.snapshot.versions, admission_reader, before_stage,
+        labor_admission_candidate=labor_candidate,labor_action_evidence=labor_action_evidence)
     from .d10_habit_v1 import attach_habit_life_occurrence_transition_v1
     return attach_habit_life_occurrence_transition_v1(db,preparation=preparation,issuer=issuer)
 
@@ -722,17 +834,38 @@ def record_life_preparation_after_cas_v1(db, *, issuer, preparation, graph_recei
     metadata = db.execute("SELECT requirements_json,graph_revision FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?", b.namespace.as_tuple).fetchone()
     epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?", b.namespace.as_tuple).fetchone()
     key = job_graph_write(preparation.job).key
-    jobrow = db.execute("SELECT value,revision FROM graph_atoms WHERE token=? AND valid=1", (key.token,)).fetchone()
+    from .natural_producer_qualification_v1 import _producer_original_point_v3
+    jobrow=_producer_original_point_v3(db,table="graph_atoms",columns=("value","revision"),
+        key_columns=("token","bot","persona"),key=(key.token,*b.namespace.as_tuple),
+        legacy_reader=lambda:db.execute("SELECT value,revision FROM graph_atoms WHERE token=? AND valid=1",(key.token,)).fetchone())
     if metadata is None or epoch is None or jobrow is None or json.loads(jobrow[0]) != job_graph_write(preparation.job).value:
         raise ValueError("Life preparation current post-CAS originals are absent")
-    p = replace(p, requirements_json=metadata[0], graph_revision=metadata[1], graph_epoch=epoch[0], job_projection_json=jobrow[0], job_projection_revision=jobrow[1])
+    labor_fields={}
+    if type(p)is D11CharacterLaborLifePreparedV1:
+        from .d11_character_work_segment_v1 import record_character_labor_admission_after_cas_v1
+        labor_original=record_character_labor_admission_after_cas_v1(db,frame=preparation.frame,
+            candidate=preparation.labor_admission_candidate,receipt=graph_receipt,issuer=issuer)
+        labor_fields=dict(labor_admission_ref=labor_original.original_ref,labor_admission_digest=labor_original.original_digest)
+    elif preparation.labor_admission_candidate is not None:
+        raise ValueError('old Life preparation cannot consume a character-labor admission')
+    p = replace(p, requirements_json=metadata[0], graph_revision=metadata[1], graph_epoch=epoch[0],
+        job_projection_json=jobrow[0], job_projection_revision=jobrow[1],**labor_fields)
     from .d08_life_admission_v1 import record_life_action_admission_after_cas_v1
     admission = record_life_action_admission_after_cas_v1(db, preparation=preparation, prepared=p, receipt=graph_receipt)
     p = replace(p, admission_ref=admission.original_ref, admission_digest=admission.original_digest)
-    original = _record(db, issuer=issuer, namespace=b.namespace, kind="prepared", ref=b.prepared_original_ref,
-        operation_id=p.prepare_operation_id, value=p)
+    original = _record(db, issuer=issuer, namespace=b.namespace,
+        kind='character_labor_prepared_v1' if type(p)is D11CharacterLaborLifePreparedV1 else 'prepared',
+        ref=b.prepared_original_ref,operation_id=p.prepare_operation_id,value=p)
+    if type(p)is D11CharacterLaborLifePreparedV1:
+        from .d11_character_work_segment_v1 import record_character_labor_prepared_metadata_after_cas_v1
+        record_character_labor_prepared_metadata_after_cas_v1(db,frame=preparation.frame,
+            prepared=p,prepared_original=original,receipt=graph_receipt,issuer=issuer)
     from .d11_life_accounting_v1 import record_life_accounting_prepared_after_cas_v1
     record_life_accounting_prepared_after_cas_v1(db, issuer=issuer, prepared=p)
+    if type(p)is D11CharacterLaborLifePreparedV1:
+        from .d11_character_labor_accounting_v1 import record_character_labor_accounting_basis_after_cas_v1
+        record_character_labor_accounting_basis_after_cas_v1(db,frame=preparation.frame,
+            execution_id=b.execution_id,receipt=graph_receipt,issuer=issuer)
     if preparation.before_capture_stage is not None:
         from .d04_life_before_original_v1 import record_life_d04_before_after_cas_v1
         record_life_d04_before_after_cas_v1(db, stage=preparation.before_capture_stage,
@@ -764,6 +897,9 @@ def read_current_prepared_life_v1(db, *, binding, issuer, resource_issuer, now_u
     accounting = read_life_accounting_prepared_v1(db, binding=binding, issuer=issuer, resource_issuer=resource_issuer)
     if accounting is None or accounting.prepared_digest != p.digest:
         raise ValueError("Life original accounting preparation is absent")
+    if type(p)is D11CharacterLaborLifePreparedV1:
+        from .d11_character_work_segment_v1 import require_committed_character_labor_admission_v1
+        require_committed_character_labor_admission_v1(db,prepared=p,issuer=issuer)
     _verify_life_current_budget_v1(db,p,issuer,resource_issuer,now_utc,for_execution=for_execution)
     job = get_job(db, binding.job_id)
     _verify_life_running_job_v1(p,job)
@@ -842,7 +978,8 @@ def verify_life_preparation_in_transaction_v1(db, preparation, issuer, resource_
         raise ValueError("Life signed plan differs from pending preparation")
     _plan_current(db, read, p.plan)
     from .d08_life_admission_v1 import evaluate_life_admission_v1
-    evaluate_life_admission_v1(db, frame=frame, prepared=p, reader=preparation.admission_reader, new_work=True)
+    if type(p)is not D11CharacterLaborLifePreparedV1:
+        evaluate_life_admission_v1(db,frame=frame,prepared=p,reader=preparation.admission_reader,new_work=True)
     _verify_life_current_budget_v1(db,p,issuer,resource_issuer,frame.now_utc,for_execution=True)
     _verify_life_running_job_v1(p,get_job(db,p.binding.job_id))
     if preparation.job != get_job(db,p.binding.job_id) or preparation.writes != (job_graph_write(preparation.job),) or preparation.read_versions != frame.snapshot.versions:
@@ -852,4 +989,37 @@ def verify_life_preparation_in_transaction_v1(db, preparation, issuer, resource_
         raise ValueError("Life first job projection lacks actual pre-CAS absence")
     from .d10_habit_v1 import verify_habit_life_occurrence_transition_v1
     verify_habit_life_occurrence_transition_v1(db,preparation=preparation,issuer=issuer)
+    if type(p)is D11CharacterLaborLifePreparedV1:
+        from .d08_life_admission_v1 import require_character_labor_action_evidence_before_cas_v1
+        require_character_labor_action_evidence_before_cas_v1(db,preparation)
     return preparation
+
+
+def _read_life_variant_v1(db,*,issuer,namespace,ref,kinds):
+    rows=db.execute('SELECT kind FROM '+TABLE+' WHERE bot=? AND persona=? AND original_ref=? '
+        'AND kind IN (?,?) ORDER BY kind LIMIT 3',(*namespace.as_tuple,ref,*kinds)).fetchall()
+    if len(rows)>1:raise ValueError('Life original locator aliases two distinct recipe contracts')
+    if not rows:return None
+    kind=rows[0][0]
+    original=_read(db,issuer=issuer,namespace=namespace,kind=kind,ref=ref)
+    if original is None:raise ValueError('Life original disappeared after its fixed kind header')
+    return kind,original
+
+
+def _registered_labor_body_v1(db,*,plan,namespace,issuer):
+    from .d11_character_work_segment_v1 import require_character_labor_body_preparation_v1
+    from .domain_production_contracts_v1 import ProductionOriginalRefV1
+    if type(plan)is not RegisteredCharacterLaborLifePlanV1:
+        raise TypeError('only the independent recipe2 plan can consume labor B')
+    original=plan.labor_body_preparation_original
+    operation=original.original_ref.removeprefix('character-labor-body:')
+    body=require_character_labor_body_preparation_v1(db,namespace=namespace,operation_id=operation,issuer=issuer)
+    if (original!=ProductionOriginalRefV1('d11.life_character_labor_body_preparation_v1',
+            'character-labor-body:'+body.body_prepare_operation_id,canonical_digest(plain_v1(body)))
+            or (body.namespace,body.action_operation_id,body.activity_id,body.effect_id,
+                body.action_intent_ref,body.action_intent_digest,body.recipe_ref,body.recipe_revision,body.recipe_digest)!=
+               (namespace,plan.operation_id,plan.activity_id,plan.effect_id,plan.action_intent.ref,
+                plan.action_intent.digest,plan.recipe.ref,plan.recipe.revision,plan.recipe.digest)
+            or plan.input_source.ref not in body.source_refs):
+        raise ValueError('character-labor plan differs from the unique actual signed first B')
+    return body

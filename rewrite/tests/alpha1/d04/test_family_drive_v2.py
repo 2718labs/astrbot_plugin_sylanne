@@ -149,9 +149,12 @@ def test_one_contribution_has_explicit_two_block_shares_and_one_dose():
     assert allocation.block_shares == ((portions[0].checkpoint_ref, 0.25),
                                        (portions[1].checkpoint_ref, 0.75))
     assert all(row.allocation_ref == allocation.allocation_ref for row in candidate.portions)
-    with pytest.raises(FamilyDriveHold, match="sum to one"):
-        _compile(snapshot, role, condition, policy, (shared[0],))
-    with pytest.raises(FamilyDriveHold, match="sum to one"):
+    # Partial block shares are allowed (positive total up to one); only an
+    # over-one total is refused.
+    partial = _compile(snapshot, role, condition, policy, (shared[0],))
+    assert partial.contribution_allocations[0].block_shares == (
+        (portions[0].checkpoint_ref, 0.25),)
+    with pytest.raises(FamilyDriveHold, match="positive total at most one"):
         _compile(snapshot, role, condition, policy,
                  (replace(shared[0], share=1.0), replace(shared[1], share=1.0)))
     with pytest.raises(FamilyDriveHold, match="budget exceeded"):

@@ -1,6 +1,6 @@
 """Explicit series original dispatch for subsequent advances and D06 consumers."""
 
-from dataclasses import asdict
+from dataclasses import asdict,dataclass
 import json
 from types import SimpleNamespace
 from pathlib import Path
@@ -202,3 +202,118 @@ def _require_series_adopted_original_in_transaction_v1(db, namespace, operation_
             or background_json_loads_v3(job[0])["result_ref"] != root.root_ref):
         raise ValueError("series final actual worker was not atomically completed with all CPU")
     return root, tuple(chunks), numeric, output, summary
+
+
+@dataclass(frozen=True,slots=True)
+class HistoricalD04SeriesRootMetadataV1:
+    root_ref:str
+    payload:dict
+    digest:str
+    binding:object
+    frozen:object
+
+
+def decode_historical_d04_series_root_v1(payload,digest,model):
+    from .d04_numeric_artifact_v3 import HistoricalNumericModelMetadataV1
+    from .d04_series_codec_v1 import decode_series_dto_v1
+    from ..native_runtime.d04_joint_product_math import D04JointCompiledInputsV1
+    from ..native_runtime.d04_fixed_trajectory_v2 import exact_d04_series_step_plan_v1
+    from .d04_series_initial_original_v1 import require_historical_d04_series_initial_binding_v1
+    if type(model)is not HistoricalNumericModelMetadataV1:raise TypeError('actual numeric model metadata required')
+    ref='d04-series-root:'+canonical_digest((model.binding.namespace,model.binding.operation_id))[:48]
+    if(payload['schema']!='d04.series-root.v1'or payload['root_ref']!=ref or canonical_digest(payload)!=digest
+            or payload['numeric_prepared_digest']!=model.prepared_digest
+            or payload['numeric_operation_id']!=model.binding.operation_id):
+        raise ValueError('historical series root/prepared complete original differs')
+    frozen=decode_series_dto_v1(D04JointCompiledInputsV1,payload['frozen_model'])
+    expected=exact_d04_series_step_plan_v1(frozen.plan.role_start,frozen.plan.role_end,family_count=len(frozen.family_drives))
+    if frozen.plan!=expected or payload['plan_digest']!=expected.digest:
+        raise ValueError('historical series absolute-step plan differs')
+    root=HistoricalD04SeriesRootMetadataV1(ref,payload,digest,model.binding,frozen)
+    require_historical_d04_series_initial_binding_v1(root,model)
+    return root
+
+
+def verify_historical_d04_series_values_v1(root,model,*,prefix,adopted,bindings,chunks,terminals,gate,receipt,
+        numeric_row,evidence,persisted_output,contributions,graph_receipt,job):
+    """The full historical series formulas over authenticated numeric-only values."""
+    from .d04_series_output_v1 import derive_historical_d04_series_final_v1
+    from .d04_joint_advance_v2 import ProductAdvanceEvidenceV2,ProductAdvanceMemberV2,_decode_numeric_candidate
+    from ..domains.d04.joint_state_output_v1 import joint_checkpoint_payload_v1,joint_state_payload_v1
+    from .d04_semantic_mapping_v3 import joint_evidence_field_v3
+    if(type(root)is not HistoricalD04SeriesRootMetadataV1 or prefix['root_digest']!=root.digest
+            or prefix['root_ref']!=root.root_ref or adopted['root_digest']!=root.digest or not prefix['chunks']
+            or len(chunks)!=len(bindings)or len(chunks)!=len(terminals)or len(chunks)!=len(prefix['chunks'])):
+        raise ValueError('historical series lacks its exact complete committed prefix')
+    total_cpu=0
+    for (operation,digest,terminal_digest),binding,chunk,terminal in zip(prefix['chunks'],bindings,chunks,terminals):
+        if(terminal.binding!=binding or binding.numeric.operation_id!=operation or terminal.digest!=terminal_digest
+                or chunk.digest!=digest or terminal.measurement.status!='chunk_completed'
+                or terminal.measurement.actual_cpu_ms>binding.numeric.cpu_ceiling_ms
+                or terminal.measurement.chunk_math_digest!=chunk.digest
+                or terminal.measurement.endpoint_digest!=canonical_digest(chunk.endpoints)
+                or binding.root_digest!=root.digest):
+            raise ValueError('historical series packet differs from its actual terminal')
+        if chunk.invariant_domain is not None:
+            from ..native_runtime.d04_invariant_domain_v1 import require_installed_d04_invariant_verifier_v1
+            require_installed_d04_invariant_verifier_v1(chunk.invariant_domain,root.binding.native_manifest_sha256)
+        native=chunk.full.production_binding
+        if(native.native_sha256!=root.binding.native_sha256
+                or native.manifest_sha256!=root.binding.native_manifest_sha256 or native.abi_version!=2):
+            raise ValueError('historical series native identity differs')
+        total_cpu+=terminal.measurement.actual_cpu_ns
+    policy=dict(root.payload['output_policy']);policy['axis_ids']=tuple(policy['axis_ids'])
+    installed=SimpleNamespace(policy=JointStateOutputPolicyV1(**policy),manifest_sha256=root.binding.native_manifest_sha256,
+        policy_sha256=root.payload['output_policy_sha256'])
+    if(gate.root_digest!=root.digest or gate.binding!=terminals[-1].binding or gate.digest!=adopted['gate_digest']
+            or len(receipt.invalidated_epochs)!=1):
+        raise ValueError('historical series final gate/prefix differs')
+    numeric,output,summary=derive_historical_d04_series_final_v1(root,chunks,installed,model,
+        adoption_stamp=(gate.before_graph_revision,receipt.invalidated_epochs[0].revision-1))
+    verification=derive_d04_series_numeric_verification_v1(numeric,summary,package_root=Path(__file__).resolve().parents[3])
+    fields_=dict(model.field_digests)
+    fields_['numeric_input_digest']=joint_evidence_field_v3('numeric_input_digest',
+        {'root_digest':root.digest,'plan_digest':root.frozen.plan.digest,'frozen_model':root.payload['frozen_model']})[1]
+    members=[];predecessors={m.checkpoint_ref:m for m in model.predecessors.members}
+    for member in output.members:
+        old=predecessors[member.checkpoint_ref]
+        members.append(ProductAdvanceMemberV2(member.checkpoint_ref,old.checkpoint.commit_operation_id,
+            old.checkpoint_revision,canonical_digest(joint_checkpoint_payload_v1(old.checkpoint)),old.state_ref,
+            old.state_revision,canonical_digest(joint_state_payload_v1(old.state)),old.checkpoint.certificate_digest,
+            old.checkpoint.numeric_error_bound,old.checkpoint_revision+1,
+            canonical_digest(joint_checkpoint_payload_v1(member.next_checkpoint)),member.next_checkpoint.numeric_error_bound,
+            old.state_ref,old.state_revision+1,canonical_digest(joint_state_payload_v1(member.next_state))))
+    component=model.current.component
+    operation_digest=canonical_digest(('d04.series-final-adoption.v1',root.digest,
+        tuple(chunk.digest for chunk in chunks),output.original_digest,tuple(contributions)))
+    expected=ProductAdvanceEvidenceV2('d11.product_advance_evidence.v3'if component.root_original_digest else'd11.product_advance_evidence.v2',
+        numeric.namespace,output.operation_id,operation_digest,'d04-joint:'+canonical_digest(component.checkpoint_refs),
+        root.binding.execution_id,component.role_start,component.role_end,tuple(members),component.catalogue_hash,
+        component.graph_incarnation,numeric.graph_revision,numeric.graph_epoch,component.access_epoch,component.delete_epoch,
+        fields_['read_versions_digest'],fields_['snapshot_stamp_digest'],fields_['time_mapping_digest'],fields_['closure_digest'],
+        fields_['source_closure_digest'],fields_['absent_reads_digest'],fields_['asset_digest'],numeric.native_manifest_sha256,
+        numeric.native_sha256,fields_['numeric_input_digest'],numeric.full_transcript_sha256,numeric.family_transcripts,
+        output.write_set_digest,fields_['contribution_consumption_digest'])
+    if(persisted_output!=output or _decode_numeric_candidate(canonical_serialize(numeric_row[0]))!=numeric
+            or numeric_row[1]!=numeric.receipt_digest or canonical_serialize(numeric_row[2])!=canonical_serialize(asdict(verification))
+            or numeric_row[3]!=canonical_digest(asdict(verification))or numeric_row[4]!=expected.digest
+            or evidence!=expected or evidence.full_transcript_digest!=numeric.full_transcript_sha256
+            or evidence.family_loo_transcripts!=numeric.family_transcripts
+            or evidence.output_write_set_digest!=output.write_set_digest
+            or adopted['complete_prefix_digest']!=summary.transcript_sha256 or adopted['output_original_digest']!=output.original_digest
+            or adopted['numeric_receipt_digest']!=numeric.receipt_digest or adopted['actual_cpu_ns']!=total_cpu
+            or adopted['actual_cpu_ms']!=sum(t.measurement.actual_cpu_ms for t in terminals)
+            or adopted['chunk_count']!=len(chunks)or adopted['total_step_count']!=root.frozen.plan.total_step_count
+            or prefix['math_digest']!=summary.transcript_sha256 or adopted['graph_receipt_digest']!=canonical_digest(graph_receipt)
+            or receipt.operation_digest!=evidence.bundle_digest):
+        raise ValueError('historical series complete math/member/readout originals differ')
+    from .d11_types import runtime_job_key,runtime_cost_settlement_key
+    job_ref=runtime_job_key(*root.binding.namespace.as_tuple,root.binding.activity_id,root.binding.job_id).token
+    last=terminals[-1].binding
+    cost_id='d04-series-cost:'+canonical_digest((last.root_digest,last.start_step_index))[:48]
+    cost_ref=runtime_cost_settlement_key(*last.numeric.namespace.as_tuple,last.numeric.activity_id,cost_id).token
+    expected_refs={ref for ref,_,_ in _write_set(output.members)}|set(receipt.ledger_refs)|{job_ref,cost_ref}
+    if({v.key.token for v in receipt.write_versions}!=expected_refs or job.get('phase')!='completed'
+            or job.get('usage_digest')!=canonical_digest({'cpu_ms':adopted['actual_cpu_ms']})or job.get('result_ref')!=root.root_ref):
+        raise ValueError('historical series final atomic worker/output/CPU set differs')
+    return root,chunks,numeric,output,summary

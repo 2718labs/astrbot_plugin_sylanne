@@ -19,14 +19,15 @@ _OWNER_CALLER_RETAINED_V3 = WeakKeyDictionary()
 _D07_MODEL_SOURCE_OWNER_SERVICES_V3 = WeakKeyDictionary()
 _D07_MODEL_SOURCE_OBSERVER_PHASE_V3 = object()
 _D07_MODEL_SOURCE_POLICY_PHASE_V3 = object()
-_OWNER_CALLER_KINDS_V3 = frozenset(("host_artifact_borrowed_header", "host_artifact_model_dispatch_read", "host_named_joint_source_read", "host_named_joint_write_source", "host_conditioned_write_source", "host_habit_write_source", "host_habit_maintenance_write_source", "host_conditioned_source_read", "host_conditioned_personal_choice_read", "host_habit_source_read", "host_semantic_recovery_read", "host_d07_write", "host_d07_model_seal", "host_foreground_read",
-    "host_d07_stage_read", "host_method_owner_read", "host_owner_lease_read",
-    "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_contact_owner_read", "host_contact_owner_write", "authority_model_header", "authority_model_seal",
+_D07_AUTHORITY_OWNER_BINDINGS_V3 = WeakKeyDictionary()
+_OWNER_CALLER_KINDS_V3 = frozenset(("host_d04_source_read", "host_artifact_borrowed_header", "host_artifact_model_dispatch_read", "host_named_joint_source_read", "host_named_joint_write_source", "host_conditioned_write_source", "host_habit_write_source", "host_habit_maintenance_write_source", "host_conditioned_source_read", "host_conditioned_personal_choice_read", "host_habit_source_read", "host_semantic_recovery_read", "host_d07_write", "host_d07_model_seal", "host_foreground_read",
+    "host_d07_stage_read", "host_method_owner_read", "host_d04_root_topology_read", "host_c04_body_resource_read", "host_d13_counter_metadata_read", "host_current_graph_full_read", "host_private_dispatch_inventory_read", "host_d13_natural_parent_closure_read", "host_character_labor_adoption_read", "host_owner_lease_read",
+    "host_contact_dispatch_identity_read", "host_contact_dispatch_text_read", "host_contact_owner_read", "host_contact_owner_write", "authority_d04_model_header", "authority_model_header", "authority_model_seal",
     "authority_internal_life_model_header", "authority_artifact_model_header", "authority_foreground_mesh_header",
     "authority_original_foreground_header", "authority_original_owner_task_header",
     "authority_numeric_model_header", "authority_d13_paid_header", "authority_habit_header", "authority_named_joint_header",
     "authority_numeric_location", "authority_root_location", "authority_series_location",
-    "authority_life_location", "authority_offline_location", "authority_source_fence_location",
+    "authority_life_location", "authority_d11_life_execution", "authority_character_labor_census", "authority_offline_location", "authority_source_fence_location",
     "authority_target_public_location", "authority_target_background_location",
     "authority_life_numeric_result", "authority_life_content_result", "authority_artifact_model_result",
     "authority_natural_self_location", "authority_c04_self_location", "authority_conditioned_child_location", "goal_management_metadata", "authority_contact_location", "artifact_no_dispatch_metadata", "goal_projection_metadata", "owner_stop_reply_metadata"))
@@ -74,6 +75,9 @@ class OwnerLocationCallerProofV3:
         if self.kind in ("authority_model_header", "authority_model_seal"):
             if self.model_source_phase not in ("model_seal_observer", "model_policy"):
                 raise AuthorityUnavailable("model Source requires its fixed actual caller phase")
+        elif self.kind == "authority_d04_model_header":
+            from .d04_ordinary_source_v3 import require_d04_authority_owner_header_v3
+            require_d04_authority_owner_header_v3(self)
         elif self.kind == "authority_internal_life_model_header":
             from .internal_life_model_source_read_v3 import require_internal_life_owner_header_v3
             require_internal_life_owner_header_v3(self)
@@ -110,7 +114,7 @@ class OwnerLocationCallerProofV3:
 
     @property
     def clock_policy_digest(self):
-        if self.kind in ('host_artifact_borrowed_header','host_artifact_model_dispatch_read','host_named_joint_source_read','host_named_joint_write_source','host_conditioned_write_source','host_habit_write_source','host_habit_maintenance_write_source','host_conditioned_source_read','host_conditioned_personal_choice_read','host_habit_source_read','host_semantic_recovery_read','host_method_owner_read','host_owner_lease_read','host_contact_dispatch_identity_read','host_contact_dispatch_text_read'):
+        if self.kind in ('host_d04_source_read','host_artifact_borrowed_header','host_artifact_model_dispatch_read','host_named_joint_source_read','host_named_joint_write_source','host_conditioned_write_source','host_habit_write_source','host_habit_maintenance_write_source','host_conditioned_source_read','host_conditioned_personal_choice_read','host_habit_source_read','host_semantic_recovery_read','host_method_owner_read','host_d04_root_topology_read','host_c04_body_resource_read','host_d13_counter_metadata_read','host_current_graph_full_read','host_private_dispatch_inventory_read','host_d13_natural_parent_closure_read','host_character_labor_adoption_read','host_owner_lease_read','host_contact_dispatch_identity_read','host_contact_dispatch_text_read'):
             return canonical_digest(asdict(self.graph._GraphCoordinator__scene_clock_policy))
         return canonical_digest(asdict(self.bundle.ingress_clock))
 
@@ -123,6 +127,10 @@ class OwnerLocationCallerProofV3:
         return self.retained_operation
 
     def release_v3(self):
+        if self.kind == "authority_model_header":
+            saved = _D07_AUTHORITY_OWNER_BINDINGS_V3.get(self.request)
+            if saved is not None and saved[0] is self:
+                _D07_AUTHORITY_OWNER_BINDINGS_V3.pop(self.request)
         _OWNER_CALLERS_V3.discard(self)
         provider = _OWNER_CALLER_RETAINED_V3.pop(self, None)
         if provider is not None:
@@ -303,8 +311,16 @@ def require_owner_location_caller_proof_v3(proof, *, phase, graph_stamp=None):
             _require_semantic_write_owner_caller_v3(proof)
         elif proof.kind in _SEMANTIC_BACKGROUND_OWNER_KINDS_V3:
             _require_semantic_background_owner_caller_v3(proof)
+        elif proof.kind == "host_d13_counter_metadata_read":
+            _require_d13_counter_metadata_owner_caller_v1(proof)
+        elif proof.kind == "host_c04_body_resource_read":
+            _require_host_c04_body_resource_owner_caller_v3(proof)
+        elif proof.kind == "host_d04_root_topology_read":
+            _require_host_d04_root_topology_owner_caller_v1(proof)
         elif proof.kind == "host_method_owner_read":
             _require_host_method_owner_caller_v3(proof)
+        elif proof.kind in ("host_current_graph_full_read", "host_private_dispatch_inventory_read", "host_d13_natural_parent_closure_read", "host_character_labor_adoption_read"):
+            _require_full_owner_caller_v3(proof)
         elif proof.kind == "host_foreground_read":
             _require_foreground_owner_caller_v3(proof)
         elif proof.kind == "host_d07_stage_read":
@@ -380,6 +396,9 @@ def require_owner_location_caller_proof_v3(proof, *, phase, graph_stamp=None):
                     or metadata.graph_revision != intent.graph_revision
                     or epoch.revision != intent.graph_epoch):
                 raise AuthorityUnavailable("InternalLife Owner location changed its original Graph comparison")
+    elif proof.kind=='authority_d04_model_header':
+        from .d04_ordinary_source_v3 import require_d04_authority_owner_header_v3
+        require_d04_authority_owner_header_v3(proof)
     elif proof.kind=='authority_artifact_model_header':
         from .artifact_model_source_read_v3 import require_artifact_model_owner_header_v3
         require_artifact_model_owner_header_v3(proof)
@@ -539,6 +558,26 @@ def _create_d07_model_source_owner_caller_proof_v3(owner_service, *, model_servi
             owner_grant_key(*owner_service.namespace_id.as_tuple).token, owner_service.namespace_id,
             ("d11",), grant["purposes"][0], (grant["audiences"][0],), grant["issuer_ref"],
             anchor.activation_generation)
+        from ..graph_coordinator import OwnerLeaseBindingV1
+        from .d12_owner_storage_admission_v1 import require_owner_storage_graph_binding_v1
+        if admission is not None:
+            require_owner_storage_graph_binding_v1(admission,authority=owner_acl,
+                principal=head.issue_operation.principal,grant=grant,proof=head.issue_proof,
+                metadata=facts.metadata,installation_id=owner_service.installation_id,
+                holder=owner_service.holder,guard=head.guard)
+        elif (grant["graph_incarnation"] != facts.metadata.requirements.graph_incarnation
+                or grant["installation_id"] != owner_service.installation_id
+                or grant["activation_generation"] != original_permit.generation):
+            raise AuthorityUnavailable("D07 current Owner full binding has no actual current storage admission")
+        binding = OwnerLeaseBindingV1(head.issue_operation.principal,actor.actor_id,
+            owner_service.namespace_id,owner_acl.purpose,owner_acl.audience[0],
+            grant["grant_id"],grant["scope"],grant["issuer_ref"],frozenset(grant["capabilities"]),
+            frozenset(grant["purposes"]),frozenset(grant["audiences"]),head.grant_digest,1,
+            facts.epochs[0],facts.epochs[1],facts.metadata.requirements.graph_incarnation,
+            head.guard.authorization_head,head.guard.authorization_revision,
+            head.guard.minimum_revocation_epoch,None,admission)
+        _D07_AUTHORITY_OWNER_BINDINGS_V3[work] = (header,binding,work.operation,work.scope,
+            work.permit,work.selection_digest,facts.graph_epoch,tuple(facts.epochs))
         from .d07_authority_model_source_read_v3 import prepare_current_d07_authority_model_source_read_v3
         if location_observation is None:
             location_observation = controller.location.observe_business_for_fence_v1(
@@ -620,6 +659,25 @@ def _require_owner_permission_outside_graph_v3(proof):
                 if (pairing is None or pairing.principal != principal or pairing.actor_id != authority.actor
                         or pairing.installation_id != proof.installation_id):
                     raise AuthorityUnavailable("semantic background actual Owner principal pairing changed")
+            return proof
+        elif proof.kind in ("host_current_graph_full_read", "host_private_dispatch_inventory_read", "host_d13_natural_parent_closure_read", "host_character_labor_adoption_read"):
+            return _require_full_owner_permission_v3(proof)
+        elif proof.kind == "host_d13_counter_metadata_read":
+            observed_self,current,reading=_observe_d13_counter_metadata_owner_v1(proof.request)
+            state=_D13_COUNTER_METADATA_OWNER_CALLERS_V1[proof]
+            if observed_self!=state.current_self or current!=proof.current_owner_authority:
+                raise AuthorityUnavailable('D13 namespace Owner permission changed since its actual READ observation')
+            state.reading=reading
+            return proof
+        elif proof.kind == "host_c04_body_resource_read":
+            current=_observe_host_c04_body_resource_owner_authority_v3(proof.request)
+            if current!=proof.current_owner_authority:
+                raise AuthorityUnavailable('C04 resource original current Owner Authority changed')
+            return proof
+        elif proof.kind == "host_d04_root_topology_read":
+            current=_observe_host_d04_root_topology_owner_authority_v1(proof.request)
+            if current!=proof.current_owner_authority:
+                raise AuthorityUnavailable('RootTopology original current Owner Authority changed')
             return proof
         elif proof.kind == "host_method_owner_read":
             current=_observe_host_method_owner_authority_v3(proof.request)
@@ -1157,7 +1215,7 @@ _D07_SOURCE_SCOPE_FIELDS_V3 = frozenset((
     "activation_generation", "selection_digest", "original_deadline_utc"))
 _D07_SOURCE_SCOPE_KINDS_V3 = frozenset((
     "ordinary_owner", "ingress_recall_self", "relationship_self", "method_growth_self",
-    "reflection", "general_growth_owner"))
+    "reflection", "general_growth_owner", "ordinary_continuity_owner", "single_event_review_owner"))
 
 
 def _d07_authority_from_plain_v3(raw):
@@ -4378,23 +4436,25 @@ def prepare_owner_location_for_model_graph_work_v3(work, *, installed_reader, ow
     from .internal_life_model_graph_v2 import InstalledInternalLifeModelGraphReaderV2
     from .artifact_model_graph_v3 import InstalledArtifactDraftModelGraphReaderV3
     from .d13_authority_model_source_v3 import InstalledD13AuthorityModelReaderV3
+    from .d04_ordinary_source_v3 import InstalledD04AuthoritySourceReaderV3
     from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
     from ..graph_types import validate_owner_grant_v1
     if (type(work) is not AuthorityGraphReadWorkV3
             or type(owner_service) is not InstalledD12OwnerStorageAdmissionServiceV1
             or type(installed_reader) not in (InstalledLifeNumericModelGraphReaderV1,
-                InstalledInternalLifeModelGraphReaderV2,InstalledArtifactDraftModelGraphReaderV3,InstalledD13AuthorityModelReaderV3)
+                InstalledInternalLifeModelGraphReaderV2,InstalledArtifactDraftModelGraphReaderV3,InstalledD13AuthorityModelReaderV3,InstalledD04AuthoritySourceReaderV3)
             or installed_reader.owner_storage is not owner_service
             or work.db.in_transaction):
         raise AuthorityUnavailable('model Owner location requires its actual installed reader before Graph SQL')
     require_actual_authority_graph_attachment_owner_v3(work)
     controller = work.controller.require_installed_v3()
     verifier = controller.verifier
-    actual = (verifier._d13_paid_reader_v3 if type(installed_reader)is InstalledD13AuthorityModelReaderV3
+    actual = (verifier._d04_source_reader_v3 if type(installed_reader)is InstalledD04AuthoritySourceReaderV3
+        else verifier._d13_paid_reader_v3 if type(installed_reader)is InstalledD13AuthorityModelReaderV3
         else verifier._life_numeric_reader_v1 if type(installed_reader) is InstalledLifeNumericModelGraphReaderV1
         else verifier._artifact_model_reader_v3 if type(installed_reader)is InstalledArtifactDraftModelGraphReaderV3
         else verifier._internal_life_reader_v2)
-    if (controller.kind != 'model' or actual is not installed_reader
+    if (controller.kind not in {'model','d04_result'} or actual is not installed_reader
             or controller.control is not owner_service.control
             or controller.fences is not owner_service.fences
             or controller.location._graph_db_path != owner_service.graph_path
@@ -4422,7 +4482,10 @@ def prepare_owner_location_for_model_graph_work_v3(work, *, installed_reader, ow
     if bundle is not verifier._artifact_draft_bundle:
         raise AuthorityUnavailable('Life model Owner reader crossed the installed bundle identity')
     caller_kind, model_source_phase = 'authority_model_header', None
-    if type(installed_reader)is InstalledD13AuthorityModelReaderV3:
+    if type(installed_reader)is InstalledD04AuthoritySourceReaderV3:
+        installed_reader.require_installed_v3(work)
+        caller_kind='authority_d04_model_header'
+    elif type(installed_reader)is InstalledD13AuthorityModelReaderV3:
         from .d13_authority_model_source_v3 import require_d13_authority_model_phase_v3
         caller_kind='authority_d13_paid_header'
         model_source_phase=require_d13_authority_model_phase_v3(work,installed_reader)
@@ -4493,6 +4556,16 @@ def prepare_owner_location_for_model_graph_work_v3(work, *, installed_reader, ow
 
 @contextmanager
 def bind_owner_location_for_model_graph_work_v3(work):
+    if work.controller.kind=='character_labor_census':
+        from .character_labor_census_v1 import bind_character_labor_census_owner_v1
+        with bind_character_labor_census_owner_v1(work):
+            yield
+        return
+    if work.controller.kind=='character_labor':
+        from .d11_life_execution_owner_v1 import bind_d11_life_execution_owner_v1
+        with bind_d11_life_execution_owner_v1(work):
+            yield
+        return
     from .original_foreground_source_read_v3 import original_foreground_work_v3,bind_original_foreground_owner_quantum_v3
     if original_foreground_work_v3(work)is not None:
         with bind_original_foreground_owner_quantum_v3(work):yield
@@ -4566,6 +4639,13 @@ def require_owner_location_for_model_graph_read_v3(db, *, installed_reader, inte
 
 
 def release_owner_location_for_model_graph_work_v3(work):
+    if work.controller.kind=='character_labor_census':
+        from .character_labor_census_v1 import release_character_labor_census_owner_v1
+        return release_character_labor_census_owner_v1(work)
+    if work.controller.kind=='character_labor':
+        from .d11_life_execution_owner_v1 import release_d11_life_execution_owner_v1
+        release_d11_life_execution_owner_v1(work)
+        return
     from .original_foreground_source_read_v3 import original_foreground_work_v3
     if original_foreground_work_v3(work)is not None:
         from .original_foreground_owner_location_v3 import release_original_foreground_owner_v3
@@ -4595,6 +4675,12 @@ def release_owner_location_for_model_graph_work_v3(work):
 
 
 def prepare_owner_location_for_model_quantum_v3(work):
+    if work.controller.kind=='character_labor_census':
+        from .character_labor_census_v1 import observe_character_labor_census_owner_v1
+        return observe_character_labor_census_owner_v1(work)
+    if work.controller.kind=='character_labor':
+        from .character_labor_source_read_v1 import observe_character_labor_source_owner_v1
+        return observe_character_labor_source_owner_v1(work)
     from .original_foreground_source_read_v3 import original_foreground_work_v3,prepare_original_foreground_owner_quantum_v3
     if original_foreground_work_v3(work)is not None:
         return prepare_original_foreground_owner_quantum_v3(work)
@@ -4632,11 +4718,13 @@ def prepare_owner_location_for_model_quantum_v3(work):
             from .contact_background_graph_v3 import require_contact_background_work_v3
             owner=require_contact_background_work_v3(work)[0]._policy.owner_service
         return observe_owner_location_for_contact_v3(owner,work)
-    if work.controller.kind != 'model':
+    if work.controller.kind not in {'model','d04_result'}:
         return
     kind = work.owner_model_work_kind
     verifier = work.controller.verifier
-    if kind == 'd06.encode_internal_life_numeric':
+    if kind == 'd04.appraisal':
+        reader = verifier._d04_source_reader_v3
+    elif kind == 'd06.encode_internal_life_numeric':
         reader = verifier._life_numeric_reader_v1
     elif kind == 'd06.encode_internal_life_content':
         reader = verifier._internal_life_reader_v2
@@ -4678,13 +4766,14 @@ from ..runtime_storage_v3 import (bind_runtime_database_from_control_v3,
 
 _OWNER_LOCATION_AUTHORITY_CALLS_V3=WeakSet()
 _OWNER_LOCATION_AUTHORITY_KINDS_V3=frozenset(('authority_numeric_location','authority_root_location',
-    'authority_series_location','authority_life_location','authority_offline_location',
+    'authority_series_location','authority_life_location','authority_d11_life_execution','authority_character_labor_census','authority_offline_location',
     'authority_source_fence_location','authority_target_public_location','authority_target_background_location',
     'authority_life_numeric_result','authority_life_content_result','authority_artifact_model_result',
     'authority_natural_self_location','authority_c04_self_location','authority_conditioned_child_location'))
 
 
 def _owner_location_actual_service_v3(service,kind):
+    from .character_labor_census_v1 import InstalledCharacterLaborCensusServiceV1
     from .d04_numeric_service_v3 import AuthorityD04NumericServiceV3
     from .d04_root_execution_service_v3 import AuthorityD04RootExecutionServiceV3
     from .d04_series_service_v1 import AuthorityD04SeriesServiceV1
@@ -4701,6 +4790,8 @@ def _owner_location_actual_service_v3(service,kind):
         'authority_root_location':AuthorityD04RootExecutionServiceV3,
         'authority_series_location':AuthorityD04SeriesServiceV1,
         'authority_life_location':AuthorityD11LifeServiceV1,
+        'authority_d11_life_execution':AuthorityD11LifeServiceV1,
+        'authority_character_labor_census':InstalledCharacterLaborCensusServiceV1,
         'authority_offline_location':AuthorityD11OfflineTickServiceV1,
         'authority_source_fence_location':InstalledD12OwnerStorageAdmissionServiceV1,
         'authority_target_public_location':InstalledD12TargetOwnerAdmissionServiceV1,
@@ -4718,7 +4809,7 @@ def _owner_location_actual_service_v3(service,kind):
 class _AuthorityOwnerLocationCallV3:
     def __init__(self,issuer,*,service,kind,owner_service,credential,subject,permit,
             permission_anchor,comparison_anchor,head,history,deadline_utc,
-            actor=None,session_token=None,session_request=None):
+            actor=None,session_token=None,session_request=None,execution_work=None):
         if issuer is not _OWNER_CALLER_ISSUER_V3:
             raise AuthorityUnavailable('Owner location call requires its actual registered producer')
         _owner_location_actual_service_v3(service,kind)
@@ -4730,6 +4821,9 @@ class _AuthorityOwnerLocationCallV3:
                 or permit.namespace!=owner_service.namespace):
             raise AuthorityUnavailable('Owner metadata call crossed its real permit or installed Owner service')
         self.service,self.kind,self.owner_service=service,kind,owner_service
+        self.execution_work=execution_work
+        if (kind in('authority_d11_life_execution','authority_character_labor_census')) != (execution_work is not None):
+            raise AuthorityUnavailable('bounded Life Owner must borrow exactly its actual Source Work')
         self.controller=self;self.credential,self.subject,self.permit=credential,subject,permit
         self.namespace,self.request=owner_service.namespace_id,permit
         self.permission_anchor,self.comparison_anchor,self.head,self.history=permission_anchor,comparison_anchor,head,history
@@ -4743,6 +4837,16 @@ class _AuthorityOwnerLocationCallV3:
             raise AuthorityUnavailable('Owner call crossed its actual selected Core installation')
         self.control=control;self.scope=None;self.proof=None;self.decoded_grant=None;self.location=None;self.consumer_records=None
         self._check_permission_v3()
+        if self.kind in('authority_d11_life_execution','authority_character_labor_census'):
+            work=self.execution_work
+            work._actual()
+            if (work.service is not service or work.permit!=permit or work.credential is not credential
+                    or work.controller.kind!=('character_labor_census' if self.kind=='authority_character_labor_census' else 'character_labor') or work.controller.control is not control):
+                raise AuthorityUnavailable('Life Owner changed the actual service/Work/Control/permit')
+            self.db,self.handle,self.operation=work.db,work.handle,work.operation
+            self.scope=work.scope;self.selection_digest=work.selection_digest
+            _OWNER_LOCATION_AUTHORITY_CALLS_V3.add(self)
+            return
         from .daemon import _bootstrap_control_quantum_v3
         path=(owner_service.graph_path if type(owner_service) is InstalledD12OwnerStorageAdmissionServiceV1
             else owner_service.target_graph)
@@ -4779,7 +4883,7 @@ class _AuthorityOwnerLocationCallV3:
                     or service.bridge.deletion is not owner.fences.deletion
                     or service.bridge.journal is not owner.fences.execution):
                 raise AuthorityUnavailable('numeric Owner call changed its actual Core/fences/Graph/Owner composition')
-        elif self.kind in ('authority_life_location','authority_offline_location'):
+        elif self.kind in ('authority_life_location','authority_d11_life_execution','authority_character_labor_census','authority_offline_location'):
             if (service.owner_service is not owner or service.bridge.core is not owner.core
                     or service.fences is not owner.fences or service.owner_tickets is not owner.tickets
                     or service.namespace!=owner.namespace_id or service.installation_id!=owner.installation_id
@@ -4822,7 +4926,17 @@ class _AuthorityOwnerLocationCallV3:
         self._require_components_v3()
         if owner.core._db.in_transaction or self.db is not None and self.db.in_transaction:
             raise AuthorityUnavailable('Owner metadata observations must precede Core and Graph SQL')
-        owner.core._require(self.credential,'owner_guard_read',owner.namespace,owner.holder)
+        if self.kind in('authority_d11_life_execution','authority_character_labor_census'):
+            if self.kind=='authority_character_labor_census':
+                from .character_labor_census_v1 import require_character_labor_census_permission_v1
+                require_character_labor_census_permission_v1(self.service,credential=self.credential,
+                    subject=self.subject,permit=self.permit,request=self.execution_work.request)
+            else:
+                from .d11_life_execution_owner_v1 import require_character_labor_execution_permission_v1
+                require_character_labor_execution_permission_v1(self.service,credential=self.credential,
+                    subject=self.subject,permit=self.permit,request=self.execution_work.request)
+        else:
+            owner.core._require(self.credential,'owner_guard_read',owner.namespace,owner.holder)
         if self.kind in('authority_source_fence_location','authority_target_public_location','authority_target_background_location',
                 'authority_life_numeric_result','authority_life_content_result','authority_artifact_model_result'):
             if self.kind in ('authority_life_numeric_result','authority_life_content_result','authority_artifact_model_result'):
@@ -4845,7 +4959,7 @@ class _AuthorityOwnerLocationCallV3:
             owner.core._require(self.credential,'self_identity_read',owner.namespace,owner.holder)
             owner.fences.validate_fence(credential=self.credential,subject=self.subject,permit=self.permit)
         else:
-            owner.core._require(self.credential,'execution' if self.kind in('authority_life_location','authority_offline_location')
+            owner.core._require(self.credential,'execution' if self.kind in('authority_life_location','authority_d11_life_execution','authority_character_labor_census','authority_offline_location')
                 else 'current',owner.namespace)
         with owner.fences._frozen() as (db,deletion,execution,_):
             anchor=owner.fences._current_locked(db,deletion,execution,holder=owner.holder,generation=self.permit.generation)
@@ -4882,6 +4996,8 @@ class _AuthorityOwnerLocationCallV3:
     def release_v3(self):
         if self.closed:return
         self.closed=True;_OWNER_LOCATION_AUTHORITY_CALLS_V3.discard(self)
+        if self.kind in('authority_d11_life_execution','authority_character_labor_census'):
+            return
         try:
             if self.operation is not None:finish_runtime_storage_operation_v3(self.operation)
         finally:
@@ -4893,13 +5009,14 @@ class _AuthorityOwnerLocationCallV3:
 
 def _owner_location_complete_service_v3(caller,*,kind,owner_service,credential,permit,
         permission_anchor,comparison_anchor,head,history=None,deadline_utc=None,
-        actor=None,session_token=None,session_request=None):
+        actor=None,session_token=None,session_request=None,execution_work=None):
     from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
     from ..graph_types import validate_owner_grant_v1
     call=_AuthorityOwnerLocationCallV3(_OWNER_CALLER_ISSUER_V3,service=caller,kind=kind,
         owner_service=owner_service,credential=credential,subject=permit.subject,permit=permit,
         permission_anchor=permission_anchor,comparison_anchor=comparison_anchor,head=head,history=history,
-        deadline_utc=deadline_utc,actor=actor,session_token=session_token,session_request=session_request)
+        deadline_utc=deadline_utc,actor=actor,session_token=session_token,session_request=session_request,
+        execution_work=execution_work)
     proof=graph_work=lineage=None;published=False
     invocation=_OWNER_LOCATION_SERVICE_INVOCATION_V3.get()
     if invocation is None or invocation[0] is not caller:
@@ -4908,7 +5025,8 @@ def _owner_location_complete_service_v3(caller,*,kind,owner_service,credential,p
     call.consumer_records=invocation[1]
     try:
         proof=OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,kind,None,caller,owner_service,call,None,
-            None,None,None,head.issue_operation.principal,D12CurrentOwnerAuthorityV1(head.guard,None),head,
+            caller.installed_bundle if kind in('authority_d11_life_execution','authority_character_labor_census') else None,
+            call.scope,None,head.issue_operation.principal,D12CurrentOwnerAuthorityV1(head.guard,None),head,
             call.operation,call.control,call.selection_digest,call.namespace,owner_service.installation_id,
             owner_service.holder,permission_anchor,comparison_anchor,credential,permit.subject,permit,
             call,deadline_utc,get_ident(),target_history=history,
@@ -5022,7 +5140,7 @@ def prepare_owner_location_for_numeric_v3(service, *, permit, binding=None, orig
     if self.target_owner_service is None and self.storage_owner_service is not None:
         return _prepare_numeric_source_location_v3(self,permit,binding)
     if self.target_owner_service is None:
-        selectors=self._read_source_owner_selectors(binding) if binding is not None else ()
+        selectors=self._read_source_owner_selectors(binding,permit=permit) if binding is not None else ()
         with self.bridge.core._tx() as db:
             head=self.owner_tickets.current_migration_head_in_tx(db,authority_namespace=self.bridge.namespace)
             if head is None or head.state!="active":
@@ -6060,7 +6178,21 @@ def _require_host_method_owner_reader_v3(reader):
         from ..runtime.current_life_numeric_read_v3 import require_numeric_read_work_v3
         require_numeric_read_work_v3(reader)
     from ..runtime.current_beta1_source_read_v3 import beta1_source_operation_v3,beta1_source_work_kind_v3,beta1_source_reader_work_kind_v3,require_current_beta1_source_work_v3
-    own_source=beta1_source_operation_v3(reader.operation_kind)
+    from ..runtime.current_method_learning_read_v3 import (
+        is_ordinary_continuity_method_v1, is_single_event_review_method_v1,
+        require_actual_method_learning_attachment_owner_v3)
+    from ..runtime.d02_character_labor_read_v1 import is_character_labor_prepare_profile_v1
+    ordinary_continuity = is_ordinary_continuity_method_v1(reader)
+    single_event_review = is_single_event_review_method_v1(reader)
+    if ordinary_continuity or single_event_review:
+        require_actual_method_learning_attachment_owner_v3(reader,db=reader.db)
+    if single_event_review:
+        if reader.authority.purpose != "context":
+            raise AuthorityUnavailable("single-event review Owner metadata requires its actual context Method")
+        reader.graph._authorize(reader.lease,reader.authority,
+            {"d01","d06","d07","d08","d10","d11"},owner_read=True)
+    own_source=(beta1_source_operation_v3(reader.operation_kind) or
+        is_character_labor_prepare_profile_v1(reader)) and not ordinary_continuity and not single_event_review
     if own_source:require_current_beta1_source_work_v3(reader)
     graph=reader.graph;store=graph._GraphCoordinator__store;scope=reader.fence.scope
     assembly=graph._GraphCoordinator__d04_installed_joint_assembly
@@ -6069,7 +6201,7 @@ def _require_host_method_owner_reader_v3(reader):
     bundle=assembly.admin_bundle;policy=bundle.installation_policy;port=graph._GraphCoordinator__content_fence_v2
     reader.work._require_invocation(graph)
     provisional=_host_method_owner_read_provisional_v3(reader)
-    if (not own_source and reader.operation_kind not in (_METHOD_OWNER_READ_OPERATIONS_V3 | _NUMERIC_METHOD_OWNER_READ_OPERATIONS_V3 | _NUMERIC_HOST_READ_OPERATIONS_V3 | _OWNER_JOB_CANCEL_READ_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OWNER_OPERATIONS_V3)
+    if (not own_source and not ordinary_continuity and not single_event_review and reader.operation_kind not in (_METHOD_OWNER_READ_OPERATIONS_V3 | _NUMERIC_METHOD_OWNER_READ_OPERATIONS_V3 | _NUMERIC_HOST_READ_OPERATIONS_V3 | _OWNER_JOB_CANCEL_READ_OPERATIONS_V3 | _NUMERIC_PAID_WRITE_OWNER_OPERATIONS_V3)
             or reader.work.state is not reader or reader.work.operation is not reader.operation
             or reader.work.kind!=(beta1_source_reader_work_kind_v3(reader)if own_source else "current_life_numeric_paid_write_v3" if reader.operation_kind in _NUMERIC_PAID_WRITE_OWNER_OPERATIONS_V3 else "current_owner_job_cancel_v3" if reader.operation_kind in _OWNER_JOB_CANCEL_READ_OPERATIONS_V3 else "current_life_numeric_read_v3" if reader.operation_kind in _NUMERIC_HOST_READ_OPERATIONS_V3 else METHOD_LEARNING_WORK_KIND_V3) or reader.work.coordinator is not graph
             or reader.runtime is not graph._GraphCoordinator__domain_production_runtime_v1
@@ -6206,8 +6338,76 @@ class _HostMethodOwnerReadEntryV3:
             require_owner_location_caller_proof_v3(proof,phase='before',graph_stamp=reader.graph_stamp)
             return _host_method_owner_binding_from_facts_v3(proof,facts)
 
+    def require_source_groups_v3(self, reader, groups):
+        state = _METHOD_OWNER_READ_ENTRIES_V3.get(self)
+        if (state is None or state[0].request is not reader
+                or reader.operation_kind not in (
+                    'input:create_commitment', 'input:create_commitment_with_fulfillment_terms',
+                    'input:register_commitment_terms_communication',
+                    'acknowledge_commitment_terms', 'settle_current_commitment_fulfillment')):
+            raise AuthorityUnavailable('Commitment Source request lost its exact private Owner entry')
+        if reader.read_finished:
+            from ..runtime.current_beta1_source_read_v3 import require_beta1_source_write_phase_v3
+            require_beta1_source_write_phase_v3(reader)
+            binding = reader.owner_binding
+        else:
+            binding = self.require_for_v3(reader)
+        requested = (('expression', (reader.audience_ref,)),
+            ('context', (reader.audience_ref,)), ('context', ('owner',)))
+        allowed = tuple((purpose, audiences) for purpose, audiences in requested
+            if purpose in binding.purposes and set(audiences).issubset(binding.audiences))
+        if any(refs and not any(purpose == allowed_purpose and audiences
+                    and set(audiences).issubset(allowed_audiences)
+                    for allowed_purpose, allowed_audiences in allowed)
+                for purpose, audiences, refs in groups):
+            raise AuthorityUnavailable('Commitment Source request is outside its actual Owner grant intersection')
+        return allowed
 
-def prepare_current_host_method_owner_read_entry_v3(reader):
+
+
+class _CurrentOwnerEntryTaskV3:
+    """One original Owner-kernel quantum per enclosing business Work tick."""
+    def __init__(self,issuer,reader,steps):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:raise AuthorityUnavailable('actual current Owner task required')
+        self.reader,self.operation,self.steps=reader,reader.operation,steps
+        self.complete=self.closed=False;self.result=None
+        self.operation.register_retained_state_v3(self)
+    def _runtime_retained_heap_bytes_v3(self):
+        # The original Owner kernel accounts its actual retained metadata separately.
+        return 4096
+    def advance(self):
+        if self.closed:raise AuthorityUnavailable('Owner task already released its actual EOF')
+        self.reader.work._require_invocation(self.reader.graph)
+        if self.complete:return True
+        try:next(self.steps)
+        except StopIteration as done:
+            self.result=done.value;self.steps=None;self.complete=True
+            return True
+        except BaseException as first:
+            try:self.release_v3()
+            except BaseException as later:first.add_note('Owner task cleanup failed: '+type(later).__name__)
+            raise
+        return False
+    def take_result_v3(self):
+        if not self.complete or self.closed or self.result is None:
+            raise AuthorityUnavailable('Owner task has no completed original EOF to transfer')
+        result,self.result=self.result,None
+        self.release_v3()
+        return result
+    def release_v3(self):
+        if self.closed:return
+        self.closed=True
+        steps,self.steps=self.steps,None
+        result,self.result=self.result,None
+        try:
+            if steps is not None:steps.close()
+            if result is not None:result.release_v3()
+        finally:
+            self.operation.unregister_retained_state_v3(self)
+            self.reader=None
+
+
+def _iterate_prepare_current_host_method_owner_read_entry_v3(reader):
     graph,port,bundle,scope,control,principal=_require_host_method_owner_reader_v3(reader)
     current=_observe_host_method_owner_authority_v3(reader)
     policy=bundle.installation_policy
@@ -6228,6 +6428,7 @@ def prepare_current_host_method_owner_read_entry_v3(reader):
                 progress=work.advance(meter=meter)
             if type(progress)is dict and progress.get('phase')=='owner_location_quantum_commit':
                 work.complete_reserved_quantum_v3(proof)
+            yield
         facts=work.result.require_for_v3(proof)
         _host_method_owner_binding_from_facts_v3(proof,facts)
         _require_owner_permission_outside_graph_v3(proof)
@@ -6240,14 +6441,440 @@ def prepare_current_host_method_owner_read_entry_v3(reader):
         raise
 
 
+def prepare_current_host_method_owner_read_entry_v3(reader):
+    return _CurrentOwnerEntryTaskV3(_OWNER_CALLER_ISSUER_V3,reader,_iterate_prepare_current_host_method_owner_read_entry_v3(reader))
 
+
+
+
+
+_FULL_OWNER_CALLERS_V3 = WeakKeyDictionary()
+_FULL_OWNER_ENTRIES_V3 = WeakKeyDictionary()
+
+
+class _FullOwnerCallerStateV3:
+    def __init__(self, proof, current_self, groups):
+        self.proof, self.control = proof, proof.control
+        self.current_self, self.groups = current_self, groups
+        self.dispatch_basis = None
+        if proof.kind == 'host_current_graph_full_read':
+            self.contract, self.borrowed = proof.request.contract, proof.request.borrowed
+        elif proof.kind == 'host_private_dispatch_inventory_read':
+            from ..runtime.private_dispatch_source_read_v3 import private_dispatch_metadata_identity_v3
+            self.contract = self.borrowed = None
+            self.dispatch_basis = private_dispatch_metadata_identity_v3(proof.request)
+        elif proof.kind == 'host_character_labor_adoption_read':
+            from ..runtime.current_character_labor_adoption_v1 import character_labor_adoption_owner_metadata_identity_v1
+            self.contract = self.borrowed = None
+            self.dispatch_basis = character_labor_adoption_owner_metadata_identity_v1(proof.request)
+        elif proof.kind == 'host_d13_natural_parent_closure_read':
+            from ..runtime.d13_natural_parent_closure_read_v3 import natural_parent_closure_metadata_identity_v3
+            self.contract = self.borrowed = None
+            self.dispatch_basis = natural_parent_closure_metadata_identity_v3(proof.request)
+        else:
+            raise AuthorityUnavailable('unregistered current metadata Owner producer')
+        self.authority = self.principal = self.binding = None
+
+    def _c09_retained_heap_bytes_v3(self, _seen=None):
+        seen = set() if _seen is None else _seen
+        return _owner_heap_size_v3(self) + _owner_location_payload_heap_v3((
+            self.current_self, self.groups, self.authority, self.principal, self.binding, self.dispatch_basis), seen)
+
+
+def _require_full_owner_reader_v3(reader, kind='host_current_graph_full_read'):
+    if kind == 'host_current_graph_full_read':
+        from ..runtime.current_graph_full_read_v3 import (
+            require_current_full_owner_reader_v3, NATURAL_ADMIN_PREPARE_FULL_V3,
+            D13_COUNTER_PREPARE_FULL_V1,require_actual_d13_counter_prepare_full_reader_v1)
+        graph, port, bundle, scope, groups = require_current_full_owner_reader_v3(reader)
+        if (scope.operation not in ('read', 'write')
+                or scope.operation == 'write' and (reader.borrowed is None
+                    or reader.contract not in(NATURAL_ADMIN_PREPARE_FULL_V3,D13_COUNTER_PREPARE_FULL_V1))):
+            raise AuthorityUnavailable('ordinary FULL Owner lost its original read or exact borrowed write')
+        if reader.contract is D13_COUNTER_PREPARE_FULL_V1:
+            require_actual_d13_counter_prepare_full_reader_v1(reader)
+    elif kind == 'host_private_dispatch_inventory_read':
+        from ..runtime.private_dispatch_source_read_v3 import require_current_private_dispatch_owner_reader_v3
+        from ..runtime.dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+        graph, port, bundle, scope, groups = require_current_private_dispatch_owner_reader_v3(reader)
+        if (type(reader) is not _DispatchInventoryReadV3 or reader.family != 'private_reply'
+                or reader.work.kind != 'dispatch_inventory_prepare_v3' or scope.operation != 'read'
+                or scope.permit.operation != 'read'):
+            raise AuthorityUnavailable('private P2 Owner requires its original distinct metadata READ')
+    elif kind == 'host_character_labor_adoption_read':
+        from ..runtime.current_character_labor_adoption_v1 import (
+            CharacterLaborAdoptionReadV1, require_current_character_labor_adoption_owner_reader_v1)
+        graph, port, bundle, scope, groups = require_current_character_labor_adoption_owner_reader_v1(reader)
+        if (type(reader) is not CharacterLaborAdoptionReadV1
+                or reader.work.kind != 'current_character_labor_adoption_v1'
+                or scope.operation != 'write' or scope.permit.operation != 'write'):
+            raise AuthorityUnavailable('labor adoption Owner requires its actual named original WRITE Work')
+    elif kind == 'host_d13_natural_parent_closure_read':
+        from ..runtime.d13_natural_parent_closure_read_v3 import (
+            D13NaturalParentClosureReadV3, require_current_d13_natural_parent_closure_owner_reader_v3)
+        graph, port, bundle, scope, groups = require_current_d13_natural_parent_closure_owner_reader_v3(reader)
+        if (type(reader) is not D13NaturalParentClosureReadV3
+                or reader.work.kind != 'd13_natural_parent_closure_read_v3'
+                or scope.operation != 'read' or scope.permit.operation != 'read'):
+            raise AuthorityUnavailable('parent cleanup Owner requires its distinct original metadata READ')
+    else:
+        raise AuthorityUnavailable('unregistered closed current metadata Owner caller')
+    policy = bundle.installation_policy
+    if (scope.namespace != reader.namespace
+            or scope.namespace != policy.namespace or scope.authority_namespace != policy.authority_namespace
+            or scope.permit.holder != policy.administrator_holder
+            or port.installation_grant.installation_id != policy.installation_id
+            or reader.operation is not reader.work.operation
+            or reader.work.state is not reader or reader.work.coordinator is not graph
+            or reader.operation.selection_digest != reader.selection_digest
+            or not groups or any(not audiences for purpose, audiences, roots in groups)):
+        raise AuthorityUnavailable('ordinary FULL Owner entry left its actual installed content scope')
+    control = _require_owner_operation_v3(reader.operation, db=reader.db, namespace=reader.namespace)
+    return graph, port, bundle, scope, groups, control
+
+
+def _full_owner_graph_comparison_anchor_v3(reader, kind, scope):
+    if kind != 'host_character_labor_adoption_read':
+        return scope.pinned_anchor
+    from ..runtime.current_character_labor_adoption_v1 import require_current_character_labor_adoption_owner_reader_v1
+    from .d11_life_bridge_v1 import D11LifeAdoptionBridgeV1
+    from ..runtime.d10_offline_tick_execution_v1 import _decode_json
+    from ..runtime_contracts import SnapshotRequirementsV2
+    graph, port, bundle, scope, groups = require_current_character_labor_adoption_owner_reader_v1(reader)
+    gate = reader.gate
+    if (type(gate) is not D11LifeAdoptionBridgeV1 or gate.permit != scope.permit
+            or gate.after_anchor != scope.pinned_anchor
+            or gate.binding != reader.expected_metadata.binding
+            or gate.prepared_digest != reader.expected_metadata.prepared_digest
+            or reader.graph_stamp[0].graph_revision != gate.before_graph_revision
+            or reader.graph_stamp[1].revision != gate.before_graph_epoch
+            or reader.graph_stamp[0].requirements != _decode_json(gate.before_requirements_json, SnapshotRequirementsV2)
+            or not graph._anchor_matches(reader.graph_stamp[0].requirements, gate.before_anchor)):
+        raise AuthorityUnavailable('labor Owner comparison left its actual authenticated before/after adoption bridge')
+    return gate.before_anchor
+
+
+def _observe_full_owner_authority_v3(reader, kind):
+    from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
+    from ..runtime.first_ingress_v2 import trusted_upper
+    graph, port, bundle, scope, groups, control = _require_full_owner_reader_v3(reader, kind)
+    if reader.db.in_transaction or reader.store._lock._is_owned():
+        raise AuthorityUnavailable('ordinary FULL Self/Owner observation must precede Graph SQL and lock')
+    if port.validate_fence(scope) != scope.permit:
+        raise AuthorityUnavailable('ordinary FULL original content permit changed')
+    current_self = graph._GraphCoordinator__self_identity_port.current_self_identity(
+        namespace=reader.namespace, authority_namespace=scope.authority_namespace,
+        request_operation_id=scope.operation_id, permit=scope.permit)
+    observed = port.get_current_background_owner_authority_for_fence_v1(
+        namespace=reader.namespace, authority_namespace=scope.authority_namespace, permit=scope.permit)
+    if (type(current_self) is not AuthorityCurrentSelfIdentityV1
+            or type(observed) is not tuple or len(observed) != 2
+            or type(observed[0]) is not D12CurrentOwnerAuthorityV1 or observed[1] != scope.permit):
+        raise AuthorityUnavailable('ordinary FULL lacks its actual current Self and Owner originals')
+    current = observed[0]
+    policy, guard = bundle.installation_policy, current.guard
+    if ((current_self.namespace, current_self.authority_namespace, current_self.authority_id,
+            current_self.installation_id, current_self.manifest_digest,
+            current_self.activation_generation, current_self.request_operation_id, current_self.permit) !=
+            (reader.namespace, scope.authority_namespace, scope.pinned_anchor.authority_id,
+            policy.installation_id, policy.manifest_digest, scope.generation, scope.operation_id, scope.permit)
+            or current_self.graph_revision != reader.graph_stamp[0].graph_revision
+            or current_self.graph_epoch != reader.graph_stamp[1].revision
+            or guard.namespace != reader.namespace or guard.authority_id != scope.pinned_anchor.authority_id
+            or guard.authorization_revision != current_self.owner_authorization_revision
+            or guard.authorization_head != current_self.owner_authorization_head
+            or guard.minimum_revocation_revision != current_self.owner_minimum_revocation_revision
+            or guard.minimum_revocation_epoch != current_self.owner_revocation_epoch
+            or guard.minimum_revocation_revision != 0 or guard.pending_revoke_operation_id is not None
+            or (current.target_admission is None and current.storage_admission is None
+                and guard.installation_id != policy.installation_id)):
+        raise AuthorityUnavailable('ordinary FULL current Self/Owner scope or authorization changed')
+    now = trusted_upper(port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    if reader.operation.deadline_utc is not None and now >= reader.operation.deadline_utc:
+        raise AuthorityUnavailable('ordinary FULL Owner exceeded its original deadline')
+    if port.validate_fence(scope) != scope.permit:
+        raise AuthorityUnavailable('ordinary FULL original permit changed after current observation')
+    return current_self, current
+
+
+def _require_full_owner_caller_v3(proof):
+    state = _FULL_OWNER_CALLERS_V3.get(proof)
+    graph, port, bundle, scope, groups, control = _require_full_owner_reader_v3(proof.request, proof.kind)
+    if (state is None or state.proof is not proof or state.control is not control
+            or state.groups != groups
+            or proof.kind == 'host_current_graph_full_read' and (
+                state.contract is not proof.request.contract or state.borrowed is not proof.request.borrowed)
+            or proof.graph is not graph or proof.port is not port
+            or proof.bundle is not bundle or proof.scope is not scope or proof.control is not control
+            or proof.service is not graph._GraphCoordinator__domain_production_runtime_v1
+            or proof.retained_operation is not proof.request.operation
+            or proof.selection_digest != proof.request.selection_digest
+            or proof.namespace != scope.namespace or proof.original_permit != scope.permit
+            or proof.permission_anchor != scope.pinned_anchor
+            or proof.graph_comparison_anchor != _full_owner_graph_comparison_anchor_v3(proof.request, proof.kind, scope)
+            or proof.subject != scope.permit.subject or proof.authority is not None or proof.principal is not None):
+        raise AuthorityUnavailable('ordinary FULL Owner proof crossed its original private reader')
+    if proof.kind == 'host_private_dispatch_inventory_read':
+        from ..runtime.private_dispatch_source_read_v3 import private_dispatch_metadata_identity_v3
+        if state.dispatch_basis != private_dispatch_metadata_identity_v3(proof.request):
+            raise AuthorityUnavailable('private P2 Owner changed its P0 admission or exact metadata seal')
+
+    if proof.kind == 'host_character_labor_adoption_read':
+        from ..runtime.current_character_labor_adoption_v1 import character_labor_adoption_owner_metadata_identity_v1
+        if (state.dispatch_basis != character_labor_adoption_owner_metadata_identity_v1(proof.request)
+                or state.authority is not None and state.authority.actor != proof.request.authority.actor):
+            raise AuthorityUnavailable('labor adoption Owner changed its sealed actual gate/binding/Census/paired actor')
+    if proof.kind == 'host_d13_natural_parent_closure_read':
+        from ..runtime.d13_natural_parent_closure_read_v3 import natural_parent_closure_metadata_identity_v3
+        if state.dispatch_basis != natural_parent_closure_metadata_identity_v3(proof.request):
+            raise AuthorityUnavailable('parent cleanup Owner changed its actual Core parse/plan metadata seal')
+
+
+def _require_full_owner_permission_v3(proof):
+    state = _FULL_OWNER_CALLERS_V3[proof]
+    current_self, current = _observe_full_owner_authority_v3(proof.request, proof.kind)
+    if current_self != state.current_self or current != proof.current_owner_authority:
+        raise AuthorityUnavailable('ordinary FULL current Self/Owner changed after fixed metadata EOF')
+    if state.principal is not None:
+        pairing = proof.port.current_owner_principal_binding(namespace=proof.namespace,
+            authority_namespace=proof.scope.authority_namespace, principal=state.principal)
+        if (pairing is None or pairing.principal != state.principal
+                or pairing.installation_id != proof.installation_id
+                or pairing.actor_id != state.authority.actor):
+            raise AuthorityUnavailable('ordinary FULL actual paired Owner principal changed')
+    return proof
+
+
+def _full_owner_binding_from_facts_v3(proof, facts):
+    state = _FULL_OWNER_CALLERS_V3[proof]
+    reader, current = proof.request, proof.current_owner_authority
+    facts.require_for_v3(proof)
+    if state.authority is None or state.principal is None:
+        raise AuthorityUnavailable('ordinary FULL fixed Owner EOF has no actual paired principal')
+    metadata, scope = facts.metadata, proof.scope
+    if (metadata.requirements.namespace != proof.namespace
+            or metadata.graph_revision != reader.graph_stamp[0].graph_revision
+            or facts.graph_epoch != reader.graph_stamp[1]
+            or metadata.requirements.authority_namespace != scope.authority_namespace
+            or metadata.requirements.graph_incarnation != state.current_self.graph_incarnation
+            or not proof.graph._anchor_matches(metadata.requirements, scope.pinned_anchor)):
+        raise AuthorityUnavailable('ordinary FULL fixed Owner EOF left its original Graph stamp')
+    if proof.kind == 'host_private_dispatch_inventory_read':
+        from ..graph_types import owner_grant_key
+        grant = json.loads(facts.atom[1])
+        admission = reader.admission.admission
+        owner_token = owner_grant_key(*proof.namespace.as_tuple).token
+        versions = tuple(revision for token, revision in admission.graph_reads if token == owner_token)
+        if (grant['grant_id'] != admission.owner_head_ref
+                or state.dispatch_basis[13] != facts.work.grant_metadata
+                or len(versions) > 1 or versions and versions != (facts.atom[0],)):
+            raise AuthorityUnavailable('private P2 Owner EOF differs from its admitted grant and full census head')
+    binding = proof.graph._owner_graph_binding_from_current_metadata_v3(
+        state.authority, state.principal, metadata=metadata, graph_epoch=facts.graph_epoch,
+        atom=facts.atom, proof_row=facts.proof_row, epochs=facts.epochs,
+        target_admission=current.target_admission, storage_admission=current.storage_admission,
+        current_guard=current.guard)
+    guard = current.guard
+    if (binding.authorization_head != guard.authorization_head
+            or binding.authorization_revision != guard.authorization_revision
+            or binding.revocation_epoch != guard.minimum_revocation_epoch
+            or guard.minimum_revocation_revision != 0 or guard.pending_revoke_operation_id is not None
+            or any(roots and (purpose not in binding.purposes
+                or not set(audiences).issubset(binding.audiences))
+                for purpose, audiences, roots in state.groups)
+            or state.binding is not None and state.binding != binding):
+        raise AuthorityUnavailable('ordinary FULL requested Source groups exceed its actual current Owner grant')
+    if proof.kind=='host_current_graph_full_read':
+        from ..runtime.current_graph_full_read_v3 import(D13_COUNTER_PREPARE_FULL_V1,
+            require_actual_d13_counter_prepare_full_reader_v1)
+        if reader.contract is D13_COUNTER_PREPARE_FULL_V1:
+            require_actual_d13_counter_prepare_full_reader_v1(reader)
+            if(guard!=reader.owner_guard or _d13_counter_owner_binding_identity_v1(binding)
+                    !=_d13_counter_owner_binding_identity_v1(reader.owner_binding)):
+                raise AuthorityUnavailable('D13 counter FULL Owner EOF differs from Root fresh WRITE qualification')
+    return binding
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _HostCurrentGraphFullOwnerReadEntryV3:
+    issuer: InitVar[object]
+
+    def __post_init__(self, issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable('ordinary FULL Owner entry requires its actual private producer')
+
+    def require_for_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None or state[0].request is not reader:
+            raise AuthorityUnavailable('ordinary FULL Owner entry left its original reader')
+        proof, work, facts = state
+        require_owner_location_caller_proof_v3(proof, phase='before', graph_stamp=reader.graph_stamp)
+        return _full_owner_binding_from_facts_v3(proof, facts)
+
+    def require_permission_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None or state[0].request is not reader:
+            raise AuthorityUnavailable('ordinary FULL permission left its original reader')
+        proof, work, facts = state
+        _require_owner_permission_outside_graph_v3(proof)
+        with reader.store._lock:
+            return self.require_for_v3(reader)
+
+    @property
+    def current_owner_guard(self):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None:
+            raise AuthorityUnavailable('ordinary FULL Owner entry was released')
+        return state[0].current_owner_authority.guard
+
+    def release_v3(self):
+        state = _FULL_OWNER_ENTRIES_V3.pop(self, None)
+        if state is not None:
+            proof, work, facts = state
+            try:
+                work.close_v3()
+            finally:
+                _FULL_OWNER_CALLERS_V3.pop(proof, None)
+                proof.release_v3()
+
+
+def _iterate_current_host_metadata_owner_entry_v3(reader, kind):
+    from ..graph_types import owner_grant_key, validate_owner_grant_v1
+    graph, port, bundle, scope, groups, control = _require_full_owner_reader_v3(reader, kind)
+    current_self, current = _observe_full_owner_authority_v3(reader, kind)
+    policy = bundle.installation_policy
+    proof = OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,
+        kind=kind, graph=graph,
+        service=graph._GraphCoordinator__domain_production_runtime_v1, owner_service=None, controller=None,
+        port=port, bundle=bundle, scope=scope, authority=None, principal=None,
+        current_owner_authority=current, current_owner_head=None, retained_operation=reader.operation,
+        control=control, selection_digest=reader.selection_digest, namespace=reader.namespace,
+        installation_id=policy.installation_id, holder=policy.administrator_holder,
+        permission_anchor=scope.pinned_anchor, graph_comparison_anchor=_full_owner_graph_comparison_anchor_v3(reader, kind, scope),
+        credential=None, subject=scope.permit.subject, original_permit=scope.permit, request=reader,
+        deadline_utc=reader.operation.deadline_utc, thread=get_ident())
+    state = _FullOwnerCallerStateV3(proof, current_self, groups)
+    _FULL_OWNER_CALLERS_V3[proof] = state
+    work = None
+    try:
+        register_owner_location_retained_state_v3(proof, state)
+        work = prepare_owner_location_read_work_v3(proof)
+        while not work.complete:
+            with owner_location_read_quantum_v3(proof) as meter:
+                progress = work.advance(meter=meter)
+            if type(progress) is dict and progress.get('phase') == 'owner_location_quantum_commit':
+                work.complete_reserved_quantum_v3(proof)
+            yield
+        facts = work.result.require_for_v3(proof)
+        grant = json.loads(facts.atom[1])
+        validate_owner_grant_v1(grant)
+        principal = OwnerPrincipalV1(**grant['principal'])
+        pairing = port.current_owner_principal_binding(namespace=reader.namespace,
+            authority_namespace=scope.authority_namespace, principal=principal)
+        if (pairing is None or pairing.principal != principal
+                or pairing.installation_id != policy.installation_id):
+            raise AuthorityUnavailable('ordinary FULL fixed Owner EOF lost its actual paired principal')
+        purpose, audiences, roots = next((group for group in groups if group[2]), groups[0])
+        reserve_owner_location_retained_growth_v3(proof, 32768)
+        try:
+            state.principal = principal
+            from ..runtime.current_graph_full_read_v3 import(D13_COUNTER_PREPARE_FULL_V1,
+                require_actual_d13_counter_prepare_full_reader_v1)
+            if kind=='host_current_graph_full_read'and reader.contract is D13_COUNTER_PREPARE_FULL_V1:
+                from dataclasses import replace
+                require_actual_d13_counter_prepare_full_reader_v1(reader)
+                if reader.authority.actor!=current_self.self_entity_ref:
+                    raise AuthorityUnavailable('D13 counter FULL business actor differs from actual current Self')
+                state.authority=replace(reader.authority,actor=pairing.actor_id)
+            else:
+                state.authority = AuthorityContext(pairing.actor_id, 'd12',
+                    owner_grant_key(*reader.namespace.as_tuple).token, reader.namespace, ('d11',),
+                    purpose, (audiences[0],), grant['issuer_ref'], scope.generation)
+            with reader.store._lock:
+                state.binding = _full_owner_binding_from_facts_v3(proof, facts)
+        finally:
+            finish_owner_location_retained_growth_v3(proof)
+        _require_owner_permission_outside_graph_v3(proof)
+        entry_type = {'host_current_graph_full_read': _HostCurrentGraphFullOwnerReadEntryV3,
+            'host_private_dispatch_inventory_read': _HostPrivateDispatchInventoryOwnerReadEntryV3,
+            'host_d13_natural_parent_closure_read': _HostD13NaturalParentClosureOwnerReadEntryV3,
+            'host_character_labor_adoption_read': _HostCharacterLaborAdoptionOwnerReadEntryV1}[kind]
+        entry = entry_type(_OWNER_CALLER_ISSUER_V3)
+        _FULL_OWNER_ENTRIES_V3[entry] = (proof, work, facts)
+        return entry
+    except BaseException as error:
+        if work is not None:
+            work.cancel_v3(error)
+        _FULL_OWNER_CALLERS_V3.pop(proof, None)
+        proof.release_v3()
+        raise
+
+
+def _prepare_current_host_metadata_owner_entry_v3(reader,kind):
+    steps=_iterate_current_host_metadata_owner_entry_v3(reader,kind)
+    try:
+        while True:
+            try:next(steps)
+            except StopIteration as complete:return complete.value
+    finally:steps.close()
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _HostPrivateDispatchInventoryOwnerReadEntryV3:
+    issuer: InitVar[object]
+
+    def __post_init__(self, issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable('private P2 Owner entry requires its actual metadata producer')
+
+    def require_for_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != 'host_private_dispatch_inventory_read'
+                or state[0].request is not reader):
+            raise AuthorityUnavailable('private P2 Owner entry left its original reader')
+        proof, work, facts = state
+        require_owner_location_caller_proof_v3(proof, phase='before', graph_stamp=reader.graph_stamp)
+        return _full_owner_binding_from_facts_v3(proof, facts)
+
+    def require_permission_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != 'host_private_dispatch_inventory_read'
+                or state[0].request is not reader):
+            raise AuthorityUnavailable('private P2 permission left its original reader')
+        proof, work, facts = state
+        _require_owner_permission_outside_graph_v3(proof)
+        with reader.store._lock:
+            return self.require_for_v3(reader)
+
+    @property
+    def current_owner_guard(self):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None:
+            raise AuthorityUnavailable('private P2 Owner entry was released')
+        return state[0].current_owner_authority.guard
+
+    def release_v3(self):
+        state = _FULL_OWNER_ENTRIES_V3.pop(self, None)
+        if state is not None:
+            proof, work, facts = state
+            try:
+                work.close_v3()
+            finally:
+                _FULL_OWNER_CALLERS_V3.pop(proof, None)
+                proof.release_v3()
+
+
+
+
+def prepare_current_host_private_dispatch_inventory_owner_entry_v3(reader):
+    return _prepare_current_host_metadata_owner_entry_v3(reader, 'host_private_dispatch_inventory_read')
 
 
 _SEMANTIC_BACKGROUND_OWNER_ENTRIES_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_IDENTITIES_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_ACLS_V3 = WeakKeyDictionary()
 _SEMANTIC_BACKGROUND_OWNER_KINDS_V3 = frozenset((
-    'host_artifact_model_dispatch_read','host_named_joint_source_read', 'host_conditioned_source_read','host_conditioned_personal_choice_read', 'host_habit_source_read', 'host_semantic_recovery_read'))
+    'host_d04_source_read','host_artifact_model_dispatch_read','host_named_joint_source_read', 'host_conditioned_source_read','host_conditioned_personal_choice_read', 'host_habit_source_read', 'host_semantic_recovery_read'))
 
 
 def _semantic_background_owner_identity_v3(reader):
@@ -6256,6 +6883,10 @@ def _semantic_background_owner_identity_v3(reader):
         state,cause_digest=personal_choice_owner_identity_v3(reader)
         return 'host_conditioned_personal_choice_read',state,cause_digest
     kind = reader.work.kind
+    if kind == 'd04_source_read_v3':
+        from ..runtime.d04_source_work_v3 import installed_d04_background_owner_identity_v3
+        state,cause_digest=installed_d04_background_owner_identity_v3(reader)
+        return 'host_d04_source_read',state,cause_digest
     if kind == 'current_world_source_read_v3':
         from ..runtime.named_joint_source_work_v3 import named_joint_background_owner_identity_v3
         state,cause_digest=named_joint_background_owner_identity_v3(reader)
@@ -7632,3 +8263,1314 @@ def create_owner_stop_reply_metadata_caller_proof_v1(invocation):
         invocation.installation_id,invocation.holder,invocation.current_anchor,invocation.current_anchor,
         invocation.credential,invocation.subject,invocation.original_permit,invocation,
         invocation.registered_deadline_utc,get_ident())
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _HostD13NaturalParentClosureOwnerReadEntryV3:
+    issuer: InitVar[object]
+
+    def __post_init__(self, issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable('parent cleanup Owner entry requires its actual metadata producer')
+
+    def require_for_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != 'host_d13_natural_parent_closure_read'
+                or state[0].request is not reader):
+            raise AuthorityUnavailable('parent cleanup Owner entry left its original reader')
+        proof, work, facts = state
+        require_owner_location_caller_proof_v3(proof, phase='before', graph_stamp=reader.graph_stamp)
+        return _full_owner_binding_from_facts_v3(proof, facts)
+
+    def require_permission_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != 'host_d13_natural_parent_closure_read'
+                or state[0].request is not reader):
+            raise AuthorityUnavailable('parent cleanup permission left its original reader')
+        proof, work, facts = state
+        _require_owner_permission_outside_graph_v3(proof)
+        with reader.store._lock:
+            return self.require_for_v3(reader)
+
+    @property
+    def current_owner_guard(self):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None:
+            raise AuthorityUnavailable('parent cleanup Owner entry was released')
+        return state[0].current_owner_authority.guard
+
+    def release_v3(self):
+        state = _FULL_OWNER_ENTRIES_V3.pop(self, None)
+        if state is not None:
+            proof, work, facts = state
+            try:
+                work.close_v3()
+            finally:
+                _FULL_OWNER_CALLERS_V3.pop(proof, None)
+                proof.release_v3()
+
+
+def prepare_current_host_full_read_owner_entry_v3(reader):
+    return _CurrentOwnerEntryTaskV3(_OWNER_CALLER_ISSUER_V3,reader,
+        _iterate_current_host_metadata_owner_entry_v3(reader,'host_current_graph_full_read'))
+
+
+
+def prepare_current_host_d13_natural_parent_closure_owner_entry_v3(reader):
+    return _prepare_current_host_metadata_owner_entry_v3(reader, 'host_d13_natural_parent_closure_read')
+
+
+@dataclass(frozen=True, slots=True, eq=False, weakref_slot=True)
+class _HostCharacterLaborAdoptionOwnerReadEntryV1:
+    issuer: InitVar[object]
+
+    def __post_init__(self, issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable("labor adoption Owner entry requires its exact WRITE producer")
+
+    def require_for_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != "host_character_labor_adoption_read"
+                or state[0].request is not reader):
+            raise AuthorityUnavailable("labor adoption Owner entry left its private original Work")
+        proof, work, facts = state
+        require_owner_location_caller_proof_v3(proof, phase="before", graph_stamp=reader.graph_stamp)
+        return _full_owner_binding_from_facts_v3(proof, facts)
+
+    def require_permission_v3(self, reader):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if (state is None or state[0].kind != "host_character_labor_adoption_read"
+                or state[0].request is not reader):
+            raise AuthorityUnavailable("labor adoption Owner permission left its original WRITE Work")
+        _require_owner_permission_outside_graph_v3(state[0])
+        with reader.store._lock:
+            return self.require_for_v3(reader)
+
+    @property
+    def current_owner_guard(self):
+        state = _FULL_OWNER_ENTRIES_V3.get(self)
+        if state is None or state[0].kind != "host_character_labor_adoption_read":
+            raise AuthorityUnavailable("labor adoption Owner entry was released")
+        return state[0].current_owner_authority.guard
+
+    def release_v3(self):
+        state = _FULL_OWNER_ENTRIES_V3.pop(self, None)
+        if state is not None:
+            proof, work, facts = state
+            try:
+                work.close_v3()
+            finally:
+                _FULL_OWNER_CALLERS_V3.pop(proof, None)
+                proof.release_v3()
+
+
+def prepare_current_host_character_labor_adoption_owner_entry_v1(reader):
+    return _prepare_current_host_metadata_owner_entry_v3(reader, "host_character_labor_adoption_read")
+
+
+def require_current_authority_d07_single_event_review_owner_binding_v3(work,reader):
+    """Full actual Owner grant for this named Authority Work's two Source groups."""
+    from .current_authority_graph_read_v3 import require_actual_authority_graph_attachment_owner_v3
+    from .d07_authority_model_source_read_v3 import require_current_single_event_review_authority_metadata_v1
+    require_actual_authority_graph_attachment_owner_v3(work,db=work.db)
+    if require_current_single_event_review_authority_metadata_v1(work) is not reader:
+        raise AuthorityUnavailable("D07 review Owner binding belongs to a different actual Source reader")
+    saved = _D07_AUTHORITY_OWNER_BINDINGS_V3.get(work)
+    if saved is None:
+        raise AuthorityUnavailable("D07 review has no actual full Owner metadata producer")
+    header,binding,operation,scope,permit,selection,epoch,rights = saved
+    if (header is not reader.owner_header_proof or header.request is not work
+            or operation is not work.operation or scope is not work.scope or permit is not work.permit
+            or selection != work.selection_digest or header.original_permit is not permit
+            or header.current_owner_authority.guard != reader.current_owner_guard
+            or tuple(work.graph_stamp) != (epoch.revision,*rights)
+            or binding.namespace != work.namespace
+            or binding.principal != header.principal
+            or binding.authorization_head != reader.current_owner_guard.authorization_head
+            or binding.authorization_revision != reader.current_owner_guard.authorization_revision
+            or binding.revocation_epoch != reader.current_owner_guard.minimum_revocation_epoch
+            or reader.current_owner_guard.minimum_revocation_revision
+            or reader.current_owner_guard.pending_revoke_operation_id is not None):
+        raise AuthorityUnavailable("D07 review full Owner grant left its actual same Work/guard/selection")
+    require_owner_location_caller_proof_v3(header,phase="before")
+    return binding
+
+
+_CREATOR_OWNER_EOF_V3=WeakKeyDictionary()
+_CREATOR_OWNER_EOF_ISSUER_V3=object()
+
+
+class _CurrentCreatorOwnerEOFV3:
+    def __init__(self,issuer,reader,entry,proof,work,facts,grant_header):
+        if issuer is not _CREATOR_OWNER_EOF_ISSUER_V3:
+            raise AuthorityUnavailable('Creator Owner EOF requires its actual completed metadata producer')
+        _CREATOR_OWNER_EOF_V3[self]=(reader,entry,proof,work,facts,grant_header,
+            reader.graph,reader.operation,reader.work,reader.selection_digest,reader.graph_stamp,
+            work.grant_metadata,work.issue_metadata,facts.epochs)
+        reader.operation.register_retained_state_v3(self)
+    def _runtime_retained_heap_bytes_v3(self):
+        from ..runtime.dispatch_current_inventory_v3 import _heap
+        state=_CREATOR_OWNER_EOF_V3[self]
+        return 2048+_heap((state[4].atom,state[4].proof_row,state[5],state[11:]))
+    @contextmanager
+    def decode_peak_v3(self,meter,amount):
+        operation=_CREATOR_OWNER_EOF_V3[self][7]
+        peak=amount*8+4096
+        if peak>meter.budget.reserved_arena_bytes:
+            raise AuthorityUnavailable('Creator compact Owner EOF exceeds its original decoder arena')
+        operation.reserve_retained_state_growth_v3(self,peak)
+        try:yield
+        finally:operation.finish_retained_state_growth_v3(self)
+    def require_for_write_v3(self,reader,*,creator_prepare,scope,metadata,epoch,meter):
+        saved=_CREATOR_OWNER_EOF_V3.get(self)
+        from ..runtime.d12_creator_draft_read_v3 import require_current_creator_draft_owner_write_metadata_v3
+        require_current_creator_draft_owner_write_metadata_v3(creator_prepare,reader,scope)
+        if(saved is None or saved[0]is not reader or saved[1]is not reader.general_owner_entry
+                or(saved[6],saved[7],saved[8],saved[9],saved[10])!=(reader.graph,reader.operation,
+                    reader.work,reader.selection_digest,reader.graph_stamp)
+                or(metadata,epoch)!=saved[10]
+                or _METHOD_OWNER_READ_ENTRIES_V3.get(saved[1])!=(saved[2],saved[3],saved[4])):
+            raise AuthorityUnavailable('Creator retained Owner EOF changed its actual reader/selection')
+        proof,work,facts=saved[2:5]
+        if(work not in _OWNER_LOCATION_GRAPH_WORKS_V3 or facts not in _OWNER_LOCATION_GRAPH_FACTS_V3
+                or not work.complete or work.failed is not None or work.result is not facts
+                or facts.work is not work or work.proof is not proof
+                or(facts.metadata,facts.graph_epoch)!=(metadata,epoch)):
+            raise AuthorityUnavailable('Creator retained Owner EOF lost its original canonical completion')
+        work._require_selected(meter)
+        db=reader.db;namespace=reader.namespace
+        grant=meter.read_fixed_row(db,'graph_atoms',('revision','valid','value_cell_id'),
+            'token=? AND bot=? AND persona=?',(owner_grant_key(*namespace.as_tuple).token,*namespace.as_tuple))
+        expected=saved[11]
+        if(grant is None or grant[:len(expected)]!=expected
+                or reader.graph._v2_graph_stamp(namespace)!=(metadata,epoch)):
+            raise AuthorityUnavailable('Creator current Owner grant or Graph stamp changed after its EOF')
+        issue=meter.read_fixed_row(db,'graph_owner_issue_operations_v1',
+            ('operation_id','request_digest','grant_id','grant_digest','graph_incarnation',
+                'graph_access_epoch','graph_epoch','graph_receipt_digest'),'bot=? AND persona=?',namespace.as_tuple)
+        epochs=meter.read_fixed_row(db,'graph_authority_epochs',('access_epoch','delete_epoch'),
+            'bot=? AND persona=?',namespace.as_tuple)
+        if issue!=saved[12]or epochs!=saved[13]:
+            raise AuthorityUnavailable('Creator current Owner issue proof or authority epochs changed')
+        if saved[5]is not None:
+            header=meter.read_fixed_row(db,'segmented_cells_v1',
+                ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(grant[2],))
+            if header!=saved[5]:raise AuthorityUnavailable('Creator Owner grant sealed canonical cell changed')
+        return facts.atom,facts.proof_row,facts.epochs
+
+
+def freeze_current_creator_owner_eof_v3(reader):
+    from ..runtime.d12_creator_draft_read_v3 import require_current_creator_draft_metadata_owner_v3
+    require_current_creator_draft_metadata_owner_v3(reader)
+    entry=reader.general_owner_entry
+    if type(entry)is not _HostMethodOwnerReadEntryV3:
+        raise AuthorityUnavailable('Creator requires its actual independent Method Owner EOF entry')
+    entry.require_for_v3(reader)
+    state=_METHOD_OWNER_READ_ENTRIES_V3.get(entry)
+    if state is None:raise AuthorityUnavailable('Creator actual Owner EOF producer was released')
+    proof,work,facts=state;facts.require_for_v3(proof)
+    if(work.result is not facts or not work.complete or work.failed is not None
+            or(facts.metadata,facts.graph_epoch)!=reader.graph_stamp):
+        raise AuthorityUnavailable('Creator actual Owner EOF differs from its current READ stamp')
+    header=None
+    if len(work.grant_metadata)==3:
+        from ..runtime_storage_v3 import runtime_storage_quantum_v3
+        with reader.store._lock,runtime_storage_quantum_v3(reader.db)as meter:
+            header=meter.read_fixed_row(reader.db,'segmented_cells_v1',
+                ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),
+                'cell_id=?',(work.grant_metadata[2],))
+        if header is None or header[1]!=owner_grant_key(*reader.namespace.as_tuple).token:
+            raise AuthorityUnavailable('Creator actual Owner EOF differs from its current sealed grant')
+    snapshot=_CurrentCreatorOwnerEOFV3(_CREATOR_OWNER_EOF_ISSUER_V3,reader,entry,proof,work,facts,header)
+    try:
+        if header is not None:
+            with reader.store._lock,runtime_storage_quantum_v3(reader.db)as meter,snapshot.decode_peak_v3(meter,len(facts.atom[1])):
+                if sha256(facts.atom[1].encode('utf-8')).hexdigest()!=header[5]:
+                    raise AuthorityUnavailable('Creator actual Owner EOF SHA differs from its sealed grant')
+        return snapshot
+    except BaseException:
+        release_current_creator_owner_eof_v3(snapshot)
+        raise
+
+
+def release_current_creator_owner_eof_v3(value):
+    if type(value)is not _CurrentCreatorOwnerEOFV3:
+        raise AuthorityUnavailable('Creator Owner EOF release requires its exact private snapshot')
+    state=_CREATOR_OWNER_EOF_V3.get(value)
+    if state is not None:state[7].unregister_retained_state_v3(value)
+    _CREATOR_OWNER_EOF_V3.pop(value,None)
+
+
+_ROOT_TOPOLOGY_OWNER_ENTRIES_V1=WeakKeyDictionary()
+_ROOT_TOPOLOGY_OWNER_EOF_V1=WeakKeyDictionary()
+_ROOT_TOPOLOGY_OWNER_FROZEN_V1=WeakKeyDictionary()
+
+
+def _root_topology_owner_identity_v1(r):
+    return(r.graph,r.work,r.operation,r.fence,r.authority,r.lease,r.session_proof,r.request,
+        r.selection_digest,r.graph_stamp,r.initial_monotonic_deadline)
+
+
+def _require_host_d04_root_topology_owner_reader_v1(r):
+    from ..runtime.d04_root_topology_read_v1 import(_RootTopologyReadV1,RootTopologyReadRequestV1,
+        require_actual_d04_root_topology_owner_reader_v1)
+    from ..host.authority_profile import AdminInstallationBundle
+    graph,port,bundle,scope,groups=require_actual_d04_root_topology_owner_reader_v1(r)
+    if(type(r)is not _RootTopologyReadV1 or type(r.request)is not RootTopologyReadRequestV1
+            or type(bundle)is not AdminInstallationBundle or type(scope)is not FenceScope
+            or r.read_finished or r.complete or r.operation.closed or r.work.state is not r
+            or r.work.kind!='d04_root_topology_read_v1'or r.work.operation is not r.operation
+            or r.work.coordinator is not graph or r.graph is not graph
+            or r.runtime is not graph._GraphCoordinator__domain_production_runtime_v1
+            or r.db is not graph._GraphCoordinator__store._db or r.store is not graph._GraphCoordinator__store
+            or r.bundle is not bundle or port is not graph._GraphCoordinator__content_fence_v2
+            or scope is not r.fence.scope or scope.operation!='read' or scope.namespace!=r.namespace
+            or r.authority.issuer_domain!='d12'or 'persona'not in r.authority.owner_scope
+            or r.authority.namespace!=r.namespace or r.session_proof is None
+            or groups!=((r.authority.purpose,tuple(r.authority.audience),()),)
+            or r.selection_digest!=r.operation.selection_digest or r.work.selection_digest!=r.selection_digest
+            or r.work.deadline_utc!=r.operation.deadline_utc):
+        raise AuthorityUnavailable('RootTopology Owner requires its independent exact registered READ/empty Source recipe')
+    policy=bundle.installation_policy;owner=r.owner_binding
+    if(scope.namespace!=policy.namespace or scope.authority_namespace!=policy.authority_namespace
+            or scope.permit.holder!=policy.administrator_holder
+            or port.installation_grant.installation_id!=policy.installation_id
+            or graph._GraphCoordinator__owner_session_proofs.get(r.lease)!=r.session_proof
+            or graph._GraphCoordinator__owner_leases.get(r.lease)!=owner
+            or 'workbench.activate'not in owner.capabilities or r.authority.purpose not in owner.purposes
+            or not set(r.authority.audience)<=set(owner.audiences)
+            or r.session_proof[1].principal!=owner.principal
+            or r.fence.authority is not r.authority or r.fence.owner_session_proof!=r.session_proof
+            or r.fence.owner_binding is not None or r.fence.owner_principal is not None
+            or r.owner_guard is not None and(r.fence.observed_guard!=r.owner_guard or r.fence.observed_owner!=owner)):
+        raise AuthorityUnavailable('RootTopology Owner READ changed its original current lease/session/installation')
+    r.work._require_invocation(graph)
+    control=_require_owner_operation_v3(r.operation,db=r.db,namespace=r.namespace)
+    return graph,port,bundle,scope,control,owner.principal
+
+
+def _observe_host_d04_root_topology_owner_authority_v1(r):
+    from ..runtime.first_ingress_v2 import trusted_upper
+    from time import monotonic
+    graph,port,bundle,scope,control,principal=_require_host_d04_root_topology_owner_reader_v1(r)
+    if(r.db.in_transaction or port.validate_fence(scope)!=scope.permit
+            or graph._current_owner_principal(r.authority.actor,r.namespace)!=principal):
+        raise AuthorityUnavailable('RootTopology Owner observation lost its actual READ/session pairing')
+    token,request=r.session_proof
+    current,permit=port.get_current_owner_authority_for_fence_v1(namespace=r.namespace,
+        authority_namespace=scope.authority_namespace,permit=scope.permit,
+        owner_actor_id=r.authority.actor,owner_session_token=token,owner_session_request=request)
+    if(type(current)is not D12CurrentOwnerAuthorityV1 or permit!=scope.permit
+            or current.guard.namespace!=r.namespace or current.guard.authority_id!=scope.pinned_anchor.authority_id
+            or current.guard.pending_revoke_operation_id is not None or current.guard.minimum_revocation_revision!=0
+            or r.owner_guard is not None and current.guard!=r.owner_guard
+            or(current.target_admission is None and current.storage_admission is None
+                and current.guard.installation_id!=port.installation_grant.installation_id)
+            or trusted_upper(r.initial_reading)>=r.operation.deadline_utc
+            or monotonic()>=r.initial_monotonic_deadline or port.validate_fence(scope)!=scope.permit):
+        raise AuthorityUnavailable('RootTopology current Owner guard or original READ deadline changed')
+    return current
+
+
+def _require_host_d04_root_topology_owner_caller_v1(proof):
+    r=proof.request
+    graph,port,bundle,scope,control,principal=_require_host_d04_root_topology_owner_reader_v1(r)
+    if(proof.graph is not graph or proof.service is not r.runtime or proof.port is not port
+            or proof.bundle is not bundle or proof.scope is not scope or proof.authority is not r.authority
+            or proof.principal!=principal or proof.control is not control or proof.retained_operation is not r.operation
+            or proof.selection_digest!=r.selection_digest or proof.original_permit!=scope.permit
+            or proof.permission_anchor!=scope.pinned_anchor or proof.graph_comparison_anchor!=scope.pinned_anchor
+            or proof.namespace!=r.namespace or proof.installation_id!=bundle.installation_policy.installation_id
+            or proof.holder!=bundle.installation_policy.administrator_holder):
+        raise AuthorityUnavailable('RootTopology Owner proof crossed its actual independent caller')
+
+
+def _root_topology_owner_binding_from_facts_v1(proof,facts):
+    r=proof.request;scope=proof.scope;current=proof.current_owner_authority
+    facts.require_for_v3(proof)
+    if((facts.metadata,facts.graph_epoch)!=r.graph_stamp
+            or facts.metadata.graph_revision!=scope.graph_revision or facts.graph_epoch!=scope.graph_epoch
+            or not r.graph._anchor_matches(facts.metadata.requirements,scope.pinned_anchor)):
+        raise AuthorityUnavailable('RootTopology Owner EOF changed its actual recovery/fence metadata')
+    binding=r.graph._owner_graph_binding_from_current_metadata_v3(r.authority,proof.principal,
+        metadata=facts.metadata,graph_epoch=facts.graph_epoch,atom=facts.atom,proof_row=facts.proof_row,
+        epochs=facts.epochs,target_admission=current.target_admission,storage_admission=current.storage_admission,
+        current_guard=current.guard)
+    if(binding!=r.owner_binding or 'workbench.activate'not in binding.capabilities
+            or r.authority.purpose not in binding.purposes or not set(r.authority.audience)<=set(binding.audiences)
+            or current.guard.authorization_revision!=binding.authorization_revision
+            or current.guard.authorization_head!=binding.authorization_head
+            or current.guard.minimum_revocation_epoch!=binding.revocation_epoch
+            or current.guard.minimum_revocation_revision!=0 or current.guard.pending_revoke_operation_id is not None
+            or r.owner_guard is not None and r.owner_guard!=current.guard):
+        raise AuthorityUnavailable('RootTopology actual Owner EOF differs from the original signed lease/rights')
+    if r.owner_guard is None:
+        r.owner_binding=binding;r.owner_guard=current.guard
+        r.fence.observed_owner=binding;r.fence.observed_guard=current.guard
+    return binding
+
+
+@dataclass(frozen=True,slots=True,eq=False,weakref_slot=True)
+class _HostD04RootTopologyOwnerEntryV1:
+    issuer:InitVar[object]
+    def __post_init__(self,issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:raise AuthorityUnavailable('actual RootTopology Owner EOF issuer required')
+    def require_for_v3(self,r):
+        saved=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1.get(self)
+        if(saved is None or saved[0].request is not r or saved[3]!=_root_topology_owner_identity_v1(r)):
+            raise AuthorityUnavailable('RootTopology Owner entry lost its actual original Work/request')
+        proof,work,facts,_=saved
+        require_owner_location_caller_proof_v3(proof,phase='before',graph_stamp=r.graph_stamp)
+        return _root_topology_owner_binding_from_facts_v1(proof,facts)
+    def require_permission_v3(self,r):
+        saved=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1.get(self)
+        if saved is None or saved[0].request is not r:
+            raise AuthorityUnavailable('RootTopology Owner permission belongs to another private reader')
+        _require_owner_permission_outside_graph_v3(saved[0])
+        with r.store._lock:return self.require_for_v3(r)
+    @property
+    def current_owner_guard(self):
+        saved=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('RootTopology Owner entry was released')
+        return saved[0].current_owner_authority.guard
+    def grant_value_v3(self,r):
+        self.require_for_v3(r)
+        proof,work,facts,_=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1[self]
+        reserve_owner_location_retained_growth_v3(proof,len(facts.atom[1])*8+4096)
+        try:return json.loads(facts.atom[1])
+        finally:finish_owner_location_retained_growth_v3(proof)
+    def release_v3(self):
+        saved=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1.pop(self,None)
+        if saved is None:return
+        proof,work,facts,_=saved
+        snapshot=_ROOT_TOPOLOGY_OWNER_FROZEN_V1.pop(proof.request,None)
+        if snapshot is not None:release_current_d04_root_topology_owner_eof_v1(snapshot)
+        try:work.close_v3()
+        finally:proof.release_v3()
+
+
+def _iterate_prepare_current_host_d04_root_topology_owner_entry_v1(r):
+    graph,port,bundle,scope,control,principal=_require_host_d04_root_topology_owner_reader_v1(r)
+    current=_observe_host_d04_root_topology_owner_authority_v1(r);policy=bundle.installation_policy
+    proof=OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,kind='host_d04_root_topology_read',
+        graph=graph,service=r.runtime,owner_service=None,controller=None,port=port,bundle=bundle,
+        scope=scope,authority=r.authority,principal=principal,current_owner_authority=current,
+        current_owner_head=None,retained_operation=r.operation,control=control,
+        selection_digest=r.selection_digest,namespace=r.namespace,installation_id=policy.installation_id,
+        holder=policy.administrator_holder,permission_anchor=scope.pinned_anchor,
+        graph_comparison_anchor=scope.pinned_anchor,credential=None,subject=scope.permit.subject,
+        original_permit=scope.permit,request=r,deadline_utc=r.operation.deadline_utc,thread=get_ident())
+    work=None
+    try:
+        work=prepare_owner_location_read_work_v3(proof)
+        while not work.complete:
+            with owner_location_read_quantum_v3(proof)as meter:progress=work.advance(meter=meter)
+            if type(progress)is dict and progress.get('phase')=='owner_location_quantum_commit':
+                work.complete_reserved_quantum_v3(proof)
+            yield
+        facts=work.result.require_for_v3(proof)
+        _root_topology_owner_binding_from_facts_v1(proof,facts)
+        _require_owner_permission_outside_graph_v3(proof)
+        entry=_HostD04RootTopologyOwnerEntryV1(_OWNER_CALLER_ISSUER_V3)
+        _ROOT_TOPOLOGY_OWNER_ENTRIES_V1[entry]=(proof,work,facts,_root_topology_owner_identity_v1(r))
+        return entry
+    except BaseException as error:
+        if work is not None:work.cancel_v3(error)
+        proof.release_v3()
+        raise
+
+
+def prepare_current_host_d04_root_topology_owner_entry_v1(r):
+    return _CurrentOwnerEntryTaskV3(_OWNER_CALLER_ISSUER_V3,r,_iterate_prepare_current_host_d04_root_topology_owner_entry_v1(r))
+
+
+class _CurrentD04RootTopologyOwnerEOFV1:
+    def __init__(self,issuer,r,entry,proof,work,facts,header):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable('RootTopology retained Owner EOF requires its actual independent issuer')
+        _ROOT_TOPOLOGY_OWNER_EOF_V1[self]=(r,entry,proof,work,facts,_root_topology_owner_identity_v1(r),header,None)
+        r.operation.register_retained_state_v3(self)
+    def _runtime_retained_heap_bytes_v3(self):
+        from ..runtime.dispatch_current_inventory_v3 import _heap
+        state=_ROOT_TOPOLOGY_OWNER_EOF_V1[self]
+        return 2048+_heap((state[4].atom,state[4].proof_row,state[4].epochs,state[6]))
+    @contextmanager
+    def decode_peak_v1(self,meter,amount):
+        operation=_ROOT_TOPOLOGY_OWNER_EOF_V1[self][0].operation;peak=amount*8+4096
+        if peak>meter.budget.reserved_arena_bytes:
+            raise AuthorityUnavailable('RootTopology compact Owner EOF exceeds its original decoder arena')
+        operation.reserve_retained_state_growth_v3(self,peak)
+        try:yield
+        finally:operation.finish_retained_state_growth_v3(self)
+    def require_fixed_v1(self,r,scope,metadata,epoch,meter):
+        from ..runtime.d04_root_topology_read_v1 import require_actual_d04_root_topology_write_reader_v1
+        if require_actual_d04_root_topology_write_reader_v1(r,scope)is not r:
+            raise AuthorityUnavailable('RootTopology Owner WRITE lacks its actual private retained command')
+        saved=_ROOT_TOPOLOGY_OWNER_EOF_V1.get(self)
+        if(saved is None or saved[0]is not r or saved[1]is not r.owner_entry
+                or saved[5]!=_root_topology_owner_identity_v1(r)
+                or _ROOT_TOPOLOGY_OWNER_ENTRIES_V1.get(saved[1])!=(saved[2],saved[3],saved[4],saved[5])):
+            raise AuthorityUnavailable('RootTopology retained Owner EOF lost its independent Work/entry binding')
+        proof,work,facts=saved[2:5]
+        attempt_id='owner-domain-'+canonical_digest((r.namespace,r.request.command_operation_id,
+            r.request.command_input_digest))[:48]
+        if(not r.read_finished or not r.complete or r.operation.closed or scope is r.fence.scope
+                or type(scope)is not FenceScope or scope.operation!='write' or scope.namespace!=r.namespace
+                or scope.operation_id!=attempt_id or scope.permit.operation_id!=attempt_id
+                or scope.generation!=r.authority.activation_generation or(metadata,epoch)!=r.graph_stamp
+                or scope.graph_revision!=metadata.graph_revision or scope.graph_epoch!=epoch
+                or work not in _OWNER_LOCATION_GRAPH_WORKS_V3 or facts not in _OWNER_LOCATION_GRAPH_FACTS_V3
+                or not work.complete or work.failed is not None or work.result is not facts or facts.work is not work
+                or work.proof is not proof or(facts.metadata,facts.graph_epoch)!=(metadata,epoch)):
+            raise AuthorityUnavailable('RootTopology fixed Owner EOF differs from its actual fresh WRITE scope')
+        work._require_selected(meter);r.operation.handle.require_current(meter)
+        if r.graph._v2_graph_stamp(r.namespace)!=(metadata,epoch):
+            raise AuthorityUnavailable('RootTopology current Graph stamp changed after its Owner EOF')
+        grant=meter.read_fixed_row(r.db,'graph_atoms',('revision','valid','value_cell_id'),
+            'token=? AND bot=? AND persona=?',(owner_grant_key(*r.namespace.as_tuple).token,*r.namespace.as_tuple))
+        issue=meter.read_fixed_row(r.db,'graph_owner_issue_operations_v1',
+            ('operation_id','request_digest','grant_id','grant_digest','graph_incarnation',
+                'graph_access_epoch','graph_epoch','graph_receipt_digest'),'bot=? AND persona=?',r.namespace.as_tuple)
+        epochs=meter.read_fixed_row(r.db,'graph_authority_epochs',('access_epoch','delete_epoch'),
+            'bot=? AND persona=?',r.namespace.as_tuple)
+        if(grant is None or grant[:len(work.grant_metadata)]!=work.grant_metadata
+                or issue!=work.issue_metadata or epochs!=facts.epochs):
+            raise AuthorityUnavailable('RootTopology Owner current grant/issue/authority epochs changed')
+        if saved[6]is not None:
+            header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+                ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(grant[2],))
+            if header!=saved[6]:raise AuthorityUnavailable('RootTopology Owner sealed canonical grant changed')
+        from ..runtime.first_ingress_v2 import trusted_upper
+        from time import monotonic
+        if trusted_upper(r.initial_reading)>=r.operation.deadline_utc or monotonic()>=r.initial_monotonic_deadline:
+            raise AuthorityUnavailable('RootTopology retained Owner EOF exceeded its original deadline')
+        return facts
+
+
+def freeze_current_d04_root_topology_owner_eof_v1(r):
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    entry=r.owner_entry
+    if type(entry)is not _HostD04RootTopologyOwnerEntryV1:
+        raise AuthorityUnavailable('RootTopology retained EOF requires its exact independent Owner entry')
+    entry.require_for_v3(r)
+    existing=_ROOT_TOPOLOGY_OWNER_FROZEN_V1.get(r)
+    if existing is not None:return existing
+    proof,work,facts,_=_ROOT_TOPOLOGY_OWNER_ENTRIES_V1[entry]
+    header=None
+    if len(work.grant_metadata)==3:
+        with r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+            header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+                ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(work.grant_metadata[2],))
+        if header is None or header[1]!=owner_grant_key(*r.namespace.as_tuple).token:
+            raise AuthorityUnavailable('RootTopology Owner EOF differs from its selected sealed grant')
+    snapshot=_CurrentD04RootTopologyOwnerEOFV1(_OWNER_CALLER_ISSUER_V3,r,entry,proof,work,facts,header)
+    try:
+        if header is not None:
+            with r.store._lock,runtime_storage_quantum_v3(r.db)as meter,snapshot.decode_peak_v1(meter,len(facts.atom[1])):
+                if sha256(facts.atom[1].encode('utf-8')).hexdigest()!=header[5]:
+                    raise AuthorityUnavailable('RootTopology complete Owner EOF SHA differs from its sealed grant')
+        _ROOT_TOPOLOGY_OWNER_FROZEN_V1[r]=snapshot
+        return snapshot
+    except BaseException:
+        release_current_d04_root_topology_owner_eof_v1(snapshot)
+        raise
+
+
+def _qualify_current_d04_root_topology_owner_write_v1(snapshot,r,scope,current,metadata,epoch,meter):
+    facts=snapshot.require_fixed_v1(r,scope,metadata,epoch,meter)
+    saved=_ROOT_TOPOLOGY_OWNER_EOF_V1[snapshot];proof=saved[2]
+    with snapshot.decode_peak_v1(meter,len(facts.atom[1])+len(facts.proof_row[-1])):
+        owner=r.graph._owner_graph_binding_from_current_metadata_v3(r.authority,proof.principal,
+            metadata=metadata,graph_epoch=epoch,atom=facts.atom,proof_row=facts.proof_row,epochs=facts.epochs,
+            target_admission=current.target_admission,storage_admission=current.storage_admission,
+            current_guard=current.guard)
+    guard=current.guard
+    if(owner!=r.owner_binding or guard!=r.owner_guard or 'workbench.activate'not in owner.capabilities
+            or r.authority.purpose not in owner.purposes or not set(r.authority.audience)<=set(owner.audiences)
+            or guard.authorization_revision!=owner.authorization_revision or guard.authorization_head!=owner.authorization_head
+            or guard.minimum_revocation_revision!=0 or guard.minimum_revocation_epoch!=owner.revocation_epoch
+            or guard.pending_revoke_operation_id is not None
+            or(current.target_admission is None and current.storage_admission is None
+                and guard.installation_id!=r.graph._GraphCoordinator__content_fence_v2.installation_grant.installation_id)):
+        raise AuthorityUnavailable('RootTopology current Owner rights changed after its actual independent EOF')
+    return guard,owner
+
+
+def observe_current_d04_root_topology_owner_write_v1(r,graph,authority,lease,scope,
+        original_owner,session_proof,metadata,epoch):
+    from ..runtime.d04_root_topology_read_v1 import require_actual_d04_root_topology_write_reader_v1
+    from ..runtime_storage_v3 import bind_runtime_storage_operation_v3,runtime_storage_quantum_v3
+    if require_actual_d04_root_topology_write_reader_v1(r,scope)is not r:
+        raise AuthorityUnavailable('RootTopology Owner observer requires its actual private fresh WRITE command')
+    snapshot=_ROOT_TOPOLOGY_OWNER_FROZEN_V1.get(r)
+    saved=None if snapshot is None else _ROOT_TOPOLOGY_OWNER_EOF_V1.get(snapshot)
+    if(saved is None or saved[7]is not None or r.graph is not graph or r.authority is not authority
+            or r.lease is not lease or r.db.in_transaction or original_owner!=r.owner_binding
+            or session_proof!=r.session_proof or(metadata,epoch)!=r.graph_stamp):
+        raise AuthorityUnavailable('RootTopology fresh Owner WRITE changed its original session/Graph/command')
+    port=graph._GraphCoordinator__content_fence_v2
+    if(type(scope)is not FenceScope or scope.operation!='write' or scope.namespace!=r.namespace
+            or port.validate_fence(scope)!=scope.permit
+            or not graph._anchor_matches(metadata.requirements,scope.pinned_anchor)
+            or graph._current_owner_principal(authority.actor,r.namespace)!=original_owner.principal):
+        raise AuthorityUnavailable('RootTopology current Owner pairing or WRITE permit changed')
+    token,request=r.session_proof
+    current,permit=port.get_current_owner_authority_for_fence_v1(namespace=r.namespace,
+        authority_namespace=scope.authority_namespace,permit=scope.permit,
+        owner_actor_id=authority.actor,owner_session_token=token,owner_session_request=request)
+    if(type(current)is not D12CurrentOwnerAuthorityV1 or permit!=scope.permit
+            or current.guard.namespace!=r.namespace or current.guard.authority_id!=scope.pinned_anchor.authority_id
+            or port.validate_fence(scope)!=scope.permit):
+        raise AuthorityUnavailable('RootTopology current session Authority differs from its fresh WRITE permit')
+    with bind_runtime_storage_operation_v3(r.operation,r.db),r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+        guard,owner=_qualify_current_d04_root_topology_owner_write_v1(snapshot,r,scope,current,metadata,epoch,meter)
+    _ROOT_TOPOLOGY_OWNER_EOF_V1[snapshot]=(*saved[:7],(scope,current,guard,owner))
+    return guard,owner
+
+
+def require_current_d04_root_topology_owner_write_v1(r,scope,current_owner,guard,metadata,epoch,meter):
+    snapshot=_ROOT_TOPOLOGY_OWNER_FROZEN_V1.get(r)
+    saved=None if snapshot is None else _ROOT_TOPOLOGY_OWNER_EOF_V1.get(snapshot)
+    if(saved is None or saved[7]is None or saved[7][0]is not scope or saved[7][2:]!=(guard,current_owner)
+            or not r.db.in_transaction or not r.store._lock._is_owned()):
+        raise AuthorityUnavailable('RootTopology Owner WRITE is outside its actual observed same-transaction binding')
+    result=_qualify_current_d04_root_topology_owner_write_v1(snapshot,r,scope,saved[7][1],metadata,epoch,meter)
+    if result!=(guard,current_owner):raise AuthorityUnavailable('RootTopology Owner changed inside its actual WRITE')
+    return result
+
+
+def release_current_d04_root_topology_owner_eof_v1(snapshot):
+    if type(snapshot)is not _CurrentD04RootTopologyOwnerEOFV1:
+        raise AuthorityUnavailable('RootTopology Owner EOF release requires its exact private snapshot')
+    saved=_ROOT_TOPOLOGY_OWNER_EOF_V1.get(snapshot)
+    if saved is not None:
+        saved[0].operation.unregister_retained_state_v3(snapshot)
+        if _ROOT_TOPOLOGY_OWNER_FROZEN_V1.get(saved[0])is snapshot:
+            _ROOT_TOPOLOGY_OWNER_FROZEN_V1.pop(saved[0],None)
+        _ROOT_TOPOLOGY_OWNER_EOF_V1.pop(snapshot,None)
+
+
+_C04_BODY_RESOURCE_OWNER_ENTRIES_V3=WeakKeyDictionary()
+
+
+def _require_host_c04_body_resource_owner_reader_v3(r):
+    from ..runtime.c04_body_resource_inputs_v3 import(CurrentC04BodyResourceReadV3,
+        require_current_c04_body_resource_owner_reader_v3,c04_body_resource_owner_identity_v3)
+    from ..host.authority_profile import AdminInstallationBundle
+    graph,port,bundle,scope,groups=require_current_c04_body_resource_owner_reader_v3(r)
+    if(type(r)is not CurrentC04BodyResourceReadV3 or type(bundle)is not AdminInstallationBundle
+            or type(scope)is not FenceScope or scope is not r.fence.scope or scope.operation!='read'
+            or r.read_finished or r.complete or r.work.kind!='current_c04_body_resource_inputs_v3'
+            or r.work.state is not r or r.work.operation is not r.operation or r.work.coordinator is not graph
+            or r.graph is not graph or r.db is not graph._GraphCoordinator__store._db
+            or r.store is not graph._GraphCoordinator__store or r.bundle is not bundle
+            or port is not graph._GraphCoordinator__content_fence_v2
+            or r.namespace!=r.authority.namespace or r.envelope.authority is not r.authority
+            or scope.namespace!=r.namespace or r.selection_digest!=r.operation.selection_digest
+            or r.work.selection_digest!=r.selection_digest or r.work.deadline_utc!=r.operation.deadline_utc
+            or groups!=((r.authority.purpose,tuple(r.authority.audience),tuple(r.envelope.source_qualification.source_refs)),)):
+        raise AuthorityUnavailable('C04 resource Owner requires its exact independently registered Source READ')
+    policy=bundle.installation_policy;owner=r.owner_binding
+    if(scope.namespace!=policy.namespace or scope.authority_namespace!=policy.authority_namespace
+            or scope.permit.holder!=policy.administrator_holder
+            or port.installation_grant.installation_id!=policy.installation_id
+            or graph._GraphCoordinator__owner_leases.get(r.lease)is not owner
+            or graph._GraphCoordinator__owner_session_proofs.get(r.lease)is not r.session
+            or r.session[1].principal!=owner.principal or 'c04.internal_work.prepare'not in owner.capabilities
+            or r.authority.purpose not in owner.purposes or not set(r.authority.audience)<=set(owner.audiences)
+            or r.fence.authority is not r.authority or r.fence.owner_session_proof!=r.session
+            or r.fence.owner_binding is not None or r.fence.owner_principal is not None
+            or r.current_owner_guard is not None and(r.fence.observed_guard!=r.current_owner_guard
+                or r.fence.observed_owner!=owner)):
+        raise AuthorityUnavailable('C04 resource Owner READ changed its original lease/session/rights/installation')
+    r.work._require_invocation(graph)
+    control=_require_owner_operation_v3(r.operation,db=r.db,namespace=r.namespace)
+    return graph,port,bundle,scope,control,owner.principal,c04_body_resource_owner_identity_v3(r)
+
+
+def _observe_host_c04_body_resource_owner_authority_v3(r):
+    from ..runtime.first_ingress_v2 import trusted_upper
+    from time import monotonic
+    graph,port,bundle,scope,control,principal,identity=_require_host_c04_body_resource_owner_reader_v3(r)
+    if(r.db.in_transaction or port.validate_fence(scope)!=scope.permit
+            or graph._current_owner_principal(r.authority.actor,r.namespace)!=principal):
+        raise AuthorityUnavailable('C04 resource Owner observation must use its current READ/session before SQL')
+    token,request=r.session
+    current,permit=port.get_current_owner_authority_for_fence_v1(namespace=r.namespace,
+        authority_namespace=scope.authority_namespace,permit=scope.permit,
+        owner_actor_id=r.authority.actor,owner_session_token=token,owner_session_request=request)
+    if(type(current)is not D12CurrentOwnerAuthorityV1 or permit!=scope.permit
+            or current.guard.namespace!=r.namespace or current.guard.authority_id!=scope.pinned_anchor.authority_id
+            or current.guard.pending_revoke_operation_id is not None or current.guard.minimum_revocation_revision!=0
+            or r.current_owner_guard is not None and current.guard!=r.current_owner_guard
+            or(current.target_admission is None and current.storage_admission is None
+                and current.guard.installation_id!=port.installation_grant.installation_id)
+            or trusted_upper(port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))>=r.operation.deadline_utc
+            or monotonic()>=r.monotonic_deadline or port.validate_fence(scope)!=scope.permit):
+        raise AuthorityUnavailable('C04 resource current Owner guard or original deadline changed')
+    return current
+
+
+def _require_host_c04_body_resource_owner_caller_v3(proof):
+    r=proof.request
+    graph,port,bundle,scope,control,principal,identity=_require_host_c04_body_resource_owner_reader_v3(r)
+    if(proof.graph is not graph or proof.service is not graph._GraphCoordinator__domain_production_runtime_v1
+            or proof.port is not port or proof.bundle is not bundle or proof.scope is not scope
+            or proof.authority is not r.authority or proof.principal!=principal or proof.control is not control
+            or proof.retained_operation is not r.operation or proof.selection_digest!=r.selection_digest
+            or proof.original_permit!=scope.permit or proof.permission_anchor!=scope.pinned_anchor
+            or proof.graph_comparison_anchor!=scope.pinned_anchor or proof.namespace!=r.namespace
+            or proof.installation_id!=bundle.installation_policy.installation_id
+            or proof.holder!=bundle.installation_policy.administrator_holder):
+        raise AuthorityUnavailable('C04 resource Owner proof crossed its actual Source Work identity')
+
+
+def _c04_body_resource_owner_binding_v3(r,current,facts):
+    owner=r.graph._owner_graph_binding_from_current_metadata_v3(r.authority,r.owner_binding.principal,
+        metadata=facts.metadata,graph_epoch=facts.graph_epoch,atom=facts.atom,proof_row=facts.proof_row,
+        epochs=facts.epochs,target_admission=current.target_admission,storage_admission=current.storage_admission,
+        current_guard=current.guard)
+    guard=current.guard
+    if(owner!=r.owner_binding or 'c04.internal_work.prepare'not in owner.capabilities
+            or r.authority.purpose not in owner.purposes or not set(r.authority.audience)<=set(owner.audiences)
+            or guard.authorization_revision!=owner.authorization_revision or guard.authorization_head!=owner.authorization_head
+            or guard.minimum_revocation_revision!=0 or guard.minimum_revocation_epoch!=owner.revocation_epoch
+            or guard.pending_revoke_operation_id is not None
+            or r.current_owner_guard is not None and guard!=r.current_owner_guard
+            or(current.target_admission is None and current.storage_admission is None
+                and guard.installation_id!=r.graph._GraphCoordinator__content_fence_v2.installation_grant.installation_id)):
+        raise AuthorityUnavailable('C04 resource actual Owner EOF differs from its original grant intersection')
+    return guard,owner
+
+
+class _C04BodyResourceOwnerStateV3:
+    def __init__(self,proof,work,facts,identity,header):
+        self.proof,self.work,self.facts,self.identity,self.header=proof,work,facts,identity,header
+        self.observation=None;self.write_reading=None
+        proof.retained_operation.register_retained_state_v3(self)
+    def _runtime_retained_heap_bytes_v3(self):
+        from ..runtime.dispatch_current_inventory_v3 import _heap
+        return 2048+_heap((self.facts.atom,self.facts.proof_row,self.facts.epochs,self.header))
+    @contextmanager
+    def decode_peak_v3(self,meter,amount):
+        peak=amount*8+4096;operation=self.proof.retained_operation
+        if peak>meter.budget.reserved_arena_bytes:
+            raise AuthorityUnavailable('C04 compact Owner EOF exceeds its original decoder arena')
+        operation.reserve_retained_state_growth_v3(self,peak)
+        try:yield
+        finally:operation.finish_retained_state_growth_v3(self)
+    def require_fixed_write_v3(self,r,scope,meter):
+        from ..runtime.c04_body_resource_inputs_v3 import(
+            require_current_c04_body_resource_owner_write_reader_v3,c04_body_resource_owner_identity_v3)
+        if(require_current_c04_body_resource_owner_write_reader_v3(r,scope)is not r
+                or c04_body_resource_owner_identity_v3(r)!=self.identity
+                or self.proof.request is not r or r.owner_entry is None
+                or _C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(r.owner_entry)is not self
+                or not r.read_finished or not r.complete or scope is r.fence.scope
+                or type(scope)is not FenceScope or scope.operation!='write' or scope.namespace!=r.namespace
+                or scope.generation!=r.authority.activation_generation
+                or(scope.graph_revision,scope.graph_epoch)!=(r.graph_stamp[0].graph_revision,r.graph_stamp[1])
+                or self.work not in _OWNER_LOCATION_GRAPH_WORKS_V3 or self.facts not in _OWNER_LOCATION_GRAPH_FACTS_V3
+                or not self.work.complete or self.work.failed is not None or self.work.result is not self.facts
+                or self.work.proof is not self.proof or(self.facts.metadata,self.facts.graph_epoch)!=r.graph_stamp):
+            raise AuthorityUnavailable('C04 resource retained Owner EOF is not its actual new WRITE command')
+        self.work._require_selected(meter);r.operation.handle.require_current(meter)
+        if r.graph._v2_graph_stamp(r.namespace)!=r.graph_stamp:
+            raise AuthorityUnavailable('C04 resource Graph changed after its actual Owner EOF')
+        grant=meter.read_fixed_row(r.db,'graph_atoms',('revision','valid','value_cell_id'),
+            'token=? AND bot=? AND persona=?',(owner_grant_key(*r.namespace.as_tuple).token,*r.namespace.as_tuple))
+        issue=meter.read_fixed_row(r.db,'graph_owner_issue_operations_v1',
+            ('operation_id','request_digest','grant_id','grant_digest','graph_incarnation',
+                'graph_access_epoch','graph_epoch','graph_receipt_digest'),'bot=? AND persona=?',r.namespace.as_tuple)
+        epochs=meter.read_fixed_row(r.db,'graph_authority_epochs',('access_epoch','delete_epoch'),
+            'bot=? AND persona=?',r.namespace.as_tuple)
+        if(grant is None or grant[:len(self.work.grant_metadata)]!=self.work.grant_metadata
+                or issue!=self.work.issue_metadata or epochs!=self.facts.epochs):
+            raise AuthorityUnavailable('C04 resource current Owner grant/issue/epochs changed after its EOF')
+        if self.header is not None:
+            header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+                ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                    'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(grant[2],))
+            if header!=self.header:raise AuthorityUnavailable('C04 resource Owner sealed canonical grant changed')
+        from ..runtime.first_ingress_v2 import trusted_upper
+        from time import monotonic
+        if(self.write_reading is None or trusted_upper(self.write_reading)>=r.operation.deadline_utc
+                or monotonic()>=r.monotonic_deadline):
+            raise AuthorityUnavailable('C04 resource retained Owner exceeded its original operation deadline')
+        return self.facts
+
+
+@dataclass(frozen=True,slots=True,eq=False,weakref_slot=True)
+class _HostC04BodyResourceOwnerEntryV3:
+    issuer:InitVar[object]
+    def __post_init__(self,issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:raise AuthorityUnavailable('actual C04 resource Owner EOF issuer required')
+    def require_for_v3(self,r):
+        from ..runtime.c04_body_resource_inputs_v3 import c04_body_resource_owner_identity_v3
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(self)
+        if(state is None or state.proof.request is not r or c04_body_resource_owner_identity_v3(r)!=state.identity):
+            raise AuthorityUnavailable('C04 resource Owner entry changed its original Source Work')
+        proof,facts=state.proof,state.facts
+        require_owner_location_caller_proof_v3(proof,phase='before',graph_stamp=r.graph_stamp)
+        facts.require_for_v3(proof)
+        if(facts.metadata,facts.graph_epoch)!=r.graph_stamp:
+            raise AuthorityUnavailable('C04 resource Owner EOF differs from the actual READ stamp')
+        guard,owner=_c04_body_resource_owner_binding_v3(r,proof.current_owner_authority,facts)
+        if r.current_owner_guard is None:
+            r.current_owner_guard=guard;r.fence.observed_guard=guard;r.fence.observed_owner=r.owner_binding
+        return owner
+    def require_permission_v3(self,r):
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(self)
+        if state is None or state.proof.request is not r:
+            raise AuthorityUnavailable('C04 resource Owner permission belongs to another actual reader')
+        _require_owner_permission_outside_graph_v3(state.proof)
+        with r.store._lock:return self.require_for_v3(r)
+    @property
+    def current_owner_guard(self):
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(self)
+        if state is None:raise AuthorityUnavailable('C04 resource Owner entry was released')
+        return state.proof.current_owner_authority.guard
+    def observe_write_v3(self,r,scope,original_owner,session_proof):
+        from ..runtime.c04_body_resource_inputs_v3 import require_current_c04_body_resource_owner_write_reader_v3
+        from ..runtime_storage_v3 import bind_runtime_storage_operation_v3,runtime_storage_quantum_v3
+        from ..runtime.first_ingress_v2 import trusted_upper
+        from time import monotonic
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(self)
+        if(require_current_c04_body_resource_owner_write_reader_v3(r,scope)is not r or state is None
+                or state.proof.request is not r or state.observation is not None
+                or r.owner_entry is not self or r.db.in_transaction
+                or original_owner is not r.owner_binding or session_proof is not r.session):
+            raise AuthorityUnavailable('C04 resource fresh Owner WRITE changed its actual capsule/session')
+        graph=r.graph;port=graph._GraphCoordinator__content_fence_v2
+        if(type(scope)is not FenceScope or scope.operation!='write' or scope.namespace!=r.namespace
+                or scope.generation!=r.authority.activation_generation or port.validate_fence(scope)!=scope.permit
+                or not graph._anchor_matches(r.graph_stamp[0].requirements,scope.pinned_anchor)
+                or graph._current_owner_principal(r.authority.actor,r.namespace)!=original_owner.principal):
+            raise AuthorityUnavailable('C04 resource current Owner pairing or fresh WRITE permit changed')
+        token,request=r.session
+        current,permit=port.get_current_owner_authority_for_fence_v1(namespace=r.namespace,
+            authority_namespace=scope.authority_namespace,permit=scope.permit,
+            owner_actor_id=r.authority.actor,owner_session_token=token,owner_session_request=request)
+        reading=port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
+        if(type(current)is not D12CurrentOwnerAuthorityV1 or permit!=scope.permit
+                or current.guard.namespace!=r.namespace or current.guard.authority_id!=scope.pinned_anchor.authority_id
+                or trusted_upper(reading)>=r.operation.deadline_utc or monotonic()>=r.monotonic_deadline
+                or port.validate_fence(scope)!=scope.permit):
+            raise AuthorityUnavailable('C04 resource actual session Authority or original deadline changed')
+        state.write_reading=reading
+        with bind_runtime_storage_operation_v3(r.operation,r.db),r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+            facts=state.require_fixed_write_v3(r,scope,meter)
+            with state.decode_peak_v3(meter,len(facts.atom[1])+len(facts.proof_row[-1])):
+                guard,owner=_c04_body_resource_owner_binding_v3(r,current,facts)
+        state.observation=(scope,current,guard,owner)
+        return guard,owner
+    def require_write_v3(self,r,scope,guard,current_owner,meter):
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.get(self)
+        if(state is None or state.observation is None or state.observation[0]is not scope
+                or state.observation[2:]!=(guard,current_owner)or not r.db.in_transaction
+                or not r.store._lock._is_owned()):
+            raise AuthorityUnavailable('C04 resource Owner check is outside its actual observed WRITE transaction')
+        facts=state.require_fixed_write_v3(r,scope,meter)
+        with state.decode_peak_v3(meter,len(facts.atom[1])+len(facts.proof_row[-1])):
+            result=_c04_body_resource_owner_binding_v3(r,state.observation[1],facts)
+        if result!=(guard,current_owner):raise AuthorityUnavailable('C04 resource current Owner changed inside WRITE')
+        return result
+    def release_v3(self):
+        state=_C04_BODY_RESOURCE_OWNER_ENTRIES_V3.pop(self,None)
+        if state is None:return
+        state.proof.retained_operation.unregister_retained_state_v3(state)
+        state.observation=state.write_reading=None
+        try:state.work.close_v3()
+        finally:state.proof.release_v3()
+
+
+def _iterate_prepare_current_host_c04_body_resource_owner_entry_v3(r):
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    graph,port,bundle,scope,control,principal,identity=_require_host_c04_body_resource_owner_reader_v3(r)
+    current=_observe_host_c04_body_resource_owner_authority_v3(r);policy=bundle.installation_policy
+    proof=OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,kind='host_c04_body_resource_read',graph=graph,
+        service=graph._GraphCoordinator__domain_production_runtime_v1,owner_service=None,controller=None,
+        port=port,bundle=bundle,scope=scope,authority=r.authority,principal=principal,
+        current_owner_authority=current,current_owner_head=None,retained_operation=r.operation,
+        control=control,selection_digest=r.selection_digest,namespace=r.namespace,
+        installation_id=policy.installation_id,holder=policy.administrator_holder,
+        permission_anchor=scope.pinned_anchor,graph_comparison_anchor=scope.pinned_anchor,
+        credential=None,subject=scope.permit.subject,original_permit=scope.permit,request=r,
+        deadline_utc=r.operation.deadline_utc,thread=get_ident())
+    work=None;state=None
+    try:
+        work=prepare_owner_location_read_work_v3(proof)
+        while not work.complete:
+            with owner_location_read_quantum_v3(proof)as meter:progress=work.advance(meter=meter)
+            if type(progress)is dict and progress.get('phase')=='owner_location_quantum_commit':
+                work.complete_reserved_quantum_v3(proof)
+            yield
+        facts=work.result.require_for_v3(proof)
+        if(facts.metadata,facts.graph_epoch)!=r.graph_stamp:
+            raise AuthorityUnavailable('C04 resource completed Owner EOF changed its actual Graph stamp')
+        guard,owner=_c04_body_resource_owner_binding_v3(r,current,facts)
+        if r.current_owner_guard is None:
+            r.current_owner_guard=guard;r.fence.observed_guard=guard;r.fence.observed_owner=r.owner_binding
+        _require_owner_permission_outside_graph_v3(proof)
+        header=None
+        if len(work.grant_metadata)==3:
+            with r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+                header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+                    ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                        'payload_sha256','ordered_segment_root','origin_scope_digest'),
+                    'cell_id=?',(work.grant_metadata[2],))
+            if header is None or header[1]!=owner_grant_key(*r.namespace.as_tuple).token:
+                raise AuthorityUnavailable('C04 resource actual Owner EOF differs from its selected sealed grant')
+        state=_C04BodyResourceOwnerStateV3(proof,work,facts,identity,header)
+        if header is not None:
+            with r.store._lock,runtime_storage_quantum_v3(r.db)as meter,state.decode_peak_v3(meter,len(facts.atom[1])):
+                if sha256(facts.atom[1].encode('utf-8')).hexdigest()!=header[5]:
+                    raise AuthorityUnavailable('C04 resource complete Owner EOF SHA differs from its sealed grant')
+        entry=_HostC04BodyResourceOwnerEntryV3(_OWNER_CALLER_ISSUER_V3)
+        _C04_BODY_RESOURCE_OWNER_ENTRIES_V3[entry]=state
+        return entry
+    except BaseException as error:
+        if state is not None:r.operation.unregister_retained_state_v3(state)
+        if work is not None:work.cancel_v3(error)
+        proof.release_v3()
+        raise
+
+
+def prepare_current_host_c04_body_resource_owner_entry_v3(r):
+    return _CurrentOwnerEntryTaskV3(_OWNER_CALLER_ISSUER_V3,r,_iterate_prepare_current_host_c04_body_resource_owner_entry_v3(r))
+
+
+_D13_COUNTER_METADATA_OWNER_CALLERS_V1=WeakKeyDictionary()
+_D13_COUNTER_METADATA_OWNER_ENTRIES_V1=WeakKeyDictionary()
+
+
+class _D13CounterMetadataOwnerStateV1:
+    def __init__(self,proof,identity,current_self,reading):
+        self.proof,self.identity,self.current_self,self.reading=proof,identity,current_self,reading
+        self.control=proof.control
+        self.principal=None;self.pairing=None;self.grant_header=None
+        self.acl_authority=None;self.binding=None;self.observation=None;self.write_reading=None
+    def _c09_retained_heap_bytes_v3(self,_seen=None):
+        seen=set()if _seen is None else _seen
+        return 4096+_owner_location_payload_heap_v3((self.current_self,self.principal,self.pairing,self.grant_header,
+            self.acl_authority,self.binding,self.observation,self.write_reading),seen)
+
+
+def _require_d13_counter_metadata_owner_reader_v1(r):
+    from ..runtime.d13_counter_prepare_owner_v1 import(D13CounterOwnerMetadataReadV1,
+        require_actual_d13_counter_owner_metadata_reader_v1,d13_counter_owner_metadata_identity_v1,KIND)
+    from ..host.authority_profile import AdminInstallationBundle
+    graph,port,bundle,scope=require_actual_d13_counter_owner_metadata_reader_v1(r)
+    if(type(r)is not D13CounterOwnerMetadataReadV1 or type(bundle)is not AdminInstallationBundle
+            or type(scope)is not FenceScope or scope is not r.scope or scope is not r.fence.scope
+            or scope.operation!='read' or r.graph is not graph or r.db is not graph._GraphCoordinator__store._db
+            or r.store is not graph._GraphCoordinator__store or r.bundle is not bundle
+            or port is not graph._GraphCoordinator__content_fence_v2
+            or r.closed or r.read_finished or r.complete or r.work.kind!=KIND
+            or r.work.state is not r or r.work.operation is not r.operation or r.work.coordinator is not graph
+            or r.operation.closed or r.operation.operation_id!=scope.operation_id
+            or r.work.operation_id!=scope.operation_id or scope.namespace!=r.namespace
+            or scope.generation!=r.instruction.activation_generation
+            or r.work.selection_digest!=r.selection_digest or r.operation.selection_digest!=r.selection_digest
+            or r.work.deadline_utc!=r.operation.deadline_utc or r.operation.deadline_utc!=r.original_deadline):
+        raise AuthorityUnavailable('D13 counter Owner requires its actual private namespace metadata READ')
+    policy=bundle.installation_policy
+    if(scope.namespace!=policy.namespace or scope.authority_namespace!=policy.authority_namespace
+            or scope.permit.holder!=policy.administrator_holder
+            or port.installation_grant.installation_id!=policy.installation_id):
+        raise AuthorityUnavailable('D13 counter Owner READ changed its protected installation')
+    control=_require_owner_operation_v3(r.operation,db=r.db,namespace=r.namespace)
+    return graph,port,bundle,scope,control,d13_counter_owner_metadata_identity_v1(r)
+
+
+def _observe_d13_counter_metadata_owner_v1(r):
+    graph,port,bundle,scope,control,identity=_require_d13_counter_metadata_owner_reader_v1(r)
+    return _observe_d13_counter_owner_scope_v1(r,scope)
+
+
+def _observe_d13_counter_owner_write_v1(r,scope):
+    from ..runtime.d13_counter_prepare_owner_v1 import require_actual_d13_counter_owner_write_reader_v1
+    if require_actual_d13_counter_owner_write_reader_v1(r,scope)is not r:
+        raise AuthorityUnavailable('D13 Owner observation lacks its actual pending WRITE issuance')
+    return _observe_d13_counter_owner_scope_v1(r,scope)
+
+
+def _observe_d13_counter_owner_scope_v1(r,scope):
+    from .v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
+    from ..runtime.first_ingress_v2 import trusted_upper
+    graph,port,bundle=r.graph,r.port,r.bundle
+    if(r.db.in_transaction or r.store._lock._is_owned()or port.validate_fence(scope)!=scope.permit):
+        raise AuthorityUnavailable('D13 counter metadata Self/Owner observation must precede Graph SQL and lock')
+    current_self=graph._GraphCoordinator__self_identity_port.current_self_identity(namespace=r.namespace,
+        authority_namespace=scope.authority_namespace,request_operation_id=scope.operation_id,permit=scope.permit)
+    current,permit=port.get_current_background_owner_authority_for_fence_v1(namespace=r.namespace,
+        authority_namespace=scope.authority_namespace,permit=scope.permit)
+    reading=port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
+    if(type(current_self)is not AuthorityCurrentSelfIdentityV1 or type(current)is not D12CurrentOwnerAuthorityV1
+            or permit!=scope.permit or(current_self.namespace,current_self.authority_namespace,
+                current_self.authority_id,current_self.installation_id,current_self.manifest_digest,
+                current_self.activation_generation,current_self.request_operation_id,current_self.permit)
+            !=(r.namespace,scope.authority_namespace,scope.pinned_anchor.authority_id,
+                bundle.installation_policy.installation_id,bundle.installation_policy.manifest_digest,
+                scope.generation,scope.operation_id,scope.permit)
+            or current_self.graph_revision!=r.graph_stamp[0].graph_revision
+            or current_self.graph_epoch!=r.graph_stamp[1].revision):
+        raise AuthorityUnavailable('D13 counter metadata requires fresh actual Self/Owner originals for its own READ permit')
+    guard=current.guard
+    if(guard.namespace!=r.namespace or guard.authority_id!=scope.pinned_anchor.authority_id
+            or guard.authorization_revision!=current_self.owner_authorization_revision
+            or guard.authorization_head!=current_self.owner_authorization_head
+            or guard.minimum_revocation_revision!=current_self.owner_minimum_revocation_revision
+            or guard.minimum_revocation_epoch!=current_self.owner_revocation_epoch
+            or guard.minimum_revocation_revision!=0 or guard.pending_revoke_operation_id is not None
+            or(current.target_admission is None and current.storage_admission is None
+                and guard.installation_id!=bundle.installation_policy.installation_id)
+            or trusted_upper(reading)>=r.operation.deadline_utc or port.validate_fence(scope)!=scope.permit):
+        raise AuthorityUnavailable('D13 counter metadata current Owner authorization or original deadline changed')
+    return current_self,current,reading
+
+
+
+
+def _require_d13_counter_metadata_owner_caller_v1(proof):
+    r=proof.request
+    graph,port,bundle,scope,control,identity=_require_d13_counter_metadata_owner_reader_v1(r)
+    state=_D13_COUNTER_METADATA_OWNER_CALLERS_V1.get(proof)
+    if(state is None or state.proof is not proof or state.identity!=identity
+            or proof.graph is not graph or proof.service is not graph._GraphCoordinator__domain_production_runtime_v1
+            or proof.port is not port or proof.bundle is not bundle or proof.scope is not scope
+            or proof.authority is not None or proof.principal is not None or proof.control is not control
+            or proof.retained_operation is not r.operation or proof.selection_digest!=r.selection_digest
+            or proof.original_permit!=scope.permit or proof.namespace!=r.namespace
+            or proof.permission_anchor!=scope.pinned_anchor or proof.graph_comparison_anchor!=scope.pinned_anchor
+            or proof.installation_id!=bundle.installation_policy.installation_id
+            or proof.holder!=bundle.installation_policy.administrator_holder):
+        raise AuthorityUnavailable('D13 counter metadata Owner proof crossed its exact private trigger/Work/entities scope')
+
+
+def _require_d13_counter_owner_facts_v1(proof,facts):
+    facts.require_for_v3(proof)
+    state=_D13_COUNTER_METADATA_OWNER_CALLERS_V1.get(proof)
+    if(state is None or state.principal is None or state.pairing is None
+            or(facts.metadata,facts.graph_epoch)!=proof.request.graph_stamp
+            or facts.metadata.graph_revision!=proof.scope.graph_revision or facts.graph_epoch!=proof.scope.graph_epoch
+            or not proof.graph._anchor_matches(facts.metadata.requirements,proof.scope.pinned_anchor)):
+        raise AuthorityUnavailable('D13 neutral Owner EOF lost its actual principal/current namespace')
+    from ..runtime.first_ingress_v2 import trusted_upper
+    if trusted_upper(state.reading)>=proof.deadline_utc:
+        raise AuthorityUnavailable('D13 neutral Owner EOF exceeded its original resource deadline')
+    return state
+
+
+def _d13_counter_owner_binding_v1(state,current,facts,*,authority,audience):
+    from dataclasses import replace
+    r=state.proof.request;pairing=state.pairing
+    if(state.acl_authority is None or state.acl_authority!=replace(authority,actor=pairing.actor_id)
+            or authority is not r.authority or authority.actor!=state.current_self.self_entity_ref
+            or authority.purpose!='expression' or authority.audience!=(audience,)
+            or authority.owner_scope!=('persona','activity')or authority.namespace!=r.namespace):
+        raise AuthorityUnavailable('D13 expression route differs from its actual Self/Owner pairing')
+    binding=r.graph._owner_graph_binding_from_current_metadata_v3(state.acl_authority,state.principal,
+        metadata=facts.metadata,graph_epoch=facts.graph_epoch,atom=facts.atom,proof_row=facts.proof_row,
+        epochs=facts.epochs,target_admission=current.target_admission,storage_admission=current.storage_admission,
+        current_guard=current.guard)
+    guard=current.guard
+    if(binding.principal!=state.principal or binding.actor!=pairing.actor_id
+            or 'expression'not in binding.purposes or audience not in binding.audiences
+            or guard.namespace!=r.namespace or guard.authorization_revision!=binding.authorization_revision
+            or guard.authorization_head!=binding.authorization_head or guard.minimum_revocation_revision!=0
+            or guard.minimum_revocation_epoch!=binding.revocation_epoch or guard.pending_revoke_operation_id is not None
+            or state.binding is not None and _d13_counter_owner_binding_identity_v1(state.binding)
+                !=_d13_counter_owner_binding_identity_v1(binding)):
+        raise AuthorityUnavailable('D13 current Owner does not allow its actual Self expression audience')
+    return guard,binding
+
+
+@dataclass(frozen=True,slots=True,eq=False,weakref_slot=True)
+class _HostD13CounterMetadataOwnerEntryV1:
+    issuer:InitVar[object]
+    def __post_init__(self,issuer):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:raise AuthorityUnavailable('actual D13 neutral Owner EOF issuer required')
+    def _state_v1(self,r):
+        from ..runtime.d13_counter_prepare_owner_v1 import d13_counter_owner_metadata_identity_v1
+        saved=_D13_COUNTER_METADATA_OWNER_ENTRIES_V1.get(self)
+        if saved is None or saved[0].request is not r:
+            raise AuthorityUnavailable('D13 neutral Owner entry belongs to another actual reader')
+        state=_D13_COUNTER_METADATA_OWNER_CALLERS_V1.get(saved[0])
+        if state is None or state.identity!=d13_counter_owner_metadata_identity_v1(r):
+            raise AuthorityUnavailable('D13 neutral Owner entry lost its private original Work identity')
+        return state,saved[1],saved[2]
+    def require_for_v3(self,r):
+        state,work,facts=self._state_v1(r)
+        if r.read_finished:
+            from ..runtime.d13_counter_prepare_owner_v1 import require_actual_d13_counter_owner_retained_reader_v1
+            from ..runtime_storage_v3 import runtime_storage_quantum_v3
+            require_actual_d13_counter_owner_retained_reader_v1(r)
+            with r.store._lock:
+                own_transaction=not r.db.in_transaction
+                if own_transaction:r.db.execute('BEGIN')
+                try:
+                    with runtime_storage_quantum_v3(r.db)as meter:
+                        _require_d13_counter_owner_fixed_facts_v1(self,r,meter)
+                finally:
+                    if own_transaction:r.db.rollback()
+        else:
+            _require_d13_counter_owner_facts_v1(state.proof,facts)
+        return self
+    def require_permission_v3(self,r):
+        state,work,facts=self._state_v1(r)
+        _require_owner_permission_outside_graph_v3(state.proof)
+        with r.store._lock:return self.require_for_v3(r)
+    @property
+    def current_owner_guard(self):
+        saved=_D13_COUNTER_METADATA_OWNER_ENTRIES_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('D13 neutral Owner entry was released')
+        return saved[0].current_owner_authority.guard
+    @property
+    def current_self(self):
+        saved=_D13_COUNTER_METADATA_OWNER_ENTRIES_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('D13 neutral Owner entry was released')
+        return _D13_COUNTER_METADATA_OWNER_CALLERS_V1[saved[0]].current_self
+    @property
+    def owner_principal(self):
+        saved=_D13_COUNTER_METADATA_OWNER_ENTRIES_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('D13 neutral Owner entry was released')
+        return _D13_COUNTER_METADATA_OWNER_CALLERS_V1[saved[0]].principal
+    def qualify_route_v3(self,r,*,authority,audience):
+        from dataclasses import replace
+        from ..runtime.d13_counter_prepare_owner_v1 import require_actual_d13_counter_owner_route_v1
+        from ..runtime_storage_v3 import runtime_storage_quantum_v3
+        require_actual_d13_counter_owner_route_v1(r,authority=authority,audience=audience)
+        state,work,facts=self._state_v1(r)
+        if r.db.in_transaction or r.store._lock._is_owned():
+            raise AuthorityUnavailable('D13 route qualification must begin outside Graph SQL')
+        _require_owner_permission_outside_graph_v3(state.proof)
+        acl=replace(authority,actor=state.pairing.actor_id)
+        if state.acl_authority is not None and state.acl_authority!=acl:
+            raise AuthorityUnavailable('D13 neutral Owner entry cannot switch expression routes')
+        state.acl_authority=acl
+        with r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+            _require_d13_counter_owner_facts_v1(state.proof,facts)
+            with _d13_counter_owner_decode_peak_v1(state,meter,facts):
+                guard,binding=_d13_counter_owner_binding_v1(state,state.proof.current_owner_authority,facts,
+                    authority=authority,audience=audience)
+        state.binding=binding
+        state.proof.retained_operation.refresh_retained_state_v3(_OWNER_CALLER_RETAINED_V3[state.proof])
+        return binding
+    def observe_write_v3(self,r,scope):
+        from dataclasses import replace
+        from ..runtime.d13_counter_prepare_owner_v1 import require_actual_d13_counter_owner_write_reader_v1
+        from ..runtime_storage_v3 import bind_runtime_storage_operation_v3,runtime_storage_quantum_v3
+        state,work,facts=self._state_v1(r)
+        if(require_actual_d13_counter_owner_write_reader_v1(r,scope)is not r
+                or state.observation is not None or r.owner_entry is not self or state.binding is not r.owner_binding
+                or r.db.in_transaction or r.store._lock._is_owned()):
+            raise AuthorityUnavailable('D13 fresh Owner WRITE changed its actual private issuance')
+        observed_self,current,reading=_observe_d13_counter_owner_write_v1(r,scope)
+        if(observed_self!=replace(state.current_self,request_operation_id=scope.operation_id,permit=scope.permit)
+                or current.guard!=state.proof.current_owner_authority.guard):
+            raise AuthorityUnavailable('D13 fresh WRITE Self or Owner authorization changed since metadata EOF')
+        pairing=state.proof.port.current_owner_principal_binding(namespace=r.namespace,
+            authority_namespace=scope.authority_namespace,principal=state.principal)
+        if pairing!=state.pairing:
+            raise AuthorityUnavailable('D13 fresh WRITE actual Owner principal pairing changed')
+        state.write_reading=reading
+        with bind_runtime_storage_operation_v3(r.operation,r.db),r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+            facts=_require_d13_counter_owner_fixed_facts_v1(self,r,meter,scope=scope)
+            with _d13_counter_owner_decode_peak_v1(state,meter,facts):
+                guard,owner=_d13_counter_owner_binding_v1(state,current,facts,
+                    authority=r.authority,audience=r.authority.audience[0])
+        state.observation=(scope,observed_self,current,guard,owner)
+        return guard,owner
+    def require_write_v3(self,r,scope,guard,current_owner,meter):
+        state,work,facts=self._state_v1(r)
+        if(state.observation is None or state.observation[0]is not scope
+                or state.observation[3:]!=(guard,current_owner)or not r.db.in_transaction
+                or not r.store._lock._is_owned()):
+            raise AuthorityUnavailable('D13 Owner check is outside its actual observed WRITE transaction')
+        facts=_require_d13_counter_owner_fixed_facts_v1(self,r,meter,scope=scope)
+        with _d13_counter_owner_decode_peak_v1(state,meter,facts):
+            result=_d13_counter_owner_binding_v1(state,state.observation[2],facts,
+                authority=r.authority,audience=r.authority.audience[0])
+        if result!=(guard,current_owner):raise AuthorityUnavailable('D13 Owner changed inside its actual WRITE')
+        return result
+    def release_v3(self):
+        saved=_D13_COUNTER_METADATA_OWNER_ENTRIES_V1.pop(self,None)
+        if saved is None:return
+        proof,work,facts=saved
+        try:work.close_v3()
+        finally:
+            _D13_COUNTER_METADATA_OWNER_CALLERS_V1.pop(proof,None)
+            proof.release_v3()
+
+
+_D13_COUNTER_METADATA_OWNER_TASKS_V1=WeakKeyDictionary()
+
+
+class _D13CounterMetadataOwnerTaskV1:
+    def __init__(self,issuer,r,proof,state,work):
+        if issuer is not _OWNER_CALLER_ISSUER_V3:
+            raise AuthorityUnavailable('D13Counter Owner task requires its actual metadata caller issuer')
+        _D13_COUNTER_METADATA_OWNER_TASKS_V1[self]={'reader':r,'proof':proof,'state':state,
+            'work':work,'phase':'metadata','entry':None}
+    @property
+    def complete(self):
+        saved=_D13_COUNTER_METADATA_OWNER_TASKS_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('D13Counter Owner task was released')
+        return saved['phase']=='complete'
+    @property
+    def result(self):
+        saved=_D13_COUNTER_METADATA_OWNER_TASKS_V1.get(self)
+        if saved is None or saved['phase']!='complete':
+            raise AuthorityUnavailable('D13Counter Owner task has not completed its actual EOF and final permission bookend')
+        return saved['entry']
+    def advance(self):
+        from ..runtime_storage_v3 import runtime_storage_quantum_v3
+        saved=_D13_COUNTER_METADATA_OWNER_TASKS_V1.get(self)
+        if saved is None:raise AuthorityUnavailable('D13Counter Owner task was released')
+        r,proof,state,work=(saved[k]for k in('reader','proof','state','work'))
+        if(_require_d13_counter_metadata_owner_reader_v1(r)[-1]!=state.identity
+                or _D13_COUNTER_METADATA_OWNER_CALLERS_V1.get(proof)is not state):
+            raise AuthorityUnavailable('D13Counter Owner task changed its actual original Work/trigger')
+        phase=saved['phase']
+        if phase=='complete':return True
+        if phase=='reserved_commit':
+            work.complete_reserved_quantum_v3(proof)
+            saved['phase']='metadata';return False
+        if phase=='metadata':
+            with owner_location_read_quantum_v3(proof)as meter:progress=work.advance(meter=meter)
+            if type(progress)is dict and progress.get('phase')=='owner_location_quantum_commit':
+                saved['phase']='reserved_commit'
+            elif work.complete:saved['phase']='pairing'
+            return False
+        if phase=='pairing':
+            facts=work.result
+            with r.store._lock,runtime_storage_quantum_v3(r.db):facts.require_for_v3(proof)
+            if r.db.in_transaction or r.store._lock._is_owned():
+                raise AuthorityUnavailable('D13Counter actual principal pairing must precede Graph SQL and lock')
+            reserve_owner_location_retained_growth_v3(proof,len(facts.atom[1])*8+4096)
+            try:
+                grant=json.loads(facts.atom[1]);validate_owner_grant_v1(grant)
+                principal=OwnerPrincipalV1(**grant['principal'])
+                pairing=proof.port.current_owner_principal_binding(namespace=r.namespace,
+                    authority_namespace=proof.scope.authority_namespace,principal=principal)
+                if(pairing is None or pairing.principal!=principal or pairing.installation_id!=proof.installation_id):
+                    raise AuthorityUnavailable('D13Counter signed Owner principal is no longer actually paired')
+                state.principal=principal;state.pairing=pairing
+            finally:finish_owner_location_retained_growth_v3(proof)
+            saved['phase']='qualify';return False
+        if phase=='qualify':
+            facts=work.result
+            with r.store._lock,runtime_storage_quantum_v3(r.db)as meter:
+                _require_d13_counter_owner_facts_v1(proof,facts)
+                if len(work.grant_metadata)==3:
+                    state.grant_header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+                        ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                            'payload_sha256','ordered_segment_root','origin_scope_digest'),
+                        'cell_id=?',(work.grant_metadata[2],))
+                    if state.grant_header is None or state.grant_header[1]!=owner_grant_key(*r.namespace.as_tuple).token:
+                        raise AuthorityUnavailable('D13Counter Owner EOF sealed grant changed before handoff')
+            saved['phase']='bookend';return False
+        if phase=='bookend':
+            _require_owner_permission_outside_graph_v3(proof)
+            entry=_HostD13CounterMetadataOwnerEntryV1(_OWNER_CALLER_ISSUER_V3)
+            _D13_COUNTER_METADATA_OWNER_ENTRIES_V1[entry]=(proof,work,work.result)
+            saved['entry']=entry;saved['phase']='complete';return True
+        raise AuthorityUnavailable('D13Counter Owner task has no registered metadata phase')
+    def release_v3(self):
+        saved=_D13_COUNTER_METADATA_OWNER_TASKS_V1.pop(self,None)
+        if saved is None:return
+        if saved['entry']is not None:
+            saved['entry'].release_v3();return
+        proof,work=saved['proof'],saved['work']
+        try:work.close_v3()
+        finally:
+            _D13_COUNTER_METADATA_OWNER_CALLERS_V1.pop(proof,None)
+            proof.release_v3()
+
+
+def create_current_host_d13_counter_owner_metadata_task_v1(r):
+    graph,port,bundle,scope,control,identity=_require_d13_counter_metadata_owner_reader_v1(r)
+    current_self,current,reading=_observe_d13_counter_metadata_owner_v1(r);policy=bundle.installation_policy
+    proof=OwnerLocationCallerProofV3(_OWNER_CALLER_ISSUER_V3,kind='host_d13_counter_metadata_read',
+        graph=graph,service=graph._GraphCoordinator__domain_production_runtime_v1,owner_service=None,controller=None,
+        port=port,bundle=bundle,scope=scope,authority=None,principal=None,current_owner_authority=current,
+        current_owner_head=None,retained_operation=r.operation,control=control,selection_digest=r.selection_digest,
+        namespace=r.namespace,installation_id=policy.installation_id,holder=policy.administrator_holder,
+        permission_anchor=scope.pinned_anchor,graph_comparison_anchor=scope.pinned_anchor,credential=None,
+        subject=scope.permit.subject,original_permit=scope.permit,request=r,
+        deadline_utc=r.operation.deadline_utc,thread=get_ident())
+    state=_D13CounterMetadataOwnerStateV1(proof,identity,current_self,reading)
+    _D13_COUNTER_METADATA_OWNER_CALLERS_V1[proof]=state;work=None
+    try:
+        register_owner_location_retained_state_v3(proof,state)
+        work=prepare_owner_location_read_work_v3(proof)
+        return _D13CounterMetadataOwnerTaskV1(_OWNER_CALLER_ISSUER_V3,r,proof,state,work)
+    except BaseException as error:
+        if work is not None:work.cancel_v3(error)
+        _D13_COUNTER_METADATA_OWNER_CALLERS_V1.pop(proof,None)
+        proof.release_v3()
+        raise
+
+
+def _d13_counter_owner_binding_identity_v1(binding):
+    fields=('principal','actor','namespace','purpose','audience','grant_id','scope','issuer_ref',
+        'capabilities','purposes','audiences','grant_digest','grant_revision','access_epoch','delete_epoch',
+        'graph_incarnation','authorization_head','authorization_revision','revocation_epoch')
+    return tuple(getattr(binding,key)for key in fields)
+
+
+@contextmanager
+def _d13_counter_owner_decode_peak_v1(state,meter,facts):
+    provider=_OWNER_CALLER_RETAINED_V3.get(state.proof)
+    peak=len(facts.atom[1])*8+len(facts.proof_row[-1])*8+4096
+    if provider is None or peak>meter.budget.reserved_arena_bytes:
+        raise AuthorityUnavailable('D13 Owner canonical EOF exceeds its actual original decoder arena')
+    state.proof.retained_operation.reserve_retained_state_growth_v3(provider,peak)
+    try:yield
+    finally:state.proof.retained_operation.finish_retained_state_growth_v3(provider)
+
+
+def _require_d13_counter_owner_fixed_facts_v1(entry,r,meter,*,scope=None):
+    from ..runtime.d13_counter_prepare_owner_v1 import(
+        require_actual_d13_counter_owner_retained_reader_v1,require_actual_d13_counter_owner_write_reader_v1)
+    state,work,facts=entry._state_v1(r);proof=state.proof
+    if scope is None:require_actual_d13_counter_owner_retained_reader_v1(r,meter)
+    elif require_actual_d13_counter_owner_write_reader_v1(r,scope)is not r:
+        raise AuthorityUnavailable('D13 Owner fixed metadata is not its real fresh WRITE')
+    if(proof not in _OWNER_CALLERS_V3 or work not in _OWNER_LOCATION_GRAPH_WORKS_V3
+            or facts not in _OWNER_LOCATION_GRAPH_FACTS_V3 or work.result is not facts or facts.work is not work
+            or work.proof is not proof or not work.complete or work.failed is not None
+            or not r.complete or not r.read_finished or r.operation.closed
+            or proof.retained_operation is not r.operation or proof.selection_digest!=r.selection_digest
+            or proof.scope is not r.scope or(facts.metadata,facts.graph_epoch)!=r.graph_stamp):
+        raise AuthorityUnavailable('D13 retained Owner EOF lost its actual completed Work/selection')
+    work._require_selected(meter);r.operation.handle.require_current(meter)
+    if r.graph._v2_graph_stamp(r.namespace)!=r.graph_stamp:
+        raise AuthorityUnavailable('D13 Owner current Graph stamp differs from its frozen EOF')
+    grant=meter.read_fixed_row(r.db,'graph_atoms',('revision','valid','value_cell_id'),
+        'token=? AND bot=? AND persona=?',(owner_grant_key(*r.namespace.as_tuple).token,*r.namespace.as_tuple))
+    issue=meter.read_fixed_row(r.db,'graph_owner_issue_operations_v1',
+        ('operation_id','request_digest','grant_id','grant_digest','graph_incarnation',
+            'graph_access_epoch','graph_epoch','graph_receipt_digest'),'bot=? AND persona=?',r.namespace.as_tuple)
+    epochs=meter.read_fixed_row(r.db,'graph_authority_epochs',('access_epoch','delete_epoch'),
+        'bot=? AND persona=?',r.namespace.as_tuple)
+    if(grant is None or grant[:len(work.grant_metadata)]!=work.grant_metadata
+            or issue!=work.issue_metadata or epochs!=facts.epochs):
+        raise AuthorityUnavailable('D13 Owner grant/issue/authority epochs changed after its complete EOF')
+    if state.grant_header is not None:
+        header=meter.read_fixed_row(r.db,'segmented_cells_v1',
+            ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+                'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(grant[2],))
+        if header!=state.grant_header:
+            raise AuthorityUnavailable('D13 Owner sealed canonical grant changed after its actual EOF')
+    from ..runtime.first_ingress_v2 import trusted_upper
+    from time import monotonic
+    reading=state.reading if scope is None else state.write_reading
+    if reading is None or trusted_upper(reading)>=r.original_deadline or monotonic()>=r.monotonic_deadline:
+        raise AuthorityUnavailable('D13 retained Owner exceeded its actual original deadline')
+    return facts

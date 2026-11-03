@@ -84,3 +84,27 @@ def configure_initial_v7_counter_v1(value,*,metric_source_path):
             'cpu_policy_id':'cpu-policy:sdk-d13-v7-counter','cpu_policy_version':1,
             'body_policy_id':'body-policy:sdk-d13-v7-counter','body_policy_version':1})
     return value
+
+
+V10_SCENARIO='sdk_v10_d13_v7_256_current_v1'
+V10_PROFILE_ID='sdk-v10-d13-v7-256'
+V10_EXPECTED_INITIAL_PERSONA_ID='sdk-v10-d13-v7-256-persona'
+
+
+def approved_sdk_v10_d13_v7_256_initial_request_v1(*,executable_sha256,valid_until_utc):
+    """Explicit fresh blueprint; protected counter/provider assets bind before first signing."""
+    from scripts.alpha1.install_linux import request_template_v7
+    base=approved_sdk_d13_v7_256_initial_request_v1(
+        executable_sha256=executable_sha256,valid_until_utc=valid_until_utc)
+    value=request_template_v7()
+    value.update(base)
+    value.update(schema='sylanne3.linux-install-request.v7',profile_id=V10_PROFILE_ID,
+        persona_id=V10_EXPECTED_INITIAL_PERSONA_ID,
+        general_growth_cognition=None,habit_runtime=False,
+        ordinary_continuity_screen=None,ordinary_continuity_deep=None,
+        artifact_observation_cognition=None,artifact_phase_observer=None,artifact_phase_counter=None)
+    from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
+    from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION_V2
+    value['natural_template_pair_v1']={'schema':'sylanne3.initial-natural-template-pair.v1',
+        'generation':TEMPLATE_VERSION,'review':REVIEW_TEMPLATE_VERSION_V2}
+    return value

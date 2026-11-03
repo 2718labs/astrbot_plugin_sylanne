@@ -407,7 +407,7 @@ def test_provider_builds_a_candidate_domain_proposal_only() -> None:
 
 def test_provider_supplies_d11_catalogue_specs_with_writer_and_schema_validation() -> None:
     specs = D07DomainProvider().type_specs()
-    assert len(specs) == 11
+    assert len(specs) == 17
     assert all(isinstance(spec, TypeSpec) for spec in specs)
     assert all(spec.writer_domain == "d07" for spec in specs)
     assert all(spec.schema_hash is not None and len(spec.schema_hash) == 64 for spec in specs)
@@ -878,3 +878,4 @@ def test_recollection_support_historical_sources_commit_through_graph_coordinato
         assert all(after.get(key).valid for key in (choice_key, interpretation_key))
     finally:
         fixture.tearDown()
+

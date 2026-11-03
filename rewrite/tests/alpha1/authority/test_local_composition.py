@@ -221,7 +221,7 @@ def test_composition_pins_result_read_to_original_store_owner_and_installation(t
                "plugin_name": "astrbot_plugin_sylanne", "host_api_version": "4.28.1",
                "manifest_sha256": "b" * 64}
         peer = MtlsPeerCredential("a" * 64)
-        binding = server._dispatch_for_test("handshake", raw, peer, b"result-channel")
+        binding = server.dispatch("handshake", raw, peer, b"result-channel")
         request = result_request()
         request = replace(
             request, authority_id=server._authority_id(),
@@ -241,21 +241,21 @@ def test_composition_pins_result_read_to_original_store_owner_and_installation(t
 
         result.read_completed = read_completed
         with pytest.raises(RuntimeError, match="reached trusted result service"):
-            server._dispatch_for_test(
+            server.dispatch(
                 "model_result_read_v1", raw, peer, b"result-channel",
                 handshake_binding=binding["channel_binding_sha256"], command=command)
         assert reached == [request]
         with pytest.raises(RuntimeError, match="authority unavailable"):
-            server._dispatch_for_test(
+            server.dispatch(
                 "model_result_read_v1", raw, peer, b"result-channel",
                 handshake_binding=binding["channel_binding_sha256"],
                 command={**command, "graph_current": True})
         assert reached == [request]
         wrong_peer = MtlsPeerCredential("c" * 64)
-        wrong_binding = server._dispatch_for_test(
+        wrong_binding = server.dispatch(
             "handshake", raw, wrong_peer, b"wrong-channel")
         with pytest.raises(RuntimeError, match="authority unavailable"):
-            server._dispatch_for_test(
+            server.dispatch(
                 "model_result_read_v1", raw, wrong_peer, b"wrong-channel",
                 handshake_binding=wrong_binding["channel_binding_sha256"],
                 command=command)

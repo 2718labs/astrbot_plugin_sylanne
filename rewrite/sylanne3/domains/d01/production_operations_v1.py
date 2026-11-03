@@ -6,7 +6,7 @@ the Owner fence, current originals, atomic CAS and the final receipt.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
@@ -21,7 +21,6 @@ from ...runtime.domain_production_contracts_v1 import (
 )
 from ...runtime.jobs import PersistentJob
 from . import GrowthProposal, PersonaDomain, PersonaPlan
-from .identity_v3 import SelfModelProjectionV3
 
 
 def plain_v1(value):
@@ -78,6 +77,9 @@ def stage_result_v1(frame, domain, kind, request, *, writes=(), provenance=None,
                     proposal_schema=None, proposal_hash=None, required_parts=()):
     """Bounded staging assembly, with no generic writer/adoption capability."""
     current_frame_guard_v1(frame)
+    if domain == 'd06':
+        from ..d06.inspection_metadata_v1 import derive_inspection_projection_writes_v1
+        writes = derive_inspection_projection_writes_v1(frame.envelope, writes)
     return _assemble_current_stage_result_v1(frame, domain, kind, request, writes=writes, provenance=provenance,
         contribution_keys=contribution_keys, receiver_events=receiver_events, costs=costs, coverage=coverage,
         missing=missing, continuation=continuation, jobs=jobs, proposal_schema=proposal_schema,
@@ -262,7 +264,6 @@ class CurrentValuesInputsV1:
     candidate_original: ProductionOriginalRefV1
     context_original: ProductionOriginalRefV1
     method_strategy: MethodStrategyProjectionV1 | None = None
-    semantic_projection: SelfModelProjectionV3 | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +277,8 @@ class CurrentGrowthInputsV1:
     counterevidence_conflict: bool
     paid_cost_originals: tuple[ProductionOriginalRefV1, ...] = ()
     semantic_qualification: object | None = None
+    single_event_qualification: object | None = None
+    ordinary_continuity_qualification: object | None = None
 
 
 def compile_evaluate_current_values_v1(frame, request, inputs):
@@ -290,10 +293,10 @@ def compile_evaluate_current_values_v1(frame, request, inputs):
     candidates = dict(inputs.candidates)
     if len(candidates) != len(inputs.candidates):
         raise ValueError("candidate IDs repeat")
-    view = domain.project(active.plan, context_tags=inputs.context_tags,
-                          role_binding_complete=inputs.role_binding_complete, semantic_projection=inputs.semantic_projection)
+    view = domain.project_values_v1(active.plan, context_tags=inputs.context_tags,
+                                   role_binding_complete=inputs.role_binding_complete)
     evaluation = domain.evaluate_values(view, candidates)
-    provenance = {"persona_view": view, "candidate_original": inputs.candidate_original,
+    provenance = {"persona_values": view, "candidate_original": inputs.candidate_original,
         "context_original": inputs.context_original, "evaluation": evaluation}
     if inputs.method_strategy is not None:
         if (inputs.method_strategy.persona_head_id != active.plan.head_id
@@ -305,10 +308,12 @@ def compile_evaluate_current_values_v1(frame, request, inputs):
         receiver_events=(("d08", "values_evaluated"),))
 
 
-def compile_adopt_current_growth_v1(frame, request, inputs):
+def compile_adopt_current_growth_v1(frame, request, inputs, *, writer_qualification=None, writer_request=None):
     if type(request) is not AdoptCurrentGrowthRequestV1 or type(inputs) is not CurrentGrowthInputsV1:
         raise TypeError("exact D01 growth request and current inputs required")
     current_frame_guard_v1(frame)
+    if (writer_qualification is None)!=(writer_request is None):
+        raise TypeError("full writer qualification and its actual outer request must be paired")
     missing = tuple(name for name, complete in (("completed_growth_trials", inputs.trials_complete),
         ("complete_current_counterevidence_query", inputs.counterevidence_complete)) if not complete)
     if missing or inputs.counterevidence_conflict:
@@ -330,10 +335,25 @@ def compile_adopt_current_growth_v1(frame, request, inputs):
         frame.snapshot.epochs, frame.snapshot.ingress_receipts, frame.snapshot.scene_proofs)
     candidate = domain.issue_growth_candidate(semantic_snapshot,
         namespace=frame.envelope.authority.namespace, current_guard=inputs.owner_guard,
-        proposal=inputs.proposal, source_ids=inputs.source_ids, semantic_qualification=inputs.semantic_qualification)
+        proposal=inputs.proposal, source_ids=inputs.source_ids, semantic_qualification=inputs.semantic_qualification,
+        single_event_qualification=inputs.single_event_qualification)
     domain.validate_growth_candidate(candidate, semantic_snapshot,
         namespace=frame.envelope.authority.namespace, current_guard=inputs.owner_guard,
-        proposal=inputs.proposal, source_ids=inputs.source_ids, semantic_qualification=inputs.semantic_qualification)
+        proposal=inputs.proposal, source_ids=inputs.source_ids, semantic_qualification=inputs.semantic_qualification,
+        single_event_qualification=inputs.single_event_qualification)
+    if writer_qualification is not None:
+        from ...runtime.current_full_persona_writer_v1 import preserve_full_persona_writer_candidate_v1
+        candidate=preserve_full_persona_writer_candidate_v1(writer_qualification,candidate,
+            frame=frame,request=writer_request)
+    active = domain.resolve_active_role(semantic_snapshot,
+        namespace=frame.envelope.authority.namespace, current_guard=inputs.owner_guard)
+    target = next(block for block in active.plan.blocks if block.block_id == inputs.proposal.target_block)
+    from .ordinary_cumulative_growth_v1 import ordinary_growth_block_v1
+    if ordinary_growth_block_v1(target):
+        if not ordinary_growth_block_v1(replace(target,claim=inputs.proposal.replacement_claim)):
+            raise ValueError('ordinary adoption cannot install another dedicated claim protocol')
+        from ...runtime.d01_ordinary_cumulative_growth_v1 import require_ordinary_continuity_candidate_v1
+        require_ordinary_continuity_candidate_v1(inputs.ordinary_continuity_qualification,frame,request,candidate)
     return stage_result_v1(frame, "d01", "adopt_growth", request,
         writes=candidate.typed_writes, provenance={"candidate": candidate, "originals": inputs.originals},
         contribution_keys=tuple(domain.contribution_key(inputs.proposal.target_block, family,

@@ -299,6 +299,7 @@ class BodyDomain:
             ("d02.reservation.v1", ("activity",), "state", _validate_reservation, BodyReservation),
             ("d02.settlement.v1", ("activity",), "state", _validate_settlement, SettlementResult),
         )
+        from .character_labor_v1 import character_labor_type_specs_v1
         return tuple(TypeSpec(
             name,
             owners,
@@ -312,7 +313,7 @@ class BodyDomain:
                 "storage_role": storage,
                 "fields": [field.name for field in fields(value_type)],
             }),
-        ) for name, owners, storage, validator, value_type in layouts)
+        ) for name, owners, storage, validator, value_type in layouts) + character_labor_type_specs_v1()
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -422,6 +423,7 @@ class BodyDomain:
         components: tuple[WorkComponent, ...],
         *,
         valid_until: float,
+        now_utc: float,
     ) -> BodyQuote:
         if not isinstance(profile, BodyProfile) or not isinstance(state, BodyState):
             raise TypeError("profile and state must be D02 values")
@@ -432,8 +434,9 @@ class BodyDomain:
             raise ValueError("work kind is not configured by profile")
         duration_upper = _nonnegative(duration_upper, "duration_upper")
         valid_until = _nonnegative(valid_until, "valid_until")
-        if valid_until <= state.cursor:
-            raise ValueError("quote must outlive the current cursor")
+        now_utc = _nonnegative(now_utc, "now_utc")
+        if valid_until <= now_utc:
+            raise ValueError("quote must outlive the current UTC time")
         components = tuple(components)
         if not components or any(not isinstance(item, WorkComponent) for item in components):
             raise ValueError("components must contain WorkComponent values")
@@ -500,7 +503,7 @@ class BodyDomain:
 
     def reserve_work(
         self, state: BodyState, reservations: tuple[BodyReservation, ...], quote: BodyQuote,
-        reservation_id: str, effect_id: str,
+        reservation_id: str, effect_id: str, *, now_utc: float,
     ) -> BodyReservation:
         if not isinstance(quote, BodyQuote):
             raise TypeError("quote must be BodyQuote")
@@ -508,7 +511,8 @@ class BodyDomain:
         _identifier(effect_id, "effect_id")
         if quote.state_version != state.version or quote.profile_id != state.profile_id:
             raise ValueError("quote is stale")
-        if quote.valid_until <= state.cursor:
+        now_utc = _nonnegative(now_utc, "now_utc")
+        if quote.valid_until <= now_utc:
             raise ValueError("quote has expired")
         if any(item.reservation_id == reservation_id or item.effect_id == effect_id for item in reservations):
             raise ValueError("reservation or effect already exists")
@@ -561,11 +565,16 @@ class BodyDomain:
     def advance_scalar(value: float, a: float, b: float, dt: float) -> float:
         value = _unit(value, "value")
         a, b, dt = _nonnegative(a, "a"), _nonnegative(b, "b"), _nonnegative(dt, "dt")
-        rate = a + b
-        if rate == 0.0:
+        scale = max(a, b)
+        if scale == 0.0 or dt == 0.0:
             return value
-        equilibrium = a / rate
-        return equilibrium + (value - equilibrium) * math.exp(-rate * dt)
+        # Normalize before adding rates: finite a and b may have an infinite
+        # sum even though the bounded analytic state is well defined.
+        scaled_a, scaled_b = a / scale, b / scale
+        scaled_rate = scaled_a + scaled_b
+        equilibrium = scaled_a / scaled_rate
+        decay = math.exp(-(scale * dt) * scaled_rate)
+        return equilibrium + (value - equilibrium) * decay
 
     @classmethod
     def advance_passive_body(

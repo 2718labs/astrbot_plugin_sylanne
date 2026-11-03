@@ -24,7 +24,20 @@ class InstalledPeerRegistryCensusV3:
         self.control=self.config=self.context=None
         self.hold=self._continuation=None
         self.complete=False
+        self.authority_spec_v4=None
         _CENSUSES_V3.add(self)
+
+    def prepare_authority_birth_spec_v4(self,authority_spec):
+        from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2,verify_process_supervisor_spec_v1
+        if (self not in _CENSUSES_V3 or self.control is not None or self.complete
+                or self.authority_spec_v4 is not None or type(authority_spec)is not InstalledProcessSupervisorSpecV2
+                or authority_spec.service_role!='authority'
+                or (authority_spec.authority_id,authority_spec.installation_id,authority_spec.profile_id,authority_spec.namespace_cohort,
+                    authority_spec.control_socket_path)!=(self.supervisor.config.authority_id,self.supervisor.config.installation_id,
+                        self.supervisor.config.profile_id,self.supervisor.config.namespace_cohort,self.supervisor.config.control_socket_path)):
+            raise AuthorityUnavailable('fresh Authority birth spec must be the actual protected same-cohort Authority role before hold')
+        verify_process_supervisor_spec_v1(authority_spec)
+        self.authority_spec_v4=authority_spec
 
     def begin(self,*,control,config,context):
         if self not in _CENSUSES_V3 or self.control is not None:
@@ -44,11 +57,24 @@ class InstalledPeerRegistryCensusV3:
             peer_cohort_digest=canonical_digest(dict(peer=self.peer,supervisor_spec_digest=self.supervisor.config.spec_digest,
                 inventory_manifest_digest=self.inventory.manifest_digest)))
 
+    def adopt_initial_genesis_hold_v4(self,startup,hold):
+        from .c09_initial_segmented_genesis_v4 import _InitialStorageStartupHoldV4,_STARTUPS_V4
+        from .installed_process_supervisor_v1 import RootPeerRegistryGenesisHoldV3
+        if (self not in _CENSUSES_V3 or type(startup)is not _InitialStorageStartupHoldV4
+                or _STARTUPS_V4.get(startup)!=startup._identity_v4()or startup.bound is not hold
+                or type(hold)is not RootPeerRegistryGenesisHoldV3 or hold.adapter is not self.supervisor
+                or hold.channel is not startup.channel or startup.config is not self.config
+                or self.control is None or self.control.lease is not startup.lease or self.complete
+                or hold.original['registry_scope']!=self.scope):
+            raise AuthorityUnavailable('actual same-channel initial genesis hold cannot change its census/Control/config')
+        hold.require_authority_birth_observation_v4();self.hold=hold;self.complete=True
+
     def advance(self):
         if self not in _CENSUSES_V3 or self.control is None:
             raise AuthorityUnavailable('actual installed census selected scope required')
         if not self.complete:
-            self._continuation=self.supervisor.hold_peer_registry_genesis_v3(registry_scope=self.scope)
+            self._continuation=self.supervisor.hold_peer_registry_genesis_v3(registry_scope=self.scope,
+                authority_spec=self.authority_spec_v4)
             self.hold=self._continuation.__enter__()
             self.hold.require_current()
             self.complete=True
@@ -78,6 +104,9 @@ class InstalledPeerRegistryCensusV3:
             root_process_original=self.hold.launcher_original)
 
     def close(self):
+        if self._continuation is None and self.hold is not None:
+            hold,self.hold=self.hold,None
+            hold.close()
         if self._continuation is not None:
             continuation,self._continuation=self._continuation,None
             continuation.__exit__(None,None,None)

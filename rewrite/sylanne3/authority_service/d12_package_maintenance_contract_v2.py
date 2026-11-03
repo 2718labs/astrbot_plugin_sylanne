@@ -21,8 +21,12 @@ STAGES=frozenset(('accepted','packages_verified','quiescing','retire_intent','re
     'abort_authority_start_intent','abort_authority_bootstrap_ready','abort_host_start_intent','abort_bootstrap_ready','abort_complete','failed','unknown'))
 
 
+def is_package_digest_v2(value):
+    return type(value) is str and re.fullmatch('[0-9a-f]{64}', value) is not None
+
+
 def _sha(value):
-    if type(value) is not str or re.fullmatch('[0-9a-f]{64}',value) is None:raise ValueError('package maintenance digest must be exact SHA256')
+    if not is_package_digest_v2(value):raise ValueError('package maintenance digest must be exact SHA256')
 
 
 def _identifier(value):

@@ -39,11 +39,9 @@ class BodyDynamicsTests(unittest.TestCase):
     def test_actual_work_effect_follows_one_settlement_without_double_energy_debit(self):
         quote = self.domain.quote_work(
             self.profile, self.state, "activity:one", "thinking", 1.0,
-            (WorkComponent("thinking", "work", fixed_cost=0.1),), valid_until=20.0,
-        )
+            (WorkComponent("thinking", "work", fixed_cost=0.1),), valid_until=20.0, now_utc=10.0)
         reservation = self.domain.reserve_work(
-            self.state, (), quote, "reservation:one", "effect:one",
-        )
+            self.state, (), quote, "reservation:one", "effect:one", now_utc=10.0)
         settled = self.domain.settle_component(
             self.state, reservation, "thinking", actual_cost=0.1,
             component_receipt="segment:one",

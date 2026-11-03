@@ -87,7 +87,7 @@ def life_role_segment_key_v1(binding, phase):
         types[1] if phase == "start" else types[2], binding.execution_id)
 
 
-def life_fact_writes_v1(prepared, claim, terminal, artifact):
+def life_fact_writes_v1(prepared, claim, terminal, artifact, *, adoption_inputs=None):
     b = prepared.binding
     result = []
     for phase, original in (("start", claim), ("end", terminal)):
@@ -111,6 +111,6 @@ def life_fact_writes_v1(prepared, claim, terminal, artifact):
                 "binding": life_to_wire_v1(b), "artifact": json.loads(data), "artifact_digest": digest, "artifact_length": length,
                 "source_refs": list(source_refs), "audiences": list(prepared.plan.audiences), "purposes": ["context", "consolidation"]}))
     from .d11_life_fact_provenance_v1 import life_fact_qualified_writes_v1
-    qualified=life_fact_qualified_writes_v1(prepared,claim,terminal,tuple(result))
+    qualified=life_fact_qualified_writes_v1(prepared,claim,terminal,tuple(result),adoption_inputs=adoption_inputs)
     from .d11_life_outcome_provenance_v1 import life_outcome_qualified_writes_v1
-    return (*qualified,*life_outcome_qualified_writes_v1(prepared,terminal,qualified))
+    return (*qualified,*life_outcome_qualified_writes_v1(prepared,terminal,qualified,adoption_inputs=adoption_inputs))

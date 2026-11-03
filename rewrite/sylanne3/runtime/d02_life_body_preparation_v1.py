@@ -178,10 +178,10 @@ def stage_prepare_source_note_body_in_transaction_v1(db, *, frame, request, inst
         "resource:life-body:" + identity.operation_id, None, (), (settlement_key.token,),
         {"cpu_ms": request.cpu_ceiling_ms}, None, frame.envelope.deadline_utc)
     domain = BodyDomain()
-    body = domain.quote_work(profile, state, identity.activity_id, work_kind, 0.0, (policy.component,), valid_until=policy.valid_until)
+    body = domain.quote_work(profile, state, identity.activity_id, work_kind, 0.0, (policy.component,), valid_until=policy.valid_until, now_utc=frame.now_utc)
     body = replace(body, quote_id="body-quote:" + canonical_digest({"namespace": list(ns.as_tuple),
         "operation_id": identity.operation_id, "policy_id": policy.policy_id, "policy_version": policy.version}))
-    reservation = domain.reserve_work(state, reservations, body, reservation_key.name, identity.effect_id)
+    reservation = domain.reserve_work(state, reservations, body, reservation_key.name, identity.effect_id, now_utc=frame.now_utc)
     write = domain.reservation_write(ns, identity.activity_id, reservation)
     primary = stage_result_v1(frame, "d02", "prepare_artifact_draft_body" if draft else "prepare_source_note_body", request, writes=(write,),
         provenance={"life_body_root_action_ref": root.action_intent_ref, "life_body_root_action_digest": root.action_intent_digest,
@@ -206,7 +206,7 @@ def issue_life_body_quotes_before_cas_v1(db, *, frame, staged, installed_readers
     issued = installed_readers.body_quote_authority.issue_fixed_quote_and_reservation(db,
         installed_readers.issuer.resource_issuer, frame.envelope, staged.quote,
         staged.request.body_policy_id, staged.request.body_policy_version, state, reservations,
-        staged.reservation.reservation_id, staged.root.effect_id)
+        staged.reservation.reservation_id, staged.root.effect_id, now_utc=frame.now_utc)
     if issued.body_quote != staged.body or issued.reservation != staged.reservation:
         raise ValueError("actual signed Body quote differs from the independently built reservation")
 

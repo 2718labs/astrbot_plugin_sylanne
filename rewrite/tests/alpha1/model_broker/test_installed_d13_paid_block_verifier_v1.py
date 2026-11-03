@@ -77,9 +77,15 @@ def fixture(monkeypatch):
     d11.issue_budget_grant(db, BudgetLeaseGrant("paid-grant", 1, *ns.as_tuple, "paid-lease", "USD",
         ceiling, ("d13.precompress.paid.v1",), 200.0, "paid-policy"))
     installed = D13PrecompressionInstallationV1("installed-main", "provider", "model", "a" * 64, 256)
+    from sylanne3.domains.d13.precompression import D13CurrentMainPressureV2
+    from sylanne3.runtime_contracts import canonical_digest
+    pressure = D13CurrentMainPressureV2(
+        canonical_digest(window), "b" * 64, "installed-main", "provider", "model",
+        "a" * 64, 2600, "exact-tokenizer")
     intent = prepare_paid_precompression_intent_v1(window, installed, history_token_budget=2000,
         background_capacity=True, outstanding_candidate=False, attempted_input_digests=frozenset(),
-        parent_budget_lease_ref="paid-lease", resource_ref="provider-main", ceiling=ceiling, deadline_utc=150.0)
+        parent_budget_lease_ref="paid-lease", resource_ref="provider-main", ceiling=ceiling, deadline_utc=150.0,
+        pressure=pressure)
     scheduled = schedule_paid_d13_in_transaction_v1(db, intent, window,
         resource_issuer=d02, budget_issuer=d11, valid_until_utc=160.0)
     original = scheduled.original
@@ -222,3 +228,30 @@ def test_authority_reopens_its_independent_ledger_and_finished_fence(monkeypatch
     authority_db.execute("UPDATE authority_model_egress_observations_v1 SET observation_json='{}'")
     assert not verifier.verify_current_paid_model_block_v2(c["candidate"], **args)
     authority_db.close()
+
+
+@pytest.mark.parametrize("current", [False, True])
+def test_d13_authority_canonical_parser_wrapper_keeps_work_current_gate(current):
+    """Parser ABI/ordering only; the controlled Work grants no Source authority."""
+    from sylanne3.authority_service.current_authority_graph_read_v3 import _AuthorityCanonicalTextReadV3
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    from sylanne3.runtime.c09_paged_sql_v2 import C09BatchBudgetV2,C09SqlByteMeterV2
+    class Retention:
+        def retain(self,size):assert 0<size<=8388608
+    class Work:
+        operation=Retention()
+        calls=0
+        def require_current(self,*,meter):
+            self.calls+=1
+            if not current:raise AuthorityUnavailable('controlled actual Work currentness denied')
+    work=Work()
+    reader=_AuthorityCanonicalTextReadV3(work,'{"value":"actual-original"}')
+    budget=C09BatchBudgetV2(100,262144,25000000,250000000,8388608)
+    if not current:
+        with pytest.raises(AuthorityUnavailable,match='currentness denied'):
+            reader.advance_v3(C09SqlByteMeterV2(budget))
+        assert reader.offset==0 and work.calls==1
+        return
+    for _ in range(8):
+        if reader.advance_v3(C09SqlByteMeterV2(budget)):break
+    assert reader.complete and reader.value=={'value':'actual-original'} and work.calls>=2

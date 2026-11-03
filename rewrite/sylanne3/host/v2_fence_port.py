@@ -10,9 +10,10 @@ from .model_workflows_v6 import AdminModelWorkflowsV6
 from .model_workflows_v7 import AdminModelWorkflowsV7
 from .model_workflows_v8 import AdminModelWorkflowsV8
 from .model_workflows_v9 import AdminModelWorkflowsV9
+from .model_workflows_v10 import AdminModelWorkflowsV10
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
-from weakref import WeakSet
+from weakref import WeakSet, WeakKeyDictionary
 import hashlib
 import math
 from threading import Event, RLock, Thread
@@ -62,6 +63,37 @@ _REPAIRABLE_ERRORS = frozenset({
     "authority transport unavailable",
     "authority service unavailable",
 })
+
+
+
+_NATURAL_ROSTER_RPC_ISSUER_V3 = object()
+_NATURAL_ROSTER_RPC_RESULTS_V3 = WeakKeyDictionary()
+
+
+class _NaturalRosterMetadataRPCV3:
+    def __init__(self, issuer, port, raw, namespace, authority_namespace, parent_original_id, grant):
+        if issuer is not _NATURAL_ROSTER_RPC_ISSUER_V3:
+            raise TypeError('actual paired Natural metadata RPC producer required')
+        self.port, self.raw = port, raw
+        self.namespace, self.authority_namespace = namespace, authority_namespace
+        self.installation_id, self.parent_original_id = grant.installation_id, parent_original_id
+        self.paired_identity = (grant.authority_id, grant.installation_id, grant.subject, grant.administrator_holder)
+        _NATURAL_ROSTER_RPC_RESULTS_V3[self] = self._identity_v3()
+    def _identity_v3(self):
+        from ..runtime_contracts import canonical_digest
+        return (self.port, self.namespace, self.authority_namespace, self.installation_id,
+            self.parent_original_id, self.paired_identity, canonical_digest(self.raw))
+
+
+def require_natural_roster_metadata_rpc_v3(value, *, port=None):
+    if (type(value) is not _NaturalRosterMetadataRPCV3
+            or _NATURAL_ROSTER_RPC_RESULTS_V3.get(value) != value._identity_v3()
+            or port is not None and value.port is not port):
+        raise RuntimeError('actual authenticated Natural metadata RPC result required')
+    _, grant = value.port._identity()
+    if value.paired_identity != (grant.authority_id, grant.installation_id, grant.subject, grant.administrator_holder):
+        raise RuntimeError('Natural metadata RPC crossed its actual paired installation/Host')
+    return value.raw, value.port, value.namespace, value.authority_namespace, value.installation_id, value.parent_original_id
 
 
 class V2FenceOutcomeUnknown(RuntimeError):
@@ -360,7 +392,7 @@ class V2FencePort:
                    != grant.installation_id
                 or bundle.installation_policy.manifest_digest
                    != grant.manifest_digest
-                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+                or type(bundle.model_workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
                 or type(bundle.model_workflows.natural_generation)
                    is not AdminModelWorkflowV2
                 or type(bundle.model_workflows.natural_review)
@@ -1467,6 +1499,25 @@ class V2FencePort:
         return self._submit(self._with_session_repair(lambda:self._natural_current_graph_metadata_v1(
             namespace=namespace,authority_namespace=authority_namespace)))
 
+    def read_natural_roster_metadata_v3(self, *, namespace, authority_namespace, parent_original_id):
+        return self._submit(self._with_session_repair(lambda:self._natural_roster_metadata_v3(
+            namespace=namespace,authority_namespace=authority_namespace,parent_original_id=parent_original_id)))
+
+    async def _natural_roster_metadata_v3(self, *, namespace, authority_namespace, parent_original_id):
+        from ..runtime.natural_roster_metadata_read_v3 import _decode_roster_metadata_rpc_v3
+        await self._mapped(namespace,authority_namespace)
+        handshake,grant=self._identity()
+        response=await self._transport._content_rpc(self._request,handshake,'natural_roster_selected_metadata_v3',
+            {'namespace':authority_namespace,'holder':grant.administrator_holder,
+                'parent_original_id':parent_original_id},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response)is not dict or set(response)!={'metadata','channel_binding_sha256'}
+                or response['channel_binding_sha256']!=handshake.channel_binding_sha256):
+            raise RuntimeError('Natural selected metadata crossed its exact authenticated channel')
+        _decode_roster_metadata_rpc_v3(response['metadata'],namespace=namespace,authority_namespace=authority_namespace,
+            installation_id=grant.installation_id,parent_original_id=parent_original_id)
+        return _NaturalRosterMetadataRPCV3(_NATURAL_ROSTER_RPC_ISSUER_V3,self,response['metadata'],
+            namespace,authority_namespace,parent_original_id,grant)
+
     def read_natural_roster_prepared_for_parent_v1(self, *, namespace, authority_namespace, parent_original_id):
         return self._submit(self._with_session_repair(lambda:self._natural_current_graph_metadata_v1(
             namespace=namespace,authority_namespace=authority_namespace,parent_original_id=parent_original_id)))
@@ -2192,11 +2243,184 @@ class V2FencePort:
     def count_current_d13_wire_v1(self,selector,*,frame):
         return self._submit(self._with_session_repair(lambda:self._d13_core_counter_rpc_v1('count_current_d13_wire_v1',selector,frame=frame)))
 
-    async def _d13_core_counter_rpc_v1(self,method,selector,*,frame=None):
+    def read_retention_control_metadata_v1(self,*,reader,task,action):
+        from .retention_control_port_v1 import read_retention_control_metadata_v1
+        return read_retention_control_metadata_v1(self,reader=reader,task=task,action=action)
+
+    def read_or_finalize_accounted_d13_wire_v1(self,selector,*,frame,awaiting,accounting_receipt):
+        return self._submit(self._with_session_repair(lambda:self._d13_core_counter_rpc_v1(
+            'read_or_finalize_accounted_d13_wire_v1',selector,frame=frame,
+            awaiting=awaiting,accounting_receipt=accounting_receipt)))
+
+    def read_d13_model_accounting_metadata_v3(self, *, namespace, authority_namespace, call_id):
+        return self._submit(self._with_session_repair(lambda:self._read_d13_model_accounting_metadata_v3(
+            namespace=namespace,authority_namespace=authority_namespace,call_id=call_id)))
+
+    async def _read_d13_model_accounting_metadata_v3(self, *, namespace, authority_namespace, call_id):
+        from dataclasses import asdict
+        from ..authority_service.d13_accounting_metadata_v3 import accounting_core_read_from_wire_v3
+        observed = await self._mapped(namespace,authority_namespace)
+        handshake,grant = self._identity()
+        response = await self._transport._content_rpc(self._request,handshake,
+            'read_d13_model_accounting_metadata_v3',{'namespace':authority_namespace,
+                'graph_namespace':asdict(namespace),'call_id':call_id},protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {'accounting','channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('accounting metadata crossed its actual authenticated channel')
+        result = accounting_core_read_from_wire_v3(response['accounting'])
+        intent = result.record.intent
+        if (result.namespace != namespace or intent.namespace != authority_namespace or intent.call_id != call_id
+                or intent.subject != grant.subject
+                or intent.authority_activation_generation != observed.generation):
+            raise RuntimeError('accounting metadata replaced its actual call, subject or current installation')
+        return result
+
+    def read_pending_natural_parent_closures_v3(self, *, namespace, authority_namespace,
+            after_operation_id='', limit=4):
+        return self._submit(self._with_session_repair(lambda: self._read_pending_natural_parent_closures_v3(
+            namespace=namespace, authority_namespace=authority_namespace,
+            after_operation_id=after_operation_id, limit=limit)))
+
+    async def _read_pending_natural_parent_closures_v3(self, *, namespace, authority_namespace,
+            after_operation_id, limit):
+        from dataclasses import asdict
+        from ..authority_service.d13_cache_use_contract_v2 import pending_natural_parent_closures_from_wire_v3
+        if (type(after_operation_id) is not str or len(after_operation_id) > 192
+                or type(limit) is not int or not 1 <= limit <= 4):
+            raise ValueError('bounded natural parse metadata cursor/limit required')
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        response = await self._transport._content_rpc(self._request, handshake,
+            'read_pending_natural_parent_closures_v3', {'namespace': authority_namespace,
+                'graph_namespace': asdict(namespace), 'after_operation_id': after_operation_id,
+                'limit': limit}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {'page', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('natural parent metadata crossed its actual authenticated channel')
+        page = pending_natural_parent_closures_from_wire_v3(response['page'])
+        if (page.namespace, page.authority_namespace, page.authority_id, page.installation_id,
+                page.activation_generation, page.after_operation_id, page.limit) != (
+                namespace, authority_namespace, grant.authority_id, grant.installation_id,
+                observed.generation, after_operation_id, limit):
+            raise RuntimeError('natural parent metadata replaced its actual installed selection/cursor')
+        return page
+
+    def read_natural_parent_closure_original_v3(self, *, namespace, authority_namespace, candidate):
+        return self._submit(self._with_session_repair(lambda: self._read_natural_parent_closure_original_v3(
+            namespace=namespace, authority_namespace=authority_namespace, candidate=candidate)))
+
+    async def _read_natural_parent_closure_original_v3(self, *, namespace, authority_namespace, candidate):
+        from dataclasses import asdict
+        from ..authority_service.d13_cache_use_contract_v2 import natural_parent_closure_original_from_wire_v3
+        if type(candidate) is not tuple or len(candidate) != 4:
+            raise ValueError('exact natural parent metadata candidate required')
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        response = await self._transport._content_rpc(self._request, handshake,
+            'read_natural_parent_closure_original_v3', {'namespace': authority_namespace,
+                'graph_namespace': asdict(namespace), 'candidate': list(candidate)}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {'original', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('natural parse original crossed its actual authenticated channel')
+        result = natural_parent_closure_original_from_wire_v3(response['original'])
+        if (result.namespace, result.authority_namespace, result.authority_id, result.installation_id,
+                result.activation_generation, result.candidate) != (namespace, authority_namespace,
+                grant.authority_id, grant.installation_id, observed.generation, candidate):
+            raise RuntimeError('natural parse original replaced its actual installation/candidate')
+        return result
+
+    def read_pending_natural_parent_closures_v4(self, *, namespace, authority_namespace,
+            after_operation_id='', limit=4):
+        return self._submit(self._with_session_repair(lambda: self._read_pending_natural_parent_closures_v4(
+            namespace=namespace, authority_namespace=authority_namespace,
+            after_operation_id=after_operation_id, limit=limit)))
+
+    async def _read_pending_natural_parent_closures_v4(self, *, namespace, authority_namespace,
+            after_operation_id, limit):
+        from ..authority_service.d13_cache_use_contract_v2 import pending_natural_parent_closures_from_wire_v4
+        if (type(after_operation_id) is not str or len(after_operation_id) > 192
+                or type(limit) is not int or not 1 <= limit <= 4):
+            raise ValueError('bounded natural parse metadata cursor/limit required')
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        response = await self._transport.read_pending_natural_parent_closures_v4(
+            self._request, handshake, namespace=authority_namespace, graph_namespace=namespace,
+            after_operation_id=after_operation_id, limit=limit)
+        if (type(response) is not dict or set(response) != {'page', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('natural parent metadata crossed its actual authenticated channel')
+        page = pending_natural_parent_closures_from_wire_v4(response['page'])
+        if (page.namespace, page.authority_namespace, page.authority_id, page.installation_id,
+                page.activation_generation, page.after_operation_id, page.limit) != (
+                namespace, authority_namespace, grant.authority_id, grant.installation_id,
+                observed.generation, after_operation_id, limit):
+            raise RuntimeError('natural parent metadata replaced its actual installed selection/cursor')
+        return page
+
+    def read_natural_parent_closure_original_v4(self, *, namespace, authority_namespace, candidate):
+        return self._submit(self._with_session_repair(lambda: self._read_natural_parent_closure_original_v4(
+            namespace=namespace, authority_namespace=authority_namespace, candidate=candidate)))
+
+    async def _read_natural_parent_closure_original_v4(self, *, namespace, authority_namespace, candidate):
+        from ..authority_service.d13_cache_use_contract_v2 import (
+            natural_parent_closure_original_from_wire_v4, D13NaturalParentClosureCandidateV4)
+        if type(candidate) is not D13NaturalParentClosureCandidateV4:
+            raise ValueError('exact natural parent metadata candidate required')
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        response = await self._transport.read_natural_parent_closure_original_v4(
+            self._request, handshake, namespace=authority_namespace, graph_namespace=namespace,
+            candidate=candidate)
+        if (type(response) is not dict or set(response) != {'original', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('natural parse original crossed its actual authenticated channel')
+        result = natural_parent_closure_original_from_wire_v4(response['original'])
+        if (result.namespace, result.authority_namespace, result.authority_id, result.installation_id,
+                result.activation_generation, result.candidate) != (namespace, authority_namespace,
+                grant.authority_id, grant.installation_id, observed.generation, candidate):
+            raise RuntimeError('natural parse original replaced its actual installation/candidate')
+        return result
+
+    def read_current_d13_pressure_mapping_v1(self, *, frame):
+        return self._submit(self._with_session_repair(
+            lambda: self._read_current_d13_pressure_mapping_v1(frame=frame)))
+
+    async def _read_current_d13_pressure_mapping_v1(self, *, frame):
+        from ..authority_service.d13_core_counter_contract_v1 import D13CoreFrameIntentHeaderV7
+        from ..authority_service.d13_current_pressure_mapping_v1 import pressure_mapping_from_wire_v1
+        if type(frame) is not D13CoreFrameIntentHeaderV7:
+            raise TypeError('exact actual counted frame required for pressure metadata')
+        observed = await self._mapped(frame.namespace, frame.authority_namespace)
+        handshake, grant = self._identity()
+        if (frame.install_id, frame.authority_id, frame.activation_generation) != (
+                grant.installation_id, grant.authority_id, observed.generation):
+            raise RuntimeError('pressure metadata frame crosses actual installed identity')
+        response = await self._transport._content_rpc(self._request, handshake,
+            'read_current_d13_pressure_mapping_v1', {'namespace': frame.authority_namespace,
+                'counter_operation_id': frame.counter_operation_id}, protocol=AUTHORITY_V2_PROTOCOL)
+        if (type(response) is not dict or set(response) != {'mapping', 'channel_binding_sha256'}
+                or response['channel_binding_sha256'] != handshake.channel_binding_sha256):
+            raise RuntimeError('pressure metadata crossed its actual authenticated channel')
+        if response['mapping'] is None:
+            return None
+        result = pressure_mapping_from_wire_v1(response['mapping'])
+        payload = result.payload
+        if (payload.namespace, payload.installation_id, payload.authority_namespace,
+                payload.counter_operation_id, payload.frame_intent_digest) != (
+                frame.namespace, frame.install_id, frame.authority_namespace,
+                frame.counter_operation_id, frame.frame_intent_digest):
+            raise RuntimeError('pressure metadata replaced its original counted frame')
+        return result
+
+    async def _d13_core_counter_rpc_v1(self,method,selector,*,frame=None,awaiting=None,accounting_receipt=None):
         from dataclasses import asdict
         from ..authority_service.d13_core_counter_contract_v1 import (D13CurrentFramePrepareSelectorV7,
             D13CurrentWireCountSelectorV1,D13CoreFrameIntentHeaderV7,D13CoreFullWireEnvelopeV1,D13CounterCPUPrepareInstructionV1,
             D13CounterAwaitingAccountingV1,d13_core_counter_from_wire_v1)
+        if method not in {'prepare_current_d13_frame_v7','count_current_d13_wire_v1',
+                'read_or_finalize_accounted_d13_wire_v1'}:
+            raise ValueError('unregistered Core counter operation')
+        accounted_only=method=='read_or_finalize_accounted_d13_wire_v1'
         if method=='prepare_current_d13_frame_v7':
             if type(selector) is not D13CurrentFramePrepareSelectorV7:raise TypeError('actual V7 frame selector required')
             namespace=selector.namespace;authority_namespace=selector.authority_namespace
@@ -2208,14 +2432,26 @@ class V2FencePort:
         handshake,grant=self._identity()
         if (selector.install_id,authority_namespace)!=(grant.installation_id,namespace_ref(namespace)):
             raise RuntimeError('Core counter selector crossed actual paired installation/namespace')
-        response=await self._transport._content_rpc(self._request,handshake,method,
-            {'namespace':authority_namespace,'selector':asdict(selector)},protocol=AUTHORITY_V2_PROTOCOL)
+        command={'namespace':authority_namespace,'selector':asdict(selector)}
+        if accounted_only:
+            if (type(awaiting) is not D13CounterAwaitingAccountingV1 or type(accounting_receipt)is not dict
+                    or set(accounting_receipt)!={'schema','frame_intent_id','operation_id','binding_digest',
+                        'cpu_original_digest','body_original_digest','graph_receipt_digest','job_id','status'}
+                    or (awaiting.namespace,awaiting.frame_intent_id,awaiting.frame_intent_digest,awaiting.counter_operation_id)
+                       !=(frame.namespace,frame.frame_intent_id,frame.frame_intent_digest,frame.counter_operation_id)
+                    or awaiting.status!='completed'):
+                raise ValueError('accounted-only counter requires its exact original terminal and settlement')
+            command.update(awaiting=asdict(awaiting),accounting_receipt=dict(accounting_receipt))
+        response=await self._transport._content_rpc(self._request,handshake,method,command,
+            protocol=AUTHORITY_V2_PROTOCOL)
         terminal_key='frame' if method=='prepare_current_d13_frame_v7' else 'evidence'
         if (type(response) is not dict or set(response) not in (
                 {terminal_key,'channel_binding_sha256'},{'progress','channel_binding_sha256'})
                 or response['channel_binding_sha256']!=handshake.channel_binding_sha256):
             raise RuntimeError('Core counter response crossed exact authenticated channel')
         if 'progress' in response:
+            if accounted_only:
+                raise RuntimeError('accounted-only counter cannot create or continue an unaccounted execution')
             cls=D13CounterCPUPrepareInstructionV1 if method=='prepare_current_d13_frame_v7' else D13CounterAwaitingAccountingV1
             progress=d13_core_counter_from_wire_v1(response['progress'],cls)
             if type(progress) is D13CounterCPUPrepareInstructionV1:
@@ -2239,6 +2475,9 @@ class V2FencePort:
                     selector.c02_operation_id,selector.plan_ref,selector.counter_operation_id):
                 raise RuntimeError('Core frame changed original cause/prospective plan/count operation')
         elif header!=frame:raise RuntimeError('Core counter replaced immutable original frame')
+        if accounted_only and (result.payload.cpu_worker_binding_digest,result.payload.cpu_terminal_digest)!=(
+                awaiting.binding_digest,awaiting.terminal_digest):
+            raise RuntimeError('accounted-only evidence replaced its original measured terminal')
         return result
 
     def read_current_contact_observation_for_projection_v1(self, *, namespace, authority_namespace,
@@ -2267,6 +2506,41 @@ class V2FencePort:
                 grant.authority_id,grant.subject,holder,authority_namespace,effect_id,observed.generation)):
             raise RuntimeError("Contact observation actual original crossed its paired namespace/effect")
         return result
+
+    def verify_source_inspection_member_admission_v1(self, *, namespace, authority_namespace, admission):
+        return self._submit(self._with_session_repair(lambda:
+            self._verify_source_inspection_member_admission_v1(namespace, authority_namespace, admission)))
+
+    async def _verify_source_inspection_member_admission_v1(self, namespace, authority_namespace, admission):
+        await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        verification = await self._transport.verify_source_inspection_member_admission_v1(
+            self._request, handshake, namespace=authority_namespace, admission=admission)
+        if (verification["authority_id"] != grant.authority_id
+                or verification["installation_id"] != grant.installation_id
+                or verification["namespace"] != asdict(namespace)):
+            raise RuntimeError("inspection member verification crossed the paired installation/namespace")
+        return verification
+
+    def read_historical_observation_receipt_v3(self, *, namespace, authority_namespace,
+            effect_id, mutation_id, expected_receipt_digest):
+        return self._submit(self._with_session_repair(lambda:
+            self._read_historical_observation_receipt_v3(namespace, authority_namespace,
+                effect_id, mutation_id, expected_receipt_digest)))
+
+    async def _read_historical_observation_receipt_v3(self, namespace, authority_namespace,
+            effect_id, mutation_id, expected_receipt_digest):
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        receipt = await self._transport.v2_execution_read_historical_observation_receipt_v3(
+            self._request, handshake, namespace=authority_namespace, effect_id=effect_id,
+            mutation_id=mutation_id, expected_receipt_digest=expected_receipt_digest)
+        from ..authority_service.observation_refinement_contract_v3 import observation_original_dispatch_permit_v3
+        permit = observation_original_dispatch_permit_v3(receipt)
+        if (permit.authority_id != grant.authority_id or permit.subject != grant.subject
+                or permit.generation != observed.generation):
+            raise RuntimeError('historical observation receipt installation differs')
+        return receipt
 
     def read_current_observation_receipt_v1(self, *, namespace, authority_namespace, effect_id):
         return self._submit(self._with_session_repair(lambda:
@@ -2347,7 +2621,8 @@ class V2FencePort:
         handshake, grant = self._identity()
         receipt = await self._transport.v2_execution_read_current_observation_receipt_v1(
             self._request, handshake, namespace=authority_namespace, effect_id=effect_id)
-        permit = receipt.pending.permit
+        from ..authority_service.observation_refinement_contract_v3 import observation_original_dispatch_permit_v3
+        permit = observation_original_dispatch_permit_v3(receipt)
         if (permit.authority_id != grant.authority_id or permit.subject != grant.subject
                 or permit.generation != observed.generation):
             raise RuntimeError("platform observation receipt installation differs")
@@ -2407,6 +2682,34 @@ class V2FencePort:
             raise RuntimeError("current V2 handoff installation differs")
         return await self._transport.v2_execution_read_current_dispatch_handoff(
             self._request, handshake, start=start, claimed_receipt=claimed_receipt)
+
+    def execution_refine_observation_v3(self, *, namespace, authority_namespace,
+            claimed_receipt, observation):
+        # Session repair is completed before the sole fact-write request.
+        self._submit(self._with_session_repair(lambda: self._mapped(namespace, authority_namespace)))
+        try:
+            return self._submit(self._execution_refine_observation_v3(
+                namespace, authority_namespace, claimed_receipt, observation))
+        except (RuntimeError, FutureTimeout) as exc:
+            raise V2FenceOutcomeUnknown("observation refinement outcome requires the exact fact original") from exc
+
+    async def _execution_refine_observation_v3(self, namespace, authority_namespace,
+            claimed_receipt, observation):
+        if (type(claimed_receipt) is not MutationReceiptV2
+                or claimed_receipt.pending.phase != "claimed"
+                or type(observation) is not PlatformObservationV2
+                or type(claimed_receipt.pending.binding) is not ExecutionBindingV2
+                or observation.binding != claimed_receipt.pending.binding
+                or claimed_receipt.pending.permit.namespace != authority_namespace):
+            raise ValueError("observation refinement identity differs")
+        observed = await self._mapped(namespace, authority_namespace)
+        handshake, grant = self._identity()
+        permit = claimed_receipt.pending.permit
+        if (permit.authority_id != grant.authority_id or permit.subject != grant.subject
+                or permit.generation != observed.generation):
+            raise RuntimeError("observation refinement installation differs")
+        return await self._transport.v2_execution_refine_observation_v3(
+            self._request, handshake, claimed_receipt=claimed_receipt, observation=observation)
 
     def execution_observe_v2(
         self, *, namespace: NamespaceId, authority_namespace: str,

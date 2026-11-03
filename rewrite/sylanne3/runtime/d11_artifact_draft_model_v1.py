@@ -164,8 +164,9 @@ def installed_artifact_draft_workflow_v1(bundle):
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+    from ..host.model_workflows_v10 import AdminModelWorkflowsV10
     from ..host.authority_profile import AdminInstallationBundle, AdminModelWorkflowV2
-    if type(bundle) is not AdminInstallationBundle or type(bundle.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+    if type(bundle) is not AdminInstallationBundle or type(bundle.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
         raise MissingProductionOriginalV1("explicit_installed_artifact_draft_workflows_v4")
     workflow = bundle.model_workflows.artifact_draft
     if (type(workflow) is not AdminModelWorkflowV2

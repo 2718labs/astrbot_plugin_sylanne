@@ -190,11 +190,18 @@ def read_current_reply_route_manifest_v2(
     if type(inputs) in (_PreparedCurrentReplyModelInputsV3,_PreparedFullReplyModelInputsV3,_PreparedAuthorityReplyModelInputsV3):
         inputs.require_for_v3(db,namespace,source_ref)
     source_id = source_key_from_ref(source_ref, namespace)
-    original = read_committed_ingress_identity(db, namespace, source_id)
-    if original is None:
-        raise ReplyModelJobHold("original private ingress route is absent")
+    natural_originals=None
+    if type(inputs)is _PreparedCurrentReplyModelInputsV3 and inputs.prepared_inventory.family=="natural_reply":
+        from .natural_dispatch_p2_c02_originals_v1 import require_prepared_natural_p2_c02_originals_v1
+        natural_originals=require_prepared_natural_p2_c02_originals_v1(inputs.prepared_inventory,db,
+            c02_operation_id=inputs.c02_receipt.operation_id,source_ref=source_ref)
+    if natural_originals is None:
+        original = read_committed_ingress_identity(db, namespace, source_id)
+        if original is None:
+            raise ReplyModelJobHold("original private ingress route is absent")
     try:
-        identity = json.loads(original.identity_json)
+        identity = (json.loads(original.identity_json)if natural_originals is None
+            else natural_originals.ingress_identity_v1(db,namespace,source_ref))
         platform_ref = identity["platform_ref"]
         conversation_ref = identity["conversation_ref"]
         visibility = identity["visibility"]
@@ -462,7 +469,7 @@ def read_current_reply_model_inputs_v1(
                 or prepared_inventory is not None or prepared_full_read is not None):
             raise ReplyModelJobHold('actual private prefinal C02 inventory required')
         _prefinal_source_inventory.require_current()
-        if (snapshot is not _prefinal_source_inventory.projection or namespace!=_prefinal_source_inventory.namespace
+        if (snapshot is not _prefinal_source_inventory.require_body_projection_v3() or namespace!=_prefinal_source_inventory.namespace
                 or db is not _prefinal_source_inventory.db
                 or _prefinal_source_inventory.actual_entry.c02_operation_id!=c02_receipt.operation_id):
             raise ReplyModelJobHold('prefinal C02 metadata belongs to another actual entry/Work')
@@ -494,6 +501,11 @@ def read_current_reply_model_inputs_v1(
             or snapshot.epochs[0].bot != namespace.bot_id
             or snapshot.epochs[0].persona != namespace.persona_id):
         raise ReplyModelJobHold("transactional C02/current graph evidence required")
+    natural_originals=None
+    if prepared_inventory is not None and prepared_inventory.family=="natural_reply":
+        from .natural_dispatch_p2_c02_originals_v1 import require_prepared_natural_p2_c02_originals_v1
+        natural_originals=require_prepared_natural_p2_c02_originals_v1(prepared_inventory,db,
+            c02_operation_id=c02_receipt.operation_id,source_ref=source_ref)
     meter=None
     actual_reader=authority_work if authority_work is not None else _prefinal_source_inventory if _prefinal_source_inventory is not None else prepared_full_read
     if actual_reader is not None:
@@ -501,6 +513,8 @@ def read_current_reply_model_inputs_v1(
         current=current_c09_sql_meter_v2()
         meter=require_c09_reserved_meter_v3(current.budget)
     def read_row(table,columns,where,args):
+        if natural_originals is not None:
+            return natural_originals.read_point_v1(table,columns,where,args)
         if authority_work is not None:
             keys={
                 'bot=? AND persona=? AND operation_id=?':('bot','persona','operation_id'),
@@ -520,10 +534,13 @@ def read_current_reply_model_inputs_v1(
         if row is not None:
             actual_reader.operation.retain(sum(len(value)*32 for value in row if type(value)in(str,bytes))+4096)
         return row
-    originals=_prepared_c02_originals
+    originals=natural_originals if natural_originals is not None else _prepared_c02_originals
     if originals is None and prepared_full_read is not None and prepared_full_read.source_material is not None:
         originals=prepared_full_read.source_material.c02_originals
-    if originals is not None:
+    if natural_originals is not None:
+        natural_originals.require_inventory_v1(prepared_inventory,db,
+            c02_operation_id=c02_receipt.operation_id,source_ref=source_ref)
+    elif originals is not None:
         from .current_graph_source_material_v3 import PreparedCurrentC02OriginalsV3
         prefinal=_prefinal_source_inventory if _prefinal_source_inventory is not None else prepared_full_read.prefinal
         if type(originals)is not PreparedCurrentC02OriginalsV3:
@@ -586,7 +603,14 @@ def read_current_reply_model_inputs_v1(
     settled = read_row('runtime_budget_operations',('operation_id',),"bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",namespace.as_tuple + (c02_operation_id,))
     reservation = read_row('runtime_budget_reservations',('state',),'lease_id=? AND operation_id=?',(quote.parent_budget_lease_ref, c02_operation_id))
     dep = read_row('graph_dependencies',('dependency_revision',),'dependent_token=? AND dependency_token=?',(access_key_value.token, source_ref))
-    if meter is None:
+    if natural_originals is not None:
+        first=read_row('graph_first_ingress_identity_v1',('operation_id','conversation_ref','visibility'),
+            'bot=? AND persona=? AND source_ref=? ORDER BY operation_id',namespace.as_tuple+(source.source_id,))
+        second=read_row('graph_first_ingress_identity_v1',('operation_id','conversation_ref','visibility'),
+            'bot=? AND persona=? AND source_ref=? AND operation_id>? ORDER BY operation_id',
+            namespace.as_tuple+(source.source_id,first[0]))
+        ingress=[first[1:]]if second is None else[first[1:],second[1:]]
+    elif meter is None:
         ingress=db.execute('SELECT conversation_ref,visibility FROM graph_first_ingress_identity_v1 '
             'WHERE bot=? AND persona=? AND source_ref=?',namespace.as_tuple+(source.source_id,)).fetchall()
     else:

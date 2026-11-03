@@ -113,8 +113,11 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
     initial,continuation,envelope,config,cache=read_current_beta1_resume_configuration_v3(
         setup_file=setup_file,setup_sha256=setup_sha256,continuation_file=continuation_file,
         continuation_sha256=continuation_sha256,scenario=scenario)
+    if initial.d13_installation_assets is None:
+        raise ValueError("selected Beta1 cold SDK fixture lacks the new manifest; NOT_MIGRATED")
     bootstrap_daemon=open_authority_daemon(config)
     worker=store=port=qualification=mock=initial_client_transport=transport=None
+    sdk_consumers=None
     authority_loop=authority_thread=None
     issued_case=None
     try:
@@ -124,7 +127,10 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
                 or current.prepared_original["operation_id"]!=continuation["c09_operation_id"]):
             raise ValueError("Beta1 resume needs the actual released four-role selected C09 generation")
         registry=load_verified_affect_scheme(initial.package_root,continuation["manifest_digest"]).registry
-        store=daemon._resolved_storage_composition_v3.open_graph(registry.type_registry)
+        from sylanne3.host.c09_storage_admission_v1 import read_current_controlled_sdk_host_graph_binding_v4
+        from sylanne3.graph_store import ProductionGraphStore
+        host_binding=read_current_controlled_sdk_host_graph_binding_v4(daemon=daemon)
+        store=ProductionGraphStore(host_binding.member('graph')['resolved_path'],registry.type_registry,host_storage_binding=host_binding)
         graph_path=Path(next(member["resolved_path"] for member in current.manifest["members"] if member["role"]=="graph"))
         ans=continuation["authority_namespace"];model_installation=daemon.config.natural_model_authorities_v2[ans]
         base_bundle=model_installation.installation_bundle;policy=base_bundle.installation_policy
@@ -166,11 +172,17 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
             return binding.principal if binding is not None and binding.namespace==namespace else None
         cpu=C04InternalCpuQuotePolicyAuthorityV1(hmac.digest(base_bundle.d11_signing_key,
             b"sylanne3.c04.internal_cpu_quote_policy.v1\0"+policy.installation_id.encode(),"sha256"))
+        from sylanne3.authority_service.d13_cache_use_control_v2 import InstalledD13CacheUseControlPortV2
+        use=InstalledD13CacheUseControlPortV2(fence_port=port,bundle=base_bundle)
         graph=GraphCoordinator(store,graph_bootstrap,holder=policy.administrator_holder,
             content_fence_v2=port,d02_issuer=d02,d11_issuer=d11,
             body_quote_authority=factory.body_authority,c04_cpu_quote_authority=cpu,
             owner_principal_resolver=principal_for,scene_clock_policy=base_bundle.ingress_clock,
+            d13_precompression_policy=base_bundle.d13_precompression,
             d13_paid_precompression_policy=base_bundle.d13_paid_precompression,
+            d13_derived_cache_maintenance_v2=base_bundle.d13_derived_cache_maintenance_v2,
+            d13_cache_use_control_v2=use,d13_cache_use_coverage_v2=(base_bundle.d13_derived_cache_maintenance_v2.coverage_ref,
+                base_bundle.d13_derived_cache_maintenance_v2.coverage_digest),
             reply_suppression_ack_verifier=suppressions.verify_and_consume)
         initial_storage=FreshOfflineStorageCaseV1(control,control.lease,
             OuterOwnedProtectedRootV1(str(control.key_path.parent)),daemon.config,factory,cache,factory.body_authority)
@@ -195,7 +207,6 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         if scenario.startswith("numeric-"):
             from test_d04_owner_semantic_initialization_v3 import install_d04_test_composition
             from d04_numeric_authority_acceptance_support_v3 import install_actual_numeric_authority_case_v3
-            await asyncio.to_thread(install_d04_test_composition,case)
         for registration in registry.registrations.values():
             expected=(registration.provider,registration.proposal_schema,registration.proposal_schema_hash)
             prior=graph._GraphCoordinator__providers.get(registration.domain)
@@ -229,6 +240,16 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         graph._GraphCoordinator__worker_result_fact_port=InstalledWorkerResultReadFactPort(**parameters)
         graph._GraphCoordinator__original_c02_cost_intent_port=InstalledOriginalC02CostIntentPort(**parameters)
         worker=await GraphWorker.start(lambda:store,lambda _store:graph)
+        from sylanne3.runtime.d13_consumer_manifest_v3 import prepare_current_controlled_sdk_d13_consumers_v3
+        from sylanne3.authority_service.c09_process_identity_v1 import read_process_identity_v1
+        sdk_consumers=await prepare_current_controlled_sdk_d13_consumers_v3(worker=worker,daemon=daemon,bootstrap=graph_bootstrap)
+        process=read_process_identity_v1(os.getpid())
+        admission=daemon.c09_gate.register_peer_process_v1(peer=factory.peer,process_id=os.getpid(),
+            process_incarnation='current-c09-business:'+process['birth'],pointer_version=current.pointer_version,
+            storage_generation=current.storage_generation)
+        ready=await sdk_consumers.mark_ready_v3(peer_admission=admission)
+        case.update(c09_sdk_consumers=sdk_consumers,c09_writer_admission_original=admission,c09_sdk_ready_original=ready)
+        if scenario.startswith("numeric-"):await asyncio.to_thread(install_d04_test_composition,case)
         runtime=InstalledArtifactDraftModelRuntimeV1(graph=graph,bootstrap=graph_bootstrap,bundle=bundle,
             worker=worker,authority_client=client,client_grant=actual_grant,context=context,
             owner_loop=asyncio.get_running_loop())
@@ -246,6 +267,8 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
                 artifact_draft_bundle=bundle),admin_model_policy=bundle.model_workflows)
         model.install_current_source_location_v1(daemon.c09_maintenance.current_source_location)
         daemon.server._v2_model_egress[ans]=model
+        from sylanne3.authority_service.v2_model_egress_service import install_d13_accounting_metadata_producer_v3
+        install_d13_accounting_metadata_producer_v3(model,server=daemon.server,bundle=bundle)
         case.update(installed_bundle=bundle,policy=bundle.installation_policy,authority_client=client,
             client_grant=actual_grant,phase_fixture_qualification=qualification,phase_provider_calls=calls,
             phase_model_runtime=runtime,phase_worker=worker,model_context=context,model_http_client=mock,
@@ -284,7 +307,11 @@ async def resume_current_beta1_fixture_case_v3(*,setup_file,setup_sha256,
         if issued_case is not None:
             try:unregister_current_beta1_fixture_case_v3(issued_case)
             except BaseException as failure:cleanup_failures.append(failure)
-        if worker is not None:
+        if sdk_consumers is not None:
+            result=await sdk_consumers.close_v3()
+            if result["status"]!="complete":
+                raise ValueError("cold SDK fixture retains actual original cleanup; pending")
+        elif worker is not None:
             # Accepted continuations must finish with their original provider still present.
             await finish_cleanup(worker.close())
         elif store is not None:

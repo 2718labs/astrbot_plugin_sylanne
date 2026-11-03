@@ -90,60 +90,57 @@ def discover_owner_source_note_tasks_v1(graph,bootstrap,bundle):
 
 
 
+def _owner_source_note_prepared_ref_v1(graph,bundle,authorization_original_ref):
+    from .owner_source_note_life_v1 import owner_source_note_life_ids_v1
+    from .d11_life_preparation_v1 import read_registered_life_plan_v2,life_ids_v1
+    auth,_,job,cont=_task(graph,bundle,authorization_original_ref)
+    if job is None or job.phase!='running':
+        raise ValueError('Owner native continuation requires its actual running task')
+    ids=owner_source_note_life_ids_v1(auth)
+    store=graph._GraphCoordinator__store
+    with store._lock:
+        db=store._db;db.execute('BEGIN')
+        try:
+            plan=read_registered_life_plan_v2(db,namespace=auth.cause.namespace,
+                issuer=graph._GraphCoordinator__d11_issuer,original_ref=ids['plan_ref'])
+            if plan is None:
+                raise ValueError('Owner native task has no actual registered Life plan')
+            prepared_ref=life_ids_v1(plan)['prepared']
+        finally:db.rollback()
+    return auth,ids,cont,prepared_ref
+
+
 def prepare_owner_source_note_task_life_v1(graph,bootstrap,bundle,*,authorization_original_ref):
-    from .owner_source_note_life_v1 import RegisterOwnerSourceNoteLifePlanRequestV1,owner_source_note_life_ids_v1
-    from .d11_life_preparation_v1 import PrepareCurrentLifeRequestV1,read_registered_life_plan_v2,life_ids_v1
-    auth,_,job,cont=_task(graph,bundle,authorization_original_ref);ids=owner_source_note_life_ids_v1(auth)
-    if cont.step=='register_life_plan':
-        registered=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-            operation_kind='register_owner_source_note_life_plan_v1',request=RegisterOwnerSourceNoteLifePlanRequestV1(auth.original_ref),
-            operation_id=ids['plan_operation_id'])
-        if registered['coverage']!='complete':return registered
-        checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-            next_step='prepare_life',completed_operation_ids=(ids['plan_operation_id'],))
-    prepared=run_owner_source_note_task_command_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        operation_kind='prepare_life',request=PrepareCurrentLifeRequestV1(ids['plan_ref'],ids['prepare_operation_id']),
-        operation_id=ids['prepare_operation_id'])
-    originals=prepared.get('produced_originals',())
-    prepared_refs=[item['original_ref'] for item in originals if item['kind']=='d11.life_prepared']
-    if not prepared_refs:
-        store=graph._GraphCoordinator__store
-        with store._lock:
-            db=store._db;db.execute('BEGIN')
-            try:
-                plan=read_registered_life_plan_v2(db,namespace=auth.cause.namespace,
-                    issuer=graph._GraphCoordinator__d11_issuer,original_ref=ids['plan_ref'])
-                if plan is None:return prepared
-                prepared_ref=life_ids_v1(plan)['prepared']
-                from .d11_life_preparation_v1 import read_prepared_life_by_ref_v1
-                if read_prepared_life_by_ref_v1(db,namespace=auth.cause.namespace,prepared_original_ref=prepared_ref,
-                        issuer=graph._GraphCoordinator__d11_issuer) is None:return prepared
-            finally:db.rollback()
-    elif len(prepared_refs)==1:prepared_ref=prepared_refs[0]
-    else:raise ValueError('Owner task preparation returned multiple actual execution originals')
-    # First claim requires the exact prepared Graph stamp. No parent checkpoint
-    # or other W01 is permitted between preparation and the official once driver.
-    native=graph.run_prepared_source_note_v1(bootstrap,namespace=auth.cause.namespace,prepared_original_ref=prepared_ref)
-    if native.terminal is not None and native.terminal.status=='failed' and native.adoption is not None:
-        from .owner_source_note_native_observation_v1 import read_owner_source_note_native_observation_v1
-        observed=read_owner_source_note_native_observation_v1(graph,bootstrap,authorization_original_ref=auth.original_ref)
-        if observed.state=='failed' and observed.adoption_finished:
-            _,_,_,actual_cont=_task(graph,bundle,authorization_original_ref)
-            checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-                next_step=actual_cont.step,completed_operation_ids=(ids['prepare_operation_id'],observed.adoption_operation_id))
-            return {'status':'failed','native':native,'checkpoint':checkpoint}
+    auth,_,_,prepared_ref=_owner_source_note_prepared_ref_v1(graph,bundle,authorization_original_ref)
+    # The async driver already awaited the actual preparation. Only the formal
+    # metadata Locator may classify its Prepared before Core claim/Source work.
+    return graph.run_prepared_source_note_v1(bootstrap,
+        namespace=auth.cause.namespace,prepared_original_ref=prepared_ref)
+
+
+def finish_owner_source_note_native_progress_v1(graph,bootstrap,bundle,*,authorization_original_ref,progress):
+    from .d11_life_driver_v1 import LifeExecutionProgressV1
+    graph._admin(bootstrap)
+    auth,ids,cont,prepared_ref=_owner_source_note_prepared_ref_v1(graph,bundle,authorization_original_ref)
+    if type(progress)is not LifeExecutionProgressV1 or progress.prepared_original_ref!=prepared_ref:
+        raise ValueError('Owner native consumer requires its actual same-task terminal Progress')
+    for original in (progress.claim,progress.terminal):
+        if original is not None and (original.binding.namespace!=auth.cause.namespace
+                or original.binding.prepared_original_ref!=prepared_ref):
+            raise ValueError('Owner native progress crossed its actual namespace/preparation')
+    native=progress
+    if (native.terminal is not None and native.terminal.status=='failed'
+            and native.adoption is not None and native.state=='adopted_failed'):
+        from .d11_life_contract_v1 import life_adoption_operation_id_v1
+        return {'status':'failed','native':native,'next_step':cont.step,
+            'completed_operation_ids':(ids['prepare_operation_id'],life_adoption_operation_id_v1(native.terminal.binding))}
     if native.terminal is None or native.terminal.status!='completed' or native.adoption is None or native.state!='adopted_completed':
-        # Prepared read rows include the parent task. Mutating that job before
-        # actual Native adoption would invalidate recovery of the same effect.
         return {'status':'pending_original_native','native':native,'prepared_original_ref':prepared_ref,
             'pending_effect_refs':(ids['effect_id'],),'wait_reason':native.state}
     from .d11_life_contract_v1 import life_adoption_operation_id_v1
     adoption_id=life_adoption_operation_id_v1(native.terminal.binding)
-    checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        next_step='execute_life',completed_operation_ids=(ids['prepare_operation_id'],adoption_id))
-    checkpoint=checkpoint_owner_source_note_task_step_v1(graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,
-        next_step='observe_life')
-    return {'status':'native_completed','native':native,'checkpoint':checkpoint}
+    return {'status':'native_completed','native':native,
+        'completed_operation_ids':(ids['prepare_operation_id'],adoption_id)}
 
 
 async def drive_owner_source_note_task_v1(runtime, installation, *, authorization_original_ref):
@@ -241,12 +238,24 @@ async def drive_owner_source_note_task_v1(runtime, installation, *, authorizatio
             await command("register_owner_source_note_life_plan_v1", RegisterOwnerSourceNoteLifePlanRequestV1(auth.original_ref), life["plan_operation_id"])
             await checkpoint("prepare_life", (life["plan_operation_id"],))
         elif step == "prepare_life":
-            # This existing exact producer retains the once claim boundary with
-            # no parent checkpoint between preparation and original Native claim.
-            result = await graph_call(lambda graph: prepare_owner_source_note_task_life_v1(
+            from .owner_source_note_life_v1 import owner_source_note_life_ids_v1
+            from .d11_life_preparation_v1 import PrepareCurrentLifeRequestV1
+            life=owner_source_note_life_ids_v1(auth)
+            await command("prepare_life",PrepareCurrentLifeRequestV1(life['plan_ref'],life['prepare_operation_id']),
+                life['prepare_operation_id'])
+            # No parent checkpoint may intervene between the actual preparation
+            # and its once claim. Await execution/adoption before consuming it.
+            progress = await graph_call(lambda graph: prepare_owner_source_note_task_life_v1(
                 graph, bootstrap, bundle, authorization_original_ref=auth.original_ref))
-            if result.get("status") != "native_completed":
+            result = await graph_call(lambda graph: finish_owner_source_note_native_progress_v1(
+                graph,bootstrap,bundle,authorization_original_ref=auth.original_ref,progress=progress))
+            if result['status']=='failed':
+                result['checkpoint']=await checkpoint(result.pop('next_step'),result.pop('completed_operation_ids'))
                 return result
+            if result['status']!='native_completed':
+                return result
+            await checkpoint('execute_life',result['completed_operation_ids'])
+            await checkpoint('observe_life')
         elif step in {"execute_life", "observe_life"}:
             await checkpoint("observe_life" if step == "execute_life" else "adopt_outcome")
         elif step == "adopt_outcome":

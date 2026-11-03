@@ -210,6 +210,36 @@ class CurrentD01OnboardingResolver:
             owner_session_token=session.owner_session_token,
             owner_session_request=session.owner_session_request))
 
+    def read_current_creation_choices(self, *, session, scope, purpose, audience, budget_ref):
+        """Discover actual selectors under the same initial Owner qualification."""
+        blocked = lambda code: {"choices": [], "reason_code": code}
+        if (not isinstance(session, AuthenticatedSession)
+                or not session.allows(scope, "workbench.create", purpose, audience)
+                or type(session.owner_session_token) is not str or not session.owner_session_token
+                or type(session.owner_session_request) is not OwnerSessionLoginRequestV1):
+            return blocked("signed_owner_creation_session_required")
+        if self._namespaces is None or self._owners is None or self._catalogue is None:
+            return blocked("role_initialization_policy_unavailable")
+        namespace = self._namespaces.resolve_installed_namespace(scope=scope)
+        if type(namespace) is not NamespaceId or scope != "/".join(namespace.as_tuple):
+            return blocked("installed_onboarding_scope_unavailable")
+        owner = self._owners.resolve_current_owner_identity(
+            session=session, scope=scope, namespace=namespace)
+        if (type(owner) is not CurrentOwnerIdentity or owner.actor_id != session.actor_id
+                or owner.session_id != session.session_id or owner.scope != scope
+                or owner.namespace != namespace or type(owner.principal) is not OwnerPrincipalV1
+                or type(owner.guard) is not OwnerAuthorizationGuardV1
+                or owner.guard.namespace != namespace
+                or owner.guard.authorization_revision != 1
+                or owner.guard.minimum_revocation_revision != 0
+                or owner.guard.minimum_revocation_epoch != 0
+                or owner.guard.pending_revoke_operation_id is not None):
+            return blocked("initial_owner_creation_authorization_required")
+        read = getattr(self._catalogue, "read_current_creation_choices", None)
+        if not callable(read):
+            return blocked("creation_selector_reader_unavailable")
+        return read(namespace=namespace, budget_ref=budget_ref, session=session, principal=owner.principal)
+
     def resolve_create_character(
         self, *, session: AuthenticatedSession, scope: str, purpose: str,
         audience: str, operation_id: str, request_digest: str,

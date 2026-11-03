@@ -317,6 +317,7 @@ def record_live_post_c02_foreground_cause_after_cas_v1(db, *, graph, bundle, rec
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+    from ..host.model_workflows_v10 import AdminModelWorkflowsV10
     from .foreground_cycle_v1 import ForegroundPostC02CauseV1, foreground_post_c02_cause_ref_v1
     from .ingress_observation import read_committed_ingress_identity
     from ..memory_types import SourceRecord
@@ -333,7 +334,7 @@ def record_live_post_c02_foreground_cause_after_cas_v1(db, *, graph, bundle, rec
     if assembly is None:
         return None
     installed = assembly.admin_bundle
-    if (type(installed.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+    if (type(installed.model_workflows) not in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
             or type(installed.foreground) is not AdminForegroundPolicyV1
             or installed.foreground.deadline_policy.natural is None):
         return None

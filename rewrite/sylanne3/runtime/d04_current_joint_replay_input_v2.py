@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 from ..domains.d04.affect import AffectScheme
 from ..domains.d04.numeric_drive import decode_sourced_numeric_drive, SourcedNumericDrive
 from ..domains.d04.root import decode_numeric_checkpoint, NumericCheckpoint
-from ..graph_types import TypeRegistry
+from ..graph_types import AtomKey, TypeRegistry
 from ..memory_types import SourceRecord
 from ..native_runtime.d04_joint_product_math import D04FamilyAssignment
 from ..runtime_contracts import NamespaceId, QueryEpoch
@@ -57,11 +57,30 @@ def read_current_joint_replay_input_in_transaction_v2(
         _life_source_bridge=_life_source_bridge,
     )
     versions = {version.key.token: version.revision for version in component.read_versions}
+    life_reader = None
+    if _life_source_bridge is not None:
+        from .life_numeric_source_bridge_v1 import life_joint_bridge_reader_v1
+        life_reader = life_joint_bridge_reader_v1(db, _life_source_bridge)
 
     def value_at(ref: str) -> dict:
         revision = versions.get(ref)
         if revision is None or revision < 1:
             raise JointNumericHold("joint replay input is absent from complete read set")
+        if life_reader is not None:
+            try:
+                atom = life_reader.head(db, AtomKey.from_token(ref))
+            except (TypeError, ValueError) as exc:
+                raise JointNumericHold(
+                    "joint replay input is outside the Life qualified Source frame") from exc
+            if atom.revision != revision or not atom.valid:
+                raise JointNumericHold("joint replay input changed during actual Life Source read")
+            return atom.value
+        from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
+        handled,atom=read_bound_installed_d04_component_atom_v3(db,namespace,ref)
+        if handled:
+            if atom.revision!=revision or not atom.valid:
+                raise JointNumericHold("joint replay input changed during actual D04 Source read")
+            return atom.value
         row = db.execute(
             "SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,),
         ).fetchone()

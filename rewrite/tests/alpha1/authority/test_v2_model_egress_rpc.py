@@ -203,10 +203,10 @@ def test_mtls_model_prepare_admit_recover_exact_identity(tmp_path, monkeypatch):
                 {**_REQUEST, "profile_id": "other-profile"},
                 {**_REQUEST, "manifest_sha256": "e" * 64}):
             channel = b"wrong-model-install"
-            handshake = server._dispatch_for_test(
+            handshake = server.dispatch(
                 "handshake", changed_request, _PEER_A, channel)
             with pytest.raises(RuntimeError, match="authority unavailable"):
-                server._dispatch_for_test(
+                server.dispatch(
                     "model_prepare_fenced_v1", changed_request, _PEER_A, channel,
                     handshake_binding=handshake["channel_binding_sha256"],
                     command=prepared_command)

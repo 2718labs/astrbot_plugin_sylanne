@@ -3,7 +3,6 @@
 The request is only a locator. No supplied content, approval, check, quote,
 continuation or executable callback becomes permission. No sender is installed.
 """
-from contextlib import contextmanager
 from dataclasses import dataclass, replace
 import json
 import time
@@ -17,6 +16,7 @@ from .d01_production_operations_v1 import MissingProductionOriginalV1, productio
 from .contact_final_stage_v1 import (
     _ContactFinalMaterialV1, _publish_material, require_installed_contact_material_v1,
     revoke_contact_final_material_v1, _RECEIPTS, _QUALIFIED,
+    _contact_expression_frame_v1, _provisional, _contact_final_result_v1,
 )
 
 
@@ -113,31 +113,6 @@ class ContactFinalStageV2:
     stage: object
 
 
-def _contact_expression_frame_v1(frame, content):
-    """Only authenticated reviewed claim roots describe expression permission.
-
-    Full context/structural inputs and every guarded head remain unchanged.
-    This private derivation is called after the paired-original reader; it is
-    not a caller permission flag and never changes generic frame freezing.
-    """
-    from ..domains.d09.contact_batch_v1 import ContactReviewedContentV1
-    from ..memory_types import source_key
-    if type(content) is not ContactReviewedContentV1:
-        raise TypeError('Contact expression roots need the actual typed reviewed content')
-    roots = tuple(sorted({ref for segment in content.segments for claim in segment.claims for ref in claim.source_refs}))
-    if not roots or len(roots) > frame.limits.max_source_roots:
-        raise MissingProductionOriginalV1('actual_bounded_contact_expression_claim_roots')
-    current = {v.key.token:v.revision for v in frame.snapshot.versions}
-    signed = {v.key.token:v.revision for v in content.read_versions}
-    for ref in roots:
-        key = AtomKey.from_token(ref)
-        if (key != source_key(*content.namespace.as_tuple,key.owner.subject)
-                or signed.get(ref,0) < 1 or current.get(ref) != signed[ref]):
-            raise ValueError('Contact expression claim root lacks its actual signed/current source binding')
-    return replace(frame,envelope=replace(frame.envelope,
-        source_qualification=replace(frame.envelope.source_qualification,source_refs=roots)))
-
-
 def _with_actual_absent_keys(material, db, keys):
     from .domain_production_frame_v1 import freeze_domain_production_frame_v1
     frame = material.frame
@@ -154,27 +129,6 @@ def _with_actual_absent_keys(material, db, keys):
             raise ValueError('Contact final output already exists; no duplicate adoption')
     frozen = _contact_expression_frame_v1(frozen, material.content)
     return _publish_material(replace(material, frame=frozen))
-
-
-@contextmanager
-def _provisional(material, db, writes):
-    require_installed_contact_material_v1(material)
-    graph = material.runtime.graph
-    envelope = material.frame.envelope
-    candidate = GraphCandidate(Event(Scope(*material.scope.namespace.as_tuple, material.content.activity_id),
-        envelope.identity.operation_id, material.frame.now_utc, 'domain_bundle', {'contact_provisional': material.content.digest}),
-        envelope.version_guard.read_versions, tuple(w for _, w in writes), material.frame.snapshot.epochs)
-    with graph._GraphCoordinator__store._provisional_graph_stage_in_transaction(candidate,
-            _capability=graph._GraphCoordinator__graph_capability) as receipt:
-        event = db.execute('SELECT event_id,digest FROM graph_events WHERE bot=? AND persona=? AND session=? AND epoch_revision=?',
-            (*material.scope.namespace.as_tuple, material.content.activity_id, receipt.epoch.revision)).fetchall()
-        if len(event) != 1 or not event[0][0].startswith('provisional:'):
-            raise ValueError('Contact provisional receipt has no unique actual SQL event')
-        _RECEIPTS[id(material), 'provisional_e_plus_1'] = (receipt, *event[0])
-        try:
-            yield receipt
-        finally:
-            _RECEIPTS.pop((id(material), 'provisional_e_plus_1'), None)
 
 
 def _require_contact_deadline_v1(m):
@@ -477,26 +431,8 @@ def commit_contact_final_stage_v2(runtime, db, *, operation, request, preparatio
             'write_commitments':commitments, 'job_ref':preparation.bundle.persistent_job_refs[0],
             'outbox_ref':preparation.bundle.outbox_refs[0]})
     original = record_adopted_domain_operation_v1(db, primary, receipt)
-    return _contact_final_result_v2(receipt=receipt,original_digest=original.original_digest,
+    return _contact_final_result_v1(receipt=receipt,original_digest=original.original_digest,
         job_id=m.job.job_id,admission_ref=admission.admission.admission_ref,dispatch_request_digest=canonical_digest(command))
-
-
-def _contact_final_result_v2(*, receipt, original_digest, job_id, admission_ref, dispatch_request_digest):
-    """Fixed result encoding; these values are evidence, never authority."""
-    from ..runtime_contracts import CommitReceipt
-    from .domain_production_originals_v1 import _receipt_wire
-    if type(receipt) is not CommitReceipt or receipt.status != 'committed':
-        raise ValueError('Contact result requires its actual committed typed receipt')
-    for value in (original_digest,dispatch_request_digest):
-        if type(value) is not str or len(value)!=64 or any(c not in '0123456789abcdef' for c in value):
-            raise ValueError('Contact result digest is not canonical')
-    if any(type(value) is not str or not value for value in (job_id,admission_ref)):
-        raise ValueError('Contact result lost its actual job/admission identity')
-    return {'schema':'sylanne.domain-production-receipt.v1', 'domain':'d08', 'operation_kind':'prepare_contact_dispatch',
-        'operation_id':receipt.operation_id, 'activity_id':receipt.activity_id, 'original_ref':'d08-current:'+original_digest[:48],
-        'original_digest':original_digest, 'receipt':_receipt_wire(receipt), 'receipt_digest':canonical_digest(receipt),
-        'job_states':[[job_id,'waiting']], 'coverage':'complete', 'missing_inputs':[], 'continuation_ref':None,
-        'outbox':[], 'contact_admission_ref':admission_ref, 'dispatch_request_digest':dispatch_request_digest}
 
 
 def validate_contact_final_result_v2(result, *, original, job_id, admission_ref, dispatch_request_digest):
@@ -504,7 +440,7 @@ def validate_contact_final_result_v2(result, *, original, job_id, admission_ref,
     from ..runtime_contracts import canonical_serialize
     if original['domain']!='d08' or original['operation_kind']!='prepare_contact_dispatch':
         raise ValueError('Contact result has another adopted original family')
-    expected=_contact_final_result_v2(receipt=original['receipt'],original_digest=original['original_digest'],
+    expected=_contact_final_result_v1(receipt=original['receipt'],original_digest=original['original_digest'],
         job_id=job_id,admission_ref=admission_ref,dispatch_request_digest=dispatch_request_digest)
     if type(result) is not dict or canonical_serialize(result)!=canonical_serialize(expected):
         raise ValueError('Contact saved result differs from its closed actual receipt/original/request/job')

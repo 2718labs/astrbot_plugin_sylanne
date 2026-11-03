@@ -21,9 +21,12 @@ _BOUND = ContextVar("d13_standby_read_v3", default=None)
 
 
 class _StandbyReadV3:
-    def __init__(self, issuer, graph, authority, lease, operation, fence, scene_ref):
+    def __init__(self, issuer, graph, authority, lease, operation, fence, scene_ref, *, mode="schedule", expected_pending=None, expected_decision=None):
         if issuer is not _ISSUER:
             raise AuthorityUnavailable("actual D13 standby read issuer required")
+        self.mode, self.priority_read = mode, None
+        self.expected_pending = expected_pending
+        self.expected_decision = expected_decision
         self.graph, self.authority, self.lease = graph, authority, lease
         self.operation, self.fence, self.scene_ref = operation, fence, scene_ref
         self.db = graph._GraphCoordinator__store._db
@@ -33,14 +36,14 @@ class _StandbyReadV3:
         self.scene_token = None
         self.ledger_cursor, self.ledger_rows, self.ledger_blocks = "", {}, {}
         self.phase, self.ledger_row, self.ledger_job = "scene", None, None
+        if mode == "discovery": self.phase = "priority"
         self.ledger_head, self.ledger_body, self.ledger_eof = None, None, False
         self.complete, self.proof = False, None
         self.read_finished, self.paid_original_read = False, None
 
     def require_current(self):
-        from .d13_paid_product_v1 import _authorize
         from .first_ingress_v2 import trusted_upper
-        _, port, _, _, _ = _authorize(self.graph, self.authority, self.lease)
+        _, port, _ = _d13_standby_authorities_v3(self.graph, self.authority, self.lease, self.mode)
         now = trusted_upper(port.read_ingress_clock(self.graph._GraphCoordinator__scene_clock_policy))
         self.now_utc = now
         if now >= self.operation.deadline_utc:
@@ -135,13 +138,31 @@ class PreparedD13StandbyReadV3:
         self.reader.ledger_row = self.reader.ledger_job = self.reader.ledger_head = self.reader.ledger_body = None
 
 
-def prepare_d13_standby_read_v3(graph, authority, lease, *, scene_ref):
-    from .d13_paid_product_v1 import _authorize
+def prepare_d13_standby_read_v3(graph, authority, lease, *, scene_ref, mode="schedule", expected_pending=None, expected_decision=None):
     from .first_ingress_v2 import trusted_upper
+    if mode not in {"schedule", "priority", "discovery"}:
+        raise AuthorityUnavailable("D13 standby needs an exact registered preparation mode")
+    if expected_pending is not None:
+        from .d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+        if (mode != "schedule" or type(expected_pending) is not D13PrecompressionPriorityV1
+                or expected_pending.status != "pending_paid_schedule"
+                or expected_pending.namespace != authority.namespace or expected_pending.scene_ref != scene_ref
+                or authority.audience != (expected_pending.conversation_ref,)):
+            raise AuthorityUnavailable("D13 pending metadata selector differs before preparation")
+    if expected_decision is not None:
+        from .d13_deterministic_applicability_v3 import require_issued_d13_deterministic_no_reduction_v3
+        value = require_issued_d13_deterministic_no_reduction_v3(expected_decision)
+        if (mode != "schedule" or expected_pending is not None or value.namespace != authority.namespace
+                or value.scene_ref != scene_ref or authority.audience != (value.conversation_ref,)):
+            raise AuthorityUnavailable("D13 new paid method decision differs from its actual preparation scope")
     require_graph_storage_work_admission_v3(graph)
-    store, port, policy, _, _ = _authorize(graph, authority, lease)
+    store, port, policy = _d13_standby_authorities_v3(graph, authority, lease, mode)
     now = trusted_upper(port.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
     deadline = now + policy.deadline_after_seconds
+    if expected_decision is not None:
+        deadline = min(deadline, expected_decision.original_deadline_utc)
+        if now >= deadline:
+            raise AuthorityUnavailable("D13 original deterministic decision expired before new paid Source READ")
     operation_id = "d13-standby:" + secrets.token_hex(24)
     operation = begin_runtime_storage_operation_v3(store._db, operation_id, deadline)
     fence = None
@@ -150,11 +171,14 @@ def prepare_d13_standby_read_v3(graph, authority, lease, *, scene_ref):
             from .d13_paid_original_read_v3 import observe_d13_paid_owner_guard_v3
             fence = graph._begin_read_fence_v3(authority, operation_id=operation_id,
                 fence_observer=lambda scope: observe_d13_paid_owner_guard_v3(graph, authority, scope))
-            reader = _StandbyReadV3(_ISSUER, graph, authority, lease, operation, fence, scene_ref)
+            reader = _StandbyReadV3(_ISSUER, graph, authority, lease, operation, fence, scene_ref, mode=mode, expected_pending=expected_pending, expected_decision=expected_decision)
         work = create_graph_storage_work_v3(graph, kind=KIND, operation_id=operation_id,
             selection_digest=operation.selection_digest, deadline_utc=deadline,
             state=reader, operation=operation)
         reader.work = work
+        if mode == "discovery":
+            from .d13_priority_metadata_v1 import D13PriorityMetadataReadV1
+            reader.priority_read = D13PriorityMetadataReadV1(reader)
         operation.retain(65536)
         return work
     except BaseException:
@@ -175,7 +199,12 @@ def advance_d13_standby_read_v3(graph, work):
             db.execute("BEGIN")
             try:
                 with runtime_storage_quantum_v3(db) as meter:
-                    if reader.phase != "census":
+                    if reader.phase == "priority":
+                        reader.priority_read.advance_v3(meter)
+                        if reader.priority_read.complete:
+                            reader.complete = True
+                            reader.proof = PreparedD13PriorityMetadataV1(_ISSUER, reader)
+                    elif reader.phase != "census":
                         _advance_d13_scene_ledger_metadata_v3(reader, meter)
                     elif reader.row is None:
                         row = meter.read_fixed_row(db, "graph_atoms",
@@ -183,10 +212,15 @@ def advance_d13_standby_read_v3(graph, work):
                             "bot=? AND persona=? AND type_name=? AND valid=1 AND token>? ORDER BY token",
                             (*reader.authority.namespace.as_tuple, _TYPE, reader.cursor))
                         if row is None:
-                            from .d13_paid_original_read_v3 import begin_d13_paid_original_reader_in_work_v3
-                            reader.phase = "paid"
-                            begin_d13_paid_original_reader_in_work_v3(reader,job_id=None,
-                                method="schedule_d13_paid_precompression_v1",args={"scene_ref":reader.scene_ref})
+                            if reader.mode == "priority":
+                                from .d13_priority_metadata_v1 import D13PriorityMetadataReadV1
+                                reader.phase = "priority"
+                                reader.priority_read = D13PriorityMetadataReadV1(reader)
+                            else:
+                                from .d13_paid_original_read_v3 import begin_d13_paid_original_reader_in_work_v3
+                                reader.phase = "paid"
+                                begin_d13_paid_original_reader_in_work_v3(reader,job_id=None,
+                                    method="schedule_d13_paid_precompression_v1",args={"scene_ref":reader.scene_ref})
                         else:
                             reader.row = tuple(row)
                             reader.body = (begin_runtime_json_projection_v3(
@@ -331,3 +365,44 @@ def current_d13_scene_ledger_metadata_v3(db, namespace, scene_token, now_utc):
         raise AuthorityUnavailable("D13 paid ledger requires its actual prepared metadata Work")
     return proof, *proof.require_scene_ledger_v3(db, namespace, scene_token, now_utc)
 
+
+
+class PreparedD13PriorityMetadataV1:
+    def __init__(self, issuer, reader):
+        if (issuer is not _ISSUER or reader.mode not in {"priority", "discovery"} or not reader.complete
+                or reader.priority_read is None or not reader.priority_read.complete):
+            raise AuthorityUnavailable("D13 priority requires its actual complete metadata READ")
+        self.reader = reader
+        _READS[self] = (reader, reader.work, reader.operation, reader.priority_read.result)
+
+    def terminal_result_v1(self, work):
+        r = self.reader
+        if (_READS.get(self) != (r, work, work.operation, r.priority_read.result)
+                or work.state is not r or work.kind != KIND or not r.read_finished
+                or r.operation.closed or r.priority_read.result is None):
+            raise AuthorityUnavailable("D13 priority result crossed its actual metadata Work")
+        return r.priority_read.result
+
+    def release_payload_v3(self):
+        if _READS.pop(self, None) is None: return
+        r = self.reader
+        if r.priority_read is not None: r.priority_read.release_payload_v3()
+        r.ledger_rows.clear(); r.ledger_blocks.clear()
+        r.body = r.row = r.ledger_body = r.proof = r.priority_read = None
+
+
+def _d13_standby_authorities_v3(graph, authority, lease, mode):
+    if mode != "discovery":
+        from .d13_paid_product_v1 import _authorize
+        store, port, policy, _, _ = _authorize(graph, authority, lease)
+        return store, port, policy
+    from .d13_technical_policy import AdminD13PaidPrecompressionPolicyV1
+    graph._authorize(lease, authority, frozenset({"d11", "d13"}))
+    store, port, policy = (graph._GraphCoordinator__store,
+        graph._GraphCoordinator__content_fence_v2, graph._GraphCoordinator__d13_paid_precompression_policy)
+    if (type(policy) is not AdminD13PaidPrecompressionPolicyV1 or port is None
+            or authority.namespace != policy.namespace or authority.issuer_domain != "d11"
+            or authority.purpose != "context" or authority.worker_fence is not None or authority.audience != ()
+            or policy.installation_id != port.installation_grant.installation_id):
+        raise AuthorityUnavailable("D13 namespace discovery is limited to installed D11 metadata")
+    return store, port, policy

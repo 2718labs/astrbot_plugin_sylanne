@@ -60,6 +60,28 @@ def read_numeric_policy_owner_selectors_v3(db,binding,budget_issuer,frozen,*,now
         row=read_d04_original_v3(db,binding.namespace,"semantic_mapping",ref)
         if row is None:raise ValueError("numeric actual semantic drive mapping original absent")
         raw=row[0];installed=raw["mapping_installation"]
+        manifest=raw.get('role_support_manifest')
+        if (type(manifest)is dict and manifest.get('purpose')=='consolidation'
+                and manifest.get('schema')in {'d06.ordinary-role-support-manifest.v3','d06.ordinary-role-support-manifest.v4'}):
+            from ..runtime.d06_ordinary_readout_v3 import require_life_role_manifest_current_v3
+            from ..runtime.d06_life_numeric_task_v1 import decode_life_numeric_appraisal_acceptance_v1
+            from ..runtime.d11_life_preparation_v1 import _read as read_signed_life_original
+            require_life_role_manifest_current_v3(db,binding.namespace,manifest)
+            signed_life_acceptance=read_signed_life_original(db,namespace=binding.namespace,issuer=budget_issuer,
+                kind='numeric_appraisal_acceptance_v1',ref=raw['appraisal_acceptance_ref'])
+            life_acceptance=(None if signed_life_acceptance is None else
+                decode_life_numeric_appraisal_acceptance_v1(signed_life_acceptance[0]))
+            if (life_acceptance is None or signed_life_acceptance[1]!=life_acceptance.operation_id
+                    or life_acceptance.digest!=raw['appraisal_acceptance_digest']
+                    or life_acceptance.role_support_manifest!=manifest):
+                raise ValueError('Life native mapping support differs from actual signed appraisal acceptance')
+        else:
+            from ..runtime.d04_ordinary_readout_v3 import require_current_d04_role_manifest_heads_v3
+            require_current_d04_role_manifest_heads_v3(db,binding.namespace,manifest)
+            acceptance=read_d04_original_v3(db,binding.namespace,'appraisal_acceptance',raw['appraisal_acceptance_ref'])
+            if (acceptance is None or acceptance[1]!=raw['appraisal_acceptance_digest']
+                    or acceptance[0].get('role_support_manifest')!=manifest):
+                raise ValueError('D04 native mapping ordinary support differs from actual adopted appraisal')
         if (raw.get("namespace")!=asdict(binding.namespace) or raw.get("schema")!="d04.semantic_mapping_acceptance.v3"
                 or installed["acceptance_digest"]!=saved[1] or installed["acceptance_revision"]!=saved[0]["revision"]
                 or installed["acceptance_ref"]!="d04-semantic-acceptance:"+saved[0]["operation_id"]

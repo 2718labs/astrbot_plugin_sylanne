@@ -6,7 +6,7 @@ from ..graph_types import AtomKey, Owner, owner_grant_key
 from ..memory_types import source_key, access_key
 from ..runtime_contracts import canonical_digest, canonical_serialize
 from .d01_production_operations_v1 import production_read_plan_v1, table_exists_v1, MissingProductionOriginalV1, waiting_stage_v1
-from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2, life_from_wire_v1
+from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2, RegisteredCharacterLaborLifePlanV1, life_from_wire_v1
 from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
 from .d11_life_preparation_v1 import TABLE, _read, life_ids_v1, PrepareCurrentLifeRequestV1
 
@@ -92,6 +92,20 @@ def life_plan_read_inputs_v1(db, *, namespace, plan, originals=(), now_utc=None)
             originals.extend((scope["ingress_original_ref"], scope["c02_original_ref"]))
     from .d11_role_clock_installation_v1 import role_clock_mapping_id_v1
     originals.append(role_clock_mapping_id_v1(namespace))
+    if type(plan)is RegisteredCharacterLaborLifePlanV1:
+        from .d11_character_work_segment_v1 import labor_body_preparation_from_wire_v1
+        from ..domains.d02.character_labor_v1 import character_labor_rebuild_key_v1
+        body_ref=plan.labor_body_preparation_original
+        raw=raw_life_original_v1(db,namespace,'character_labor_body_preparation_v1',body_ref.original_ref)
+        if raw is None:raise MissingProductionOriginalV1('actual_character_labor_B_for_C_read_plan')
+        body=labor_body_preparation_from_wire_v1(raw)
+        if (body.namespace!=namespace or canonical_digest(raw)!=body_ref.original_digest
+                or body.action_operation_id!=plan.operation_id):
+            raise ValueError('labor C read selector differs from its actual plan B original')
+        keys.extend((AtomKey.from_token(body.reservation_ref),AtomKey.from_token(body.settlement_ref),
+            character_labor_rebuild_key_v1(namespace,body.quote.profile_id)))
+        roots.extend(body.source_refs)
+        originals.extend((body_ref.original_ref,body.policy.policy_ref,body.quote.technical_quote_ref))
     if plan.body_effect_request_json is not None:
         contract = json.loads(plan.body_effect_request_json)
         keys.extend(AtomKey.from_token(contract[name]) for name in ("reservation_ref", "settlement_ref"))
@@ -103,7 +117,8 @@ def life_plan_read_inputs_v1(db, *, namespace, plan, originals=(), now_utc=None)
     keys.extend(inventory_keys)
     roots.extend(inventory_roots)
     originals.extend(inventory_originals)
-    return production_read_plan_v1(LIFE_CURRENT_TYPES, keys, roots, originals)
+    kinds=(*LIFE_CURRENT_TYPES,'d02.character_labor_rebuild_head.v1')if type(plan)is RegisteredCharacterLaborLifePlanV1 else LIFE_CURRENT_TYPES
+    return production_read_plan_v1(kinds, keys, roots, originals)
 
 
 def artifact_phase_draft_plan_ref_v2(selector):
@@ -336,10 +351,12 @@ def registered_phase_draft_prepare_operation_id_v2(db,*,frame,request,plan,issue
 def read_plan_current_life_preparation_v1(db, *, namespace, activity_id, operation_kind, request, now_utc, before_capture_policy=None):
     if operation_kind != "prepare_life" or type(request) is not PrepareCurrentLifeRequestV1:
         raise TypeError("exact installed Life preparation read request required")
-    raw = raw_life_original_v1(db, namespace, "plan", request.plan_original_ref)
+    selected=raw_registered_life_plan_v1(db,namespace,request.plan_original_ref)
+    raw=None if selected is None else selected[1]
     if raw is None:
         return production_read_plan_v1((), (owner_grant_key(*namespace.as_tuple),), (), (request.plan_original_ref,))
-    plan = life_from_wire_v1(raw, RegisteredLifePlanV2)
+    cls=RegisteredCharacterLaborLifePlanV1 if selected[0]=='character_labor_plan_v1' else RegisteredLifePlanV2
+    plan = life_from_wire_v1(raw,cls)
     if plan.activity_id != activity_id:
         raise ValueError("Life preparation belongs to another actual adopted activity")
     reads = life_plan_read_inputs_v1(db, namespace=namespace, plan=plan, originals=(request.plan_original_ref,), now_utc=now_utc)
@@ -369,8 +386,10 @@ def stage_prepare_current_life_in_transaction_v1(db, *, frame, request, installe
         reader = InstalledLifeAdmissionReaderV1(issuer=installed_readers.issuer,
             resource_issuer=graph._GraphCoordinator__d02_issuer,
             body_quote_authority=graph._GraphCoordinator__body_quote_authority,
-            execution_inventory=inventory, scope=installed_readers.life_scope)
-        raw_plan = raw_life_original_v1(db, frame.envelope.authority.namespace, "plan", request.plan_original_ref)
+            execution_inventory=inventory, scope=installed_readers.life_scope,
+            labor_body_readers=installed_readers.body_readers)
+        selected=raw_registered_life_plan_v1(db,frame.envelope.authority.namespace,request.plan_original_ref)
+        raw_plan=None if selected is None else selected[1]
         recipe_id = "d10.source-note.v1" if raw_plan is None else raw_plan["recipe_id"]
         build = read_installed_d11_life_build_v1(assembly.package_root, policy.manifest_digest, recipe_id=recipe_id)
         return prepare_current_life_in_transaction_v1(db, frame=frame, request=request,
@@ -420,8 +439,14 @@ def life_outcome_read_plan_v2(db, *, namespace, activity_id, outcome, original_r
         from .d11_life_outcome_provenance_v1 import life_outcome_read_keys_v1
         extra.extend(life_outcome_read_keys_v1(terminal.binding,plan.action_intent.ref))
         source_id = life_experience_source_id_v1(terminal.binding)
+        from ..domains.d06.inspection_metadata_v1 import inspection_key_v1
+        from ..runtime_storage_v3 import read_graph_row_v3
+        sk = source_key(*namespace.as_tuple, source_id)
+        source_head = read_graph_row_v3(db, ("revision",), where="token=? AND bot=? AND persona=?",
+            parameters=(sk.token, *namespace.as_tuple))
         extra.extend((life_role_segment_key_v1(terminal.binding, "start"), life_role_segment_key_v1(terminal.binding, "end"),
-            source_key(*namespace.as_tuple, source_id), access_key(*namespace.as_tuple, source_id)))
+            sk, access_key(*namespace.as_tuple, source_id),
+            inspection_key_v1(sk, (source_head[0] if source_head is not None else 0) + 1)))
     extra.extend(AtomKey.from_token(ref) for ref in outcome.paid_cost_refs)
     return production_read_plan_v1(base.fixed_type_ids, (*base.exact_keys, *extra), base.source_roots, base.required_original_refs)
 
@@ -436,6 +461,16 @@ def read_current_life_original_ref_v1(db, *, namespace, original_ref, issuer):
         raise ValueError("Life original reference is ambiguous across kinds")
     if rows:
         kind = rows[0][0]
+        if kind=='character_labor_plan_v1':
+            saved=_read(db,issuer=issuer,namespace=namespace,kind=kind,ref=original_ref)
+            value=life_from_wire_v1(saved[0],RegisteredCharacterLaborLifePlanV1)
+            return ProductionOriginalRefV1('d11.life_'+kind,original_ref,canonical_digest(saved[0]))
+        if kind=='character_labor_body_preparation_v1':
+            from .d11_character_work_segment_v1 import require_character_labor_body_preparation_v1
+            value=require_character_labor_body_preparation_v1(db,namespace=namespace,
+                operation_id=original_ref.removeprefix('character-labor-body:'),issuer=issuer)
+            from ..domains.d01.production_operations_v1 import plain_v1
+            return ProductionOriginalRefV1('d11.life_'+kind,original_ref,canonical_digest(plain_v1(value)))
         from .d11_artifact_draft_model_v1 import (C4_ORIGINAL_KINDS, C4_PHASE_ORIGINAL_KINDS_V2,
             decode_artifact_draft_original_v1, decode_artifact_draft_original_v2)
         from .c09_life_originals_v1 import FOREGROUND_CAUSE_KIND,read_foreground_post_c02_cause_original_v1
@@ -524,3 +559,17 @@ def read_current_life_original_ref_v1(db, *, namespace, original_ref, issuer):
             if value.original_ref == original_ref:
                 return ProductionOriginalRefV1("d11.life_" + kind, original_ref, canonical_digest(value))
     return None
+
+
+def raw_registered_life_plan_v1(db,namespace,original_ref):
+    """Fixed kind headers select distinct immutable V1/recipe2 plan contracts."""
+    if not table_exists_v1(db,TABLE):return None
+    rows=db.execute('SELECT kind FROM '+TABLE+' WHERE bot=? AND persona=? AND original_ref=? '
+        "AND kind IN ('plan','character_labor_plan_v1') ORDER BY kind LIMIT 3",
+        (*namespace.as_tuple,original_ref)).fetchall()
+    if len(rows)>1:raise ValueError('Life plan locator aliases independent recipe contracts')
+    if not rows:return None
+    kind=rows[0][0]
+    raw=raw_life_original_v1(db,namespace,kind,original_ref)
+    if raw is None:raise ValueError('registered Life plan disappeared after its fixed kind header')
+    return kind,raw

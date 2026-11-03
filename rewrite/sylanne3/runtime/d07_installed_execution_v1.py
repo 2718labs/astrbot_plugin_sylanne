@@ -109,6 +109,10 @@ class InstalledD07ExecutionServiceV1:
                 self._last_progress[job_id] = {"status": "hold", "job_id": job_id, "reason": type(exc).__name__}
         if not self._closed:
             await self.resume_pending_jobs_v1()
+        # Discovery can enqueue while this runner is awaiting its storage work.
+        # That enqueue sees this task alive, so hand its actual backlog forward.
+        if not self._closed and self._pending:
+            self._runner_task = asyncio.create_task(self._drain_jobs_v1())
 
     async def resume_pending_jobs_v1(self):
         if self.worker is None or self.owner_loop is not asyncio.get_running_loop() or self._closed:
@@ -147,6 +151,7 @@ class InstalledD07ExecutionServiceV1:
             self._reflection_rescan_requested = True
             return ()
         from .d07_execution_v1 import TABLE
+        from ..graph_worker import OwnedGraphStorageResultV3
         from .d07_graph_stages_v1 import prepare_current_d07_reflection_continuation_v3
         self._reflection_discovery_active = True
         self._reflection_discovery_cursor = ""
@@ -167,10 +172,25 @@ class InstalledD07ExecutionServiceV1:
                         result = await self.worker.call(lambda graph, selected=ref:
                             prepare_current_d07_reflection_continuation_v3(graph, self.bootstrap, self.bundle,
                                 continuation_ref=selected))
-                        self._last_reflection_status = (ref, result["status"])
-                        results.append(result)
-                        if result["status"] == "prepared" and result["job_id"] not in self._wake_seen:
-                            self.wake_committed_job_v1(result["job_id"])
+                        retention = None
+                        if type(result) is OwnedGraphStorageResultV3:
+                            result, retention = result.take_value_v3()
+                        try:
+                            # This stage returns only detached status/identity scalars.
+                            status = result["status"]
+                            metadata = {"status": status}
+                            for key in ("job_id", "original_ref", "prepared_digest"):
+                                if key in result:
+                                    metadata[key] = result[key]
+                            self._last_reflection_status = (ref, status)
+                            results.append(metadata)
+                            next_job = metadata.get("job_id") if status == "prepared" else None
+                        finally:
+                            result = None
+                            if retention is not None:
+                                retention.release()
+                        if next_job is not None and next_job not in self._wake_seen:
+                            self.wake_committed_job_v1(next_job)
                     except (ValueError, RuntimeError) as exc:
                         self._last_reflection_status = (ref, "waiting_for_current_original", type(exc).__name__)
                 if len(rows) > 16:
@@ -243,8 +263,16 @@ class InstalledD07ExecutionServiceV1:
         from .domain_production_read_plans_v1 import CurrentDomainCommandIdentityV1
         if db is not self._db or not db.in_transaction or not operation_id or not requested_activity_id:
             raise ValueError("D07 intended execution identity requires its actual current command")
+        purpose="context"
+        if operation_kind=="serve_concern":
+            from .d07_ordinary_continuity_cognition_v1 import read_bound_ordinary_continuity_concern_metadata_v1
+            metadata=read_bound_ordinary_continuity_concern_metadata_v1(db,namespace=namespace,request=request,issuer=self.d11_issuer)
+            if metadata is not None:
+                if (operation_id,requested_activity_id)!=(metadata.reader.operation_id,metadata.reader.activity_id):
+                    raise ValueError("ordinary concern identity left its actual selected Method command")
+                purpose="consolidation"
         effect = "d07-effect:" + canonical_digest((namespace, operation_id, requested_activity_id, operation_kind, request))[:48]
-        return CurrentDomainCommandIdentityV1(requested_activity_id, effect, "context", "internal")
+        return CurrentDomainCommandIdentityV1(requested_activity_id, effect, purpose, "internal")
 
     def pre_read_cost_fact_v1(self, job_id):
         fact = self._pre_read_cost_facts.get(job_id)
@@ -312,6 +340,10 @@ class InstalledD07ExecutionServiceV1:
 
     def _configured(self, original=None):
         from .d01_production_operations_v1 import MissingProductionOriginalV1
+        from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityQuestionV1,
+            D07OrdinaryContinuityPreparedV1,configured_ordinary_continuity_workflow_v1)
+        if type(original)in {D07OrdinaryContinuityQuestionV1,D07OrdinaryContinuityPreparedV1}:
+            return configured_ordinary_continuity_workflow_v1(self.bundle,original.phase)
         from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
         from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         if type(original)in {ArtifactPhaseObservationQuestionV1,D07ArtifactObservationPreparedV3}:
@@ -325,7 +357,8 @@ class InstalledD07ExecutionServiceV1:
         if type(original)in {D07GeneralGrowthQuestionV1,D07GeneralGrowthPreparedV1}:
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
             from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-            if type(self.bundle.model_workflows) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) or self.bundle.model_workflows.general_growth_cognition is None:
+            from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+            if type(self.bundle.model_workflows) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10) or self.bundle.model_workflows.general_growth_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_general_growth_cognition_workflow_v8")
             return self.bundle.model_workflows.general_growth_cognition
         if type(original) in {D07MethodGrowthPreparedV2, D07MethodGrowthSemanticQuestionV2}:
@@ -333,7 +366,8 @@ class InstalledD07ExecutionServiceV1:
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
             from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9} or self.bundle.model_workflows.growth_cognition is None:
+            from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} or self.bundle.model_workflows.growth_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_growth_C3_workflow_v6")
             return self.bundle.model_workflows.growth_cognition
         if type(original) in {D07RelationshipPreparedV2, D07RelationshipSemanticQuestionV2}:
@@ -342,7 +376,8 @@ class InstalledD07ExecutionServiceV1:
             from ..host.model_workflows_v7 import AdminModelWorkflowsV7
             from ..host.model_workflows_v8 import AdminModelWorkflowsV8
             from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9} or self.bundle.model_workflows.d07_relationship_cognition is None:
+            from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+            if type(self.bundle.model_workflows) not in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} or self.bundle.model_workflows.d07_relationship_cognition is None:
                 raise MissingProductionOriginalV1("explicit_installed_named_relationship_C3_workflow_v5")
             return self.bundle.model_workflows.d07_relationship_cognition
         workflows = self.bundle.model_workflows
@@ -390,8 +425,20 @@ class InstalledD07ExecutionServiceV1:
                     frame=replace(frame,envelope=envelope)
                     stage=replace(stage,envelope=envelope,proposal=replace(stage.proposal,envelope=envelope),
                         provenance={**stage.provenance,'artifact_observation_basis':basis})
-                target = resolve_current_d07_semantic_target_v1(db, self.d11_issuer, frame, question)
-                stage = replace(stage, provenance={**stage.provenance, "semantic_question": question, "semantic_target": target})
+                from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityQuestionV1,
+                    current_ordinary_continuity_basis_for_d07_v1)
+                if type(question)is D07OrdinaryContinuityQuestionV1:
+                    from .d07_ordinary_continuity_cognition_v1 import require_unique_ordinary_continuity_phase_preparation_v1
+                    require_unique_ordinary_continuity_phase_preparation_v1(db,frame=frame,question=question,issuer=self.d11_issuer)
+                    basis=current_ordinary_continuity_basis_for_d07_v1(self,db,frame,question)
+                    stage=replace(stage,provenance={**stage.provenance,"semantic_question":question,
+                        "ordinary_continuity_basis":basis})
+                else:
+                    target = resolve_current_d07_semantic_target_v1(db, self.d11_issuer, frame, question)
+                    stage = replace(stage, provenance={**stage.provenance, "semantic_question": question, "semantic_target": target})
+                    if target.kind=="single_event_review_case_v1":
+                        from .d07_single_event_review_v1 import bind_current_single_event_review_novelty_stage_v1
+                        bind_current_single_event_review_novelty_stage_v1(db,frame,stage)
             from .d07_reflection_execution_v1 import read_actual_d07_reflection_request_v1
             reflection = read_actual_d07_reflection_request_v1(db, self.d11_issuer, namespace, stage.request.trigger_original_ref)
             if reflection is not None:
@@ -423,10 +470,24 @@ class InstalledD07ExecutionServiceV1:
             raise MissingProductionOriginalV1("explicit_owner_role_clock_installation")
         mapping = read_current_role_clock_installation_v1(reader, db, namespace)
         policy_id, policy_version = self._current_body_policy(db, namespace)
+        from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityQuestionV1,
+            prepare_ordinary_continuity_execution_in_transaction_v1)
+        if type(stage.provenance.get("semantic_question"))is D07OrdinaryContinuityQuestionV1:
+            return prepare_ordinary_continuity_execution_in_transaction_v1(db,frame=frame,stage=stage,workflow=workflow,
+                installation_id=self.bundle.installation_policy.installation_id,d11_issuer=self.d11_issuer,
+                resource_issuer=self.resource_issuer,body_authority=self.body_authority,clock_mapping=mapping,
+                body_policy_id=policy_id,body_policy_version=policy_version)
         from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
         if type(stage.provenance.get("semantic_question"))is D07GeneralGrowthQuestionV1:
             from .d07_general_growth_execution_v1 import prepare_general_growth_execution_in_transaction_v1
             return prepare_general_growth_execution_in_transaction_v1(db,frame=frame,stage=stage,workflow=workflow,
+                installation_id=self.bundle.installation_policy.installation_id,d11_issuer=self.d11_issuer,
+                resource_issuer=self.resource_issuer,body_authority=self.body_authority,clock_mapping=mapping,
+                body_policy_id=policy_id,body_policy_version=policy_version)
+        target=stage.provenance.get("semantic_target")
+        if target is not None and target.kind=="single_event_review_case_v1":
+            from .d07_single_event_review_v1 import prepare_single_event_review_execution_in_transaction_v1
+            return prepare_single_event_review_execution_in_transaction_v1(db,frame=frame,stage=stage,workflow=workflow,
                 installation_id=self.bundle.installation_policy.installation_id,d11_issuer=self.d11_issuer,
                 resource_issuer=self.resource_issuer,body_authority=self.body_authority,clock_mapping=mapping,
                 body_policy_id=policy_id,body_policy_version=policy_version)
@@ -465,7 +526,9 @@ class InstalledD07ExecutionServiceV1:
         return decode_d07_execution_original_v1(row[0])
 
     def verify_prepared_terminal(self, execution, frame):
-        if type(execution) is not D07ExecutionOriginalV1 or not self._db.in_transaction:
+        from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityExecutionOriginalV1,
+            D07OrdinaryContinuityPreparedV1)
+        if type(execution) not in {D07ExecutionOriginalV1,D07OrdinaryContinuityExecutionOriginalV1} or not self._db.in_transaction:
             raise ValueError("D07 current terminal proof requires its actual W01 transaction")
         original = read_prepared_d07_execution_v1(self._db, self.d11_issuer, frame.envelope.authority.namespace,
             d07_execution_ids_v1(frame.envelope.authority.namespace, execution.operation_id, execution.work_kind)["job"])
@@ -474,12 +537,27 @@ class InstalledD07ExecutionServiceV1:
                 or execution.activation_generation != frame.activation_generation
                 or json.loads(original.owner_guard_json) != asdict(frame.owner_guard)):
             raise ValueError("D07 current Owner/generation/actual terminal differs from original")
+        if type(execution)is D07OrdinaryContinuityExecutionOriginalV1:
+            if(type(original)is not D07OrdinaryContinuityPreparedV1 or execution.phase!=original.phase
+                    or execution.basis_original!=original.basis_original
+                    or execution.causal_parent_executions!=original.causal_parent_executions
+                    or(execution.review_step,execution.causal_depth)!=(original.review_step,original.causal_depth)):
+                raise ValueError("ordinary terminal is not its exact independent prepared phase")
+        elif type(original)is D07OrdinaryContinuityPreparedV1:
+            raise ValueError("ordinary continuity execution cannot be downgraded to the generic terminal")
         require_current_d07_content_reads_v1(self._db, original, issuer=self.d11_issuer)
         paid = read_d07_original_v1(self._db, self.d11_issuer, original.namespace, "paid_cost", original.job_id)
         body = read_d07_original_v1(self._db, self.d11_issuer, original.namespace, "body_cost", original.job_id)
         if (paid is None or body is None or not paid[0]["paid"] or body[0]["unpaid_cost"]
                 or execution.cost_receipt_refs != (paid[0]["cost_ref"],)):
             raise ValueError("D07 actual paid cost/body original missing")
+        from .d07_execution_v1 import require_actual_d07_execution_wall_deadline_v1
+        from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadV1, from_wire
+        result = read_d07_original_v1(self._db, self.d11_issuer, original.namespace,
+            "result", paid[0]["result_ref"])
+        actual_read = from_wire(result[0], D07CognitionResultReadV1)
+        require_actual_d07_execution_wall_deadline_v1(original, actual_read,
+            get_job(self._db, original.job_id), deadline_utc=frame.envelope.deadline_utc)
 
     async def _run_ingress_recall_operation_v1(self, job_id, operation_kind):
         def run(graph):
@@ -507,154 +585,209 @@ class InstalledD07ExecutionServiceV1:
 
     async def _execute_current_d07_job_once_v3(self, job):
         """One invocation consumes at most the original Authority start right."""
-        from ..host.v2_installation import V2InstallationAssembly
-        from ..host.authority_client import AuthorityClient
-        from ..host.authority_profile import AdminModelWorkflowV2
-        from ..authority_service.v2_model_egress_contract import ModelEgressDraftV1
-        from ..model_broker.broker import ModelProviderDescriptor
-        from ..host.astrbot_model_call import AstrBotModelProvider, LocalModelCapacityDeniedV1
-        from ..host.model_egress_executor import HostModelEgressExecutor
-        if (type(self.installation) is not V2InstallationAssembly or self.worker is None
-                or type(self.authority_client) is not AuthorityClient or type(self.client_grant) is not InstallationGrantV2
-                or self.context is None):
-            return {"status": "hold", "missing_inputs": ("actual_installed_d07_host_execution_binding",), "job_id": job.job_id}
-        if self.owner_loop is not asyncio.get_running_loop():
-            raise RuntimeError("D07 actual model executor must run on the owning AstrBot loop")
-        graph_args = {"job_id": job.job_id}
-        bundle = self.bundle
-        from .d07_graph_stages_v1 import read_resume_current_d07_metadata_v1
-        resume_job, accounting, existing_intent = await self.worker.call(lambda graph:
-            read_resume_current_d07_metadata_v1(graph, self.bootstrap, bundle, **graph_args))
-        prepared_kind = await self.worker.call(lambda graph: read_prepared_d07_execution_v1(
-            self._db, self.d11_issuer, self.bundle.installation_policy.namespace, job.job_id))
-        workflow = self._configured(prepared_kind)
-        if type(workflow) is not AdminModelWorkflowV2:
-            raise ValueError("D07 actual signed prepared kind lost its installed named workflow")
-        if resume_job.phase == "completed":
-            if resume_job.work_kind == "d07.recall_need":
-                from .d07_ingress_recall_result_v1 import ADOPT_OPERATION
-                receipt = await self._run_ingress_recall_operation_v1(job.job_id, ADOPT_OPERATION)
-                return {"status": "adopted", "job_id": job.job_id, "operation_id": receipt["operation_id"],
-                    "terminal_ref": resume_job.result_ref, "receipt": receipt["receipt"]}
-            return await self.worker.call(lambda graph: graph.resume_current_d07_behavior_v1(self.bootstrap, bundle, **graph_args))
-        if existing_intent is not None:
-            from .model_cost_settlement import read_original_model_cost
+        from ..graph_worker import OwnedGraphStorageResultV3
+        from .domain_production_originals_v1 import _receipt, _receipt_wire
+        retained_results = {}
+        read = prepared = current_job = call = draft = anchor = None
+        sealed_intent = trusted_umo = request = prepared_kind = None
+        result = receipt = adapter = executor = record = permit = terminal = facts = None
+
+        def take(value, slot):
+            if type(value) is OwnedGraphStorageResultV3:
+                value, retention = value.take_value_v3()
+                retained_results[slot] = retention
+            return value
+
+        def release(slot):
+            retention = retained_results.pop(slot, None)
+            if retention is not None:
+                retention.release()
+
+        def metadata(value):
+            retention = None
+            if type(value) is OwnedGraphStorageResultV3:
+                value, retention = value.take_value_v3()
             try:
-                observed = await self.authority_client.model_terminal_fact_v2(bundle, self.client_grant, intent=existing_intent)
-                if observed[0].state == "dispatch_started" and observed[3] is None:
-                    original_permit = observed[1]
-                    recovered = None if original_permit is None else await self._recover_local_observation_v1(
-                        existing_intent, original_permit.pinned_anchor, job.job_id)
-                    if recovered is None:
-                        return {"status": "original_terminal_unknown", "job_id": job.job_id}
+                # These are the actual acquire/seal/finish/adopt/refusal fields.
+                projected = {key: value[key] for key in (
+                    "schema", "status", "job_id", "terminal_ref", "operation_id",
+                    "activity_id", "domain", "operation_kind", "request_digest",
+                    "phase", "reason", "reason_code", "attempt_id", "prepared_digest",
+                    "permit_digest", "graph_revision", "graph_epoch", "coverage",
+                    "reflection_request_ref", "graph_receipt_digest",
+                ) if key in value}
+                if "interpretation_refs" in value:
+                    projected["interpretation_refs"] = tuple(value["interpretation_refs"])
+                if "missing_inputs" in value:
+                    projected["missing_inputs"] = tuple(value["missing_inputs"])
+                if "receipt" in value:
+                    projected["receipt"] = _receipt_wire(_receipt(value["receipt"]))
+                return projected
+            finally:
+                value = None
+                if retention is not None:
+                    retention.release()
+
+        try:
+            from ..host.v2_installation import V2InstallationAssembly
+            from ..host.authority_client import AuthorityClient
+            from ..host.authority_profile import AdminModelWorkflowV2
+            from ..authority_service.v2_model_egress_contract import ModelEgressDraftV1
+            from ..model_broker.broker import ModelProviderDescriptor
+            from ..host.astrbot_model_call import AstrBotModelProvider, LocalModelCapacityDeniedV1
+            from ..host.model_egress_executor import HostModelEgressExecutor
+            if (type(self.installation) is not V2InstallationAssembly or self.worker is None
+                    or type(self.authority_client) is not AuthorityClient or type(self.client_grant) is not InstallationGrantV2
+                    or self.context is None):
+                return {"status": "hold", "missing_inputs": ("actual_installed_d07_host_execution_binding",), "job_id": job.job_id}
+            if self.owner_loop is not asyncio.get_running_loop():
+                raise RuntimeError("D07 actual model executor must run on the owning AstrBot loop")
+            graph_args = {"job_id": job.job_id}
+            bundle = self.bundle
+            from .d07_graph_stages_v1 import read_resume_current_d07_metadata_v1
+            resume_job, accounting, existing_intent = await self.worker.call(lambda graph:
+                read_resume_current_d07_metadata_v1(graph, self.bootstrap, bundle, **graph_args))
+            prepared_kind = await self.worker.call(lambda graph: read_prepared_d07_execution_v1(
+                self._db, self.d11_issuer, self.bundle.installation_policy.namespace, job.job_id))
+            workflow = self._configured(prepared_kind)
+            if type(workflow) is not AdminModelWorkflowV2:
+                raise ValueError("D07 actual signed prepared kind lost its installed named workflow")
+            if resume_job.phase == "completed":
+                if resume_job.work_kind == "d07.recall_need":
+                    from .d07_ingress_recall_result_v1 import ADOPT_OPERATION
+                    receipt = metadata(await self._run_ingress_recall_operation_v1(job.job_id, ADOPT_OPERATION))
+                    return {"status": "adopted", "job_id": job.job_id, "operation_id": receipt["operation_id"],
+                        "terminal_ref": resume_job.result_ref, "receipt": receipt["receipt"]}
+                return metadata(await self.worker.call(lambda graph: graph.resume_current_d07_behavior_v1(self.bootstrap, bundle, **graph_args)))
+            if existing_intent is not None:
+                from .model_cost_settlement import read_original_model_cost
+                try:
                     observed = await self.authority_client.model_terminal_fact_v2(bundle, self.client_grant, intent=existing_intent)
-            except Exception:
-                # An unavailable original query cannot grant a new start or a
-                # new content-fence begin after an uncertain consumed claim.
-                return {"status": "original_terminal_unknown", "job_id": job.job_id}
-            if observed[0].state == "observed" and observed[3] is not None:
-                self._adapters.pop(job.job_id, None)
-                self._pre_read_cost_facts[job.job_id] = read_original_model_cost(lambda _intent: observed, existing_intent)
-                # A known charge stays known even when its actual accounting
-                # permit or SQL reconciliation needs later recovery.
-                await self._account_original_cost_v1(job.job_id)
-            elif observed[0].state != "prepared":
-                return {"status": "original_terminal_unknown", "job_id": job.job_id}
-        if resume_job.work_kind == "d07.recall_need":
-            if resume_job.phase == "queued":
-                from .d07_ingress_recall_acquisition_v1 import ACQUIRE_OPERATION
-                await self._run_ingress_recall_operation_v1(job.job_id, ACQUIRE_OPERATION)
-        else:
-            acquired = await self.worker.call(lambda graph: graph.acquire_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
-            if acquired["status"] != "acquired":
-                return acquired
-        read = await self.worker.call(lambda graph: graph.read_acquired_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
-        if isinstance(read, dict):
-            return read
-        prepared, current_job, call, draft, anchor, sealed_intent, trusted_umo = read
-        descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
-            frozenset({"text"}), frozenset({workflow.purpose}), frozenset({workflow.privacy_tier}),
-            workflow.provider_config_ref, "unknown", False, False)
-        adapter = AstrBotModelProvider(context=self.context, host_loop=self.owner_loop, trusted_umo=trusted_umo,
-            descriptor=descriptor, admin_model=workflow, installation_bundle=bundle)
-        executor = HostModelEgressExecutor(authority=self.authority_client, bundle=bundle, grant=self.client_grant, adapter=adapter, local_module_admission=self.graph.local_module_admission)
-        if sealed_intent is None:
-            try:
-                record, permit = await executor.prepare_once(
-                    draft=draft, expected_anchor=anchor, request=call)
-            except LocalModelCapacityDeniedV1:
-                return {"status": "model_capacity_hold", "job_id": current_job.job_id}
-        else:
-            record, permit = await self.authority_client.model_recover_fenced_v1(bundle, self.client_grant, intent=sealed_intent)
-            if record.intent != sealed_intent:
-                raise ValueError("D07 recovered call differs from original consumed claim")
-            draft, anchor = ModelEgressDraftV1.from_intent(sealed_intent), permit.pinned_anchor
-        if ModelEgressDraftV1.from_intent(record.intent) != draft or permit.pinned_anchor != anchor:
-            raise ValueError("D07 Authority prepared another original call")
-        if record.state == "prepared":
-            self._adapters[current_job.job_id] = adapter
-            await self.worker.call(lambda graph: graph.seal_current_d07_egress_v1(self.bootstrap, bundle,
-                intent=record.intent, permit=permit, **graph_args))
-            terminal = await executor.execute_once(intent=record.intent, expected_anchor=anchor,
-                request=call, d07_original=prepared)
-            if terminal is None:
+                    if observed[0].state == "dispatch_started" and observed[3] is None:
+                        original_permit = observed[1]
+                        recovered = None if original_permit is None else await self._recover_local_observation_v1(
+                            existing_intent, original_permit.pinned_anchor, job.job_id)
+                        if recovered is None:
+                            return {"status": "original_terminal_unknown", "job_id": job.job_id}
+                        observed = await self.authority_client.model_terminal_fact_v2(bundle, self.client_grant, intent=existing_intent)
+                except Exception:
+                    # An unavailable original query cannot grant a new start or a
+                    # new content-fence begin after an uncertain consumed claim.
+                    return {"status": "original_terminal_unknown", "job_id": job.job_id}
+                if observed[0].state == "observed" and observed[3] is not None:
+                    self._adapters.pop(job.job_id, None)
+                    self._pre_read_cost_facts[job.job_id] = read_original_model_cost(lambda _intent: observed, existing_intent)
+                    # A known charge stays known even when its actual accounting
+                    # permit or SQL reconciliation needs later recovery.
+                    await self._account_original_cost_v1(job.job_id)
+                elif observed[0].state != "prepared":
+                    return {"status": "original_terminal_unknown", "job_id": job.job_id}
+            if resume_job.work_kind == "d07.recall_need":
+                if resume_job.phase == "queued":
+                    from .d07_ingress_recall_acquisition_v1 import ACQUIRE_OPERATION
+                    metadata(await self._run_ingress_recall_operation_v1(job.job_id, ACQUIRE_OPERATION))
+            else:
+                acquired = metadata(await self.worker.call(lambda graph: graph.acquire_current_d07_execution_v1(self.bootstrap, bundle, **graph_args)))
+                if acquired["status"] != "acquired":
+                    return acquired
+            read = take(await self.worker.call(lambda graph: graph.read_acquired_current_d07_execution_v1(self.bootstrap, bundle, **graph_args)), 'source')
+            if isinstance(read, dict):
+                return metadata(read)
+            prepared, current_job, call, draft, anchor, sealed_intent, trusted_umo = read
+            descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
+                frozenset({"text"}), frozenset({workflow.purpose}), frozenset({workflow.privacy_tier}),
+                workflow.provider_config_ref, "unknown", False, False)
+            adapter = AstrBotModelProvider(context=self.context, host_loop=self.owner_loop, trusted_umo=trusted_umo,
+                descriptor=descriptor, admin_model=workflow, installation_bundle=bundle)
+            executor = HostModelEgressExecutor(authority=self.authority_client, bundle=bundle, grant=self.client_grant, adapter=adapter, local_module_admission=self.graph.local_module_admission)
+            if sealed_intent is None:
+                try:
+                    record, permit = await executor.prepare_once(
+                        draft=draft, expected_anchor=anchor, request=call)
+                except LocalModelCapacityDeniedV1:
+                    return {"status": "model_capacity_hold", "job_id": current_job.job_id}
+            else:
+                record, permit = await self.authority_client.model_recover_fenced_v1(bundle, self.client_grant, intent=sealed_intent)
+                if record.intent != sealed_intent:
+                    raise ValueError("D07 recovered call differs from original consumed claim")
+                draft, anchor = ModelEgressDraftV1.from_intent(sealed_intent), permit.pinned_anchor
+            if ModelEgressDraftV1.from_intent(record.intent) != draft or permit.pinned_anchor != anchor:
+                raise ValueError("D07 Authority prepared another original call")
+            if record.state == "prepared":
+                self._adapters[current_job.job_id] = adapter
+                metadata(await self.worker.call(lambda graph: graph.seal_current_d07_egress_v1(self.bootstrap, bundle,
+                    intent=record.intent, permit=permit, **graph_args)))
+                terminal = await executor.execute_once(intent=record.intent, expected_anchor=anchor,
+                    request=call, d07_original=prepared)
+                if terminal is None:
+                    terminal = await self._recover_local_observation_v1(record.intent, anchor, current_job.job_id)
+                    if terminal is None:
+                        return {"status": "original_terminal_unknown", "job_id": current_job.job_id}
+            elif record.state != "observed":
+                # dispatch_started/unknown are inspection-only. A renewed worker
+                # lease can never manufacture another Authority admission.
                 terminal = await self._recover_local_observation_v1(record.intent, anchor, current_job.job_id)
                 if terminal is None:
                     return {"status": "original_terminal_unknown", "job_id": current_job.job_id}
-        elif record.state != "observed":
-            # dispatch_started/unknown are inspection-only. A renewed worker
-            # lease can never manufacture another Authority admission.
-            terminal = await self._recover_local_observation_v1(record.intent, anchor, current_job.job_id)
-            if terminal is None:
-                return {"status": "original_terminal_unknown", "job_id": current_job.job_id}
-        from .model_cost_settlement import read_original_model_cost
-        facts = await self.authority_client.model_terminal_fact_v2(bundle, self.client_grant, intent=record.intent)
-        if facts[0].state == "observed" and facts[3] is not None:
-            self._adapters.pop(current_job.job_id, None)
-        self._pre_read_cost_facts[current_job.job_id] = read_original_model_cost(lambda _intent: facts, record.intent)
-        paid = await self._account_original_cost_v1(current_job.job_id)
-        if paid.get("paid") is not True:
-            return paid
-        if resume_job.work_kind == "d07.recall_need":
-            from .d07_ingress_recall_result_v1 import RESULT_OPERATION
-            from ..authority_service.d07_current_execution_v1 import from_wire, D07CognitionResultReadRequestV1
-            await self._run_ingress_recall_operation_v1(job.job_id, RESULT_OPERATION)
-            def read_request(graph):
-                with self._store._lock:
-                    original = read_d07_original_v1(self._db, self.d11_issuer, bundle.installation_policy.namespace,
-                        "result_attempt", job.job_id)
-                    if original is None:
-                        raise ValueError("Self C3 result request was not actually committed")
-                    return from_wire(original[0], D07CognitionResultReadRequestV1)
-            request = await self.worker.call(read_request)
-        else:
-            request = await self.worker.call(lambda graph: graph.prepare_current_d07_result_read_v1(self.bootstrap, bundle, **graph_args))
-        try:
-            result = await self.authority_client.d07_cognition_result_read_v1(bundle, self.client_grant, read_request=request)
-        except BaseException:
-            try:
-                await self.authority_client.d07_cognition_result_recover_finish_v1(bundle, self.client_grant, read_request=request)
-            except Exception:
-                pass
-            raise
-        result.require_original(record.intent, prepared)
-        self._pre_read_results[current_job.job_id] = result
-        try:
+            from .model_cost_settlement import read_original_model_cost
+            facts = await self.authority_client.model_terminal_fact_v2(bundle, self.client_grant, intent=record.intent)
+            if facts[0].state == "observed" and facts[3] is not None:
+                self._adapters.pop(current_job.job_id, None)
+            self._pre_read_cost_facts[current_job.job_id] = read_original_model_cost(lambda _intent: facts, record.intent)
+            paid = await self._account_original_cost_v1(current_job.job_id)
+            if paid.get("paid") is not True:
+                return paid
             if resume_job.work_kind == "d07.recall_need":
-                from .d07_ingress_recall_result_v1 import FINISH_OPERATION
-                receipt = await self._run_ingress_recall_operation_v1(job.job_id, FINISH_OPERATION)
-                finished = {"status": "actual_execution_completed", "job_id": job.job_id, "receipt": receipt["receipt"]}
+                from .d07_ingress_recall_result_v1 import RESULT_OPERATION
+                from ..authority_service.d07_current_execution_v1 import from_wire, D07CognitionResultReadRequestV1
+                metadata(await self._run_ingress_recall_operation_v1(job.job_id, RESULT_OPERATION))
+                def read_request(graph):
+                    with self._store._lock:
+                        original = read_d07_original_v1(self._db, self.d11_issuer, bundle.installation_policy.namespace,
+                            "result_attempt", job.job_id)
+                        if original is None:
+                            raise ValueError("Self C3 result request was not actually committed")
+                        return from_wire(original[0], D07CognitionResultReadRequestV1)
+                request = await self.worker.call(read_request)
             else:
-                finished = await self.worker.call(lambda graph: graph.finish_current_d07_execution_v1(self.bootstrap, bundle, **graph_args))
+                request = take(await self.worker.call(lambda graph: graph.prepare_current_d07_result_read_v1(self.bootstrap, bundle, **graph_args)), 'result_request')
+            try:
+                result = await self.authority_client.d07_cognition_result_read_v1(bundle, self.client_grant, read_request=request)
+            except BaseException:
+                try:
+                    await self.authority_client.d07_cognition_result_recover_finish_v1(bundle, self.client_grant, read_request=request)
+                except Exception:
+                    pass
+                raise
+            finally:
+                request = None
+                release("result_request")
+            result.require_original(record.intent, prepared)
+            self._pre_read_results[current_job.job_id] = result
+            try:
+                if resume_job.work_kind == "d07.recall_need":
+                    from .d07_ingress_recall_result_v1 import FINISH_OPERATION
+                    receipt = metadata(await self._run_ingress_recall_operation_v1(job.job_id, FINISH_OPERATION))
+                    finished = {"status": "actual_execution_completed", "job_id": job.job_id, "receipt": receipt["receipt"]}
+                else:
+                    finished = metadata(await self.worker.call(lambda graph: graph.finish_current_d07_execution_v1(self.bootstrap, bundle, **graph_args)))
+            finally:
+                # The authenticated result is needed only for this fixed SQL
+                # import. Later adoption reads the durable signed original; a
+                # failed import must recheck the original scoped Authority read.
+                self._pre_read_results.pop(current_job.job_id, None)
+            if finished.get("status") != "actual_execution_completed":
+                return finished
+            if resume_job.work_kind == "d07.recall_need":
+                from .d07_ingress_recall_result_v1 import ADOPT_OPERATION
+                receipt = metadata(await self._run_ingress_recall_operation_v1(job.job_id, ADOPT_OPERATION))
+                return {"status": "adopted", "job_id": job.job_id, "operation_id": receipt["operation_id"], "receipt": receipt["receipt"]}
+            return metadata(await self.worker.call(lambda graph: graph.resume_current_d07_behavior_v1(self.bootstrap, bundle, **graph_args)))
         finally:
-            # The authenticated result is needed only for this fixed SQL
-            # import. Later adoption reads the durable signed original; a
-            # failed import must recheck the original scoped Authority read.
-            self._pre_read_results.pop(current_job.job_id, None)
-        if finished.get("status") != "actual_execution_completed":
-            return finished
-        if resume_job.work_kind == "d07.recall_need":
-            from .d07_ingress_recall_result_v1 import ADOPT_OPERATION
-            receipt = await self._run_ingress_recall_operation_v1(job.job_id, ADOPT_OPERATION)
-            return {"status": "adopted", "job_id": job.job_id, "operation_id": receipt["operation_id"], "receipt": receipt["receipt"]}
-        return await self.worker.call(lambda graph: graph.resume_current_d07_behavior_v1(self.bootstrap, bundle, **graph_args))
+            # Clear all aliases to the Source-bearing tuple before its payload
+            # cleanup and physical retention lease are released.
+            read = prepared = current_job = call = draft = anchor = None
+            sealed_intent = trusted_umo = request = prepared_kind = None
+            result = receipt = adapter = executor = record = permit = terminal = facts = None
+            release("result_request")
+            release("source")

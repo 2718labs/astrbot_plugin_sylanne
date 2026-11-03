@@ -7,6 +7,7 @@ import json
 import re
 from typing import TYPE_CHECKING, Protocol
 
+from ...authority_service.contract import AuthorityUnavailable
 from ...runtime_contracts import (
     CompressedTurnBlockV2, ConversationWindowProjectionV1, TurnAnchorV1,
     TurnDetailSlotV1, TurnTimelineItemV1, VersionedRef, canonical_digest,
@@ -72,6 +73,14 @@ class PrecompressionPlan:
     expires_at_utc: float
 
 
+class D13CurrentPressureUnavailableV3(AuthorityUnavailable):
+    """Current authenticated main-input pressure cannot establish a fresh plan."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__("D13 current main pressure unavailable: " + reason)
+
+
 def plan_precompression(
     window: ConversationWindowProjectionV1,
     history_token_budget: int,
@@ -79,21 +88,29 @@ def plan_precompression(
     background_capacity: bool,
     outstanding_candidate: bool,
     attempted_input_digests: frozenset[str] = frozenset(),
+    pressure: D13CurrentMainPressureV2 | None = None,
 ) -> PrecompressionPlan | None:
-    """Plan the oldest complete prefix after the 60% line, without dispatching.
+    """Plan after exact main-input pressure; callers authenticate its original.
 
-    Bytes are a conservative local proxy; D11 freezes actual token and cost
-    budgets. The attempted set must come from D11's persistent job ledger.
+    Byte sizes bound retained prefix material only. They do not establish token
+    pressure. The attempted set comes from D11's persistent job ledger.
     """
     if type(history_token_budget) is not int or history_token_budget <= 0:
         raise ValueError("history_token_budget must be positive")
+    if not background_capacity or outstanding_candidate:
+        return None
     recent = tuple(t for t in window.turns if 0 <= window.trusted_utc - t.trusted_utc < _TTL)
-    total = sum(_size(f"{t.speaker_ref}: {t.text}") for t in recent)
+    if len(recent) < 3:
+        return None
+    if type(pressure) is not D13CurrentMainPressureV2:
+        raise D13CurrentPressureUnavailableV3("pressure_missing")
+    if pressure.window_digest != canonical_digest(window):
+        raise D13CurrentPressureUnavailableV3("pressure_selection_changed")
     return _plan_prefix(window, history_token_budget,
                         background_capacity=background_capacity,
                         outstanding_candidate=outstanding_candidate,
                         attempted_input_digests=attempted_input_digests,
-                        pressure_reached=total >= history_token_budget * 0.6)
+                        pressure_reached=pressure.input_tokens * 10 >= history_token_budget * 6)
 
 
 def _plan_prefix(
@@ -200,20 +217,24 @@ def plan_paid_precompression_v2(
             type(attempted_input_digests) is not frozenset or
             any(type(item) is not str for item in attempted_input_digests)):
         raise TypeError("typed current D13 window, budget and inventory required")
-    if (type(pressure) is not D13CurrentMainPressureV2 or
-            type(selected_main_model) is not D13PrecompressionInstallationV1 or
-            pressure.window_digest != canonical_digest(window) or
+    if not background_capacity or outstanding_candidate:
+        return None
+    recent = tuple(t for t in window.turns if 0 <= window.trusted_utc - t.trusted_utc < _TTL)
+    if len(recent) < 3:
+        return None
+    if type(pressure) is not D13CurrentMainPressureV2:
+        raise D13CurrentPressureUnavailableV3("pressure_missing")
+    if (type(selected_main_model) is not D13PrecompressionInstallationV1 or
             (pressure.installation_id, pressure.provider_id, pressure.model_id,
              pressure.provider_config_digest) !=
             (selected_main_model.installation_id, selected_main_model.provider_id,
              selected_main_model.model_id, selected_main_model.provider_config_digest)):
-        return None
-    return _plan_prefix(
+        raise D13CurrentPressureUnavailableV3("pressure_installation_changed")
+    return plan_precompression(
         window, history_token_budget,
         background_capacity=background_capacity,
         outstanding_candidate=outstanding_candidate,
-        attempted_input_digests=attempted_input_digests,
-        pressure_reached=pressure.input_tokens * 10 >= history_token_budget * 6,
+        attempted_input_digests=attempted_input_digests, pressure=pressure,
     )
 
 
@@ -250,10 +271,26 @@ def _structural_fragments(text: str) -> tuple[str, tuple[str, ...], bool]:
     return beat, details, not represented
 
 
+class DeterministicPrecompressionNoReductionV1(ValueError):
+    """Only the complete same-prefix compiler reduction comparison failed."""
+
+
 def compile_deterministic_candidate(
     window: ConversationWindowProjectionV1, plan: PrecompressionPlan,
+    *, _prepared_deterministic_v3=None,
 ) -> CompressedTurnBlockV2:
     """Fold raw turns to anchored beats, without interpreting their claims."""
+    if _prepared_deterministic_v3 is not None:
+        from ...runtime.d13_deterministic_applicability_v3 import (
+            require_d13_deterministic_compiler_applicability_v3,
+        )
+        actual = require_d13_deterministic_compiler_applicability_v3(
+            _prepared_deterministic_v3, window, plan)
+        if actual.plan is None or actual.candidate is None or plan != actual.plan:
+            raise ValueError("deterministic applicability has no complete matching prefix")
+        if actual.rendered_bytes >= actual.original_bytes:
+            raise DeterministicPrecompressionNoReductionV1("deterministic fold does not reduce this prefix")
+        return actual.candidate
     turns = tuple(t for t in window.turns
                   if plan.first_sequence <= t.sequence <= plan.last_sequence)
     if (len(turns) != plan.last_sequence - plan.first_sequence + 1 or
@@ -288,7 +325,7 @@ def compile_deterministic_candidate(
         status="candidate",
     )
     if _size(candidate.rendered_text) >= sum(_size(t.text) for t in turns):
-        raise ValueError("deterministic fold does not reduce this prefix")
+        raise DeterministicPrecompressionNoReductionV1("deterministic fold does not reduce this prefix")
     return candidate
 
 
@@ -598,6 +635,7 @@ def render_detail_slot(block: CompressedTurnBlockV2, slot: TurnDetailSlotV1) -> 
 def adopt_candidate(
     candidate: CompressedTurnBlockV2, plan: PrecompressionPlan,
     window: ConversationWindowProjectionV1, *, job_fence_valid: bool,
+    _prepared_deterministic_v3=None,
 ) -> CompressedTurnBlockV2:
     """Validate a late result against current source revisions before CAS save."""
     if not job_fence_valid or candidate.status != "candidate":
@@ -606,7 +644,8 @@ def adopt_candidate(
             candidate.compiler_version != COMPILER_VERSION or
             candidate.block_ref != f"d13:block:{plan.input_digest}"):
         raise ValueError("candidate identity mismatch")
-    expected = compile_deterministic_candidate(window, plan)
+    expected = compile_deterministic_candidate(window, plan,
+        _prepared_deterministic_v3=_prepared_deterministic_v3)
     if candidate != expected:
         raise ValueError("candidate content or source closure changed")
     return replace(candidate, status="standby")

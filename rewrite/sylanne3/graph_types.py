@@ -270,6 +270,13 @@ class GraphAtom:
         if _canonical_original is None:
             value = json_object(self.value)
         else:
+            from .runtime.source_correction_commit_read_v3 import (
+                SourceCorrectionBodyOriginalV3, require_source_correction_graph_atom_v3)
+            if type(_canonical_original) is SourceCorrectionBodyOriginalV3:
+                value = require_source_correction_graph_atom_v3(_canonical_original,
+                    key=self.key, revision=self.revision, value=self.value, valid=self.valid)
+                object.__setattr__(self, "value", value)
+                return
             from .runtime.domain_background_read_v3 import (
                 BackgroundJSONColumnV3, require_background_graph_atom_json_v3)
             if type(_canonical_original) is BackgroundJSONColumnV3:

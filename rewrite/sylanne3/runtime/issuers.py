@@ -1173,7 +1173,25 @@ class _Signer:
         from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
         from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
         from .foreground_command_source_v3 import _CommandInputColumnV3,require_foreground_command_metadata_signature_v3
-        if type(original)is _CommandInputColumnV3:
+        from .d01_ordinary_origin_read_v3 import OrdinaryOriginColumnV3,require_ordinary_origin_signature_column_v3
+        from .role_control_signed_metadata_v4 import _RoleControlSignedColumnV4,require_role_control_signature_column_v4
+        from .d07_single_event_review_v1 import (_SingleEventCaseParentColumnV1,
+            require_single_event_case_parent_signature_column_v1)
+        from .d13_deterministic_applicability_v3 import (_D13PressureGrantColumnV1,
+            require_d13_pressure_grant_signature_column_v1)
+        from ..authority_service.d13_current_pressure_mapping_v1 import (
+            AuthorityPressureGrantColumnV1, require_authority_pressure_grant_column_v1)
+        if type(original) is _D13PressureGrantColumnV1:
+            require_d13_pressure_grant_signature_column_v1(original, signer=self, kind=kind)
+        elif type(original) is AuthorityPressureGrantColumnV1:
+            require_authority_pressure_grant_column_v1(original, signer=self, kind=kind)
+        elif type(original)is _SingleEventCaseParentColumnV1:
+            require_single_event_case_parent_signature_column_v1(original,signer=self,kind=kind)
+        elif type(original)is _RoleControlSignedColumnV4:
+            require_role_control_signature_column_v4(original,signer=self,kind=kind)
+        elif type(original)is OrdinaryOriginColumnV3:
+            require_ordinary_origin_signature_column_v3(original,signer=self,kind=kind)
+        elif type(original)is _CommandInputColumnV3:
             require_foreground_command_metadata_signature_v3(original,signer=self,kind=kind)
         elif type(original)is _ArtifactBorrowedColumnV3:
             require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind)
@@ -1196,7 +1214,28 @@ class _Signer:
         from ..authority_service.original_artifact_recipe_metadata_v3 import _OriginalArtifactColumnV3,require_original_artifact_signature_column_v3
         from .artifact_borrowed_source_v3 import _ArtifactBorrowedColumnV3,require_artifact_borrowed_signature_column_v3
         from .foreground_command_source_v3 import _CommandInputColumnV3,require_foreground_command_metadata_signature_v3
-        if type(original)is _CommandInputColumnV3:
+        from .d01_ordinary_origin_read_v3 import OrdinaryOriginColumnV3,require_ordinary_origin_signature_column_v3
+        from .role_control_signed_metadata_v4 import _RoleControlSignedColumnV4,require_role_control_signature_column_v4
+        from .d07_single_event_review_v1 import (_SingleEventCaseParentColumnV1,
+            require_single_event_case_parent_signature_column_v1)
+        from .d13_deterministic_applicability_v3 import (_D13PressureGrantColumnV1,
+            require_d13_pressure_grant_signature_column_v1)
+        from ..authority_service.d13_current_pressure_mapping_v1 import (
+            AuthorityPressureGrantColumnV1, require_authority_pressure_grant_column_v1)
+        if type(original) is _D13PressureGrantColumnV1:
+            require_d13_pressure_grant_signature_column_v1(original, signer=self, kind=kind,
+                signature=signature, verifier=verifier, complete=True)
+        elif type(original) is AuthorityPressureGrantColumnV1:
+            require_authority_pressure_grant_column_v1(original, signer=self, kind=kind,
+                signature=signature, verifier=verifier, complete=True)
+        elif type(original)is _SingleEventCaseParentColumnV1:
+            require_single_event_case_parent_signature_column_v1(original,signer=self,kind=kind,
+                signature=signature,verifier=verifier,complete=True)
+        elif type(original)is _RoleControlSignedColumnV4:
+            require_role_control_signature_column_v4(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        elif type(original)is OrdinaryOriginColumnV3:
+            require_ordinary_origin_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
+        elif type(original)is _CommandInputColumnV3:
             require_foreground_command_metadata_signature_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
         elif type(original)is _ArtifactBorrowedColumnV3:
             require_artifact_borrowed_signature_column_v3(original,signer=self,kind=kind,signature=signature,verifier=verifier,complete=True)
@@ -1839,6 +1878,9 @@ class D02ResourceIssuer:
         numeric,quote=read_bound_numeric_host_quote_v3(db,self,quote_id,version)
         if numeric:return quote
         if prepared_originals is not None:
+            from .natural_dispatch_p2_c02_originals_v1 import PreparedNaturalP2C02OriginalsV1
+            if type(prepared_originals)is PreparedNaturalP2C02OriginalsV1:
+                return prepared_originals.require_quote_for_v3(self,db,quote_id,version)
             from .current_graph_source_material_v3 import PreparedCurrentC02OriginalsV3
             from .c09_paged_sql_v2 import require_c09_reserved_meter_v3
             if(type(prepared_originals)is not PreparedCurrentC02OriginalsV3 or meter is None

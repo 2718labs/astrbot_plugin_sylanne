@@ -1045,3 +1045,85 @@ async def test_installed_relationship_authored_prior_and_actual_shared_c3_revisi
         assert dimension["estimate"] == "unknown" and dimension["time_status"] == "stale"
         assert tuple(case["phase_provider_calls"]) == calls_after
     await run_installed_m1_phase_case_v2(installed_m1_phase_fixture_v2, after_c02=after_c02, owner_controls=True)
+
+
+@pytest.mark.asyncio
+async def test_installed_owner_aspiration_birth_source_cas_v1(installed_m1_phase_fixture_v2):
+    """Actual selected Source Work, original receipt replay, CAS and Owner-domain refusal."""
+    from contextlib import ExitStack
+    from m1_artifact_draft_acceptance_support_v1 import run_installed_m1_phase_case_v2
+    from sylanne3.graph_worker import GraphStorageWorkV3, OwnedGraphStorageResultV3
+    from sylanne3.graph_coordinator import AuthorityDenied
+    from sylanne3.domains.d08.execution import Aspiration
+    from sylanne3.runtime.domain_production_inputs_v1 import CreateCurrentAspirationInputRequestV1
+    from sylanne3.runtime.current_beta1_source_read_v3 import WORLD_SOURCE_WORK_KIND_V3
+    from sylanne3.runtime_storage_v3 import runtime_storage_v3
+
+    async def after_c02(case):
+        worker = await case['get_http_worker']()
+        ns = case['namespace']
+        source = case['source_ref']
+        activity = 'activity:aspiration-source-cas'
+        output = AtomKey(Owner('activity',*ns.as_tuple,activity),'d08.aspiration.v1','aspiration:retain-uncontrollable-meaning')
+        request = CreateCurrentAspirationInputRequestV1(Aspiration(output.name,1,
+            'Retain the original wish without replacing it with an easier outcome.',
+            'uncontrollable',(),(source,)))
+        operation = str(uuid4())
+        observed_works = []
+
+        async def submit(request,operation_id,*,domains=('d01','d06','d08','d11')):
+            def invoke(graph):
+                assert runtime_storage_v3(case['store']._db) is not None, 'selected Source Work is required; no legacy SQL substitute'
+                lifetime = ExitStack()
+                try:
+                    authority,lease,_ = graph.grant_current_owner(case['bootstrap'],actor='owner-actor-reply',namespace=ns,
+                        domains=domains,purpose='workbench_user_action',audience='owner',activation_generation=1,
+                        owner_session_token=case['owner_session_token'],owner_session_request=case['owner_session_request'])
+                    lifetime.callback(graph.release_current_owner_lease,case['bootstrap'],lease)
+                    result = graph.register_current_domain_input_v1(authority,lease,producer_kind='create_aspiration',
+                        request=request,operation_id=operation_id,activity_id=activity,audience_ref=case['ingress'].conversation_ref,
+                        parent_budget_lease_ref=case['policy'].root_grant.lease_id)
+                    if type(result) is GraphStorageWorkV3:
+                        assert result.kind == WORLD_SOURCE_WORK_KIND_V3
+                        observed_works.append((operation_id,result.kind))
+                        result.adopt_request_lifetime_v3(lifetime)
+                        return result
+                    lifetime.close()
+                    return result
+                except BaseException:
+                    lifetime.close()
+                    raise
+            result = await worker.call(invoke)
+            if type(result) is OwnedGraphStorageResultV3:
+                value,retention = result.take_value_v3()
+                try:return value
+                finally:retention.release()
+            return result
+
+        created = await submit(request,operation)
+        assert created['schema'] == 'sylanne.domain-production-receipt.v1', created
+        assert created['coverage'] == 'complete' and created['receipt']['status'] == 'committed'
+        assert (operation,WORLD_SOURCE_WORK_KIND_V3) in observed_works
+        receipt = created['receipt']
+        reads = {token:revision for token,revision in receipt['read_versions']}
+        assert reads[output.token] == 0 and reads[source] > 0
+        assert receipt['write_versions'] == [[output.token,1]]
+        assert {'d01.persona_activation.v1','d01.persona_plan.v1'} <= {
+            AtomKey.from_token(token).type_name for token,revision in receipt['read_versions'] if revision > 0}
+        assert created['outbox'] == [], 'an aspiration is not a Goal, execution or external communication'
+        replay = await submit(request,operation)
+        assert replay['receipt'] == receipt and replay['original_digest'] == created['original_digest']
+
+        replaced = await submit(request,str(uuid4()))
+        assert replaced['schema'] == 'sylanne.domain-production-refusal.v1' and replaced['status'] == 'held', replaced
+        assert not replaced.get('receipt',{}).get('write_versions')
+        other = CreateCurrentAspirationInputRequestV1(replace(request.aspiration,aspiration_id='aspiration:requires-d08-owner-domain'))
+        try:
+            denied = await submit(other,str(uuid4()),domains=('d01','d06','d11'))
+        except AuthorityDenied:
+            pass
+        else:
+            assert denied['schema'] == 'sylanne.domain-production-refusal.v1' and denied['status'] == 'held', denied
+            assert not denied.get('receipt',{}).get('write_versions')
+
+    await run_installed_m1_phase_case_v2(installed_m1_phase_fixture_v2,after_c02=after_c02,owner_controls=True)

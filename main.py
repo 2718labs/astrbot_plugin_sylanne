@@ -28,6 +28,14 @@ else:
     from astrbot.api import logger, AstrBotConfig
     from astrbot.api.event import AstrMessageEvent, filter
     from astrbot.api.star import Context, Star, StarTools
+
+    # Plugin-market logging: shipped runtime modules emit through the neutral
+    # diagnostic channel because the same code also loads in the AstrBot-free
+    # Authority service. The host process wires its formal sink to the SDK
+    # logger here, before any runtime module can emit.
+    from sylanne3.diagnostic_channel_v1 import install_diagnostic_sink_v1
+    from sylanne3.host.host_diagnostic_sink_v1 import AstrBotDiagnosticSinkV1
+    install_diagnostic_sink_v1(AstrBotDiagnosticSinkV1())
     
     from sylanne3.authority_service.v2_owner_contract import OwnerPrincipalV1
     from sylanne3.host import (
@@ -55,6 +63,8 @@ else:
     from sylanne3.host.model_workflows_v6 import AdminModelWorkflowsV6
     from sylanne3.host.model_workflows_v7 import AdminModelWorkflowsV7
     from sylanne3.host.model_workflows_v8 import AdminModelWorkflowsV8
+    from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+    from sylanne3.host.model_workflows_v10 import AdminModelWorkflowsV10
     from sylanne3.host.model_selection import observe_host_model_selection_v1
     from sylanne3.host.webui_configuration_v1 import (
         WebuiConfigurationV1, configuration_values_v1, default_model_selection_v1,
@@ -74,10 +84,10 @@ else:
         run_installed_post_c02_reply_model_v1,
     )
     from sylanne3.host.installed_d13_paid_driver import (
-        run_installed_d13_paid_precompression_v1,
+        run_installed_d13_paid_precompression_v1, resume_installed_d13_paid_original_v1,
     )
     from sylanne3.host.natural_reply_dispatch_driver import (
-        NaturalReplyDispatchResultV2,
+        NaturalReplyDispatchResultV3,
     )
     from sylanne3.host.reply_takeover import rendezvous_private_reply_v1
     from sylanne3.installation_policy import AdminInstallationPolicy
@@ -130,7 +140,7 @@ else:
         bundle = installation.admin_bundle
         has_v2_workflows = (
             type(bundle) is AdminInstallationBundle
-            and type(bundle.model_workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8}
+            and type(bundle.model_workflows) in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
             and bundle.ingress_model is None
         )
         if (type(bundle) is not AdminInstallationBundle
@@ -218,7 +228,7 @@ else:
             self._d13_pending_jobs: dict[str, str] = {}
             self._d13_pending_expiries: dict[str, str] = {}
             self._d13_deadline_wakes: dict[str, asyncio.TimerHandle] = {}
-            self._d13_pending_schedules: dict[str, tuple[object, str]] = {}
+            self._d13_pending_schedules: dict[str, tuple[object, str, object]] = {}
             self._d13_scan_needed = False
             self._d13_attempted_jobs: set[str] = set()
             self._d13_drain_task: asyncio.Task | None = None
@@ -301,21 +311,33 @@ else:
                     if requested != installed.provider_id:
                         self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                         return False
-            if type(workflows) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.d07_relationship_cognition is not None:
+            if type(workflows) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and workflows.d07_relationship_cognition is not None:
                 requested = selection["auxiliary_provider_id"]
                 if requested and requested != workflows.d07_relationship_cognition.provider_id:
                     self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                     return False
-            if type(workflows) in {AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8} and workflows.growth_cognition is not None:
+            if type(workflows) in {AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and workflows.growth_cognition is not None:
                 requested = selection["auxiliary_provider_id"]
                 if requested and requested != workflows.growth_cognition.provider_id:
                     self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                     return False
-            if type(workflows) is AdminModelWorkflowsV8 and workflows.general_growth_cognition is not None:
+            if type(workflows) in {AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and workflows.general_growth_cognition is not None:
                 requested = selection["auxiliary_provider_id"]
                 if requested and requested != workflows.general_growth_cognition.provider_id:
                     self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
                     return False
+            if type(workflows) in {AdminModelWorkflowsV9, AdminModelWorkflowsV10} and workflows.artifact_observation_cognition is not None:
+                requested = selection["auxiliary_provider_id"]
+                if requested and requested != workflows.artifact_observation_cognition.provider_id:
+                    self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
+                    return False
+            if type(workflows) is AdminModelWorkflowsV10:
+                for slot in ("ordinary_continuity_screen", "ordinary_continuity_deep"):
+                    installed = getattr(workflows, slot)
+                    requested = selection["overrides"].get(slot) or selection["auxiliary_provider_id"]
+                    if installed is not None and requested and requested != installed.provider_id:
+                        self.runtime_health = RuntimeHealth("blocked", ("model_workflow_binding_required",))
+                        return False
             return True
     
         async def _setup_status(self):
@@ -864,7 +886,7 @@ else:
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
             c02_operation_id: str, *, source_ref: str | None = None,
             trusted_umo: str | None = None, new_ingress: bool = False,
-            resumed_foreground: bool = False,
+            resumed_foreground: bool = False, d13_ingress_envelope=None,
         ) -> None:
             """Create a new paid original only with the complete natural path installed."""
             if not self._natural_reply_ready_v2(runtime, installation):
@@ -933,13 +955,18 @@ else:
                 if waiting.get("status") not in {"waiting", "legacy"}:
                     logger.info("Sylanne 3 foreground actual checkpoint remains HOLD: %s", waiting.get("reason_code", "current_original_missing"))
                     return
+                from sylanne3.runtime.first_ingress_v2 import ingress_ids
                 saved = await runtime.prepare_post_c02_natural_generation_v2(
                     installation=installation,
                     server=getattr(self, "_final_handoff_server", None),
                     listener=getattr(self, "_final_handoff_listener", None),
                     candidates=getattr(self, "_scene_candidates", None),
                     context=self.context, c02_operation_id=c02_operation_id,
-                    source_ref=source_ref)
+                    source_ref=source_ref,
+                    on_d13_pressure_ready=(None if d13_ingress_envelope is None else
+                        lambda originals: self._queue_d13_schedule_v2(runtime, installation,
+                            ingress_ids(d13_ingress_envelope.lineage.source_ref)[2], d13_ingress_envelope,
+                            trusted_umo=trusted_umo, pressure_mapping=originals)))
             else:
                 if runtime._v2_artifact_draft_model_runtime_v1 is not None:
                     if source_ref is None:
@@ -1024,7 +1051,7 @@ else:
                         listener=self._final_handoff_listener)
                     if outcome is None:
                         logger.warning("Sylanne 3 natural original remains HOLD")
-                    elif type(outcome) is NaturalReplyDispatchResultV2:
+                    elif type(outcome) is NaturalReplyDispatchResultV3:
                         if outcome.status == "unknown":
                             logger.warning("Sylanne 3 natural effect outcome unknown; reconcile original")
                         elif outcome.status == "hold":
@@ -1041,6 +1068,18 @@ else:
                     logger.exception("Sylanne 3 natural original failed; HOLD")
                 finally:
                     if not self._encoding_stopping:
+                        await self._consume_d13_natural_parent_closures_v4(runtime)
+                        try:
+                            from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as D13_V7
+                            if installation.admin_bundle.model_workflows.natural_generation.template_version==D13_V7:
+                                accounting=await runtime.capture_d13_accounting_diagnostic_v3(
+                                    foreground_call_id=saved.seal.call_id)
+                                if accounting is not None:
+                                    logger.info('Sylanne D13 actual foreground accounting: %s',accounting)
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception('Sylanne D13 actual accounting metadata remains HOLD')
                         try:
                             await self._arm_registered_artifact_task_wait_v1(runtime,installation,saved.seal.c02_operation_id)
                         except asyncio.CancelledError:
@@ -1177,14 +1216,11 @@ else:
                     if attention is None or attention.status not in {"committed", "duplicate"}:
                         logger.warning("Sylanne 3 settled C02 attention remains HOLD")
                         return
-                    if inbound_turn is not None:
-                        self._queue_d13_schedule_v2(
-                            runtime, installation, receipt.operation_id, envelope,
-                            trusted_umo=trusted_umo)
                     await self._prepare_new_post_c02_natural_v2(
                         runtime, installation, committed.operation_id,
                         source_ref=source_ref, trusted_umo=trusted_umo,
-                        new_ingress=committed.status == "committed")
+                        new_ingress=committed.status == "committed",
+                        d13_ingress_envelope=envelope if inbound_turn is not None else None)
             except asyncio.CancelledError:
                 logger.warning("Sylanne 3 first encoding interrupted; original call HOLD")
                 raise
@@ -1221,7 +1257,7 @@ else:
     
         def _queue_d13_schedule_v2(
             self, runtime: RuntimeContext, installation: V2InstallationAssembly,
-            ingress_operation_id: str, envelope, *, trusted_umo: str,
+            ingress_operation_id: str, envelope, *, trusted_umo: str, pressure_mapping,
         ) -> None:
             if (self._encoding_stopping or self._runtime is not runtime
                     or self._v2_installation is not installation
@@ -1236,7 +1272,7 @@ else:
                 logger.warning("Sylanne 3 D13 optional schedule backlog bounded; HOLD")
                 return
             self._d13_pending_schedules.setdefault(
-                ingress_operation_id, (envelope, trusted_umo))
+                ingress_operation_id, (envelope, trusted_umo, pressure_mapping))
             self._start_d13_drain_v2(runtime, installation)
     
         def _queue_d13_precompression_v2(
@@ -1333,30 +1369,60 @@ else:
                             logger.warning("Sylanne 3 D13 deadline expiry %s remains HOLD", job_id)
                         continue
                     if self._d13_pending_schedules:
-                        operation_id, (envelope, trusted_umo) = next(
+                        operation_id, (envelope, trusted_umo, pressure_mapping) = next(
                             iter(self._d13_pending_schedules.items()))
                         self._d13_pending_schedules.pop(operation_id)
                         try:
-                            paid = await run_installed_d13_paid_precompression_v1(
-                                runtime, installation, context=self.context,
-                                trusted_umo=trusted_umo, envelope=envelope,
-                                ingress_operation_id=operation_id)
-                            if paid is not None:
-                                if paid.status != "standby":
-                                    logger.warning(
-                                        "Sylanne 3 D13 paid original remains HOLD")
-                                continue
+                            from sylanne3.runtime.d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+                            observed = await runtime.inspect_d13_precompression_priority_v1(
+                                ingress_operation_id=operation_id, envelope=envelope)
+                            with RuntimeContext._background_graph_result_v3(observed) as priority:
+                                if type(priority) is not D13PrecompressionPriorityV1:
+                                    raise TypeError("D13 priority requires its actual metadata result")
+                                if priority.status in {"existing_paid", "pending_paid_schedule"}:
+                                    paid = await run_installed_d13_paid_precompression_v1(
+                                        runtime, installation, context=self.context,
+                                        trusted_umo=trusted_umo, envelope=envelope,
+                                        ingress_operation_id=operation_id, priority=priority)
+                                    if paid is None or not paid.original_resolved:
+                                        logger.warning("Sylanne 3 D13 selected paid original remains HOLD")
+                                    continue
+                                if priority.status != "no_outstanding_paid":
+                                    logger.warning("Sylanne 3 D13 priority HOLD: %s", priority.reason)
+                                    continue
+                            observed = priority = None
                         except asyncio.CancelledError:
                             raise
                         except Exception:
                             logger.exception("Sylanne 3 D13 paid original attempt failed; HOLD")
+                            # An exception can follow a durable paid admission.
+                            # Keep that original unresolved; do not create a
+                            # competing deterministic job for this attempt.
+                            continue
                         try:
                             scheduled = await runtime.schedule_d13_deterministic_precompression_v2(
-                                ingress_operation_id=operation_id, envelope=envelope)
+                                ingress_operation_id=operation_id, envelope=envelope,pressure_mapping=pressure_mapping)
                             if scheduled is not None:
-                                _, original_job = scheduled
-                                self._d13_pending_jobs.setdefault(
-                                    original_job.job_id, envelope.conversation_ref)
+                                with RuntimeContext._background_graph_result_v3(scheduled) as selected:
+                                    original_job = None
+                                    try:
+                                        from sylanne3.runtime.d13_deterministic_applicability_v3 import (
+                                            D13DeterministicNoReductionV3, require_issued_d13_deterministic_no_reduction_v3)
+                                        if type(selected) is D13DeterministicNoReductionV3:
+                                            decision = require_issued_d13_deterministic_no_reduction_v3(selected)
+                                            paid = await run_installed_d13_paid_precompression_v1(
+                                                runtime, installation, context=self.context, trusted_umo=trusted_umo,
+                                                envelope=envelope, ingress_operation_id=operation_id,
+                                                deterministic_decision=decision)
+                                            if paid is None or not paid.original_resolved:
+                                                logger.warning("Sylanne 3 D13 new paid original remains HOLD")
+                                            decision = None
+                                            continue
+                                        _, original_job = selected
+                                        self._d13_pending_jobs.setdefault(
+                                            original_job.job_id, envelope.conversation_ref)
+                                    finally:
+                                        original_job = selected = scheduled = None
                             else:
                                 logger.warning("Sylanne 3 D13 original schedule remains HOLD")
                                 self._d13_scan_needed = True
@@ -1370,8 +1436,23 @@ else:
                     if job_id in self._d13_attempted_jobs:
                         continue
                     self._d13_attempted_jobs.add(job_id)
-                    completed = await runtime.consume_d13_deterministic_precompression_job_v2(
-                        job_id=job_id, conversation_ref=conversation_ref)
+                    try:
+                        completed = await runtime.consume_d13_deterministic_precompression_job_v2(
+                            job_id=job_id, conversation_ref=conversation_ref)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception("Sylanne 3 D13 original consumer first refusal; HOLD")
+                        completed = None
+                    if completed is not None:
+                        with RuntimeContext._background_graph_result_v3(completed) as terminal:
+                            try:
+                                if (type(terminal) is not tuple or len(terminal) != 3
+                                        or terminal[2].job_id != job_id or terminal[2].phase != "completed"):
+                                    raise TypeError("D13 deterministic consumer terminal differs")
+                            finally:
+                                completed = terminal = None
+                        continue
                     if completed is None:
                         expired = await runtime.expire_d13_deterministic_precompression_job_v2(
                             job_id=job_id, conversation_ref=conversation_ref)
@@ -1590,6 +1671,16 @@ else:
             except Exception:
                 logger.exception("Sylanne 3 unacquired first encoding scan failed; HOLD")
     
+        async def _consume_d13_natural_parent_closures_v4(self,runtime) -> None:
+            try:
+                result=await runtime.drain_d13_natural_parent_closures_v4()
+                if result is not None and (result['status']in {'hold','waiting'} or result.get('closed_parent_count',0)):
+                    logger.info('Sylanne D13 actual natural parent closure: %s',result)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception('Sylanne D13 natural parent closure first failure retained; HOLD')
+
         async def _run_startup_c02_recovery_v1(self) -> None:
             # Reconcile any original D13 write fence before other graph reads.
             # Consumption remains queued until the reply recovery scan has ended.
@@ -1617,6 +1708,8 @@ else:
             if not self._encoding_stopping:
                 self._released_attention_scan_pending = True
                 await self._restore_released_attention_v2()
+            if not self._encoding_stopping and self._runtime is not None:
+                await self._consume_d13_natural_parent_closures_v4(self._runtime)
             if not self._encoding_stopping and self._d13_pending_jobs:
                 runtime = self._runtime
                 installation = self._v2_installation
@@ -1961,6 +2054,23 @@ else:
                         self._queue_d13_precompression_v2(
                             runtime, installation, job.job_id, item.conversation_ref,
                             start_drain=start_drain)
+                from sylanne3.runtime.d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+                observed = await runtime.discover_d13_paid_originals_v1()
+                with RuntimeContext._background_graph_result_v3(observed) as paid_items:
+                    if (type(paid_items) is not tuple or len(paid_items) > 64
+                            or any(type(item) is not D13PrecompressionPriorityV1 for item in paid_items)):
+                        raise TypeError("D13 cold discovery requires exact paid metadata identities")
+                    for paid_item in paid_items:
+                        if self._encoding_stopping: return
+                        if paid_item.status == "hold":
+                            logger.warning("Sylanne 3 D13 saved paid original %s HOLD: %s",
+                                           paid_item.job_ref, paid_item.reason)
+                            continue
+                        status = await resume_installed_d13_paid_original_v1(runtime, installation,
+                            context=self.context, selection=paid_item)
+                        if status is None or not status.original_resolved:
+                            logger.warning("Sylanne 3 D13 saved paid original %s recovery HOLD", paid_item.job_ref)
+                observed = paid_items = paid_item = None
             except asyncio.CancelledError:
                 raise
             except Exception:

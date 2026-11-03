@@ -587,6 +587,12 @@ def read_frozen_model_budget_original_v2(*, core_db, business, namespace_id, sea
             raise AuthorityUnavailable("C09 natural model requires complete installed pre-mirror Graph proof")
         source_commitments.extend(_natural_proof.require_for(core=core_db,business=business,seal=seal,
             namespace_id=namespace_id,intent=intent,job=job,installation=installation,terminal=terminal))
+    elif job.work_kind=='d06.encode_internal_life_numeric':
+        from ..runtime.c09_life_numeric_originals_v1 import read_numeric_frozen_model_source_rows_v1
+        numeric_rows=read_numeric_frozen_model_source_rows_v1(business,namespace=namespace_id,
+            seal=seal,issuer=budget_job_issuer,intent=intent,permit=permit,job=job,quote=quote,
+            installation=installation,record=record,terminal=terminal)
+        source_commitments.extend(commitment(business,table,row)for table,row in numeric_rows)
     else:
         # Generic acquire, or the exact D04 appraisal driver acquire variant.
         acquire = business.execute("SELECT * FROM graph_job_acquire_intents_v2 WHERE bot=? AND persona=? AND acquire_operation_id=?",

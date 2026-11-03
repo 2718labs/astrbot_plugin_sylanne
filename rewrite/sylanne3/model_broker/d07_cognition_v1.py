@@ -129,9 +129,17 @@ class D07CognitionInputV1:
             if (type(self.target_original_json) is not str or len(self.target_original_json.encode()) > 8192
                     or canonical_serialize(json.loads(self.target_original_json)) != self.target_original_json):
                 raise ValueError("D07 target must be the exact bounded current original")
-            if (self.target_original_kind not in {"graph_head", "d08_joint_plan_intent", "simulation_forecast_context_v1"}
+            if (self.target_original_kind not in {"graph_head", "d08_joint_plan_intent", "simulation_forecast_context_v1", "single_event_review_case_v1"}
                     or self.target_original_digest != canonical_digest(json.loads(self.target_original_json))):
                 raise ValueError("D07 target original kind/commitment differs")
+            if self.target_original_kind=="single_event_review_case_v1":
+                from ..runtime.domain_production_erasure_v1 import decode_typed_production_value_v1
+                from ..domains.d01.single_event_review_case_v1 import RegisteredSingleEventReviewCaseV1
+                case=decode_typed_production_value_v1(json.loads(self.target_original_json),RegisteredSingleEventReviewCaseV1)
+                roots=tuple(dict.fromkeys((*case.support_source_refs,*case.context_source_refs)))
+                if(self.work_kind!="concern"or case.namespace!=self.namespace or case.case_ref!=self.target_ref
+                        or set(roots)!=refs):
+                    raise ValueError("single-event review input differs from its complete actual Case")
             if self.target_original_kind=='simulation_forecast_context_v1':
                 raw=json.loads(self.target_original_json)
                 if self.work_kind!='simulation'or raw.get('schema')!='d07.simulation-forecast-context.v1' or raw.get('forecast_mode')!='declared_forecast':

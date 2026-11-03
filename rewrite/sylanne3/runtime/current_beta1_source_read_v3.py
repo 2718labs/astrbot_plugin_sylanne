@@ -10,10 +10,23 @@ D07_SIMULATION_SOURCE_WORK_KIND_V3="current_d07_simulation_source_read_v3"
 D07_DISPATCH_WORK_KIND_V3="current_d07_dispatch_read_v3"
 HABIT_SOURCE_WORK_KIND_V3="current_habit_source_read_v3"
 CONDITIONED_SELF_WORK_KIND_V3="current_conditioned_self_source_read_v3"
-BETA1_SOURCE_WORK_KINDS_V3=frozenset({WORLD_SOURCE_WORK_KIND_V3,D07_SOURCE_WORK_KIND_V3,D07_SIMULATION_SOURCE_WORK_KIND_V3,CONDITIONED_SELF_WORK_KIND_V3,HABIT_SOURCE_WORK_KIND_V3})
+CHARACTER_LABOR_SOURCE_WORK_KIND_V1="current_character_labor_source_read_v1"
+BETA1_SOURCE_WORK_KINDS_V3=frozenset({WORLD_SOURCE_WORK_KIND_V3,D07_SOURCE_WORK_KIND_V3,D07_SIMULATION_SOURCE_WORK_KIND_V3,CONDITIONED_SELF_WORK_KIND_V3,HABIT_SOURCE_WORK_KIND_V3,CHARACTER_LABOR_SOURCE_WORK_KIND_V1})
 _WORLD_WORKS=WeakKeyDictionary()
+from .current_commitment_input_source_v3 import OPERATIONS as COMMITMENT_INPUT_OPERATIONS_V3
+from .current_relationship_source_read_v3 import OPERATIONS as RELATIONSHIP_SOURCE_OPERATIONS_V3
+
+def _retention_source_operation_v1(operation_kind):
+    from .d06_retention_v1 import OPERATIONS
+    return operation_kind in OPERATIONS
+
 
 def beta1_source_operation_v3(operation_kind):
+    if _retention_source_operation_v1(operation_kind):return True
+    from .d02_character_labor_read_v1 import OPERATIONS as CHARACTER_LABOR_OPERATIONS
+    if operation_kind in CHARACTER_LABOR_OPERATIONS:return True
+    if operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:return True
+    if operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:return True
     if operation_kind=='input:freeze_joint_window_node_command_v1':return True
     if operation_kind=='read_beta1_owner_state_v1':return True
     from .current_habit_source_read_v3 import habit_source_operation_types_v3
@@ -24,6 +37,8 @@ def beta1_source_operation_v3(operation_kind):
     return operation_kind in WORLD_OPERATIONS or operation_kind in {"serve_concern","run_simulation"}
 
 def beta1_source_work_kind_v3(operation_kind):
+    from .d02_character_labor_read_v1 import OPERATIONS as CHARACTER_LABOR_OPERATIONS
+    if operation_kind in CHARACTER_LABOR_OPERATIONS:return CHARACTER_LABOR_SOURCE_WORK_KIND_V1
     from .current_habit_source_read_v3 import habit_source_operation_types_v3
     if operation_kind in habit_source_operation_types_v3() and operation_kind not in {'prepare_life','prepare_source_note_body'}:return HABIT_SOURCE_WORK_KIND_V3
     from .current_conditioned_self_read_v3 import conditioned_operation_types_v3
@@ -33,7 +48,25 @@ def beta1_source_work_kind_v3(operation_kind):
     if operation_kind=="run_simulation":return D07_SIMULATION_SOURCE_WORK_KIND_V3
     return D07_SOURCE_WORK_KIND_V3 if operation_kind=="serve_concern"else WORLD_SOURCE_WORK_KIND_V3
 
+def _character_labor_adoption_reader_v1(reader):
+    from .current_character_labor_adoption_v1 import CharacterLaborAdoptionReadV1
+    return type(reader)is CharacterLaborAdoptionReadV1
+
+
+def _character_labor_source_operation_v1(operation_kind):
+    from .d02_character_labor_read_v1 import OPERATIONS
+    return operation_kind in OPERATIONS
+
+
+def _character_labor_source_reader_v1(reader):
+    from .d02_character_labor_read_v1 import is_character_labor_prepare_profile_v1
+    return _character_labor_source_operation_v1(reader.operation_kind) or is_character_labor_prepare_profile_v1(reader)
+
+
 def _identity_v3(reader):
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import character_labor_adoption_source_identity_v1
+        return character_labor_adoption_source_identity_v1(reader)
     return(reader.graph,reader.runtime,reader.work,reader.operation,reader.fence,reader.fence.scope,
         reader.authority,reader.lease,reader.session_proof,reader.operation_kind,reader.request,
         reader.request_digest,reader.operation_id,reader.activity_id,reader.audience_ref,
@@ -42,6 +75,14 @@ def _identity_v3(reader):
         getattr(reader,"d07_dispatch_pin_v3",None))
 
 def register_current_beta1_source_work_v3(reader,work):
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import require_actual_character_labor_adoption_reader_v1
+        require_actual_character_labor_adoption_reader_v1(reader)
+        if reader.work is not work or reader in _WORLD_WORKS:
+            raise AuthorityUnavailable('Host labor Source registers only its actual once-issued WRITE Work')
+        work._require_invocation(reader.graph,initial=True)
+        _WORLD_WORKS[reader]=_identity_v3(reader)
+        return work
     if reader.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import register_owner_state_reader_v3
         register_owner_state_reader_v3(reader,work)
@@ -55,7 +96,7 @@ def register_current_beta1_source_work_v3(reader,work):
     from .domain_production_registry_v1 import installed_operation_v1
     installed=installed_operation_v1(reader.operation_kind)
     if(type(reader)is not _MethodLearningReadV3 or reader not in _READERS
-            or type(work)is not GraphStorageWorkV3 or not beta1_source_operation_v3(reader.operation_kind)
+            or type(work)is not GraphStorageWorkV3 or not beta1_source_reader_operation_v3(reader)
             or work.kind!=beta1_source_reader_work_kind_v3(reader)or reader.work is not work
             or work.state is not reader or work.operation is not reader.operation
             or work.coordinator is not reader.graph or work.operation_id!=reader.operation_id
@@ -68,10 +109,26 @@ def register_current_beta1_source_work_v3(reader,work):
         raise AuthorityUnavailable("World Source Work requires its exact installed originating Owner command")
     work._require_invocation(reader.graph,initial=True)
     reader.graph._authorize(reader.lease,reader.authority,beta1_source_reader_required_domains_v3(reader),owner_read=True)
+    from .d02_character_labor_read_v1 import is_character_labor_prepare_profile_v1,bind_character_labor_prepare_work_v1
+    character_prepare=is_character_labor_prepare_profile_v1(reader)
+    if character_prepare:bind_character_labor_prepare_work_v1(reader,work)
     _WORLD_WORKS[reader]=_identity_v3(reader)
-    if getattr(reader,"d07_dispatch_classify_v3",False):
+    if character_prepare:pass
+    elif getattr(reader,"d07_dispatch_classify_v3",False):
         from .d07_source_dispatch_read_v3 import register_d07_dispatch_read_v3
         register_d07_dispatch_read_v3(reader)
+    elif _character_labor_source_operation_v1(reader.operation_kind):
+        from .d02_character_labor_read_v1 import register_character_labor_source_v1
+        register_character_labor_source_v1(reader)
+    elif _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import register_current_retention_source_v1
+        register_current_retention_source_v1(reader)
+    elif reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import register_relationship_source_v3
+        register_relationship_source_v3(reader)
+    elif reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import register_commitment_input_source_v3
+        register_commitment_input_source_v3(reader)
     elif reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import register_frozen_joint_source_v3
         register_frozen_joint_source_v3(reader)
@@ -87,6 +144,12 @@ def register_current_beta1_source_work_v3(reader,work):
     return work
 
 def require_current_beta1_source_work_identity_v3(reader):
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import require_actual_character_labor_adoption_reader_v1
+        require_actual_character_labor_adoption_reader_v1(reader)
+        if _WORLD_WORKS.get(reader)!=_identity_v3(reader):
+            raise AuthorityUnavailable('Host labor Source lost its actual private Work/WRITE binding')
+        return reader
     from .current_method_learning_read_v3 import _MethodLearningReadV3,_READERS
     if(type(reader)is not _MethodLearningReadV3 or reader not in _READERS
             or _WORLD_WORKS.get(reader)!=_identity_v3(reader)or reader.operation.closed
@@ -106,6 +169,7 @@ def require_current_beta1_source_work_identity_v3(reader):
 def require_current_beta1_source_work_v3(reader):
     r=require_current_beta1_source_work_identity_v3(reader)
     r.work._require_invocation(r.graph)
+    if _character_labor_adoption_reader_v1(r):return r
     import time
     deadline=r.operation.deadline_utc if r.selected_envelope is None else min(r.operation.deadline_utc,r.selected_envelope.deadline_utc)
     if time.monotonic()>=r.initial_monotonic_deadline-(r.operation.deadline_utc-deadline):
@@ -122,7 +186,9 @@ def prepare_current_beta1_owner_entry_v3(reader):
     r=require_current_beta1_source_work_v3(reader)
     if r.general_owner_entry is None:
         from ..authority_service.owner_location_read_v3 import prepare_current_host_method_owner_read_entry_v3
-        r.general_owner_entry=prepare_current_host_method_owner_read_entry_v3(r)
+        if r.general_owner_task is None:r.general_owner_task=prepare_current_host_method_owner_read_entry_v3(r)
+        if not r.general_owner_task.advance():return False
+        r.general_owner_entry=r.general_owner_task.take_result_v3();r.general_owner_task=None
     r.general_owner_entry.require_permission_v3(r)
     with r.store._lock:r.general_owner_entry.require_for_v3(r)
     if getattr(r,"d07_dispatch_classify_v3",False):
@@ -131,6 +197,18 @@ def prepare_current_beta1_owner_entry_v3(reader):
     elif r.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import pin_owner_state_owner_v3
         pin_owner_state_owner_v3(r)
+    elif _character_labor_source_reader_v1(r):
+        from .d02_character_labor_read_v1 import pin_character_labor_owner_v1
+        pin_character_labor_owner_v1(r)
+    elif _retention_source_operation_v1(r.operation_kind):
+        from .d06_retention_v1 import pin_current_retention_owner_v1
+        pin_current_retention_owner_v1(r)
+    elif r.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import pin_relationship_owner_v3
+        pin_relationship_owner_v3(r)
+    elif r.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import pin_commitment_input_owner_v3
+        pin_commitment_input_owner_v3(r)
     elif r.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import pin_frozen_joint_owner_v3
         pin_frozen_joint_owner_v3(r)
@@ -163,8 +241,11 @@ def release_current_beta1_source_work_v3(reader):
             _METADATA_TASKS.pop(task,None)
     cap=_SOURCE_GROUPS.pop(reader,None)
     if cap is not None:_WORLD_SOURCE_CAPS.pop(cap,None)
+    from .source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+    release_inspection_metadata_owner_v3(reader)
     _SOURCE_TASKS.pop(reader,None);_SOURCE_PENDING.pop(reader,None)
-    _SOURCE_RESERVATIONS.pop(reader,None);_RECHECK_PEAKS.pop(reader,None)
+    _RECHECK_PEAKS.pop(reader,None)
+    if _character_labor_adoption_reader_v1(reader):return
     if reader.work.kind==HABIT_SOURCE_WORK_KIND_V3:
         from .current_habit_source_read_v3 import release_habit_source_work_v3
         release_habit_source_work_v3(reader)
@@ -177,6 +258,18 @@ def release_current_beta1_source_work_v3(reader):
     elif reader.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import release_owner_state_reader_v3
         release_owner_state_reader_v3(reader)
+    elif _character_labor_source_operation_v1(reader.operation_kind) or reader.operation_kind=='prepare_life':
+        from .d02_character_labor_read_v1 import release_character_labor_source_v1
+        release_character_labor_source_v1(reader)
+    elif _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import release_current_retention_v1
+        release_current_retention_v1(reader)
+    elif reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import release_relationship_source_v3
+        release_relationship_source_v3(reader)
+    elif reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import release_commitment_input_source_v3
+        release_commitment_input_source_v3(reader)
     elif reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import release_frozen_joint_source_v3
         release_frozen_joint_source_v3(reader)
@@ -195,6 +288,14 @@ def release_current_beta1_source_work_v3(reader):
         reader.general_owner_entry.release_v3();reader.general_owner_entry=None
 
 def require_beta1_source_terminal_value_v3(value,work):
+    from .d02_character_labor_read_v1 import (
+        is_character_labor_rebuild_selector_v1,is_character_labor_rebuild_options_v1)
+    if is_character_labor_rebuild_options_v1(work.state):
+        from .d02_character_labor_rebuild_v1 import require_character_labor_rebuild_options_terminal_v1
+        return require_character_labor_rebuild_options_terminal_v1(value,work)
+    if is_character_labor_rebuild_selector_v1(work.state):
+        from .d02_character_labor_rebuild_v1 import require_character_labor_rebuild_selection_terminal_v1
+        return require_character_labor_rebuild_selection_terminal_v1(value,work)
     from .named_joint_source_work_v3 import named_joint_host_reader_v3,require_named_joint_terminal_v3
     if named_joint_host_reader_v3(work.state):return require_named_joint_terminal_v3(value,work)
     if getattr(work.state,'operation_kind',None)=='read_beta1_owner_state_v1':
@@ -207,7 +308,8 @@ def require_beta1_source_terminal_value_v3(value,work):
         from .current_conditioned_self_read_v3 import require_conditioned_source_terminal_value_v3
         return require_conditioned_source_terminal_value_v3(value,work)
     from .current_method_learning_read_v3 import PreparedMethodDomainInputsV3
-    if(type(value)is not PreparedMethodDomainInputsV3 or work.kind not in BETA1_SOURCE_WORK_KINDS_V3
+    if(type(value)is not PreparedMethodDomainInputsV3 or (work.kind not in BETA1_SOURCE_WORK_KINDS_V3
+            and not _character_labor_source_reader_v1(work.state))
             or value.owner is not work.state):
         raise AuthorityUnavailable("World Source Work returned an unissued terminal value")
     return value.require_business_result_v3(work)
@@ -218,7 +320,6 @@ from ..runtime_storage_v3 import runtime_storage_quantum_v3
 from .dispatch_current_inventory_v3 import _heap
 _SOURCE_ISSUER=object()
 _SOURCE_TASKS=WeakKeyDictionary()
-_SOURCE_RESERVATIONS=WeakKeyDictionary()
 _SOURCE_PENDING=WeakKeyDictionary()
 _SOURCE_GROUPS=WeakKeyDictionary()
 _WORLD_SOURCE_CAPS=WeakKeyDictionary()
@@ -258,7 +359,10 @@ def _source_caps_v3(reader):
 
 def _source_groups_v3(reader,roots):
     r=require_current_beta1_source_work_v3(reader)
-    if r.work.kind==HABIT_SOURCE_WORK_KIND_V3:
+    if _character_labor_adoption_reader_v1(r):
+        from .current_character_labor_adoption_v1 import character_labor_adoption_source_groups_v1
+        groups=character_labor_adoption_source_groups_v1(r,roots)
+    elif r.work.kind==HABIT_SOURCE_WORK_KIND_V3:
         from .current_habit_source_read_v3 import habit_source_groups_v3
         groups=habit_source_groups_v3(r,roots)
     elif r.work.kind==CONDITIONED_SELF_WORK_KIND_V3:
@@ -267,6 +371,18 @@ def _source_groups_v3(reader,roots):
     elif r.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import owner_state_source_groups_v3
         groups=owner_state_source_groups_v3(r,roots)
+    elif _character_labor_source_reader_v1(r):
+        from .d02_character_labor_read_v1 import character_labor_source_groups_v1
+        groups=character_labor_source_groups_v1(r,roots)
+    elif _retention_source_operation_v1(r.operation_kind):
+        from .d06_retention_v1 import retention_source_groups_v1
+        groups=retention_source_groups_v1(r,roots)
+    elif r.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import relationship_source_groups_v3
+        groups=relationship_source_groups_v3(r,roots)
+    elif r.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import commitment_input_source_groups_v3
+        groups=commitment_input_source_groups_v3(r,roots)
     elif r.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import frozen_joint_source_groups_v3
         groups=frozen_joint_source_groups_v3(r,roots)
@@ -279,6 +395,9 @@ def _source_groups_v3(reader,roots):
     else:
         from .world_owner_read_v3 import world_source_groups_v3
         groups=world_source_groups_v3(r,roots)
+    if r.operation_kind in {'input:create_commitment','input:create_commitment_with_fulfillment_terms','input:register_commitment_terms_communication','acknowledge_commitment_terms','settle_current_commitment_fulfillment'}:
+        if r.general_owner_entry is None:raise AuthorityUnavailable('actual Owner EOF required before Commitment Source groups')
+        r.general_owner_entry.require_source_groups_v3(r,groups)
     union=tuple(sorted({ref for purpose,audiences,refs in groups for ref in refs}))
     if (r.selected_plan is None or union!=tuple(sorted(set(r.selected_plan.source_roots)))
             or union!=tuple(sorted(set(roots)))or any(not audiences or not set(audiences)<=set(r.owner_binding.audiences)
@@ -314,16 +433,17 @@ def require_beta1_source_control_point_v3(reader,request):
     return True
 
 class _Beta1SourcePermissionV3:
-    def __init__(self,issuer,reader,groups,records,versions):
+    def __init__(self,issuer,reader,groups,records,versions,qualified_members):
         if issuer is not _SOURCE_ISSUER:raise AuthorityUnavailable("actual Beta1 Source completion issuer required")
         self.reader,self.groups,self.records,self.versions=reader,groups,records,versions
         self.source_refs=tuple(sorted(records))
+        self.qualified_members=frozenset(qualified_members)
         self.owner_entry=reader.general_owner_entry
-        _source_caps_v3(reader)[self]=(_identity_v3(reader),groups,self.source_refs,versions,self.owner_entry,reader.owner_binding)
+        _source_caps_v3(reader)[self]=(_identity_v3(reader),groups,self.source_refs,versions,self.owner_entry,reader.owner_binding,self.qualified_members)
     def require_for_v3(self,reader):
         r=require_current_beta1_source_work_v3(reader)
         if (_source_caps_v3(r).get(self)!=(_identity_v3(r),self.groups,self.source_refs,self.versions,
-                r.general_owner_entry,r.owner_binding)or _SOURCE_GROUPS.get(r)is not self
+                r.general_owner_entry,r.owner_binding,self.qualified_members)or _SOURCE_GROUPS.get(r)is not self
                 or _source_groups_v3(r,r.selected_plan.source_roots)!=self.groups):
             raise AuthorityUnavailable("Beta1 Source permission crossed its own Work/profile/current Owner/metadata EOF")
         if not r.read_finished:self.owner_entry.require_for_v3(r)
@@ -350,6 +470,9 @@ def qualify_current_beta1_source_groups_v3(reader,roots):
     cap=_SOURCE_GROUPS.get(r)
     if cap is not None:return cap.require_for_v3(r)
     r.general_owner_entry.require_for_v3(r)
+    if r.operation_kind=='reevaluate_relationship':
+        from .current_relationship_source_read_v3 import prepare_relationship_correction_context_v3
+        prepare_relationship_correction_context_v3(r)
     records,versions,visited,active={}, {},set(),set()
     def visit(ref,purpose,audiences):
         group_key=(ref,purpose,audiences)
@@ -364,12 +487,21 @@ def qualify_current_beta1_source_groups_v3(reader,roots):
             _SOURCE_PENDING.setdefault(r,set()).add(ref)
             _need_method_input(r,("beta1_source_metadata",ref))
         with runtime_storage_quantum_v3(r.db)as meter:task.require_v1(r,meter)
-        access=method_graph_head_v3(r.db,r.namespace,access_key(*r.namespace.as_tuple,key.owner.subject))
-        correction=method_graph_head_v3(r.db,r.namespace,source_correction_head_key(r.namespace,key.owner.subject))
+        if _character_labor_adoption_reader_v1(r):
+            from .current_character_labor_adoption_v1 import character_labor_adoption_metadata_head_v1
+            access=character_labor_adoption_metadata_head_v1(r,access_key(*r.namespace.as_tuple,key.owner.subject))
+            correction=character_labor_adoption_metadata_head_v1(r,source_correction_head_key(r.namespace,key.owner.subject))
+        else:
+            access=method_graph_head_v3(r.db,r.namespace,access_key(*r.namespace.as_tuple,key.owner.subject))
+            correction=method_graph_head_v3(r.db,r.namespace,source_correction_head_key(r.namespace,key.owner.subject))
         record=None
         for audience in audiences:
-            record=_qualify_source_rights_values_v3(r.namespace,ref,task,access,correction,
-                audience=audience,purpose=purpose,metadata_only=True)
+            if r.operation_kind=='reevaluate_relationship'and correction.valid:
+                from .current_relationship_source_read_v3 import qualify_relationship_corrected_context_v3
+                record=qualify_relationship_corrected_context_v3(r,ref,task,access,correction,purpose=purpose,audience=audience)
+            else:
+                record=_qualify_source_rights_values_v3(r.namespace,ref,task,access,correction,
+                    audience=audience,purpose=purpose,metadata_only=True)
             if record is None:raise AuthorityUnavailable("Beta1 current Source/Access/Correction/purpose/audience denied")
         active.add(group_key)
         for parent in record.parent_source_ids:visit(source_key(*r.namespace.as_tuple,parent).token,purpose,audiences)
@@ -379,119 +511,54 @@ def qualify_current_beta1_source_groups_v3(reader,roots):
             versions[atom_key]=GraphVersion(atom_key,atom.revision)
     for purpose,audiences,refs in groups:
         for ref in refs:visit(ref,purpose,audiences)
-    r.operation.retain(_heap((groups,tuple(records),tuple(versions.values())))+1024)
-    cap=_Beta1SourcePermissionV3(_SOURCE_ISSUER,r,groups,records,tuple(sorted(versions.values(),key=lambda v:v.key.token)))
+    r.operation.retain(_heap((groups,tuple(records),tuple(versions.values()),visited))+1024)
+    cap=_Beta1SourcePermissionV3(_SOURCE_ISSUER,r,groups,records,tuple(sorted(versions.values(),key=lambda v:v.key.token)),visited)
     _SOURCE_GROUPS[r]=cap
     return cap.require_for_v3(r)
 
-def _beta1_source_heap_v3(reader,extra=0):
-    from .dispatch_current_inventory_v3 import _heap
-    require_current_beta1_source_work_v3(reader)
-    tasks=_SOURCE_TASKS.get(reader,{})
-    size=_heap(tuple((t.header,t.fragment,t.metadata) for t in tasks.values()))+extra+65536
-    for task in tasks.values():
-        if task.parser is not None:
-            parser=task.parser
-            size+=parser._source_heap_bytes()+_heap((parser._stack,parser._string,parser._literal,parser._number,parser._active_scalar))
-    reserved=_SOURCE_RESERVATIONS.get(reader,0)
-    if size>reserved:
-        reader.operation.retain(size-reserved);_SOURCE_RESERVATIONS[reader]=size
-    return size
-
-
-def _new_beta1_source_parser_v3(reader,*,ensure_ascii):
-    from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
-    from weakref import ref
-    owner=ref(reader)
-    class _WorldSourceParser(C09MemorySourceJSONStreamV3):
-        def _source_require_arena(self,extra=0):
-            _beta1_source_heap_v3(owner(),extra)
-            return super()._source_require_arena(extra)
-    return _WorldSourceParser(ensure_ascii=ensure_ascii)
+def require_beta1_source_member_v3(reader,ref,purpose,audiences):
+    """Consume only membership qualified by this Work's original Source walker."""
+    r=require_current_beta1_source_work_v3(reader)
+    cap=_SOURCE_GROUPS.get(r)
+    if cap is None:raise AuthorityUnavailable("Source member requires actual complete Source ALL")
+    cap.require_for_v3(r)
+    if (ref,purpose,tuple(audiences))not in cap.qualified_members:
+        raise AuthorityUnavailable("selected provenance is outside the qualified purpose/audience ancestor closure")
+    return cap.records[ref]
 
 
 class _Beta1SourceMetadataEOFV3:
+    """Independent inspection EOF; this leaf never opens Source text."""
     def __init__(self,issuer,reader,ref):
         if issuer is not _SOURCE_ISSUER:raise TypeError("actual World Source metadata leaf issuer required")
         require_current_beta1_source_work_v3(reader)
         from weakref import ref as weak_ref
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
         self.reader=weak_ref(reader);self.key=AtomKey.from_token(ref)
         if self.key.type_name!="memory.source"or NamespaceId.from_key(self.key)!=reader.namespace:
             raise ValueError("World Source metadata leaf crossed actual Source namespace")
-        self.header=None;self.cell=None;self.parser=None;self.fragment=b"";self.offset=0;self.total=None
-        self.phase="header";self.metadata=None;self.sha256=None;self.complete=False
+        self.inspection=InspectionMetadataReadV3(reader,self.key)
+        self.header=self.metadata=self.sha256=None
+        self.complete=False
 
     def advance(self,meter):
-        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3,begin_runtime_cell_read_v3
-        from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2,legacy_cell_read_transaction_v2
         reader=self.reader();reader.require_current(meter=meter)
         if self.complete:self.require_v1(reader,meter);return True
-        if self.header is not None:
-            current=_beta1_metadata_row_v3(reader,meter,"graph_atoms",("revision","valid","value_cell_id"),
-                "token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple))
-            if current!=self.header:raise AuthorityUnavailable("World Source physical head changed")
-        if self.phase=="header":
-            self.header=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",
-                ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",
-                (self.key.token,*reader.namespace.as_tuple))
-            if self.header is None or self.header[0]<1 or self.header[1]!=1:
-                raise ValueError("World Source metadata lost its actual positive current head")
-            self.cell=begin_runtime_cell_read_v3(reader.db,self.header[2],erasure_owner_ref=self.key.token)if self.header[2]is not None else None
-            codec=None if self.cell is None else self.cell.header[0]
-            if codec not in(None,"canonical-json.ascii.v1","canonical-json.utf8.v1"):
-                raise ValueError("World Source metadata has another actual cell codec")
-            self.parser=_new_beta1_source_parser_v3(reader,ensure_ascii=codec!="canonical-json.utf8.v1")
-            self.phase="source";return False
-        if self.fragment:
-            part=self.fragment[:1024]
-            _beta1_source_heap_v3(reader,len(part)*4+65536)
-            self.parser.feed(part,lambda event:None)
-            self.fragment=self.fragment[len(part):]
-            return False
-        if self.cell is not None:chunk=self.cell.read_fragment(meter=meter)
-        else:
-            with legacy_cell_read_transaction_v2(reader.db):
-                if self.total is None:
-                    meter.require_available(1024)
-                    row=reader.db.execute("SELECT typeof(value),length(CAST(value AS BLOB)) FROM graph_atoms "
-                        "WHERE token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple)).fetchone()
-                    meter.charge_read(16)
-                    if row is None or row[0]!="text":raise ValueError("World Source original byte length/kind disappeared")
-                    self.total=row[1]
-                if self.offset<self.total:
-                    chunk,total,kind=read_legacy_sql_cell_fragment_v2(reader.db,table="graph_atoms",column="value",
-                        where="token=? AND bot=? AND persona=?",parameters=(self.key.token,*reader.namespace.as_tuple),
-                        start=self.offset,length=min(16384,self.total-self.offset),meter=meter)
-                    if(total,kind)!=(self.total,"text"):raise ValueError("World Source original byte count/kind changed")
-                    self.offset+=len(chunk)
-                else:chunk=None
-        if chunk is not None:
-            _beta1_source_heap_v3(reader,len(chunk)+65536);self.fragment=chunk;return False
-        result=self.parser.finish()
-        if self.cell is not None:
-            if(result.sha256,result.byte_count)!=(self.cell.finish(meter=meter),self.cell.header[3]):
-                raise ValueError("World Source actual raw EOF/cell digest differs")
-        elif result.byte_count!=self.total:raise ValueError("World Source legacy original EOF differs")
-        _beta1_source_heap_v3(reader,_heap(self.parser._source_metadata))
-        metadata=dict(self.parser._source_metadata)
-        for name in("audiences","purposes","parent_source_ids"):metadata[name]=tuple(metadata[name])
-        if metadata["source_id"]!=self.key.owner.subject:
-            raise ValueError("World Source metadata identity differs from actual key")
-        _beta1_source_heap_v3(reader,_heap(metadata))
-        self.metadata=MappingProxyType(metadata);self.sha256=result.sha256;self.complete=True
-        self.parser=None;self.cell=None;self.fragment=b""
+        self.inspection.advance(meter)
+        if not self.inspection.complete:return False
+        original=self.inspection.result.require_v3(reader,meter)
+        self.header=(original.revision,int(original.valid),original.cell_id)
+        self.metadata=original.metadata
+        self.sha256=original.semantic_digest
+        self.complete=True
         return True
 
     def require_v1(self,reader,meter):
-        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
         if self.reader()is not reader or _SOURCE_TASKS.get(reader,{}).get(self.key.token)is not self or not self.complete:
             raise ValueError("World Source metadata is not this actual Work's complete original leaf")
         reader.require_current(meter=meter)
-        current=_beta1_metadata_row_v3(reader,meter,"graph_atoms",
-            ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple))
-        if current!=self.header:raise ValueError("World Source metadata changed its physical head after actual EOF")
+        self.inspection.result.require_v3(reader,meter)
         return self
-
 
     @property
     def revision(self):return self.header[0]
@@ -505,6 +572,15 @@ _METADATA_COLUMNS=WeakKeyDictionary()
 _METADATA_ISSUER=object()
 
 def _metadata_profile_v3(reader,identity):
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import character_labor_adoption_metadata_spec_v1
+        return character_labor_adoption_metadata_spec_v1(reader,identity)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import character_labor_metadata_spec_v1
+        return character_labor_metadata_spec_v1(reader,identity)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import relationship_metadata_spec_v3
+        return relationship_metadata_spec_v3(reader,identity)
     if reader.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import owner_state_metadata_spec_v3
         return owner_state_metadata_spec_v3(reader,identity)
@@ -589,7 +665,16 @@ class _Beta1MetadataTaskV3:
             expected=self.metadata[self.header_columns.index(digest_name)]
             if self.column.canonical_digest!=expected:
                 raise AuthorityUnavailable("Beta1 signed locator whole original digest differs")
-        if r.operation_kind=='read_beta1_owner_state_v1':
+        if _character_labor_adoption_reader_v1(r):
+            from .current_character_labor_adoption_v1 import finish_character_labor_adoption_metadata_v1
+            self.result=finish_character_labor_adoption_metadata_v1(self,value)
+        elif _character_labor_source_reader_v1(r):
+            from .d02_character_labor_read_v1 import finish_character_labor_metadata_v1
+            self.result=finish_character_labor_metadata_v1(self,value)
+        elif r.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+            from .current_relationship_source_read_v3 import finish_relationship_metadata_v3
+            self.result=finish_relationship_metadata_v3(self,value)
+        elif r.operation_kind=='read_beta1_owner_state_v1':
             from .beta1_owner_state_read_v3 import finish_owner_state_metadata_v3
             self.result=finish_owner_state_metadata_v3(self,value)
         elif r.work.kind==HABIT_SOURCE_WORK_KIND_V3:
@@ -640,6 +725,8 @@ def _Beta1MetadataColumnV3(task,*,cell,signer,signature):
     if cell is not None and cell.header[0]=="canonical-json.utf8.v1":
         import codecs,hashlib
         column.semantic_decoder=codecs.getincrementaldecoder("utf8")("strict");column.semantic_hash=hashlib.sha256()
+    from .persona_growth_review_owner_read_v1 import growth_owner_receipt_parser_v1
+    growth_owner_receipt_parser_v1(column, ensure_ascii=cell is None or cell.header[0]!="canonical-json.utf8.v1")
     return column
 
 def retain_beta1_metadata_path_v3(column,path):
@@ -648,6 +735,15 @@ def retain_beta1_metadata_path_v3(column,path):
     if(_METADATA_COLUMNS.get(column)!=(task,task.reader,task.reader.work,task.reader.operation,task.spec)
             or task.column is not column):
         raise AuthorityUnavailable("Beta1 metadata path has no actual private column/task")
+    if _character_labor_adoption_reader_v1(task.reader):
+        from .current_character_labor_adoption_v1 import retain_character_labor_adoption_metadata_path_v1
+        return retain_character_labor_adoption_metadata_path_v1(task,path)
+    if _character_labor_source_reader_v1(task.reader):
+        from .d02_character_labor_read_v1 import retain_character_labor_metadata_path_v1
+        return retain_character_labor_metadata_path_v1(task,path)
+    if task.reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import retain_relationship_metadata_path_v3
+        return retain_relationship_metadata_path_v3(task,path)
     if task.reader.work.kind==HABIT_SOURCE_WORK_KIND_V3:
         from .current_habit_source_read_v3 import retain_habit_metadata_path_v3
         return retain_habit_metadata_path_v3(task,path)
@@ -672,7 +768,9 @@ def advance_beta1_metadata_column_v3(c,meter):
     if c.complete:return True
     if c.fragment_offset<len(c.fragment):
         end=min(c.fragment_offset+1024,len(c.fragment));chunk=c.fragment[c.fragment_offset:end]
-        c._reserve_v3(131072);c.parser.feed(chunk,c._emit_v3)
+        c._reserve_v3(131072)
+        from .persona_growth_review_owner_read_v1 import growth_owner_metadata_emit_v1
+        c.parser.feed(chunk,lambda event: growth_owner_metadata_emit_v1(c,event))
         if c.semantic_decoder is not None:
             from ..authority_service.d07_authority_model_source_read_v3 import _D07AuthorityGraphMetadataColumnV3
             _D07AuthorityGraphMetadataColumnV3._semantic_v3(c,chunk,meter)
@@ -775,6 +873,19 @@ def finish_current_beta1_source_work_v3(graph,work,error):
     return finish_current_method_learning_read_v3(graph,work,error)
 
 def beta1_source_required_domains_v3(operation_kind):
+    if _retention_source_operation_v1(operation_kind):
+        from .d06_retention_v1 import retention_required_domains_v1
+        return retention_required_domains_v1()
+    if _character_labor_source_operation_v1(operation_kind):
+        from .d02_character_labor_read_v1 import required_character_labor_domains_v1
+        return required_character_labor_domains_v1()
+    if operation_kind in {'input:create_aspiration','cancel_action'}:return frozenset({'d01','d06','d08','d11'})
+    if operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import required_domains_v3
+        return required_domains_v3(operation_kind)
+    if operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import DOMAINS,LIFECYCLE_OPERATIONS
+        return DOMAINS|{'d07'}if operation_kind in LIFECYCLE_OPERATIONS else DOMAINS
     if operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import DOMAINS
         return DOMAINS
@@ -794,6 +905,21 @@ def beta1_source_required_domains_v3(operation_kind):
     raise AuthorityUnavailable("unregistered independent Source command domains")
 
 def require_beta1_source_body_v3(reader,table,key):
+    if _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import require_current_retention_body_v1
+        return require_current_retention_body_v1(reader,table,key)
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import require_character_labor_adoption_body_v1
+        return require_character_labor_adoption_body_v1(reader,table,key)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import require_character_labor_body_v1
+        return require_character_labor_body_v1(reader,table,key)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import require_relationship_body_v3
+        return require_relationship_body_v3(reader,table,key)
+    if reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import require_commitment_input_body_v3
+        return require_commitment_input_body_v3(reader,table,key)
     if reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import require_frozen_joint_body_v3
         return require_frozen_joint_body_v3(reader,table,key)
@@ -820,6 +946,21 @@ def require_beta1_source_body_v3(reader,table,key):
     return require_world_body_v3(reader,table,key)
 
 def require_beta1_source_point_v3(reader,request):
+    if _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import require_current_retention_point_v1
+        return require_current_retention_point_v1(reader,request)
+    if _character_labor_adoption_reader_v1(reader):
+        from .current_character_labor_adoption_v1 import require_character_labor_adoption_point_v1
+        return require_character_labor_adoption_point_v1(reader,request)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import require_character_labor_point_v1
+        return require_character_labor_point_v1(reader,request)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import require_relationship_point_v3
+        return require_relationship_point_v3(reader,request)
+    if reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import require_commitment_input_point_v3
+        return require_commitment_input_point_v3(reader,request)
     if reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import require_frozen_joint_point_v3
         return require_frozen_joint_point_v3(reader,request)
@@ -842,6 +983,24 @@ def require_beta1_source_point_v3(reader,request):
     return require_world_point_v3(reader,request)
 
 def require_beta1_source_groups_v3(reader,roots):
+    if _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import require_current_retention_sources_v1
+        return require_current_retention_sources_v1(reader,roots)
+    if _character_labor_adoption_reader_v1(reader):
+        r=require_current_beta1_source_work_v3(reader)
+        cap=_SOURCE_GROUPS.get(r)
+        if cap is None or _source_groups_v3(r,roots)!=cap.groups:
+            raise AuthorityUnavailable('Host labor Sources require its actual completed all-group permission')
+        return cap.require_for_v3(r)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import require_character_labor_sources_v1
+        return require_character_labor_sources_v1(reader,roots)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import require_relationship_sources_v3
+        return require_relationship_sources_v3(reader,roots)
+    if reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import require_commitment_input_sources_v3
+        return require_commitment_input_sources_v3(reader,roots)
     if reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import require_frozen_joint_sources_v3
         return require_frozen_joint_sources_v3(reader,roots)
@@ -861,6 +1020,18 @@ def require_beta1_source_groups_v3(reader,roots):
     return require_world_sources_v3(reader,roots)
 
 def register_beta1_source_write_phase_v3(inputs,scope,current_owner):
+    if _retention_source_operation_v1(inputs.owner.operation_kind):
+        from .d06_retention_v1 import register_current_retention_write_v1
+        return register_current_retention_write_v1(inputs,scope,current_owner)
+    if _character_labor_source_reader_v1(inputs.owner):
+        from .d02_character_labor_read_v1 import register_character_labor_write_v1
+        return register_character_labor_write_v1(inputs,scope,current_owner)
+    if inputs.owner.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import register_relationship_write_v3
+        return register_relationship_write_v3(inputs,scope,current_owner)
+    if inputs.owner.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import register_commitment_input_write_v3
+        return register_commitment_input_write_v3(inputs,scope,current_owner)
     if inputs.owner.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import register_frozen_joint_write_v3
         return register_frozen_joint_write_v3(inputs,scope,current_owner)
@@ -880,6 +1051,18 @@ def register_beta1_source_write_phase_v3(inputs,scope,current_owner):
     return register_world_write_phase_v3(inputs,scope,current_owner)
 
 def require_beta1_source_write_phase_v3(reader):
+    if _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import require_current_retention_write_v1
+        return require_current_retention_write_v1(reader)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import require_character_labor_write_v1
+        return require_character_labor_write_v1(reader)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import require_relationship_write_v3
+        return require_relationship_write_v3(reader)
+    if reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import require_commitment_input_write_v3
+        return require_commitment_input_write_v3(reader)
     if reader.operation_kind=='input:freeze_joint_window_node_command_v1':
         from .frozen_joint_command_source_v3 import require_frozen_joint_write_v3
         return require_frozen_joint_write_v3(reader)
@@ -899,6 +1082,18 @@ def require_beta1_source_write_phase_v3(reader):
     return require_world_write_phase_v3(reader)
 
 def require_beta1_source_plan_metadata_v3(reader):
+    if _retention_source_operation_v1(reader.operation_kind):
+        from .d06_retention_v1 import require_current_retention_source_v1
+        return require_current_retention_source_v1(reader)
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import require_character_labor_source_v1
+        return require_character_labor_source_v1(reader)
+    if reader.operation_kind in RELATIONSHIP_SOURCE_OPERATIONS_V3:
+        from .current_relationship_source_read_v3 import require_relationship_source_v3
+        return require_relationship_source_v3(reader)
+    if reader.operation_kind in COMMITMENT_INPUT_OPERATIONS_V3:
+        from .current_commitment_input_source_v3 import require_commitment_input_source_v3
+        return require_commitment_input_source_v3(reader)
     if reader.work.kind==HABIT_SOURCE_WORK_KIND_V3:
         from .current_habit_source_read_v3 import require_habit_source_plan_metadata_v3
         return require_habit_source_plan_metadata_v3(reader)
@@ -915,6 +1110,10 @@ def require_beta1_source_plan_metadata_v3(reader):
 
 
 def beta1_source_reader_work_kind_v3(reader):
+    from .d02_character_labor_read_v1 import is_character_labor_prepare_profile_v1
+    if is_character_labor_prepare_profile_v1(reader):
+        from .current_method_learning_read_v3 import METHOD_LEARNING_WORK_KIND_V3
+        return METHOD_LEARNING_WORK_KIND_V3
     from .current_habit_source_read_v3 import _HabitPendingSourceV3
     if type(reader.source_pending_owner)is _HabitPendingSourceV3:return HABIT_SOURCE_WORK_KIND_V3
     if getattr(reader,"d07_dispatch_classify_v3",False):
@@ -923,6 +1122,9 @@ def beta1_source_reader_work_kind_v3(reader):
     return beta1_source_work_kind_v3(reader.operation_kind)
 
 def beta1_source_reader_required_domains_v3(reader):
+    if _character_labor_source_reader_v1(reader):
+        from .d02_character_labor_read_v1 import required_character_labor_domains_v1
+        return required_character_labor_domains_v1()
     if reader.operation_kind=='read_beta1_owner_state_v1':
         from .beta1_owner_state_read_v3 import owner_state_required_domains_v3
         return owner_state_required_domains_v3(reader.request)
@@ -963,13 +1165,17 @@ def require_pending_beta1_owner_factory_v3(capsule,graph,operation,fence,authori
 
 
 def reset_current_beta1_source_permission_v3(reader):
-    if reader.work.kind!=CONDITIONED_SELF_WORK_KIND_V3:
-        raise AuthorityUnavailable('Source renewal is restricted to the actual unsealed conditioned output phase')
-    from .current_conditioned_self_read_v3 import require_conditioned_output_requalification_v3
-    state=require_conditioned_output_requalification_v3(reader)
+    if reader.operation_kind in {'adopt_relationship_revision_v2','adopt_relationship_contribution'}:
+        from .current_relationship_source_read_v3 import require_relationship_output_requalification_v3
+        state=require_relationship_output_requalification_v3(reader)
+    elif reader.work.kind==CONDITIONED_SELF_WORK_KIND_V3:
+        from .current_conditioned_self_read_v3 import require_conditioned_output_requalification_v3
+        state=require_conditioned_output_requalification_v3(reader)
+    else:raise AuthorityUnavailable('Source renewal requires its exact registered unsealed output phase')
     cap=_SOURCE_GROUPS.pop(reader,None)
-    if cap is not None:state.source_caps.pop(cap,None)
-    state.source_permission=None
+    if cap is not None:_source_caps_v3(reader).pop(cap,None)
+    if reader.operation_kind in {'adopt_relationship_revision_v2','adopt_relationship_contribution'}:state.permission=None
+    else:state.source_permission=None
 
 
 def require_pending_beta1_owner_reader_current_v3(reader,*,meter=None):
@@ -979,3 +1185,13 @@ def require_pending_beta1_owner_reader_current_v3(reader,*,meter=None):
     if type(reader.source_pending_owner)is _ConditionedPendingOwnerV3:
         return require_conditioned_pending_current_v3(reader,meter=meter)
     raise AuthorityUnavailable('pending Owner control requires its exact privately issued Source reader')
+
+
+def beta1_source_reader_operation_v3(reader):
+    """Classified ordinary concern has its distinct actual Method Source Work."""
+    from .d02_character_labor_read_v1 import is_character_labor_prepare_profile_v1
+    if is_character_labor_prepare_profile_v1(reader):return True
+    if reader.operation_kind=='serve_concern':
+        from .current_method_learning_read_v3 import is_ordinary_continuity_method_v1,is_single_event_review_method_v1
+        if is_ordinary_continuity_method_v1(reader) or is_single_event_review_method_v1(reader):return False
+    return beta1_source_operation_v3(reader.operation_kind)

@@ -10,10 +10,10 @@ from test_natural_final_graph_stage_v2 import (  # noqa: E402
 
 from sylanne3.host.natural_reply_dispatch_driver import _read_original
 from sylanne3.host.installed_natural_reply_driver import (
-    InstalledNaturalGenerationProgressV2,
+    InstalledNaturalGenerationProgressV3,
 )
 from sylanne3.host.installed_natural_review_driver import (
-    InstalledNaturalReviewProgressV2,
+    InstalledNaturalReviewProgressV3,
 )
 from sylanne3.runtime.natural_reply_job_v2 import SavedNaturalPreparationV2
 
@@ -51,12 +51,10 @@ def test_real_paid_stage_terminals_support_content_free_host_recovery(
             authority, lease, parent, installed)
         review_output = graph.read_natural_review_terminal_receipt_v2(
             authority, lease, parent, installed)
-        recovered_generation = InstalledNaturalGenerationProgressV2(
-            None, None, None, None, None, generation_output, None,
-            "review_content_hold")
-        recovered_review = InstalledNaturalReviewProgressV2(
-            None, None, None, None, None, review_output, None,
-            "paid_review_current_hold")
+        recovered_generation = InstalledNaturalGenerationProgressV3(
+            generation_output, "review_content_hold")
+        recovered_review = InstalledNaturalReviewProgressV3(
+            review_output, "paid_review_current_hold")
         assert recovered_generation.output.output_digest == (
             generation.terminal_output_digest)
         assert recovered_review.output.output_digest == (

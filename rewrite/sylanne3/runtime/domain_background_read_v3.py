@@ -113,7 +113,11 @@ _D07_LOCATOR_FIELDS=frozenset({'schema','namespace','job_id','operation_id','wor
     'reflection_request_ref','reflection_request_digest','reflection_continuation_ref','reflection_continuation_digest',
     'checkpoint_ref','checkpoint_digest','ticket_id','source_refs','parent_budget_lease_ref','parent_grant_digest',
     'original_deadline_utc','cycle_ref','cycle_digest','call_plan_digest','c02_operation_id','cancel_generation',
-    'execution_id','semantic_question_ref','semantic_question_digest','observation_basis_ref','observation_basis_digest'})
+    'execution_id','semantic_question_ref','semantic_question_digest','observation_basis_ref','observation_basis_digest',
+    'review_attention_ref','review_attention_digest','review_case_original','policy_original','adoption_original',
+    'adoption_version','original_parent_budget_lease_ref','original_parent_grant_digest','review_not_before_utc',
+    'review_due_utc','readout_valid_until_utc','causal_original','causal_operation_id','causal_receipt_digest',
+    'causal_depth','depth_basis','context_source_refs','consolidation_source_refs','case_source_versions','case_control_heads'})
 
 _FOLLOWUP_TYPES=MappingProxyType({
     'd01':('d01.persona_activation.v1','d01.persona_plan.v1','d07.current_interpretation.v1'),
@@ -124,6 +128,12 @@ _FOLLOWUP_TYPES=MappingProxyType({
         'd10.life_project.v1','d10.activity_recipe.v1','d03.account_binding','d03.entity_anchor','d05.boundary_rule'),
     'd06':(), 'd07':('d07.concern_round.v1','d07.reflection_checkpoint.v1','d07.attention_ticket.v1'),
 })
+from .persona_growth_review_contract_v1 import TARGET_TYPES_V1, REVIEW_TYPES_V1
+_FOLLOWUP_TYPES = MappingProxyType({**_FOLLOWUP_TYPES,
+    **{domain: tuple(dict.fromkeys((*_FOLLOWUP_TYPES[domain], *TARGET_TYPES_V1[domain],
+        REVIEW_TYPES_V1[domain], "d01.persona_activation.v1")))
+        for domain in ("d08", "d10")}})
+
 _SIGNED_INPUT_KINDS=MappingProxyType({
     'graph_d05_production_policies_v1':'d11.d05-production-policy.v2',
     'runtime_d11_d04_root_freezes_v3':'d11.d04-authored-root-freeze.v3',
@@ -281,7 +291,8 @@ class BackgroundJSONColumnV3:
         self.fragment=b'';self.fragment_offset=0;self.offset=0;self.total=None
         self.complete=False;self.frozen=None;self.reserved=0;self.sha256=None;self.byte_count=None
         self.semantic_sha256=None;self.semantic_state=None;self.semantic_decoder=None
-        if codec=='canonical-json.utf8.v1' and(type(owner)is not BackgroundReadWorkV3 or general_metadata_profile is not None or joint_contact_metadata_profile is not None):
+        from .role_control_rows_metadata_v4 import role_control_background_value_commitment_v4
+        if codec=='canonical-json.utf8.v1' and(role_control_background_value_commitment_v4(owner,table,column,key) or type(owner)is not BackgroundReadWorkV3 or general_metadata_profile is not None or joint_contact_metadata_profile is not None or table=='graph_atoms'and column=='value'and AtomKey.from_token(key[0]).type_name=='memory.source'):
             import codecs,hashlib
             self.semantic_state=hashlib.sha256()
             self.semantic_decoder=codecs.getincrementaldecoder('utf-8')('strict')
@@ -304,6 +315,13 @@ class BackgroundJSONColumnV3:
     def _reserve_v3(self,extra=0):
         self.owner.reserve_heap_v3(extra=extra+65536)
     def retain_path_v3(self,path):
+        from .d07_single_event_review_v1 import single_event_review_rejection_control_retains_path_v1
+        if type(self.owner)is BackgroundReadWorkV3:
+            rejected=single_event_review_rejection_control_retains_path_v1(self.owner,self,path)
+            if rejected is not None:return rejected
+        from .role_control_rows_metadata_v4 import role_control_background_plan_profile_v4
+        if role_control_background_plan_profile_v4(self.owner,self.table,self.column,self.key):
+            return not path or path[0]in {'namespace','plan_id','version','authored'}
         from .artifact_host_control_metadata_v3 import control_metadata_column_retains_v3
         control=control_metadata_column_retains_v3(self,path)
         if control is not None:return control
@@ -321,6 +339,49 @@ class BackgroundJSONColumnV3:
         if type(self.owner)is not BackgroundReadWorkV3:
             _require_json_column_owner_v3(self.owner,db=self.db)
             return self.owner.retain_column_path_v3(self,path)
+        if(type(self.owner)is BackgroundReadWorkV3 and self.table=='graph_d07_execution_originals_v1'
+                and self.column=='payload_json' and len(self.key)==4 and self.key[2]=='ordinary_continuity_adoption_v1'):
+            from .d07_ordinary_continuity_cognition_v1 import(ordinary_continuity_completion_metadata_request_allowed_v1,
+                ordinary_continuity_completion_metadata_retains_path_v1)
+            request=(self.table,('payload_json','payload_digest','signature'),self.key_columns,self.key)
+            if not ordinary_continuity_completion_metadata_request_allowed_v1(self.owner,request):
+                raise AuthorityUnavailable('completed cognition metadata lost its actual causal Background selection')
+            return ordinary_continuity_completion_metadata_retains_path_v1(path)
+        if(type(self.owner)is BackgroundReadWorkV3 and self.table=='graph_d07_execution_originals_v1'
+                and self.column=='payload_json'and len(self.key)==4 and self.key[2]=='single_event_review_adoption_v1'):
+            from .d07_single_event_review_v1 import(single_event_review_completion_metadata_request_allowed_v1,
+                single_event_review_completion_metadata_retains_path_v1)
+            request=(self.table,('payload_json','payload_digest','signature'),self.key_columns,self.key)
+            if not single_event_review_completion_metadata_request_allowed_v1(self.owner,request):
+                raise AuthorityUnavailable('review completion metadata lost its actual causal Background selection')
+            return single_event_review_completion_metadata_retains_path_v1(path)
+        if(type(self.owner)is BackgroundReadWorkV3 and self.table=='graph_d07_execution_originals_v1'
+                and self.column=='payload_json'and len(self.key)==4 and self.key[2]=='single_event_review_cardinality_rejected_v1'):
+            from .d07_single_event_review_v1 import(single_event_review_rejection_metadata_request_allowed_v1,
+                single_event_review_rejection_metadata_retains_path_v1)
+            request=(self.table,('payload_json','payload_digest','signature'),self.key_columns,self.key)
+            if not single_event_review_rejection_metadata_request_allowed_v1(self.owner,request):
+                raise AuthorityUnavailable('review rejection metadata lost its actual derived job selection')
+            return single_event_review_rejection_metadata_retains_path_v1(path)
+        if self.locator and type(self.owner)is BackgroundReadWorkV3:
+            from .d01_ordinary_cumulative_growth_v1 import ordinary_continuity_cause_locator_path_v1
+            selected=ordinary_continuity_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
+            from .d07_ordinary_continuity_attention_v1 import ordinary_continuity_attention_cause_locator_path_v1
+            selected=ordinary_continuity_attention_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
+            from .d07_ordinary_continuity_cognition_v1 import ordinary_continuity_adoption_cause_locator_path_v1
+            selected=ordinary_continuity_adoption_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
+            from .d07_single_event_review_v1 import(single_event_review_followup_cause_locator_path_v1,
+                single_event_review_completion_cause_locator_path_v1)
+            selected=single_event_review_followup_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
+            selected=single_event_review_completion_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
+            from .d01_single_event_growth_v1 import single_event_cause_locator_path_v1
+            selected=single_event_cause_locator_path_v1(self.owner,self,path)
+            if selected is not None:return selected
         if self.locator and self.table in {'graph_contact_expression_plan_originals_v2'}:
             return not path or path[0]=='plan'
         return not self.locator or not path or path[0]in('authority','parent_budget','namespace','identity')
@@ -433,6 +494,9 @@ class BackgroundJSONColumnV3:
         return True
     def json_v3(self):
         self._actual_v3()
+        from .role_control_rows_metadata_v4 import role_control_background_plan_profile_v4
+        if role_control_background_plan_profile_v4(self.owner,self.table,self.column,self.key):
+            raise AuthorityUnavailable('role plan controls are not a complete PersonaPlan Body')
         if not self.complete or self.locator or self.general_metadata_profile is not None or self.joint_contact_metadata_profile is not None:
             raise AuthorityUnavailable('complete full background JSON original required')
         from .dispatch_initial_source_read_v3 import _container_bytes_v3
@@ -519,6 +583,8 @@ class _BackgroundPointReadV3:
         if self.phase=='metadata':
             json_names=tuple(n for n in self.columns if n in _JSON_NAMES or n.endswith('_json'))
             metadata=tuple(n for n in self.columns if n not in json_names)
+            if self.table in ('graph_d04_semantic_installations_v3','runtime_d11_owner_role_clock_originals_v1'):
+                metadata=tuple(dict.fromkeys((*metadata,'revision','operation_id','original_digest','signature')))
             if self.table in('graph_atoms','graph_history')and 'value'in json_names:metadata=(*metadata,'value_cell_id')
             self.metadata_columns=tuple(dict.fromkeys((*self.key_columns,*metadata)))
             self.metadata=_runtime_bounded_fixed_row_v3(owner.db,meter,self.table,self.metadata_columns,self.where,self.key)
@@ -526,6 +592,29 @@ class _BackgroundPointReadV3:
             self.small=dict(zip(self.metadata_columns,self.metadata));self.pending=list(json_names);self.phase='columns';return
         if self.column is not None:
             if self.column.advance(meter):
+                if (self.table=='graph_atoms' and self.column.column=='value'
+                        and AtomKey.from_token(self.key[0]).type_name=='memory.source'
+                        and type(owner)is BackgroundReadWorkV3):
+                    from .d07_general_growth_attention_v1 import _GENERAL_SOURCE_TASKS
+                    if owner.kind=='d07_stage':
+                        original=owner.d07_source_qualification.inspections[self.key[0]].result
+                    elif self.key[0]in _GENERAL_SOURCE_TASKS.get(owner,{}):
+                        leaf=_GENERAL_SOURCE_TASKS[owner][self.key[0]];leaf.require_v1(owner,meter)
+                        original=leaf.inspection.result
+                    else:
+                        from .d01_single_event_growth_v1 import single_event_metadata_work_v1,single_event_background_source_original_v1
+                        original=single_event_background_source_original_v1(owner,self.key[0],meter)if single_event_metadata_work_v1(owner)else None
+                    if original is not None:
+                        original.require_v3(owner,meter)
+                        from ..memory_types import SourceRecord
+                        from ..domains.d06.inspection_metadata_v1 import SOURCE_FIELDS
+                        record=SourceRecord.from_dict(self.column.json_v3());data=record.to_dict()
+                        metadata={name:tuple(data[name])if type(data[name])is list else data[name]for name in SOURCE_FIELDS}
+                        if ((self.small['value_cell_id'],tuple(self.column.cell.header),self.column.sha256,
+                                self.column.semantic_sha256)!=(original.cell_id,original.header,
+                                original.payload_sha256,original.semantic_digest)
+                                or metadata!=dict(original.metadata)):
+                            raise AuthorityUnavailable('qualified Background Source Body differs from inspection original')
                 self.values[self.column.column]=self.column;self.column=None
             return
         if self.pending:
@@ -534,7 +623,10 @@ class _BackgroundPointReadV3:
                 require_artifact_host_dispatch_body_v3(owner,self.table,self.key)
             from .contact_joint_context_source_v3 import require_contact_joint_body_v3
             require_contact_joint_body_v3(owner,self.table,self.key)
-            name=self.pending.pop(0);cell=self.small.get('value_cell_id')if name=='value'else None
+            name=self.pending[0]
+            from .d01_single_event_growth_v1 import require_single_event_background_body_v1
+            require_single_event_background_body_v1(owner,self.table,self.key,column=name)
+            self.pending.pop(0);cell=self.small.get('value_cell_id')if name=='value'else None
             if owner.kind=="d07_stage" and self.table=="graph_atoms" and name=="value":
                 token=dict(zip(self.key_columns,self.key))["token"]
                 atom_key=AtomKey.from_token(token)
@@ -563,6 +655,10 @@ class _BackgroundPointReadV3:
                 'resource-outcome.v1' if self.table=='runtime_resource_outcomes' and name=='outcome_json' else
                 'budget-grant.v1' if self.table=='runtime_budget_grants' and name=='grant_json' else None)
             signed=signature_kind is not None
+            if self.table in ('graph_d04_semantic_installations_v3','runtime_d11_owner_role_clock_originals_v1') and name=='original_json':
+                from .role_control_signed_metadata_v4 import create_background_role_original_column_v4
+                self.column=create_background_role_original_column_v4(owner,self.table,self.key,self.small['signature'])
+                return
             self.column=BackgroundJSONColumnV3(_ISSUER,owner,table=self.table,column=name,key_columns=self.key_columns,key=self.key,cell_id=cell,
                 signer=_json_column_signer_v3(owner,self.table)if signed else None,
                 signature_kind=signature_kind,
@@ -986,6 +1082,15 @@ class BackgroundReadWorkV3:
         return semantic_recovery_require_current_v3(self,meter)
 
     def require_request_v3(self,request):
+        from .d07_single_event_review_v1 import(single_event_review_followup_metadata_request_allowed_v1,
+            single_event_review_completion_metadata_request_allowed_v1,single_event_review_rejection_metadata_request_allowed_v1)
+        if single_event_review_followup_metadata_request_allowed_v1(self,request):return
+        if single_event_review_completion_metadata_request_allowed_v1(self,request):return
+        if single_event_review_rejection_metadata_request_allowed_v1(self,request):return
+        from .d07_ordinary_continuity_cognition_v1 import ordinary_continuity_completion_metadata_request_allowed_v1
+        if ordinary_continuity_completion_metadata_request_allowed_v1(self,request):return
+        from .d01_single_event_review_case_v1 import case_original_metadata_request_allowed_v1
+        if case_original_metadata_request_allowed_v1(self,request):return
         if self.kind=='artifact_model_dispatch':
             from .artifact_host_dispatch_source_v3 import require_artifact_host_dispatch_request_v3
             return require_artifact_host_dispatch_request_v3(self,request)
@@ -1180,6 +1285,34 @@ class BackgroundReadWorkV3:
         if (scope.graph_revision,scope.graph_epoch)!=(self.graph_stamp[0].graph_revision,self.graph_stamp[1]):
             raise AuthorityUnavailable('background child WRITE lost original data stamp')
     def release_payload_v3(self):
+        from .single_event_review_target_v1 import release_current_single_event_review_target_v1
+        release_current_single_event_review_target_v1(self)
+        from .role_control_lineage_metadata_v4 import release_role_control_lineage_metadata_v4
+        release_role_control_lineage_metadata_v4(self)
+        from .d01_ordinary_cumulative_growth_v1 import release_ordinary_continuity_followup_metadata_v1
+        from .d07_ordinary_continuity_attention_v1 import release_ordinary_continuity_attention_followup_metadata_v1
+        release_ordinary_continuity_followup_metadata_v1(self)
+        release_ordinary_continuity_attention_followup_metadata_v1(self)
+        from .d07_ordinary_continuity_cognition_v1 import release_ordinary_continuity_adoption_followup_metadata_v1
+        from .domain_followup_consumer_v1 import release_ordinary_continuity_service_metadata_v1
+        release_ordinary_continuity_adoption_followup_metadata_v1(self)
+        release_ordinary_continuity_service_metadata_v1(self)
+        from .d07_single_event_review_v1 import(release_single_event_review_followup_metadata_v1,
+            release_single_event_review_completion_metadata_v1)
+        release_single_event_review_followup_metadata_v1(self)
+        release_single_event_review_completion_metadata_v1(self)
+        from .d07_single_event_review_v1 import(release_current_d07_attention_prepared_metadata_v1,
+            release_current_single_event_review_cause_history_v1)
+        release_current_d07_attention_prepared_metadata_v1(self)
+        release_current_single_event_review_cause_history_v1(self)
+        from .source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+        release_inspection_metadata_owner_v3(self)
+        from .persona_growth_review_metadata_v1 import release_growth_review_metadata_v1
+        from .persona_growth_review_frame_v1 import release_growth_review_frames_v1
+        release_growth_review_frames_v1(self)
+        release_growth_review_metadata_v1(self)
+        from .d01_single_event_growth_v1 import release_single_event_background_metadata_v1
+        release_single_event_background_metadata_v1(self)
         if self.kind=='artifact_model_dispatch':
             from .artifact_host_dispatch_source_v3 import release_artifact_host_dispatch_payload_v3
             release_artifact_host_dispatch_payload_v3(self)
@@ -1257,7 +1390,10 @@ def _reserve_background_heap_v3(owner,extra=0):
     size+=sum(_heap((task.material,task.value),seen) for task in owner.typed_digests.values())
     size+=sum(_heap((task.args,task.result),seen) for task in owner.predecessors.values())
     size+=sum(_heap((task.nodes,task.value,task.scalar,task.text_parts,task.text_chars),seen)+_frozen_heap_v3(task.frozen,seen) for task in owner.embedded_json.values())
-    size+=sum(_heap((task.selections,None if task.proof is None else task.proof.inputs),seen) for task in owner.role_clocks.values())
+    for task in owner.role_clocks.values():
+        inputs=None if task.proof is None else task.proof.inputs
+        rows=None if inputs is None else inputs.get('role_control_rows')
+        size+=_heap((task.selections,inputs,()if rows is None else rows.rows),seen)
     size+=sum(_heap((task.after,task.rows, None if task.pending is None else task.pending.metadata),seen) for task in owner.offline_lookups.values())
     for column in owner.columns:
         size+=_heap((column.nodes,column.value,column.scalar,column.text_parts,column.text_chars,column.fragment,
@@ -1335,6 +1471,7 @@ class _BackgroundD07EntryLocatorV3:
         from .d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
         from .artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
         from dataclasses import fields
         o=self.owner;o.require_data_current_v3(meter)
         if self.phase=='job':
@@ -1362,7 +1499,8 @@ class _BackgroundD07EntryLocatorV3:
                 'd07.relationship-prepared.v2':D07RelationshipPreparedV2,'d07.method-growth-prepared.v2':D07MethodGrowthPreparedV2,
                 'd07.reflection-prepared.v3':D07ReflectionPreparedV3,
                 'd07.general-growth-prepared.v1':D07GeneralGrowthPreparedV1,
-                'd07.artifact-observation-prepared.v3':D07ArtifactObservationPreparedV3}
+                'd07.artifact-observation-prepared.v3':D07ArtifactObservationPreparedV3,
+                'd07.single-event-review-prepared.v1':D07SingleEventReviewPreparedV1}
             actual=classes.get(projected.get('schema'))
             if actual is None or self.column.fields_seen!={item.name for item in fields(actual)}:
                 raise AuthorityUnavailable('D07 stage parent has another registered complete prepared schema')
@@ -1484,7 +1622,8 @@ def prepare_domain_background_read_v3(graph,bootstrap,installed_bundle,*,kind,op
                 d07_model_seal_binding.require_for_work_v3(graph,d07_service,installed_bundle,operation)
                 reader.d07_model_seal_binding=d07_model_seal_binding
             from .first_ingress_v2 import trusted_upper
-            reader.now=trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+            reader.initial_clock=graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
+            reader.now=trusted_upper(reader.initial_clock)
             work=create_graph_storage_work_v3(graph,kind='domain_background_read_v3',operation_id=operation_id,
                 selection_digest=operation.selection_digest,deadline_utc=deadline_utc,state=reader,operation=operation)
             reader.work=work
@@ -1498,8 +1637,18 @@ def _prepare_background_algorithm_v3(reader):
         from .d07_graph_stages_v1 import prepare_d07_stage_read_data_v3
         return prepare_d07_stage_read_data_v3(reader)
     if reader.kind in('followup','followup_child'):
+        review=(reader.kind=='followup_child'and reader.handoff.command.operation_kind=='review_single_event_growth_v1')
+        if review:
+            from .single_event_review_target_v1 import(prepare_current_single_event_review_target_metadata_v1,
+                prepare_current_single_event_review_target_v1)
+            prepare_current_single_event_review_target_metadata_v1(reader)
         from .domain_followup_consumer_v1 import prepare_background_followup_data_v3
-        return prepare_background_followup_data_v3(reader)
+        result=prepare_background_followup_data_v3(reader)
+        if review:
+            prepare_current_single_event_review_target_v1(reader)
+            from .d01_single_event_growth_v1 import prepare_current_single_event_review_read_dependencies_v1
+            prepare_current_single_event_review_read_dependencies_v1(reader,frame=result[7][1])
+        return result
     if reader.kind in('offline','offline_close'):
         from .d10_offline_recovery_driver_v1 import prepare_background_offline_data_v3
         return prepare_background_offline_data_v3(reader)
@@ -1524,6 +1673,33 @@ def _advance_background_pending_v3(reader,meter):
 
 def _start_background_request_v3(reader,request):
     kind=request[0]
+    if kind=='role_control_lineage_v4':
+        from .role_control_lineage_metadata_v4 import create_background_role_control_lineage_task_v4
+        reader.pending=create_background_role_control_lineage_task_v4(reader);return
+    if kind=='single_event_review_cause_census':
+        from .d07_single_event_review_v1 import create_current_single_event_review_cause_census_task_v1
+        reader.pending=create_current_single_event_review_cause_census_task_v1(reader,request[1]);return
+    if kind=='single_event_review_interpretation_dependencies':
+        from .d07_single_event_review_v1 import create_single_event_review_interpretation_dependencies_task_v1
+        reader.pending=create_single_event_review_interpretation_dependencies_task_v1(reader,request[1]);return
+    if kind=='single_event_review_interpretation_case_metadata':
+        from .d07_single_event_review_v1 import create_single_event_review_interpretation_case_metadata_task_v1
+        reader.pending=create_single_event_review_interpretation_case_metadata_task_v1(reader,request[1]);return
+    if kind=='d07_attention_prepared_metadata_census_v1':
+        from .d07_single_event_review_v1 import create_current_d07_attention_prepared_metadata_census_v1
+        reader.pending=create_current_d07_attention_prepared_metadata_census_v1(reader,request[1]);return
+    if kind=='single_event_review_adoption_metadata_v1':
+        from .single_event_review_target_v1 import create_current_single_event_review_adoption_metadata_task_v1
+        reader.pending=create_current_single_event_review_adoption_metadata_task_v1(reader,request[1]);return
+    if kind=='single_event_review_target_body_v1':
+        from .single_event_review_target_v1 import create_current_single_event_review_target_task_v1
+        reader.pending=create_current_single_event_review_target_task_v1(reader,request[1]);return
+    if kind=='single_event_case_body':
+        from .d01_single_event_review_case_v1 import create_current_single_event_case_body_task_v1
+        reader.pending=create_current_single_event_case_body_task_v1(reader,request[1]);return
+    if kind=='single_event_source_metadata':
+        from .d01_single_event_growth_v1 import start_single_event_background_source_metadata_v1
+        reader.pending=start_single_event_background_source_metadata_v1(reader,request[1]);return
     if reader.kind=='artifact_model_dispatch'and kind=='artifact_host_life_parent_metadata':
         from .artifact_host_dispatch_source_v3 import start_artifact_host_life_parent_metadata_v3
         return start_artifact_host_life_parent_metadata_v3(reader,request)
@@ -1575,6 +1751,7 @@ def _start_background_request_v3(reader,request):
         require_current_general_growth_trial_metadata_reader_v1(reader)
         from .d01_general_growth_v1 import create_current_general_background_metadata_task_v1
         reader.reserve_heap_v3(extra=8192)
+        _require_background_review_case_metadata_selector_v1(reader,request[1])
         task=create_current_general_background_metadata_task_v1(reader,request[1])
         reader.general_trial_metadata[request[1]]=task
     elif kind=='general_growth_start_metadata_census_v1':
@@ -1582,6 +1759,9 @@ def _start_background_request_v3(reader,request):
     elif kind=='general_growth_source_metadata':
         from .d07_general_growth_attention_v1 import start_general_growth_source_metadata_task_v1
         task=start_general_growth_source_metadata_task_v1(reader,request[1])
+    elif kind=='growth_review_metadata_v1':
+        from .persona_growth_review_metadata_v1 import start_growth_review_metadata_v1
+        task=start_growth_review_metadata_v1(reader,request[1])
     elif kind=='point':
         actual=request[1];reader.require_request_v3(actual)
         task=reader.points.get(actual)
@@ -2429,6 +2609,40 @@ def require_current_d07_content_source_authority_v3(reader):
     return reader.d07_content_authority
 
 
+def _current_d07_stage_source_groups_v3(reader):
+    authority=require_current_d07_content_source_authority_v3(reader)
+    review=False
+    if reader.d07_selector.stage=='egress_seal':
+        from ..authority_service.owner_location_read_v3 import d07_content_source_scope_to_wire_v3
+        wire=d07_content_source_scope_to_wire_v3(reader.d07_source_scope)
+        review=wire['kind']=='single_event_review_owner'
+        if review and reader.entry_metadata[1]['schema']!='d07.single-event-review-prepared.v1':
+            raise AuthorityUnavailable('review Source delegation has another actual signed prepared schema')
+    else:
+        from .d07_stage_content_scope_v3 import(_HostStageContentScopeReadV3,_HostParentQualifiedV3,
+            _HOST_PARENT_TASKS)
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+        task=reader.d07_content_scope_task
+        if type(task)is _HostStageContentScopeReadV3 and task.parents is not None and task.parents.complete:
+            r=task.reader;r.require_registered_v3();header=r.header.require_v3(r);parents=task.parents
+            if header.prepared_class is D07SingleEventReviewPreparedV1:
+                if(_HOST_PARENT_TASKS.get(parents)!=(r,reader,reader.operation,reader.read_scope,reader.graph_stamp)
+                        or type(parents.result)is not _HostParentQualifiedV3 or parents.result.task is not parents
+                        or parents.result.kind!='single_event_review_owner'):
+                    raise AuthorityUnavailable('review Source groups need the actual completed private special-parent proof')
+                review=True
+    if not review:return((authority.purpose,tuple(authority.audience)),)
+    metadata=reader.entry_metadata[1]
+    context=tuple(metadata['context_source_refs']);consolidation=tuple(metadata['consolidation_source_refs'])
+    if not context or len(set(context))!=len(context)or set(context)!=set(consolidation):
+        raise AuthorityUnavailable('review Source groups lost the actual complete Case Source union')
+    owner=(reader.d07_owner_entry.require_for_v3(reader)if reader.d07_owner_entry is not None else reader.owner)
+    if(not {'context','consolidation'}<=set(owner.purposes)
+            or not set(authority.audience)<=set(owner.audiences)):
+        raise AuthorityUnavailable('review Source groups exceed current actual Owner purposes/audiences')
+    return(('context',tuple(authority.audience)),('consolidation',tuple(authority.audience)))
+
+
 _D07_SOURCE_MATERIALS_V3=WeakKeyDictionary()
 _D07_SOURCE_METADATA_V3=WeakKeyDictionary()
 
@@ -2464,6 +2678,7 @@ class PreparedD07StageSourceMaterialV3:
         source_authority=require_current_d07_content_source_authority_v3(reader)
         self.namespace,self.purpose,self.audience=reader.namespace,source_authority.purpose,tuple(source_authority.audience)
         self.actor,self.original_digest=source_authority.actor,reader.entry_metadata[0][0]
+        self.source_groups=_current_d07_stage_source_groups_v3(reader)
         self.source_scope=reader.d07_source_scope if reader.d07_selector.stage=="egress_seal" else None
         self.source_scope_commitment=None if self.source_scope is None else self.source_scope.commitment
         self.model_authority=reader.d07_model_authority if self.source_scope is not None else None
@@ -2472,16 +2687,17 @@ class PreparedD07StageSourceMaterialV3:
         self.access_versions=tuple(task.access_versions)
         _D07_SOURCE_MATERIALS_V3[self]=(reader,self.scope,self.graph_stamp,self.namespace,self.actor,self.purpose,
             self.audience,self.original_digest,self.source_versions,self.witnesses,self.access_versions,
-            self.source_scope,self.source_scope_commitment,self.model_authority)
+            self.source_scope,self.source_scope_commitment,self.model_authority,self.source_groups)
     def require_for_prepared_v3(self,reader,digest):
         from .c09_paged_sql_v2 import current_c09_sql_meter_v2
         source_authority=require_current_d07_content_source_authority_v3(reader)
         if (_D07_SOURCE_MATERIALS_V3.get(self)!=(self.reader,self.scope,self.graph_stamp,self.namespace,self.actor,self.purpose,
                 self.audience,self.original_digest,self.source_versions,self.witnesses,self.access_versions,
-            self.source_scope,self.source_scope_commitment,self.model_authority)
+            self.source_scope,self.source_scope_commitment,self.model_authority,self.source_groups)
                 or reader is not self.reader or digest!=self.original_digest
                 or source_authority.actor!=self.actor or source_authority.purpose!=self.purpose
                 or tuple(source_authority.audience)!=self.audience
+                or _current_d07_stage_source_groups_v3(reader)!=self.source_groups
                 or (self.source_scope is not None and self.source_scope.commitment!=self.source_scope_commitment)):
             raise AuthorityUnavailable("D07 full prepared body has no exact current Source/Actor qualification")
         reader.require_data_current_v3(current_c09_sql_meter_v2())
@@ -2497,16 +2713,16 @@ class _D07StageSourceQualificationV3:
         if not self.expected or len(self.expected)>256:
             raise AuthorityUnavailable("D07 prepared locator has no bounded actual Source family")
         self.pending=list(self.expected);self.witnesses={};self.records={};self.access_versions=[]
-        self.phase="next";self.current=None;self.cell=self.parser=None;self.fragment=b"";self.offset=0
+        self.phase="next";self.current=None
+        self.inspection=None;self.inspections={}
         self.complete=False;self.reserved=0
-        self.semantic_hash=self.semantic_decoder=None;self.semantic_digest=None
+        self.semantic_digest=None
     def reserve_v3(self):
-        retained=_heap((self.expected,self.pending,self.witnesses,self.records,self.access_versions,self.fragment))+65536
-        if self.parser is not None:retained+=self.parser._source_heap_bytes()
+        retained=_heap((self.expected,self.pending,self.witnesses,self.records,self.access_versions))+65536
         if retained>self.reserved:self.reader.operation.retain(retained-self.reserved);self.reserved=retained
     def advance(self,meter):
-        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3,begin_runtime_cell_read_v3
-        from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
         from ..memory_types import source_key,access_key
         from ..domains.d06 import source_correction_head_key
         from ..domains.d07.qualified_attention_read import _qualify_source_rights_values_v3
@@ -2522,6 +2738,7 @@ class _D07StageSourceQualificationV3:
                     for parent in self.records[ref].parent_source_ids:visit(source_key(*reader.namespace.as_tuple,parent).token)
                     active.remove(ref);done.add(ref)
                 for ref in self.witnesses:visit(ref)
+                for task in self.inspections.values():task.require_current_v3(meter)
                 self.complete=True;reader.d07_source_material=PreparedD07StageSourceMaterialV3(_ISSUER,self);return
             ref=self.pending.pop()
             if ref in self.witnesses:return
@@ -2534,34 +2751,20 @@ class _D07StageSourceQualificationV3:
             if head is None or head[1]!=1 or ref in self.expected and head[0]!=self.expected[ref]:
                 raise AuthorityUnavailable("D07 frozen Source version is no longer current")
             self.current=(key,head[0],head[2])
-            self.cell=begin_runtime_cell_read_v3(reader.db,head[2],erasure_owner_ref=ref)
-            if self.cell.header[0]not in("canonical-json.ascii.v1","canonical-json.utf8.v1"):
-                raise AuthorityUnavailable("D07 Source metadata has an unregistered canonical codec")
-            self.parser=C09MemorySourceJSONStreamV3(ensure_ascii=self.cell.header[0]=="canonical-json.ascii.v1")
-            if self.cell.header[0]=="canonical-json.utf8.v1":
-                import codecs
-                from hashlib import sha256
-                self.semantic_decoder=codecs.getincrementaldecoder("utf-8")("strict")
-                self.semantic_hash=sha256()
-            self.phase="metadata";return
-        if self.phase=="metadata":
-            if self.offset<len(self.fragment):
-                end=min(self.offset+1024,len(self.fragment))
-                chunk=self.fragment[self.offset:end]
-                self.parser.feed(chunk,lambda event:None)
-                self.semantic_fragment_v3(chunk,meter)
-                self.offset=end;self.reserve_v3();return
-            fragment=self.cell.read_fragment(meter=meter)
-            if fragment is not None:self.fragment,self.offset=fragment,0;return
-            parsed=self.parser.finish();digest=self.cell.finish(meter=meter)
-            if (parsed.byte_count,parsed.sha256)!=(self.cell.header[3],digest):
-                raise AuthorityUnavailable("D07 Source metadata is erased or lacks complete original EOF")
-            self.semantic_fragment_v3(b"",meter,final=True)
-            self.semantic_digest=digest if self.semantic_hash is None else self.semantic_hash.hexdigest()
-            self.semantic_hash=self.semantic_decoder=None
+            self.inspection=InspectionMetadataReadV3(reader,key)
+            self.inspections[ref]=self.inspection
+            self.phase='metadata';return
+        if self.phase=='metadata':
+            self.inspection.advance(meter)
+            if not self.inspection.complete:return
+            original=self.inspection.result.require_v3(reader,meter)
             key,revision,cell=self.current
-            self.witness=_D07SourceMetadataV3(_ISSUER,reader,key,revision,cell,digest,self.parser._source_metadata)
-            self.parser=self.cell=None;self.fragment=b"";self.offset=0;self.phase="rights";return
+            if (original.key,original.revision,original.cell_id)!=(key,revision,cell):
+                raise AuthorityUnavailable('D07 Source inspection differs from its exact prepared locator/current head')
+            self.semantic_digest=original.semantic_digest
+            self.witness=_D07SourceMetadataV3(_ISSUER,reader,key,revision,cell,
+                original.payload_sha256,original.metadata)
+            self.inspection=None;self.phase='rights';return
         key,revision,cell=self.current
         access=access_key(*reader.namespace.as_tuple,key.owner.subject)
         correction=source_correction_head_key(reader.namespace,key.owner.subject)
@@ -2571,29 +2774,17 @@ class _D07StageSourceQualificationV3:
         correction_atom=(GraphAtom(correction,0,{},False) if correction_row is None
             else GraphAtom(correction,correction_row[0],background_json_loads_v3(correction_row[1]),bool(correction_row[2])))
         record=None
-        for audience in source_authority.audience:
-            qualified=_qualify_source_rights_values_v3(reader.namespace,key.token,self.witness,access_atom,correction_atom,
-                audience=audience,purpose=source_authority.purpose,metadata_only=True)
-            if qualified is None:raise AuthorityUnavailable("D07 Source current access/correction/purpose/audience is unqualified")
-            record=qualified
+        for purpose,audiences in _current_d07_stage_source_groups_v3(reader):
+            for audience in audiences:
+                qualified=_qualify_source_rights_values_v3(reader.namespace,key.token,self.witness,access_atom,correction_atom,
+                    audience=audience,purpose=purpose,metadata_only=True)
+                if qualified is None:raise AuthorityUnavailable("D07 Source current access/correction/purpose/audience is unqualified")
+                record=qualified
         self.witnesses[key.token]=self.witness;self.records[key.token]=record
         self.access_versions.extend((GraphVersion(key,revision),GraphVersion(access,access_atom.revision),GraphVersion(correction,0)))
         self.pending.extend(source_key(*reader.namespace.as_tuple,parent).token for parent in record.parent_source_ids)
         self.current=None;self.phase="next";self.reserve_v3()
 
-    def semantic_fragment_v3(self,chunk,meter,*,final=False):
-        if self.semantic_decoder is None:return
-        decoded=self.semantic_decoder.decode(chunk,final=final)
-        encoded=[]
-        for character in decoded:
-            point=ord(character)
-            if point<127:encoded.append(character)
-            elif point<=65535:encoded.append("\\u"+format(point,"04x"))
-            else:
-                point-=65536
-                encoded.append("\\u"+format(55296+(point>>10),"04x")+"\\u"+format(56320+(point&1023),"04x"))
-        wire="".join(encoded).encode("ascii")
-        meter.charge_encode(len(wire));self.semantic_hash.update(wire)
 
 
 def require_current_d07_frozen_source_material_v3(reader,prepared):
@@ -2806,16 +2997,41 @@ def background_general_growth_start_census_v1(db,*,criterion):
     return tuple(task.matches)
 
 
+def _background_review_case_metadata_selector_v1(reader):
+    from .d07_single_event_review_v1 import (_CASE_REGISTERED_EVENT_V1,
+        require_actual_single_event_review_attention_case_metadata_owner_v1)
+    if reader.entry is None or reader.entry[1:3]!=('d07',_CASE_REGISTERED_EVENT_V1):return None
+    require_actual_single_event_review_attention_case_metadata_owner_v1(reader,db=reader.db)
+    from .d01_single_event_review_case_v1 import CASE_KIND
+    return('signed','graph_d01_production_inputs_v1',CASE_KIND,reader.entry[3])
+
+
+def _require_background_review_case_metadata_selector_v1(reader,identity):
+    expected=_background_review_case_metadata_selector_v1(reader)
+    if expected is not None and identity!=expected:
+        raise AuthorityUnavailable('Case attention metadata escaped its actual signed Case selector')
+
+
 def require_current_general_growth_trial_metadata_reader_v1(reader):
     from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
     require_actual_background_attachment_owner_v3(reader,db=reader.db)
-    if (reader.kind!='followup_child'
+    from .d01_single_event_growth_v1 import single_event_metadata_work_v1
+    single_event = single_event_metadata_work_v1(reader)
+    if _background_review_case_metadata_selector_v1(reader)is not None:
+        if(reader.sealed or reader.fence is None or reader.read_scope is not reader.fence.scope
+                or reader.read_scope.operation!='read'):
+            raise AuthorityUnavailable('Case attention signed metadata needs its actual current Background READ')
+        return reader
+    if not single_event and (reader.kind!='followup_child'
             or type(reader.handoff.command)is not GeneralGrowthTrialFollowupCommandV1
             or reader.handoff.command.source_authority.namespace!=reader.namespace
             or reader.authority.purpose!='consolidation'
             or reader.authority.audience!=reader.handoff.command.audience_refs):
         raise AuthorityUnavailable('General metadata requires its actual private derive-child READ')
-    require_background_followup_handoff_v3(reader.handoff,reader.graph,reader.bundle)
+    if not single_event or reader.kind=="followup_child":
+        require_background_followup_handoff_v3(reader.handoff,reader.graph,reader.bundle)
+    if single_event and (reader.authority.purpose!="consolidation" or not reader.authority.audience):
+        raise AuthorityUnavailable("single-event metadata requires its actual consolidation Owner audience")
     if reader.sealed:
         binding=_GENERAL_GROWTH_WRITE_METADATA_V1.get()
         if binding is None or binding[0]is not reader:
@@ -2829,6 +3045,28 @@ def require_current_general_growth_trial_metadata_reader_v1(reader):
 def prepare_current_general_growth_trial_metadata_column_v1(reader,*,table,column,key_columns,key,kind,
         cell_id=None,signature_kind=None,signature=None):
     require_current_general_growth_trial_metadata_reader_v1(reader)
+    from .d01_single_event_growth_v1 import single_event_metadata_work_v1,single_event_metadata_type_v1
+    single_event=single_event_metadata_work_v1(reader)
+    review_selector=_background_review_case_metadata_selector_v1(reader)
+    if review_selector is not None:
+        _require_background_review_case_metadata_selector_v1(reader,('signed',table,kind,key[-1]))
+        if(column!='payload_json'or key_columns!=('bot','persona','original_ref')
+                or key!=(*reader.namespace.as_tuple,review_selector[3])):
+            raise AuthorityUnavailable('Case attention signed metadata changed its actual physical column/key')
+        return BackgroundJSONColumnV3(_ISSUER,reader,table=table,column=column,key_columns=key_columns,key=key,
+            signer=reader.graph._GraphCoordinator__d11_issuer._signer,signature_kind=signature_kind,
+            signature=signature,general_metadata_profile=(table,kind))
+    if single_event and single_event_metadata_type_v1(table,kind) is not None:
+        expected=("bot","persona","original_ref") if table=="graph_d01_production_inputs_v1" else ("token","bot","persona")
+        actual_namespace=key[:2] if table=="graph_d01_production_inputs_v1" else key[1:]
+        if (key_columns!=expected or actual_namespace!=reader.namespace.as_tuple
+                or table!="graph_d01_production_inputs_v1" and NamespaceId.from_key(AtomKey.from_token(key[0]))!=reader.namespace):
+            raise AuthorityUnavailable("single-event metadata crossed its actual key/namespace")
+        if column!=("payload_json" if table=="graph_d01_production_inputs_v1" else "value"):
+            raise AuthorityUnavailable("single-event metadata changed its fixed physical column")
+        return BackgroundJSONColumnV3(_ISSUER,reader,table=table,column=column,key_columns=key_columns,key=key,
+            cell_id=cell_id,signer=reader.graph._GraphCoordinator__d11_issuer._signer if signature_kind is not None else None,
+            signature_kind=signature_kind,signature=signature,general_metadata_profile=(table,kind))
     if table=='graph_d01_production_inputs_v1':
         if (column!='payload_json'or key_columns!=('bot','persona','original_ref')
                 or key[:2]!=reader.namespace.as_tuple or kind not in('growth_proposal','growth_counterevidence',
@@ -2836,6 +3074,13 @@ def prepare_current_general_growth_trial_metadata_column_v1(reader,*,table,colum
             raise AuthorityUnavailable('General signed metadata column escaped its actual D01 family')
     elif table=='graph_atoms':
         atom=AtomKey.from_token(key[0])
+        if single_event and kind in ('personal_plan','interpretation','activation','persona_plan'):
+            expected_type={'personal_plan':'d08.personal_plan.v1','interpretation':'d07.current_interpretation.v1',
+                'activation':'d01.persona_activation.v1','persona_plan':'d01.persona_plan.v1'}[kind]
+            if column!='value' or key_columns!=('token','bot','persona') or key[1:]!=reader.namespace.as_tuple or atom.type_name!=expected_type:
+                raise AuthorityUnavailable('single-event graph metadata changed its exact type/key')
+            return BackgroundJSONColumnV3(_ISSUER,reader,table=table,column=column,key_columns=key_columns,key=key,
+                cell_id=cell_id,general_metadata_profile=(table,kind))
         if (column!='value'or key_columns!=('token','bot','persona')or key[1:]!=reader.namespace.as_tuple
                 or NamespaceId.from_key(atom)!=reader.namespace or kind not in('action','outcome',
                     'life_progress','life_progress_provenance','cost','job','goal','cancellation')):
@@ -2865,6 +3110,7 @@ def _read_bound_general_growth_metadata_result_v1(db,identity):
     reader=_active_v3(db)
     if reader is None:return False,None
     require_current_general_growth_trial_metadata_reader_v1(reader)
+    _require_background_review_case_metadata_selector_v1(reader,identity)
     task=reader.general_trial_metadata.get(identity)
     if task is None or not task.complete:
         if reader.sealed:raise AuthorityUnavailable('General metadata lacks complete raw canonical signed EOF')
@@ -2915,7 +3161,10 @@ def read_bound_background_general_growth_type_metadata_v1(db,*,namespace,type_id
     reader=_active_v3(db)
     if reader is None:return False,None
     require_current_general_growth_trial_metadata_reader_v1(reader)
-    if namespace!=reader.namespace or type_id!='runtime.cost_settlement' or limit!=129:
+    from .d01_single_event_growth_v1 import single_event_metadata_work_v1
+    allowed={'runtime.cost_settlement'}
+    if single_event_metadata_work_v1(reader):allowed.update(('d08.goal.v1','d08.personal_plan.v1','d08.action_intent.v1','d07.current_interpretation.v1'))
+    if namespace!=reader.namespace or type_id not in allowed or limit!=129:
         raise AuthorityUnavailable('General derive metadata inventory is the actual cost-only complete selector')
     handled,result=_read_bound_general_growth_metadata_result_v1(db,('type',type_id,129))
     for record in result[0]:record.require_for_v1(reader)
@@ -3028,3 +3277,75 @@ def require_current_general_growth_trial_metadata_coverage_v1(prepared,*,db,grap
         reader.reserve_heap_v3(extra=getsizeof(())+8*len(records)+len(records)*_general_growth_metadata_dto_layout_v1())
         task.coverage_versions=tuple(GraphVersion(record.key,record.revision)for record in records)
     return task.coverage_versions
+
+
+
+@contextmanager
+def bind_single_event_fresh_write_v1(reader,*,issued,scope,guard,current_owner):
+    from .d01_single_event_growth_v1 import require_current_single_event_background_source_v1
+    from .domain_followup_consumer_v1 import require_background_followup_v1
+    require_current_single_event_background_source_v1(reader)
+    require_background_followup_v1(issued,reader.graph,issued.authority,issued.operation_id)
+    if (issued.command is not reader.handoff.command or issued.command.operation_kind!="review_single_event_growth_v1"
+            or scope.operation!="write"or scope.permit.operation!="write"or scope.namespace!=reader.namespace
+            or current_owner.namespace!=reader.namespace or issued.owner.principal!=current_owner.principal
+            or guard!=reader.owner_guard or guard.authorization_head!=current_owner.authorization_head
+            or guard.authorization_revision!=current_owner.authorization_revision):
+        raise AuthorityUnavailable("single-event fresh WRITE changed its actual private child/Owner/guard")
+    token=_GENERAL_GROWTH_WRITE_METADATA_V1.set((reader,scope,current_owner))
+    try:
+        from .d01_single_event_growth_v1 import require_single_event_background_source_permission_v1
+        require_single_event_background_source_permission_v1(reader)
+        yield
+    finally:_GENERAL_GROWTH_WRITE_METADATA_V1.reset(token)
+
+
+
+@contextmanager
+def bind_single_event_disposition_write_v1(reader,*,issued,scope,guard,current_owner):
+    from .d01_single_event_growth_v1 import require_current_single_event_disposition_source_v1,REVIEW_EVENT
+    from .domain_followup_consumer_v1 import require_background_followup_v1
+    require_current_single_event_disposition_source_v1(reader)
+    require_background_followup_v1(issued,reader.graph,issued.authority,issued.operation_id)
+    if (issued.command is not None or issued.event.event_kind!=REVIEW_EVENT or issued.event.receiver_domain!="d01"
+            or issued.event.causal_operation_id!=reader.entry[0]or issued.event.trigger_original.original_digest!=reader.entry[4]
+            or scope.operation!="write"or scope.permit.operation!="write"or scope.namespace!=reader.namespace
+            or current_owner.namespace!=reader.namespace or issued.owner.principal!=current_owner.principal
+            or guard!=reader.owner_guard or guard.authorization_head!=current_owner.authorization_head
+            or guard.authorization_revision!=current_owner.authorization_revision):
+        raise AuthorityUnavailable("single-event disposition WRITE changed its actual parent/Owner/guard")
+    token=_GENERAL_GROWTH_WRITE_METADATA_V1.set((reader,scope,current_owner))
+    try:
+        from .d01_single_event_growth_v1 import require_single_event_background_source_permission_v1
+        require_single_event_background_source_permission_v1(reader)
+        yield
+    finally:_GENERAL_GROWTH_WRITE_METADATA_V1.reset(token)
+
+
+@contextmanager
+def bind_native_attention_disposition_write_v1(reader,*,issued,scope,guard,current_owner):
+    from .domain_followup_consumer_v1 import require_actual_native_attention_disposition_v1,RESOLVER
+    from ..runtime_contracts import FenceScope
+    fact=require_actual_native_attention_disposition_v1(reader,issued)
+    request_digest=canonical_digest((RESOLVER,issued.event.dedupe_key,issued.operation_id))
+    attempt_id='owner-domain-'+canonical_digest((reader.namespace,issued.operation_id,request_digest))[:48]
+    if (type(scope)is not FenceScope or scope.operation!='write' or scope.permit.operation!='write'
+            or scope.operation_id!=attempt_id or scope is reader.read_scope
+            or reader.read_scope is None or reader.read_scope.operation!='read'
+            or scope.namespace!=reader.namespace or current_owner.namespace!=reader.namespace
+            or issued.owner is not reader.owner or issued.operation_id!=reader.local_result[7][0]
+            or issued.owner.principal!=current_owner.principal or guard!=reader.owner_guard
+            or guard.authorization_head!=current_owner.authorization_head
+            or guard.authorization_revision!=current_owner.authorization_revision
+            or (current_owner.access_epoch,current_owner.delete_epoch)!=(reader.owner.access_epoch,reader.owner.delete_epoch)
+            or reader.authority.purpose not in current_owner.purposes
+            or not set(reader.authority.audience)<=set(current_owner.audiences)
+            or scope.graph_epoch!=reader.graph_stamp[1]
+            or scope.graph_revision!=reader.graph_stamp[0].graph_revision):
+        raise AuthorityUnavailable('native attention disposition changed its actual Source/Owner/fresh WRITE W01')
+    # This context enters before BEGIN. The actual W01 rechecks data under its
+    # WRITE transaction; the old READ scope remains an immutable proof locator.
+    fact.require_current_v1(reader)
+    token=_GENERAL_GROWTH_WRITE_METADATA_V1.set((reader,scope,current_owner))
+    try:yield
+    finally:_GENERAL_GROWTH_WRITE_METADATA_V1.reset(token)

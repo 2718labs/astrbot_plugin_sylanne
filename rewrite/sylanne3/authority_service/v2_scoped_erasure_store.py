@@ -293,26 +293,7 @@ class AuthorityV2ScopedErasureStore:
                             return state
                         return self._apply_verified_head_locked_v1(db, head, execution_head, subject, receipt)
 
-    def _apply_controlled_head_for_storage_test(
-            self, *, credential, subject: str,
-            receipt: VerifiedGraphAppliedHeadV2):
-        """Exercise the storage CAS only; this is no product Graph attestation."""
-        return self._apply_current_graph_head_original_v1(credential=credential, subject=subject, receipt=receipt)
 
-    def _apply_current_graph_head_original_v1(
-            self, *, credential, subject: str, receipt: VerifiedGraphAppliedHeadV2):
-        if type(receipt) is not VerifiedGraphAppliedHeadV2:
-            raise AuthorityUnavailable("typed cumulative Graph original required")
-        identifier(subject, "subject")
-        if receipt.namespace != self.namespace:
-            raise AuthorityUnavailable("Graph application crosses namespace")
-        self.core._require(credential, "deletion", self.namespace)
-        with self.deletion.freeze_writes():
-            with self.execution.freeze_writes():
-                head = self.deletion.verified_head()
-                execution_head = self.execution.verified_head()
-                with self.core._tx() as db:
-                    return self._apply_verified_head_locked_v1(db, head, execution_head, subject, receipt)
 
     def _apply_verified_head_locked_v1(self, db, head, execution_head, subject, receipt, *, selected_proof=None):
         if (head.seq, head.digest) != (receipt.deletion_seq, receipt.deletion_digest):

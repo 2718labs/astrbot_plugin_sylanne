@@ -37,6 +37,10 @@ class HostChecks:
                                            "sha256:" + "a" * 64)
         return None
 
+    def read_current_creation_model_capability(self, *, namespace):
+        return self.resolve_current_model_capability(namespace=namespace,
+            capability_ref="model:local-current")
+
     def resolve_current_budget_lease(self, *, namespace, budget_ref, session, principal):
         self.seen.append(("budget", namespace, budget_ref, session, principal))
         if self.budget and budget_ref == "budget:local-current":
@@ -134,3 +138,37 @@ def test_rejects_host_reported_stale_capabilities(tmp_path):
     root = package_root(tmp_path)
     assert resolve(catalogue(root, HostChecks(model=False))) is None
     assert resolve(catalogue(root, HostChecks(budget=False))) is None
+
+
+def test_onboarding_choices_share_one_current_observation_only_within_this_call(tmp_path):
+    root = package_root(tmp_path)
+    checks = HostChecks()
+    cat = catalogue(root, checks)
+    result = cat.read_current_creation_choices(namespace=NAMESPACE, budget_ref="budget:local-current",
+        session=SESSION, principal=PRINCIPAL)
+    assert result["reason_code"] is None and result["choices"]
+    for choice in result["choices"]:
+        assert set(choice) == {"blueprint", "label", "description", "model_capability_ref", "budget_ref"}
+        assert choice["model_capability_ref"] == "model:local-current"
+        assert choice["budget_ref"] == "budget:local-current"
+    assert len(checks.seen) == 2
+    assert resolve(cat) is not None
+    assert len(checks.seen) == 4  # The write-side resource request re-observes, without a selector cache.
+    (root / ASSET).write_bytes((root / ASSET).read_bytes() + b" ")
+    changed = cat.read_current_creation_choices(namespace=NAMESPACE, budget_ref="budget:local-current",
+        session=SESSION, principal=PRINCIPAL)
+    assert changed == {"choices": [], "reason_code": "creation_catalogue_unavailable"}
+    assert len(checks.seen) == 4
+
+
+def test_onboarding_choices_refuse_missing_model_or_budget_with_valid_catalogue(tmp_path):
+    root = package_root(tmp_path)
+    for model, budget, reason, observations in (
+        (False, True, "installed_creation_model_unavailable", 1),
+        (True, False, "creation_resources_currently_unavailable", 2),
+    ):
+        checks = HostChecks(model=model, budget=budget)
+        result = catalogue(root, checks).read_current_creation_choices(namespace=NAMESPACE,
+            budget_ref="budget:local-current", session=SESSION, principal=PRINCIPAL)
+        assert result == {"choices": [], "reason_code": reason}
+        assert len(checks.seen) == observations

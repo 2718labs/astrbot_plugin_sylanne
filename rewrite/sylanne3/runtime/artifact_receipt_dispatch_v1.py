@@ -471,7 +471,8 @@ def _actual_receipt_original_for_operation_v1(db,namespace,operation_id):
 
 
 def recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,operation_id,*,prepared_inventory=None):
-    from ..runtime_storage_v3 import read_graph_row_v3
+    from ..graph_store import GraphStore
+    from .dispatch_candidate import DispatchCandidateEvidenceV1,validate_dispatch_candidate_writes
     from .domain_background_read_v3 import background_json_loads_v3
     from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as sql
     if not db.in_transaction or type(namespace)is not NamespaceId:
@@ -483,10 +484,15 @@ def recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,o
     if (type(candidate)is not dict or candidate.get("schema")!="sylanne.d11.dispatch_candidate.v1"
             or candidate.get("status")!="source_qualified"or len(candidate.get("refs",()))!=4):
         raise AuthorityUnavailable("Artifact completion dispatch has no actual qualified generic candidate")
+    from .artifact_outbound_receipt_adoption_read_v3 import current_artifact_recorded_fact_task_v3
+    fact=current_artifact_recorded_fact_task_v3(db,namespace,operation_id)
     if prepared_inventory is None:
         from .artifact_receipt_original_read_v1 import actual_bound_artifact_dispatch_inventory_v1
         prepared_inventory=actual_bound_artifact_dispatch_inventory_v1(db,namespace,operation_id)
-    if prepared_inventory is not None:
+    if fact is not None:
+        value=fact.receipt
+        if value is None:raise AuthorityUnavailable('Artifact fact completion original is not yet verified')
+    elif prepared_inventory is not None:
         value=prepared_inventory.artifact_receipt_originals.require_for_v1(prepared_inventory,db,
             now_utc=prepared_inventory.artifact_receipt_originals.task.now_utc)
     else:value=_actual_receipt_original_for_operation_v1(db,namespace,operation_id)
@@ -494,30 +500,49 @@ def recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,o
     if (row[:2]!=(ids["activity"],value.effect_id)or operation_id!=value.message_operation_id
             or tuple(candidate["source_refs"])!=(value.source_ref,)):
         raise AuthorityUnavailable("Artifact candidate borrowed another actual message/effect/receipt Source")
-    event=sql(db,"SELECT revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+    event=sql(db,"SELECT reads,revisions,epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
         (*namespace.as_tuple,row[0],operation_id)).fetchone()
-    if event is None or event[1]!=candidate["graph_epoch"]:
+    if event is None or event[2]!=candidate["graph_epoch"]:
         raise AuthorityUnavailable("Artifact candidate lost its actual committed event")
-    writes=background_json_loads_v3(event[0]);values=[]
+    event_reads=GraphStore._version_rows(event[0])
+    revisions={(item.key.token,item.revision)for item in GraphStore._version_rows(event[1])}
+    values=[];typed_writes=[]
     types=("d08.action_intent.v1","d08.action_schema.v1","d08.communication_intent_grant.v1","d09.verified_segment_batch.v1")
-    for (ref,revision),kind in zip(candidate["refs"],types):
-        key=AtomKey.from_token(ref)
-        if key.type_name!=kind or [ref,revision]not in writes or NamespaceId.from_key(key)!=namespace:
+    for item,kind in zip(candidate["refs"],types):
+        if (type(item)is not list or len(item)!=2 or type(item[0])is not str
+                or type(item[1])is not int or item[1]<1 or tuple(item)not in revisions):
+            raise AuthorityUnavailable("Artifact candidate write version differs from its actual event")
+        ref,revision=item;key=AtomKey.from_token(ref)
+        if key.type_name!=kind or NamespaceId.from_key(key)!=namespace:
             raise AuthorityUnavailable("Artifact candidate write is not its actual generic D08/D09 member")
-        history=read_graph_row_v3(db,("value","valid"),where="token=? AND revision=? AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
-            parameters=(ref,revision,*namespace.as_tuple,row[0],operation_id),history=True)
-        if history is None or history[1]!=1:
-            raise AuthorityUnavailable("Artifact candidate historical D08/D09 body was removed")
-        values.append(background_json_loads_v3(history[0]))
-    d08={spec.name:spec for spec in GoalExecutionProvider().register_types()}
-    action=d08[types[0]].validator(values[0]);schema=d08[types[1]].validator(values[1]);grant=d08[types[2]].validator(values[2]);batch=values[3]
-    next(spec for spec in D09ExpressionProvider.register_types()if spec.name==types[3]).validator(batch)
+        if fact is not None:
+            value_json=fact.history_value_v3(ref,revision)
+        else:
+            history=sql(db,"SELECT value,valid FROM graph_history WHERE token=? AND revision=? AND event_bot=? AND event_persona=? AND event_session=? AND event_id=?",
+                (ref,revision,*namespace.as_tuple,row[0],operation_id)).fetchone()
+            if history is None or history[1]!=1:
+                raise AuthorityUnavailable("Artifact candidate historical D08/D09 body was removed")
+            value_json=background_json_loads_v3(history[0])
+        values.append(value_json);typed_writes.append(("d09"if kind==types[3]else"d08",GraphWrite(key,value_json)))
+    action=next(spec for spec in GoalExecutionProvider().register_types()if spec.name==types[0]).validator(values[0])
+    if (action.identity.operation_id,action.identity.activity_id,action.identity.effect_id)!=(operation_id,row[0],row[1]):
+        raise AuthorityUnavailable("Artifact candidate action changed its actual operation/activity/effect")
+    base=validate_dispatch_candidate_writes(tuple(typed_writes),namespace=namespace,identity=action.identity,
+        read_versions=event_reads,source_refs=tuple(candidate["source_refs"]),
+        access_epoch=candidate.get("access_epoch"),delete_epoch=candidate.get("delete_epoch"),
+        query_epoch=candidate.get("query_epoch"))
+    if (type(base)is not DispatchCandidateEvidenceV1 or event[2]!=base.query_epoch+1
+            or type(candidate.get("source_audience"))is not list or type(candidate.get("source_proof_versions"))is not list):
+        raise AuthorityUnavailable("Artifact candidate lost its actual qualified source proof receipt")
+    qualified=replace(base,status=candidate["status"],source_audience=tuple(candidate["source_audience"]),
+        source_proof_versions=tuple(tuple(item)for item in candidate["source_proof_versions"]),
+        source_proof_digest=candidate.get("source_proof_digest"))
+    if qualified.digest!=candidate.get("digest"):
+        raise AuthorityUnavailable("Artifact complete dispatch candidate digest differs from its original receipt")
+    batch=values[3]
     expression=artifact_receipt_expression_v1(value,tuple(batch["audiences"]));segment=expression.segments[0]
     actual=batch["segments"]
-    if (action.identity.operation_id!=operation_id or action.identity.effect_id!=value.effect_id
-            or action.source_refs!=(value.source_ref,)or schema.required_checks!=action.required_checks
-            or grant.action_id!=action.action_id or grant.intent_revision!=action.revision
-            or batch["grant_digest"]!=canonical_digest(grant)or batch["batch_digest"]!=candidate["batch_digest"]
+    if (action.source_refs!=(value.source_ref,)
             or len(actual)!=1 or actual[0]["body"]!=value.text or actual[0]["media_refs"]
             or actual[0]["segment_id"]!=segment.segment_id or actual[0]["effect_id"]!=value.effect_id
             or actual[0]["payload_digest"]!=expression.payload_digest
@@ -526,7 +551,7 @@ def recover_artifact_receipt_dispatch_candidate_in_transaction_v1(db,namespace,o
         raise AuthorityUnavailable("Artifact D09 completion text or generic D08/grant lineage differs")
     evidence=ArtifactReceiptDispatchEvidenceV1(namespace,operation_id,value.effect_id,value.digest,value.source_ref,
         value.completion_digest,value.completion_receipt_digest,*tuple(ref for ref,_ in candidate["refs"]),
-        batch["batch_digest"],segment.segment_id,expression.payload_digest,(value.source_ref,),candidate["digest"])
+        qualified.batch_digest,segment.segment_id,expression.payload_digest,(value.source_ref,),qualified.digest)
     return ArtifactReceiptDispatchRecoveryV1(evidence,tuple(tuple(row)for row in candidate["refs"]),
         candidate["graph_epoch"],candidate["graph_incarnation"],candidate["graph_revision"])
 

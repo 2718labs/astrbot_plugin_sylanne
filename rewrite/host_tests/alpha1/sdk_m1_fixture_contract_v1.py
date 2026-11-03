@@ -15,6 +15,7 @@ ORDINARY_SCENARIO="sdk_ordinary_old_source_v1"
 GREETING_SCENARIO="sdk_ordinary_greeting_v1"
 D13_256_SCENARIO="sdk_d13_v6_256_current_v1"
 D13_V7_256_SCENARIO="sdk_d13_v7_256_current_v1"
+V10_D13_V7_256_SCENARIO="sdk_v10_d13_v7_256_current_v1"
 D13_256_EPISODES=tuple({"message_id":2720000+i,"task_text":f"第{i+1:03d}条记录：我把编号营灯{i+1:03d}的灯具放入第{i+1:03d}个柜子。","intent_kind":None,"semantic_segment_count":1,"artifact_text":""} for i in range(256))
 ORDINARY_EPISODES=(
     {"message_id":2718101,"task_text":"我把编号炉灰九的野营炉子收进了绿色箱子，箱子在书桌左边。","intent_kind":None,"semantic_segment_count":1,"artifact_text":""},
@@ -125,6 +126,12 @@ def approved_initial_request_v1(*, executable_sha256, valid_until_utc):
 
 
 def approved_initial_request_for_scenario_v1(*,executable_sha256,valid_until_utc,scenario=SCENARIO):
+    if scenario==V10_D13_V7_256_SCENARIO:
+        if __package__:
+            from .sdk_d13_v7_256_root_fixture_v1 import approved_sdk_v10_d13_v7_256_initial_request_v1
+        else:
+            from sdk_d13_v7_256_root_fixture_v1 import approved_sdk_v10_d13_v7_256_initial_request_v1
+        return approved_sdk_v10_d13_v7_256_initial_request_v1(executable_sha256=executable_sha256,valid_until_utc=valid_until_utc)
     if scenario==D13_V7_256_SCENARIO:
         if __package__:
             from .sdk_d13_v7_256_root_fixture_v1 import approved_sdk_d13_v7_256_initial_request_v1
@@ -156,10 +163,11 @@ def initial_install_request_v1(request,provider,identity,*,sender_id,scenario=SC
     from sylanne3.runtime.foreground_call_plan_v1 import SCHEMA
     from sylanne3.model_broker.natural_reply_history_v4 import TEMPLATE_VERSION_V5
     from sylanne3.model_broker.natural_review import REVIEW_TEMPLATE_VERSION_V2
-    if request["schema"]!="sylanne3.linux-install-request.v4":raise ValueError("SDK M1 requires explicit installer v4")
+    expected_schema="sylanne3.linux-install-request.v7" if scenario==V10_D13_V7_256_SCENARIO else "sylanne3.linux-install-request.v4"
+    if request["schema"]!=expected_schema:raise ValueError("SDK scenario requires its exact explicit installer schema")
     value=json.loads(json.dumps(request));now=time.time();until=value["budget_valid_until_utc"]
     if not now<until:raise ValueError("original approved installation budget expired")
-    if scenario not in (D13_256_SCENARIO,D13_V7_256_SCENARIO) and (value["budget_limits"]["input_tokens"]>48000 or value["budget_limits"]["output_tokens"]>8000):
+    if scenario not in (D13_256_SCENARIO,D13_V7_256_SCENARIO,V10_D13_V7_256_SCENARIO) and (value["budget_limits"]["input_tokens"]>48000 or value["budget_limits"]["output_tokens"]>8000):
         raise ValueError("M1 initial budget exceeds its fixed input/output ceiling")
     if value["budget_max_ceiling"].get("thread_cpu_ms",0)<60000 or value["budget_limits"].get("thread_cpu_ms",0)<60000:
         raise ValueError("explicit initial root CPU budget is missing; do not enlarge the approved request")
@@ -205,7 +213,7 @@ def initial_install_request_v1(request,provider,identity,*,sender_id,scenario=SC
     config={"schema":"sylanne.sdk-m1-model-fixture.v1","provider_id":value["provider_id"],"model_id":value["model_id"],
         "provider_config_digest":config_digest,"billing_private_key_hex":private_hex,"filename":FILENAME,
         "max_episode_calls":6,"max_auxiliary_calls":2,"max_total_calls":12,"episodes":list(EPISODES)}
-    if scenario in (ORDINARY_SCENARIO,GREETING_SCENARIO,D13_256_SCENARIO,D13_V7_256_SCENARIO,REAL_ELAPSED_SCENARIO):
+    if scenario in (ORDINARY_SCENARIO,GREETING_SCENARIO,D13_256_SCENARIO,D13_V7_256_SCENARIO,V10_D13_V7_256_SCENARIO,REAL_ELAPSED_SCENARIO):
         from sylanne3.host.authority_profile import AdminD06RecallPolicyV1,AdminD06RecallProfileV1
         from sylanne3.runtime.c04_interpretation_policy_v3 import installed_c04_presence_policy_v3
         from sylanne3.model_broker.d07_cognition_v1 import RECALL_TEMPLATE_VERSION_V1
@@ -224,8 +232,8 @@ def initial_install_request_v1(request,provider,identity,*,sender_id,scenario=SC
             timeout_seconds=120.0,max_output_tokens=c3_quote["output_tokens"],quote_ceiling=c3_quote)
         value.update(d06_recall=plain_v1(recall),d07_cognition=plain_v1(c3))
         config.update(schema="sylanne.sdk-ordinary-recall-model-fixture.v1",
-            episodes=list(D13_256_EPISODES if scenario in (D13_256_SCENARIO,D13_V7_256_SCENARIO) else GREETING_EPISODES if scenario==GREETING_SCENARIO else ORDINARY_EPISODES))
-        if scenario==D13_V7_256_SCENARIO:
+            episodes=list(D13_256_EPISODES if scenario in (D13_256_SCENARIO,D13_V7_256_SCENARIO,V10_D13_V7_256_SCENARIO) else GREETING_EPISODES if scenario==GREETING_SCENARIO else ORDINARY_EPISODES))
+        if scenario in (D13_V7_256_SCENARIO,V10_D13_V7_256_SCENARIO):
             from sylanne3.model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
             value['natural_template_pair_v1']['generation']=V7_TEMPLATE
             value['d13_paid_precompression']={'history_token_budget':1024,'quote_ceiling':dict(quote),
@@ -236,6 +244,17 @@ def initial_install_request_v1(request,provider,identity,*,sender_id,scenario=SC
             else:
                 from sdk_d13_v7_256_root_fixture_v1 import configure_initial_v7_counter_v1
             configure_initial_v7_counter_v1(value,metric_source_path=Path(__file__).with_name('sdk_m1_model_fixture_v1.py'))
+        if scenario==V10_D13_V7_256_SCENARIO:
+            from sylanne3.model_broker.ordinary_continuity_cognition_v1 import WORK_KIND as C3_KIND,PURPOSE as C3_PURPOSE,ordinary_continuity_template_v1
+            auxiliary_quote={**quote,'input_tokens':6000,'output_tokens':1000,'model_tokens':7000}
+            for name,phase in (('ordinary_continuity_screen','ordinary_screen'),('ordinary_continuity_deep','deep_review')):
+                value[name]=plain_v1(AdminModelWorkflowV2(work_kind=C3_KIND,purpose=C3_PURPOSE,
+                    template_version=ordinary_continuity_template_v1(phase)[0],provider_id=workflow.provider_id,
+                    model_id=workflow.model_id,provider_config_ref=workflow.provider_config_ref,
+                    provider_config_digest=workflow.provider_config_digest,audiences=workflow.audiences,
+                    privacy_tier=workflow.privacy_tier,required_capabilities=workflow.required_capabilities,
+                    timeout_seconds=120.0,max_output_tokens=1000,quote_ceiling=auxiliary_quote))
+            config.update(schema='sylanne.sdk-v10-d13-v7-256-model-fixture.v1')
         if scenario==D13_256_SCENARIO:
             from sylanne3.model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
             value["natural_template_pair_v1"]["generation"]=V6_TEMPLATE
@@ -349,7 +368,12 @@ def owner_initialization_v1(command,*,profile,package_root,graph_path):
         submit("d02_fixed_work_policy",{"policy":plain_v1(c04)})
         submit("c04_cpu_policy",{"policy":plain_v1(C04InternalCpuQuotePolicyV1(recall.cpu_policy_id,
             recall.cpu_policy_version,ns,policy.installation_id,ALGORITHM_ID_V4,cpu,until))})
-    if profile['model_workflows']['version']==7:
+    from sylanne3.authority_service.d13_core_counter_contract_v1 import InstalledD13WirePolicyV7,installed_d13_wire_policy_from_payload_v7
+    wire=profile.get('d13_wire_policy')
+    current_v7=wire is not None and wire.get('schema')=='sylanne3.d13.installed-core-wire-policy.v7'
+    if current_v7:
+        if type(installed_d13_wire_policy_from_payload_v7(wire)) is not InstalledD13WirePolicyV7:
+            raise ValueError('actual installed V7 counter wire required')
         from sylanne3.runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyV1,D13_COUNTER_CPU_WORK_KIND
         counter_profile=BodyProfile("body:sdk-d13-v7-counter",ns,1,("energy",),(D13_COUNTER_CPU_WORK_KIND,))
         counter_body=FixedBodyPolicyV1("body-policy:sdk-d13-v7-counter",1,counter_profile,

@@ -36,9 +36,13 @@ _PATHS = {
         ("before_ref",), ("operation_id",)),
     "prepared": (("namespace",), ("operation_id",), ("job_id",), ("call_id",),
         ("activity_id",), ("causal_operation_id",), ("quote_id",), ("quote_digest",),("reservation_digest",),("audience",),
-        ("read_rows",), ("frozen", "identity")),
+        ("read_rows",), ("frozen", "identity"),("role_support_manifest",)),
+    "single_event_life_scope":(("schema",),("prepare_operation_id",),("binding","namespace"),
+        ("binding","execution_id"),("binding","prepare_operation_id"),("binding","prepared_original_ref"),
+        ("plan","project","ref"),("plan","project","revision"),("plan","project","digest"),("read_rows",)),
     "numeric_model_life_prepared":(("schema",),("binding",),("prepare_operation_id",),
-        ("plan","audiences"),("plan","input_source","ref"),("read_rows",)),
+        ("plan","audiences"),("plan","input_source","ref"),("plan","project","ref"),
+        ("plan","project","revision"),("plan","project","digest"),("read_rows",)),
     "native_prepared":(("binding",),("original_ref",),("schema",)),
     "native_life_adopted":(("namespace",),("result_ref",),("producing_operation_id",),("source_refs",),("write_commitments",),
         ("terminal","binding"),("terminal","original_ref"),("terminal","claim","original_ref")),
@@ -61,7 +65,7 @@ _PATHS = {
         ("appraisal_acceptance_digests",)),
     "native_acceptance":(("namespace",),("operation_id",),("job_id",),("context_digest",),("before_digest",),
         ("appraisal_ref",),("appraisal_revision",),("prepared_digest",),("result_original_ref",),
-        ("result_original_digest",),("cost_original_ref",),("cost_original_digest",),("read_rows",)),
+        ("result_original_digest",),("cost_original_ref",),("cost_original_digest",),("read_rows",),("role_support_manifest",)),
     "binding": ((),),
     "request": (("schema",),("prepared_digest",),("binding_digest",),("request_digest",)),
     "acquire_commit": ((),),
@@ -325,7 +329,7 @@ class NumericMetadataTaskV1:
             self.key_columns, self.key = ("token", "bot", "persona"), (ref, *reader.namespace.as_tuple)
             self.header_columns = ("revision", "valid", "value_cell_id")
         elif mode == "life":
-            kinds = {"numeric_model_life_prepared":"prepared","before": "d04_before_v1", "context": "numeric_context_v1",
+            kinds = {"single_event_life_scope":"prepared","numeric_model_life_prepared":"prepared","before": "d04_before_v1", "context": "numeric_context_v1",
                 "prepared": "numeric_prepared_v1", "paid": "numeric_paid_v1",
                 "binding":"numeric_binding_v1","request":"numeric_request_v1","acquire_commit":"numeric_acquire_commit_v1",
                 "native_trace":"numeric_trace_v1","native_baseline":"d04_interval_baseline_v1",
@@ -496,7 +500,11 @@ def _metadata(reader, mode, profile, ref):
         raise AuthorityUnavailable("Numeric metadata crossed its actual selected Work")
     with runtime_storage_quantum_v3(reader.db) as meter:
         task.require_header_v1(meter)
-    return _detach_value_v3(task.result), task
+    value=_detach_value_v3(task.result)
+    if mode=="life" and profile in {"prepared","native_acceptance"}:
+        from .d06_ordinary_readout_v3 import require_life_original_manifest_v3
+        require_life_original_manifest_v3(reader,value)
+    return value, task
 
 def _numeric_paid_operations_v3():
     from .current_method_learning_read_v3 import _NUMERIC_PAID_WRITE_OPERATIONS_V3
@@ -558,6 +566,14 @@ def prepare_numeric_metadata_plan_v1(reader):
         tasks.append(adopted_task)
         if adopted["identity"]["phase"] != "adopt_internal_life_numeric":
             raise AuthorityUnavailable("Numeric actual appraisal adoption clock belongs to another phase")
+        for member in before["members"]:
+            _, checkpoint_task = _metadata(r, "graph", "checkpoint", member["checkpoint"]["ref"])
+            tasks.append(checkpoint_task)
+    if r.operation_kind in {"prepare_internal_life_numeric_drive",
+                            "prepare_internal_life_numeric_joint",
+                            "read_current_life_numeric_joint_prepared_v3"}:
+        # Life drive/joint metadata requires its selected before-root checkpoints
+        # before the Source ALL phase; the plan must retain those exact originals.
         for member in before["members"]:
             _, checkpoint_task = _metadata(r, "graph", "checkpoint", member["checkpoint"]["ref"])
             tasks.append(checkpoint_task)
@@ -721,6 +737,8 @@ def require_numeric_method_body_v1(reader, table, key):
     if reader.numeric_source_permission is None:
         raise AuthorityUnavailable("Numeric protected original/model output requires ALL actual Source/ancestor metadata EOF")
     proof = reader.numeric_source_permission.require_for_v1(reader)
+    from .d06_ordinary_readout_v3 import require_life_ordinary_body_v3
+    require_life_ordinary_body_v3(reader)
     if table in {"graph_atoms","graph_history"}:
         atom = AtomKey.from_token(key[0])
         if atom.type_name == "memory.source" and atom.token not in proof.source_refs:
@@ -826,6 +844,8 @@ def require_numeric_c04_original_selector_v1(reader,request):
     return task
 
 def release_numeric_metadata_payloads_v1(reader):
+    from .d06_ordinary_readout_v3 import release_life_ordinary_readout_v3
+    release_life_ordinary_readout_v3(reader)
     _METADATA_PLANS.pop(reader,None)
     _C04_SELECTIONS.pop(reader,None)
     if reader.numeric_source_permission is not None:

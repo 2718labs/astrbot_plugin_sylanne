@@ -20,7 +20,7 @@ _WINDOW_END = object()
 _WORK_ISSUER_V3 = object()
 _RESULT_ISSUER_V3 = object()
 _STORAGE_INVOCATION_V3 = ContextVar("sylanne_graph_storage_invocation_v3", default=None)
-_STORAGE_KINDS_V3 = frozenset({"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"})
+_STORAGE_KINDS_V3 = frozenset({"d13_counter_owner_metadata_v1","d04_root_topology_read_v1","current_c04_body_resource_inputs_v3","c04_body_accounting_inputs_v3","natural_pending_dispatch_metadata_read_v3","d13_natural_parent_closure_read_v3","source_correction_commit_read_v3","d13_accounting_diagnostic_v3","artifact_outbound_receipt_adoption_read_v3","source_owner_read_v3","natural_outbound_receipt_adoption_read_v3","d04_source_read_v3","d13_maintenance_read_v2","d02_fixed_policy_read_v3","current_d07_dispatch_read_v3","current_character_labor_cold_ack_v1","current_character_labor_rebuild_cold_v1","current_character_labor_adoption_locator_v1","current_character_labor_adoption_v1","current_character_labor_source_read_v1","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3", "current_life_numeric_model_seal_v3", "current_owner_job_cancel_v3", "source_correction_context_v3", "owner_material_source_write_v3", "dispatch_inventory_prepare_v3", "natural_dispatch_initial_read_v1", "current_graph_full_read_v3", "d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3", "current_method_learning_read_v3", "current_life_numeric_read_v3", "domain_background_read_v3", "contact_host_stage_read_v3", "contact_cost_metadata_v3", "contact_effect_accounting_v1", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"})
 
 
 def _clear_storage_error_frames_v3(error):
@@ -68,6 +68,21 @@ class GraphStorageStepV3:
             raise ValueError("unfinished graph storage step cannot publish a result")
 
 
+def _release_graph_storage_payload_v3(lease,release_payload):
+    """Close payload and retention once, retaining the first cleanup failure."""
+    failure=None
+    try:
+        if release_payload is not None:release_payload()
+    except BaseException as error:
+        failure=error
+    try:
+        lease.release()
+    except BaseException as error:
+        if failure is None:failure=error
+        elif error is not failure:failure.add_note("graph storage retention release failed: "+type(error).__name__)
+    if failure is not None:raise failure
+
+
 class OwnedGraphStorageResultV3:
     """Private DTO retention ownership, moved to the actual response encoder."""
     __slots__ = ("_value", "_lease", "_lock", "_release_payload")
@@ -95,10 +110,33 @@ class OwnedGraphStorageResultV3:
             lease, release_payload = self._lease, self._release_payload
             self._value = self._lease = self._release_payload = None
         if lease is not None:
-            try:
-                if release_payload is not None:release_payload()
-            finally:
-                lease.release()
+            _release_graph_storage_payload_v3(lease,release_payload)
+
+
+def retained_graph_calls_v3(worker):
+    """Consume each actual result once; replacement drops only its previous DTO lease."""
+    from contextlib import contextmanager,ExitStack
+
+    @contextmanager
+    def retain():
+        slots={}
+        with ExitStack()as lifetime:
+            async def call(callback,*,slot):
+                result=await worker.call(callback)
+                current=None
+                if type(result)is OwnedGraphStorageResultV3:
+                    value,retention=result.take_value_v3()
+                    current=ExitStack();current.callback(retention.release)
+                    lifetime.callback(current.close)
+                else:value=result
+                previous=slots.pop(slot,None)
+                if previous is not None:previous.close()
+                if current is not None:
+                    if value is None:current.close()
+                    else:slots[slot]=current
+                return value
+            yield call
+    return retain()
 
 
 class GraphStorageWorkV3:
@@ -163,11 +201,25 @@ class GraphStorageWorkV3:
         self._require_invocation(coordinator)
         if not self._handed_to_worker or self.terminal:
             raise RuntimeError("graph storage work is not owned and unfinished")
-        if self.kind == "current_graph_full_read_v3":
-            from .runtime.current_graph_full_read_v3 import advance_current_graph_full_read_v3
-            step = advance_current_graph_full_read_v3(coordinator,self)
-        else:
-            step = coordinator._advance_runtime_storage_work_v3(self)
+        from .runtime.source_inspection_metadata_read_v3 import resolve_pending_inspection_metadata_core_v3
+        if resolve_pending_inspection_metadata_core_v3(self):
+            return GraphStorageStepV3("progress")
+        from .runtime.d02_character_labor_read_v1 import resolve_character_labor_checkpoint_fence_v1
+        if resolve_character_labor_checkpoint_fence_v1(self):
+            return GraphStorageStepV3("progress")
+        from .runtime.d13_natural_original_use_v3 import (
+            D13NaturalOriginalAdmissionRequiredV3, resolve_graph_natural_original_admission_v3)
+        try:
+            if self.kind == "current_graph_full_read_v3":
+                from .runtime.current_graph_full_read_v3 import advance_current_graph_full_read_v3
+                step = advance_current_graph_full_read_v3(coordinator,self)
+            else:
+                step = coordinator._advance_runtime_storage_work_v3(self)
+        except D13NaturalOriginalAdmissionRequiredV3 as pending:
+            if pending.work is not self:
+                raise RuntimeError("natural receiver continuation crossed its actual Work") from pending
+            resolve_graph_natural_original_admission_v3(self)
+            return GraphStorageStepV3("progress")
         if type(step) is not GraphStorageStepV3:
             raise TypeError("actual graph storage producer step required")
         return step
@@ -181,9 +233,37 @@ class GraphStorageWorkV3:
             from .runtime.d07_source_dispatch_read_v3 import _D07DispatchHandoffV3,finish_d07_dispatch_handoff_v3
             if type(value)is _D07DispatchHandoffV3:
                 return finish_d07_dispatch_handoff_v3(value,self)
-        storage_payload = self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}
+        storage_payload = self.kind in {"d13_counter_owner_metadata_v1","d04_root_topology_read_v1","current_c04_body_resource_inputs_v3","c04_body_accounting_inputs_v3","source_correction_commit_read_v3","d13_accounting_diagnostic_v3","artifact_outbound_receipt_adoption_read_v3","source_owner_read_v3","natural_outbound_receipt_adoption_read_v3","d04_source_read_v3","d13_maintenance_read_v2","d02_fixed_policy_read_v3","current_d07_dispatch_read_v3","current_character_labor_cold_ack_v1","current_character_labor_rebuild_cold_v1","current_character_labor_adoption_locator_v1","current_character_labor_adoption_v1","current_character_labor_source_read_v1","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_accounting_v3","current_life_numeric_paid_write_v3","current_life_numeric_model_seal_v3","current_owner_job_cancel_v3","owner_material_source_write_v3","dispatch_inventory_prepare_v3", "natural_dispatch_initial_read_v1","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}
         release_payload = (value.release_payload_v3
-            if self.kind in {"current_d07_dispatch_read_v3","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"} and error is None else None)
+            if self.kind in {"d13_counter_owner_metadata_v1","current_c04_body_resource_inputs_v3","c04_body_accounting_inputs_v3","source_correction_commit_read_v3","d13_accounting_diagnostic_v3","artifact_outbound_receipt_adoption_read_v3","source_owner_read_v3","natural_outbound_receipt_adoption_read_v3","d02_fixed_policy_read_v3","d13_maintenance_read_v2","current_d07_dispatch_read_v3","current_character_labor_cold_ack_v1","current_character_labor_rebuild_cold_v1","current_character_labor_adoption_locator_v1","current_character_labor_adoption_v1","current_character_labor_source_read_v1","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_life_numeric_paid_write_v3","dispatch_inventory_prepare_v3", "natural_dispatch_initial_read_v1","current_graph_full_read_v3","d13_standby_read_v3","d13_paid_original_read_v3","d13_derived_retirement_read_v3","current_method_learning_read_v3","current_life_numeric_read_v3","domain_background_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"} and error is None else None)
+        if self.kind == "current_graph_full_read_v3" and error is None:
+            from .runtime.current_graph_full_read_v3 import release_current_graph_full_result_v3
+            def release_full_result(proof=value, work=self):
+                release_current_graph_full_result_v3(work, proof)
+            release_payload = release_full_result
+        elif self.kind == "d04_root_topology_read_v1" and error is None:
+            from .runtime.d04_root_topology_read_v1 import release_current_d04_root_topology_result_v1
+            def release_topology_result(work=self):
+                release_current_d04_root_topology_result_v1(work)
+            release_payload=release_topology_result
+        elif self.kind == "d04_source_read_v3" and error is None:
+            from .runtime.d04_source_work_v3 import release_installed_d04_source_result_v3
+            def release_d04_result(work=self):
+                release_installed_d04_source_result_v3(work)
+            release_payload = release_d04_result
+        elif self.kind in {"natural_dispatch_initial_read_v1", "dispatch_inventory_prepare_v3"} and error is None:
+            def release_natural_result(cleanup=release_payload, work=self):
+                from .runtime.d13_natural_original_use_v3 import request_graph_natural_original_release_v3
+                from .runtime.dispatch_initial_source_read_v3 import release_host_natural_roster_metadata_for_work_v3
+                def release_final():
+                    release_host_natural_roster_metadata_for_work_v3(work)
+                    request_graph_natural_original_release_v3(work)
+                cleanup()
+                if work.operation.closed:
+                    release_final()
+                else:
+                    work.operation.transfer_payload_release_v3(release_final)
+            release_payload = release_natural_result
         if storage_payload and error is not None:_clear_storage_error_frames_v3(error)
         try:
             if self.kind == "current_graph_full_read_v3":
@@ -192,13 +272,27 @@ class GraphStorageWorkV3:
             else:
                 coordinator._finish_runtime_storage_work_v3(self, error)
         except BaseException as finish_error:
-            if error is not None:
-                finish_error.__cause__ = error
-            value, error = None, finish_error
+            if error is None:error=finish_error
+            elif finish_error is not error:error.add_note("graph storage producer finish failed: "+type(finish_error).__name__)
+            value=None
             if storage_payload:_clear_storage_error_frames_v3(error)
+        if (error is not None and self.kind in {"natural_dispatch_initial_read_v1", "dispatch_inventory_prepare_v3"}
+                and self.operation.closed):
+            from .runtime.d13_natural_original_use_v3 import request_graph_natural_original_release_v3
+            from .runtime.dispatch_initial_source_read_v3 import release_host_natural_roster_metadata_for_work_v3
+            release_host_natural_roster_metadata_for_work_v3(self)
+            request_graph_natural_original_release_v3(self)
         self.terminal = True
         self.phase = "failed" if error is not None else "complete"
-        if error is None and self.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}:
+        if error is None and self.kind == "source_owner_read_v3":
+            try:
+                from .runtime.source_owner_read_v3 import require_source_owner_terminal_v3
+                value = require_source_owner_terminal_v3(value, self)
+            except BaseException as result_error:
+                value, error = None, result_error
+                self.phase = "failed"
+                _clear_storage_error_frames_v3(error)
+        if error is None and self.kind in {"current_character_labor_source_read_v1","current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3", "current_conditioned_self_source_read_v3", "current_habit_source_read_v3"}:
             try:
                 from .runtime.current_beta1_source_read_v3 import require_beta1_source_terminal_value_v3
                 value=require_beta1_source_terminal_value_v3(value,self)
@@ -253,17 +347,16 @@ class GraphStorageWorkV3:
             try:
                 lifetime.close()
             except BaseException as close_error:
-                if error is not None:
-                    close_error.__cause__ = error
-                value, error = None, close_error
+                if error is None:error=close_error
+                elif close_error is not error:error.add_note("graph storage request lifetime cleanup failed: "+type(close_error).__name__)
+                value=None
                 if storage_payload:_clear_storage_error_frames_v3(error)
         lease, self.result_lease = self.result_lease, None
         if error is not None:
             if lease is not None:
-                try:
-                    if release_payload is not None:release_payload()
-                finally:
-                    lease.release()
+                try:_release_graph_storage_payload_v3(lease,release_payload)
+                except BaseException as release_error:
+                    if release_error is not error:error.add_note("graph storage failed-result cleanup failed: "+type(release_error).__name__)
             raise error
         if lease is not None:
             return OwnedGraphStorageResultV3(_RESULT_ISSUER_V3, value, lease, release_payload)
@@ -281,7 +374,7 @@ def create_graph_storage_work_v3(coordinator, *, kind, operation_id,
 class _GraphCallV3:
     __slots__ = ("function", "args", "outcome", "is_callback", "ticket", "context",
                  "started", "deliver", "work", "terminal", "delivery_abandoned",
-                 "delivered_result", "final_mappers", "handoff_deadline", "pending_handoff_result")
+                 "delivered_result", "final_mappers", "handoff_deadline", "pending_handoff_result", "final_lifetimes")
 
     def __init__(self, function, args, outcome, *, is_callback, ticket):
         self.function, self.args, self.outcome = function, args, outcome
@@ -289,6 +382,7 @@ class _GraphCallV3:
         self.started = self.deliver = self.terminal = self.delivery_abandoned = False
         self.work = self.delivered_result = None
         self.final_mappers=[];self.handoff_deadline=None;self.pending_handoff_result=None
+        self.final_lifetimes=[]
 
 
 class _ExclusiveCallbackWindow:
@@ -401,6 +495,13 @@ class GraphWorker:
         return worker
 
     def _complete_call(self, call, value, error):
+        lifetimes,call.final_lifetimes=call.final_lifetimes,[]
+        for lifetime in reversed(lifetimes):
+            try:lifetime.close()
+            except BaseException as cleanup_error:
+                if error is None:error=cleanup_error
+                else:error.add_note('final request lifetime cleanup also failed: '+type(cleanup_error).__name__)
+        lifetimes.clear()
         pending,call.pending_handoff_result=call.pending_handoff_result,None
         if pending is not None:
             try:pending.release_v3()
@@ -416,7 +517,7 @@ class GraphWorker:
             else:
                 self._callback_call = None
             if type(value) is OwnedGraphStorageResultV3:
-                if call.delivery_abandoned or not call.deliver:
+                if error is not None or call.delivery_abandoned or not call.deliver:
                     abandoned, value = value, None
                 else:
                     call.delivered_result = value
@@ -424,7 +525,8 @@ class GraphWorker:
             try:
                 abandoned.release_v3()
             except BaseException as release_error:
-                error = release_error
+                if error is None:error=release_error
+                else:error.add_note('undelivered terminal result cleanup also failed: '+type(release_error).__name__)
         # No completed queue cell may cache request Context or producer state.
         call.function, call.args, call.context, call.work = None, (), None, None
         call.final_mappers=[]
@@ -573,6 +675,13 @@ class GraphWorker:
             failure = exc
             self._abort_calls(coordinator, failure)
         finally:
+            if coordinator is not None:
+                try:
+                    from .runtime.source_owner_read_v3 import release_source_owner_cursors_v3
+                    release_source_owner_cursors_v3(coordinator)
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
             if fence_port is not None:
                 try:
                     fence_port.close()

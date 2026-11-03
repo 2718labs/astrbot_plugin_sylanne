@@ -5,7 +5,7 @@ import math
 import sqlite3
 import time
 from types import SimpleNamespace
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import pytest
 
@@ -19,7 +19,7 @@ from sylanne3.model_broker.first_ingress_encoding import (
     issue_first_ingress_encoding_request_v2,
 )
 from sylanne3.runtime.encoding_call_binding import (
-    EncodingCallConflict, EncodingRequestIssueV1,
+    EncodingCallConflict,
     _redact_source_binding_content_in_transaction, insert_binding, load_binding,
 )
 from sylanne3.runtime.d11_types import (
@@ -216,6 +216,14 @@ def test_encoding_request_binds_in_the_job_acquire_transaction(ingress_system):
     assert coordinator.acquire_first_ingress_encoding_job_v2(
         authority, lease, job_id, operation_id, lease_seconds=30) == acquired
     assert load_binding(store._db, policy.namespace, job_id) == binding
+
+
+@dataclass(frozen=True)
+class EncodingRequestIssueV1:
+    """Retired fixture output used only to verify the production V2 boundary."""
+    request: object
+    provider_config_ref: str
+    provider_config_digest: str
 
 
 def test_legacy_v1_issue_is_explicitly_rejected_for_production_acquire(ingress_system):

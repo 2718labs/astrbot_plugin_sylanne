@@ -206,9 +206,9 @@ def test_outbound_unknown_or_uncommitted_observation_cannot_complete():
     batch_key = AtomKey(Owner("activity", *NS.as_tuple, "activity:reply"),
                         "d09.verified_segment_batch.v1", "batch:one")
     batch = GraphAtom(batch_key, 1, {"segments": [{"body": source.value["text"]}]})
-    with pytest.raises(ValueError, match="persisted D11 observation"):
+    with pytest.raises(ValueError, match="exact Authority observation receipt"):
         observe_outbound_turn_v1(NS, slot, outbox, batch, source, access, None)
-    with pytest.raises(ValueError, match="actual D11 recipient delivery"):
+    with pytest.raises(ValueError, match="exact Authority delivery receipt"):
         complete_outbound_turn_v1(NS, slot, outbox, batch, source, access, None)
     assert turn_order_key(NS, SCENE, CONVERSATION).type_name == "d09.turn_order.v1"
 

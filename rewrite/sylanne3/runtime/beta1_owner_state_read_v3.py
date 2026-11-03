@@ -15,15 +15,23 @@ from ..runtime_contracts import NamespaceId, canonical_digest
 from ..runtime_storage_v3 import runtime_storage_quantum_v3
 
 READ_KIND = 'read_beta1_owner_state_v1'
+from .persona_growth_review_contract_v1 import TARGET_TYPES_V1
+
 _TYPES = {
+    'growth_review': frozenset(kind for kinds in TARGET_TYPES_V1.values() for kind in kinds),
     'world': frozenset({'d03.world_assertion_input.v1', 'd03.world_view.v1', 'd09.world_perspective_input.v1'}),
     'habit': frozenset({'d10.habit_policy.v1', 'd10.habit_occurrence.v1'}),
+    'action': frozenset({'d08.action_intent.v1'}),
     'long_window': frozenset({'d08.long_term_plan.v1', 'd08.joint_window.v1'}),
 }
 def owner_state_required_domains_v3(request):
+    from .d12_creator_draft_read_v3 import creator_draft_request_v3,creator_draft_required_domains_v3
+    if creator_draft_request_v3(request):return creator_draft_required_domains_v3(request)
     if type(request) is not Beta1OwnerStateRequestV1:
         raise AuthorityUnavailable('Owner state domains require the exact typed finite request')
     domains = {'d06', 'd11', *(AtomKey.from_token(ref).type_name.split('.')[0] for ref in request.refs)}
+    if request.domain == 'growth_review':
+        domains.add('d01')
     if request.domain == 'world':
         domains.add('d03')
     return frozenset(domains)
@@ -76,8 +84,12 @@ class _StateReadV3:
     world_views: dict = field(default_factory=dict)
     producers: set = field(default_factory=set)
     roots: set = field(default_factory=set)
+    action_views: dict = field(default_factory=dict)
+    action_groups: tuple = ()
     source_permission: object = None
     metadata_complete: bool = False
+    growth_projection: dict | None = None
+    growth_receipt_selections: set = field(default_factory=set)
     first_utc: float = 0.0
     first_monotonic: float = 0.0
 
@@ -86,13 +98,16 @@ def register_owner_state_reader_v3(reader, work):
     from .current_method_learning_read_v3 import _MethodLearningReadV3, _READERS
     from .current_beta1_source_read_v3 import WORLD_SOURCE_WORK_KIND_V3
     issued = _FACTORIES.get(reader)
+    from .d12_creator_draft_read_v3 import creator_draft_request_v3,require_creator_draft_factory_v3
+    creator=creator_draft_request_v3(reader.request)
+    if creator:require_creator_draft_factory_v3(reader.graph,reader.authority,reader.lease,reader.request)
     if (type(reader) is not _MethodLearningReadV3 or reader not in _READERS or issued != _identity(reader)
             or reader.work is not work or work.state is not reader or work.operation is not reader.operation
             or work.coordinator is not reader.graph or work.kind != WORLD_SOURCE_WORK_KIND_V3
-            or type(reader.request) is not Beta1OwnerStateRequestV1 or reader.operation_kind != READ_KIND
+            or not creator and type(reader.request) is not Beta1OwnerStateRequestV1 or reader.operation_kind != READ_KIND
             or reader.session_proof is None or reader.fence.scope.operation != 'read'
-            or reader.authority.purpose != 'context' or reader.authority.audience != ('owner',)
-            or 'workbench.read' not in reader.owner_binding.capabilities or reader in _STATES
+            or not creator and (reader.authority.purpose != 'context' or reader.authority.audience != ('owner',)
+                or 'workbench.read' not in reader.owner_binding.capabilities) or reader in _STATES
             or reader.projection_types or reader.preplan_families):
         raise AuthorityUnavailable('Owner state requires its privately issued exact signed Source READ factory')
     for ref in reader.request.refs:
@@ -101,6 +116,9 @@ def register_owner_state_reader_v3(reader, work):
     work._require_invocation(reader.graph, initial=True)
     reader.graph._authorize(reader.lease, reader.authority, owner_state_required_domains_v3(reader.request), owner_read=True)
     _STATES[reader] = _StateReadV3(reader, _identity(reader), first_utc=reader.initial_now_utc, first_monotonic=time.monotonic())
+    if creator:
+        from .d12_creator_draft_read_v3 import register_creator_draft_reader_v3
+        register_creator_draft_reader_v3(reader)
     return work
 
 
@@ -117,6 +135,9 @@ def pin_owner_state_owner_v3(reader):
     state = require_owner_state_reader_v3(reader)
     if reader.general_owner_entry is None:
         raise AuthorityUnavailable('Owner state requires its actual completed independent Owner EOF')
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import pin_creator_draft_owner_v3
+        pin_creator_draft_owner_v3(reader)
     return state
 
 
@@ -124,17 +145,29 @@ def owner_state_source_groups_v3(reader, roots):
     state = require_owner_state_reader_v3(reader)
     if not state.metadata_complete or set(roots) != state.roots:
         raise AuthorityUnavailable('Owner state Source union differs from its complete fixed metadata recipe')
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import creator_draft_source_groups_v3
+        return creator_draft_source_groups_v3(reader,roots)
     from .named_joint_node_descriptor_v3 import descriptor_groups_v3
     groups=descriptor_groups_v3(reader,roots)
     if groups is not None:return groups
+    if reader.request.domain=='action':return state.action_groups
     return (('context', ('owner',), tuple(sorted(roots))),) if roots else ()
 
 
 def owner_state_metadata_spec_v3(reader, identity):
     state = require_owner_state_reader_v3(reader)
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import creator_draft_metadata_spec_v3
+        return creator_draft_metadata_spec_v3(reader,identity)
+    from .persona_growth_review_owner_read_v1 import growth_owner_metadata_spec_v1
+    growth = growth_owner_metadata_spec_v1(reader, identity)
+    if growth is not None:
+        return growth
     from .named_joint_node_descriptor_v3 import descriptor_metadata_spec_v3
     descriptor=descriptor_metadata_spec_v3(reader,identity)
     if descriptor is not None:return descriptor
+    if reader.request.domain=='action':return _action_metadata_spec_v3(reader,identity)
     kind, ref = identity
     if ref not in reader.request.refs and not (kind == 'view_head' and ref in state.world_views):
         raise AuthorityUnavailable('Owner state metadata reference was not explicitly selected')
@@ -152,8 +185,16 @@ def owner_state_metadata_spec_v3(reader, identity):
 def finish_owner_state_metadata_v3(task, value):
     reader = task.reader
     state = require_owner_state_reader_v3(reader)
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import finish_creator_draft_metadata_v3
+        return finish_creator_draft_metadata_v3(task,value)
+    from .persona_growth_review_owner_read_v1 import finish_growth_owner_metadata_v1
+    handled, growth = finish_growth_owner_metadata_v1(task, value)
+    if handled:
+        return growth
     if value is None:
         return None
+    if reader.request.domain=='action':return _finish_action_metadata_v3(task,value)
     from .named_joint_node_descriptor_v3 import finish_descriptor_metadata_v3
     handled,descriptor=finish_descriptor_metadata_v3(task,value)
     if handled:return descriptor
@@ -204,13 +245,115 @@ def _metadata(reader, identity):
     return task.result
 
 
+
+def _action_cancel_key_v3(ref):
+    key=AtomKey.from_token(ref)
+    return AtomKey(key.owner,'d08.action_cancellation.v1',key.name)
+
+
+def _action_metadata_spec_v3(reader,identity):
+    kind,ref=identity
+    if ref not in reader.request.refs:
+        raise AuthorityUnavailable('Action metadata was not explicitly selected')
+    if kind in {'action_head','action_cancellation'}:
+        key=AtomKey.from_token(ref) if kind=='action_head' else _action_cancel_key_v3(ref)
+        fields=('action_id','revision','identity','purpose','source_refs') if kind=='action_head' else (
+            'action_id','action_revision','action_digest','activity_id','attempt_id','effect_id','cancel_epoch','state','actor','source_refs','operation_id')
+        return ('graph_atoms','value',('token','bot','persona'),(key.token,*reader.namespace.as_tuple),
+            ('revision','valid','value_cell_id'),tuple((name,)for name in fields),None)
+    if kind=='action_admission':
+        action=_metadata(reader,('action_head',ref));identity=action['identity']
+        fields=('namespace','activity_id','effect_id','attempt_id','operation_id','action_ref',
+            'action_intent_digest','purpose','audience','destination_ref')
+        return ('graph_dispatch_admissions','admission_json',('bot','persona','operation_id','effect_id'),
+            (*reader.namespace.as_tuple,identity['operation_id'],identity['effect_id']),
+            ('admission_digest','receipt_digest'),tuple((name,)for name in fields),None)
+    raise AuthorityUnavailable('Action READ has no registered metadata selector')
+
+
+def _finish_action_metadata_v3(task,value):
+    reader=task.reader;kind,ref=task.identity
+    if kind in {'action_head','action_cancellation'}:
+        token=ref if kind=='action_head' else _action_cancel_key_v3(ref).token
+        if reader.heads.get(token)!=task.metadata or task.metadata[0]<1 or task.metadata[1]!=1:
+            raise AuthorityUnavailable('Action metadata no longer matches its actual current Head')
+    elif kind=='action_admission':
+        if task.column.canonical_digest!=task.metadata[0]:
+            raise AuthorityUnavailable('Action admission metadata differs from the full original digest')
+    return value
+
+
+def _action_metadata_plan_v3(reader):
+    from .domain_production_contracts_v1 import ProductionReadPlanV1
+    from ..domains.d08.execution import ActionCancellationState
+    state=require_owner_state_reader_v3(reader);roots=set();groups=[];keys=[];views={}
+    for ref in reader.request.refs:
+        key=AtomKey.from_token(ref);cancel=_action_cancel_key_v3(ref);keys.extend((key,cancel))
+        if reader.heads.get(ref) is None or reader.heads[ref][1]!=1:continue
+        action=_metadata(reader,('action_head',ref));cancellation=_metadata(reader,('action_cancellation',ref))
+        if cancellation is None:continue
+        before=ActionCancellationState(**{**cancellation,'source_refs':tuple(cancellation['source_refs'])})
+        identity=action['identity'];sources=tuple(action['source_refs'])
+        if (action['action_id']!=key.name or action['revision']!=reader.heads[ref][0]
+                or key.owner.kind!='activity' or key.owner.subject!=identity['activity_id']
+                or (before.action_id,before.action_revision,before.activity_id,before.attempt_id,before.effect_id,before.source_refs)!=
+                    (key.name,action['revision'],identity['activity_id'],identity['attempt_id'],identity['effect_id'],sources)):
+            raise AuthorityUnavailable('Action READ metadata changed its current cancellation/identity/Source binding')
+        admission=_metadata(reader,('action_admission',ref))
+        if admission is None:continue
+        if (admission['namespace']!='/'.join(reader.namespace.as_tuple)
+                or tuple(admission[name]for name in ('activity_id','attempt_id','effect_id','operation_id'))!=
+                    tuple(identity[name]for name in ('activity_id','attempt_id','effect_id','operation_id'))
+                or admission['action_ref']!=key.name or admission['action_intent_digest']!=before.action_digest
+                or admission['purpose']!=action['purpose'] or admission['audience']!=[admission['destination_ref']]):
+            raise AuthorityUnavailable('Action READ route differs from the actual immutable dispatch admission')
+        for source in sources:
+            source_key=AtomKey.from_token(source)
+            if source_key.type_name!='memory.source' or NamespaceId.from_key(source_key)!=reader.namespace:
+                raise AuthorityUnavailable('Action READ Source metadata crossed namespace')
+        roots.update(sources);groups.append(('context',tuple(admission['audience']),sources))
+        views[ref]=(action,before,admission,reader.heads[cancel.token][0])
+    if state.metadata_complete and (roots!=state.roots or tuple(groups)!=state.action_groups):
+        raise AuthorityUnavailable('Action READ fixed Source/route selection changed')
+    state.roots=roots;state.action_groups=tuple(groups);state.action_views=views;state.metadata_complete=True
+    return ProductionReadPlanV1((),tuple(dict.fromkeys((*keys,owner_grant_key(*reader.namespace.as_tuple)))),tuple(sorted(roots)),())
+
+
+def _action_projection_v3(reader):
+    from .current_beta1_source_read_v3 import require_beta1_source_member_v3
+    state=require_owner_state_reader_v3(reader);state.source_permission.require_for_v3(reader);items=[];missing=[]
+    for ref in reader.request.refs:
+        view=state.action_views.get(ref)
+        if view is None:
+            missing.append('current_action_or_cancellation_or_dispatch_admission_unavailable:'+ref);continue
+        action,cancellation,admission,cancel_revision=view
+        for source in action['source_refs']:
+            require_beta1_source_member_v3(reader,source,'context',tuple(admission['audience']))
+        items.append({'ref':ref,'type_name':'d08.action_intent.v1','revision':reader.heads[ref][0],
+            'state':cancellation.state,'source_refs':list(action['source_refs']),
+            'related_refs':[_action_cancel_key_v3(ref).token],'reason_codes':['cancellation_does_not_reverse_handed_off_effects'],
+            'action_id':action['action_id'],'action_revision':action['revision'],'activity_id':cancellation.activity_id,
+            'purpose':action['purpose'],'audience_ref':admission['destination_ref'],
+            'cancellation_ref':_action_cancel_key_v3(ref).token,'cancellation_revision':cancel_revision,
+            'cancellation_state':cancellation.state,'cancel_epoch':cancellation.cancel_epoch})
+    return {'domain':'action','items':items,'coverage':'partial' if missing else 'complete','missing_inputs':missing}
+
+
 def _metadata_plan(reader):
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import creator_draft_metadata_plan_v3
+        return creator_draft_metadata_plan_v3(reader)
     from .current_beta1_source_read_v3 import _beta1_metadata_row_v3
     from .domain_production_contracts_v1 import ProductionReadPlanV1
     state = require_owner_state_reader_v3(reader)
+    from .persona_growth_review_owner_read_v1 import growth_owner_plan_v1
+    growth = growth_owner_plan_v1(reader)
+    if growth is not None:
+        return growth
     from .named_joint_node_descriptor_v3 import descriptor_plan_v3
     descriptor=descriptor_plan_v3(reader)
     if descriptor is not None:return descriptor
+    if reader.request.domain=='action':return _action_metadata_plan_v3(reader)
     roots = set()
     for ref in reader.request.refs:
         header = reader.heads.get(ref)
@@ -257,6 +400,9 @@ def _metadata_plan(reader):
 
 def require_owner_state_point_v3(reader, request):
     state = require_owner_state_reader_v3(reader)
+    from .persona_growth_review_owner_read_v1 import growth_owner_point_v1
+    if growth_owner_point_v1(reader, request):
+        return
     from .named_joint_node_descriptor_v3 import descriptor_point_v3
     if descriptor_point_v3(reader,request):return
     table, columns, key_columns, key = request
@@ -266,9 +412,14 @@ def require_owner_state_point_v3(reader, request):
         from .current_beta1_source_read_v3 import require_beta1_source_control_point_v3
         if require_beta1_source_control_point_v3(reader, request):
             return
+        if reader.request.domain=='creator_draft':
+            from .d12_creator_draft_read_v3 import require_creator_draft_body_v3
+            return require_creator_draft_body_v3(reader,table,key)
         if key[0] not in reader.request.refs and key[0] not in state.world_views:
             raise AuthorityUnavailable('Owner state body was not explicitly selected')
         return require_owner_state_body_v3(reader, table, key)
+    if reader.request.domain=='creator_draft':
+        raise AuthorityUnavailable('Creator READ has no generic DomainOriginal or unrelated point')
     if table == 'graph_domain_production_originals_v1' and tuple(columns) == ('domain', 'operation_kind', 'request_digest', 'original_digest', 'original_payload_json', 'read_versions_json', 'bundle_digest', 'receipt_json', 'receipt_digest') and tuple(key_columns) == ('bot', 'persona', 'operation_id'):
         return require_owner_state_body_v3(reader, table, key)
     if table == 'graph_bundle_operations' and tuple(columns) == ('digest', 'activity_id', 'effect_id', 'commit_seq') and tuple(key_columns) == ('bot', 'persona', 'operation_id'):
@@ -278,6 +429,15 @@ def require_owner_state_point_v3(reader, request):
 
 def require_owner_state_body_v3(reader, table, key):
     state = require_owner_state_reader_v3(reader)
+    if reader.request.domain=='creator_draft':
+        from .current_beta1_source_read_v3 import require_beta1_source_control_point_v3
+        if table=='graph_atoms'and require_beta1_source_control_point_v3(reader,
+                (table,('revision','value','valid'),('token','bot','persona'),tuple(key))):return
+        from .d12_creator_draft_read_v3 import require_creator_draft_body_v3
+        return require_creator_draft_body_v3(reader,table,key)
+    from .persona_growth_review_owner_read_v1 import growth_owner_body_v1
+    if growth_owner_body_v1(reader, table, key):
+        return
     from .named_joint_node_descriptor_v3 import descriptor_body_v3
     if descriptor_body_v3(reader,table,key):return
     if table == 'graph_atoms':
@@ -364,9 +524,17 @@ def _verify_current_original(reader, atom):
 
 
 def _projection(reader):
+    if reader.request.domain=='creator_draft':
+        from .d12_creator_draft_read_v3 import creator_draft_projection_v3
+        return creator_draft_projection_v3(reader)
+    from .persona_growth_review_owner_read_v1 import growth_owner_projection_v1
+    growth = growth_owner_projection_v1(reader)
+    if growth is not None:
+        return growth
     from .named_joint_node_descriptor_v3 import descriptor_projection_v3
     descriptor=descriptor_projection_v3(reader)
     if descriptor is not None:return descriptor
+    if reader.request.domain=='action':return _action_projection_v3(reader)
     from .current_method_learning_read_v3 import method_graph_head_v3
     state = require_owner_state_reader_v3(reader)
     rows, missing = [], []
@@ -469,9 +637,14 @@ def advance_owner_state_read_v3(graph, work):
                     state.source_permission.require_for_v3(reader)
                     from .dispatch_current_inventory_v3 import _heap
                     from .named_joint_node_descriptor_v3 import named_descriptor_retained_heap_v3
-                    descriptor_bytes=named_descriptor_retained_heap_v3(value)
-                    reader.operation.retain((_heap(value)if descriptor_bytes is None else descriptor_bytes) * 2 + 65536)
-                    reader.result = _OwnerStateResultV3(reader, value)
+                    if reader.request.domain=='creator_draft':
+                        from .d12_creator_draft_read_v3 import creator_draft_retained_heap_v3
+                        reader.operation.retain(creator_draft_retained_heap_v3(value)+65536)
+                        reader.result=value
+                    else:
+                        descriptor_bytes=named_descriptor_retained_heap_v3(value)
+                        reader.operation.retain((_heap(value)if descriptor_bytes is None else descriptor_bytes) * 2 + 65536)
+                        reader.result = _OwnerStateResultV3(reader, value)
                     reader.complete = True
                 finally:
                     reader.db.rollback()
@@ -487,6 +660,9 @@ def advance_owner_state_read_v3(graph, work):
                     if task is None:
                         task = create_current_beta1_metadata_task_v3(reader, actual)
                         state.tasks[actual] = task
+                elif kind == 'growth_review_metadata_v1':
+                    from .persona_growth_review_metadata_v1 import start_growth_review_metadata_v1
+                    task = start_growth_review_metadata_v1(reader, actual)
                 elif kind == 'beta1_source_metadata':
                     task = create_current_beta1_source_metadata_task_v3(reader, actual)
                 elif kind == 'point':
@@ -505,12 +681,16 @@ def advance_owner_state_read_v3(graph, work):
 
 
 def require_owner_state_terminal_v3(value, work):
+    from .d12_creator_draft_read_v3 import PreparedCurrentCreatorDraftV3,require_creator_draft_terminal_v3
+    if type(value)is PreparedCurrentCreatorDraftV3:return require_creator_draft_terminal_v3(value,work)
     if type(value) is not _OwnerStateResultV3:
         raise AuthorityUnavailable('Owner state returned no privately issued actual readonly result')
     return value.require_result_v3(work)
 
 
 def release_owner_state_reader_v3(reader):
+    from .d12_creator_draft_read_v3 import release_creator_draft_reader_v3
+    release_creator_draft_reader_v3(reader)
     from .named_joint_node_descriptor_v3 import release_named_descriptor_v3
     release_named_descriptor_v3(reader)
     _STATES.pop(reader, None)
@@ -536,15 +716,19 @@ def prepare_owner_state_read_v3(graph, authority, lease, *, request):
     from .current_method_learning_read_v3 import begin_current_method_learning_read_v3
     from .current_beta1_source_read_v3 import register_current_beta1_source_work_v3, WORLD_SOURCE_WORK_KIND_V3
     require_graph_storage_work_admission_v3(graph)
-    if type(request) is not Beta1OwnerStateRequestV1 or authority.purpose != 'context' or authority.audience != ('owner',):
+    from .d12_creator_draft_read_v3 import creator_draft_request_v3,require_creator_draft_factory_v3
+    creator=creator_draft_request_v3(request)
+    if creator:require_creator_draft_factory_v3(graph,authority,lease,request)
+    if not creator and(type(request) is not Beta1OwnerStateRequestV1 or authority.purpose != 'context' or authority.audience != ('owner',)):
         raise AuthorityUnavailable('Owner state requires its actual fixed typed Owner context READ')
     graph._authorize(lease, authority, owner_state_required_domains_v3(request), owner_read=True)
     owner = graph._GraphCoordinator__owner_leases.get(lease)
     session = graph._GraphCoordinator__owner_session_proofs.get(lease)
     assembly = graph._GraphCoordinator__d04_installed_joint_assembly
-    if owner is None or session is None or assembly is None or 'workbench.read' not in owner.capabilities or assembly.admin_bundle.installation_policy.namespace != authority.namespace:
+    if owner is None or session is None or assembly is None or (request.required_capability if creator else 'workbench.read') not in owner.capabilities or assembly.admin_bundle.installation_policy.namespace != authority.namespace:
         raise AuthorityUnavailable('Owner state requires its actual installed signed Owner READ lease')
-    now = trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
+    clock=graph._GraphCoordinator__content_fence_v2.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy)
+    now = trusted_upper(clock)
     operation_id = 'owner-state-read:' + uuid4().hex
     operation = begin_runtime_storage_operation_v3(graph._GraphCoordinator__store._db, operation_id, now + 60.0)
     fence = reader = None
@@ -558,6 +742,7 @@ def prepare_owner_state_read_v3(graph, authority, lease, *, request):
                 request_digest=canonical_digest((READ_KIND, request)), owner_binding=owner, owner_guard=None,
                 session_proof=session, initial_now_utc=now)
             reader.initial_monotonic_deadline = time.monotonic() + 60.0
+            reader.initial_clock=clock
             reader.background_followup = reader.background_host_lifecycle = reader.background_offline = None
         work = create_graph_storage_work_v3(graph, kind=WORLD_SOURCE_WORK_KIND_V3, operation_id=operation_id,
             selection_digest=operation.selection_digest, deadline_utc=operation.deadline_utc, state=reader, operation=operation)

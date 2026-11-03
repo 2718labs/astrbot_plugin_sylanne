@@ -7,6 +7,7 @@ It never creates a separate compression provider or a second budget ledger.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import json
 
 from astrbot.api import logger
@@ -29,7 +30,7 @@ from .v2_installation import V2InstallationAssembly
 async def run_installed_d13_paid_precompression_v1(
     runtime, installation: V2InstallationAssembly, *,
     context: Context, trusted_umo: str,
-    envelope: HostIngressEnvelope, ingress_operation_id: str,
+    envelope: HostIngressEnvelope, ingress_operation_id: str, priority=None, deterministic_decision=None,
 ):
     """Run one W01 original when its paid lifecycle is installed; else HOLD."""
     from ..runtime_context import RuntimeContext
@@ -51,6 +52,33 @@ async def run_installed_d13_paid_precompression_v1(
     if (type(conversation) is not list or len(conversation) != 2
             or conversation[0] != trusted_umo):
         return None
+    async with _installed_d13_executor_v1(runtime, installation, context, trusted_umo,
+                                          envelope.namespace) as executor:
+        if executor is None: return None
+        return await runtime.run_installed_d13_paid_precompression_v1(
+            envelope, ingress_operation_id, executor=executor, priority=priority, deterministic_decision=deterministic_decision)
+
+
+async def resume_installed_d13_paid_original_v1(runtime, installation, *, context, selection):
+    from ..runtime_context import RuntimeContext
+    from ..runtime.d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+    if (type(runtime) is not RuntimeContext or type(installation) is not V2InstallationAssembly
+            or not isinstance(context, Context) or type(selection) is not D13PrecompressionPriorityV1
+            or selection.status not in {"existing_paid", "pending_paid_schedule"}):
+        return None
+    conversation = json.loads(selection.conversation_ref)
+    if (type(conversation) is not list or len(conversation) != 2
+            or type(conversation[0]) is not str or not conversation[0]):
+        return None
+    async with _installed_d13_executor_v1(runtime, installation, context, conversation[0],
+                                          selection.namespace) as executor:
+        if executor is None: return None
+        from ..runtime.d13_paid_product_v1 import resume_installed_d13_paid_original_runtime_v1
+        return await resume_installed_d13_paid_original_runtime_v1(runtime, selection, executor=executor)
+
+
+@asynccontextmanager
+async def _installed_d13_executor_v1(runtime, installation, context, trusted_umo, namespace):
     bundle = installation.admin_bundle
     grant = installation.installation_grant
     if (type(bundle) is not AdminInstallationBundle
@@ -61,18 +89,16 @@ async def run_installed_d13_paid_precompression_v1(
                is not AdminD13PaidPrecompressionPolicyV1
             or bundle.model_workflows is None
             or type(bundle.model_workflows.reply) is not AdminModelWorkflowV2
-            or envelope.namespace != bundle.installation_policy.namespace
-            or bundle.d13_paid_precompression.namespace != envelope.namespace):
-        return None
-    run_paid = getattr(runtime, "run_installed_d13_paid_precompression_v1", None)
-    if not callable(run_paid):
-        logger.warning("Sylanne 3 D13 paid lifecycle unavailable; not dispatched; HOLD")
-        return None
+            or namespace != bundle.installation_policy.namespace
+            or bundle.d13_paid_precompression.namespace != namespace):
+        yield None
+        return
     workflow = bundle.model_workflows.reply
     from ..runtime.d13_installed_paid_purpose_v1 import installed_d13_paid_context_model_v1
     if not installed_d13_paid_context_model_v1(bundle, workflow):
         logger.warning("Sylanne 3 D13 installed context binding unavailable; HOLD")
-        return None
+        yield None
+        return
     descriptor = ModelProviderDescriptor(
         workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
         frozenset({"text"}), frozenset({"context"}),
@@ -86,7 +112,8 @@ async def run_installed_d13_paid_precompression_v1(
     )
     selected = await adapter.selected_d13_main_installation_v1()
     if selected != bundle.d13_paid_precompression.selected_main:
-        return None
+        yield None
+        return
     transport = MtlsAuthorityTransport({
         bundle.tls_profile.profile_id: bundle.tls_profile,
     })
@@ -100,17 +127,13 @@ async def run_installed_d13_paid_precompression_v1(
         client_grant = await client.installation_grant_v2()
         if (status.state != "paired"
                 or not same_installed_grant_identity_v2(grant, client_grant)):
-            return None
+            yield None
+            return
         executor = HostModelEgressExecutor(
             authority=client, bundle=bundle, grant=client_grant, adapter=adapter, local_module_admission=runtime.local_module_admission)
-        try:
-            return await run_paid(
-                envelope, ingress_operation_id, executor=executor)
-        except asyncio.CancelledError:
-            await adapter.abort_local_dispatches()
-            raise
+        yield executor
     finally:
         await transport.close()
 
 
-__all__ = ("run_installed_d13_paid_precompression_v1",)
+__all__ = ("run_installed_d13_paid_precompression_v1", "resume_installed_d13_paid_original_v1")

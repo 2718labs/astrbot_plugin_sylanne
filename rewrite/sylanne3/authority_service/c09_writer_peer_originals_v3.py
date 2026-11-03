@@ -293,6 +293,9 @@ class VerifiedPreparedPeerRetirementCoverageV3:
         self._issuer, self.control, self.context, self.original = token, control, context, original
         self.operation_id = original['maintenance_operation_id']
     def require_current(self, *, meter):
+        if self.context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4'and self.context.stage=='PREPARED':
+            from .c09_initial_segmented_genesis_v4 import require_initial_prepared_peer_retirement_v4
+            return require_initial_prepared_peer_retirement_v4(self,meter=meter)
         current = self.control.read_verified_current_storage_v3(meter=meter)
         if (current.pointer_version, current.manifest_digest, current.prepared_original['operation_id']) != (
                 self.context.pointer_version, self.context.manifest_digest, self.operation_id):
@@ -304,6 +307,10 @@ class VerifiedPreparedPeerRetirementCoverageV3:
 
 def read_writer_peer_retirement_coverage_for_prepared_v3(control, gate, *, operation_id, context):
     _require_gate(control, gate)
+    if context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4'and context.stage=='PREPARED':
+        from .c09_initial_segmented_genesis_v4 import read_initial_prepared_peer_retirement_v4
+        with control._resource_sql_quantum_v3()as meter:
+            return read_initial_prepared_peer_retirement_v4(control,gate,operation_id=operation_id,context=context,meter=meter)
     with control._resource_sql_quantum_v3() as meter:
         current = control._c09_control_chain_proof_v2
         with control._db() as db:
@@ -775,8 +782,9 @@ class InstalledWriterPeerPendingStartReadV3:
         _require_gate(self.control,self.gate)
         if self.operation_id is None:
             hold=self.gate.require_pending_start_bootstrap_scope_v3(meter=meter)
-            from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+            from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3,RootPeerRegistryGenesisHoldV3
             if type(hold) is RootPeerStartCoverageHoldV3:self.current_root_process_original=hold.root_process_original
+            elif type(hold)is RootPeerRegistryGenesisHoldV3:self.current_root_process_original=hold.launcher_original
         elif self.gate._operation!=self.operation_id:
             raise AuthorityUnavailable('actual revoked maintenance Gate required for pending Host EOF')
         with self.control._db() as db:
@@ -859,9 +867,12 @@ class InstalledWriterPeerPendingStartReadV3:
         bootstrap_nonce=bootstrap_root=bootstrap_authority=None
         if self.operation_id is None:
             hold=self.gate.require_pending_start_bootstrap_scope_v3(meter=meter)
-            from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3
+            from .installed_process_supervisor_v1 import RootPeerStartCoverageHoldV3,RootPeerRegistryGenesisHoldV3
             if type(hold) is RootPeerStartCoverageHoldV3:
                 bootstrap_nonce=hold.channel_nonce;bootstrap_root=hold.root_process_original;bootstrap_authority=hold.authority_process_original
+            elif type(hold)is RootPeerRegistryGenesisHoldV3:
+                bootstrap_nonce=hold.original['root_channel_nonce']
+                bootstrap_root=hold.launcher_original;bootstrap_authority=hold.authority_original
             else:
                 bootstrap_nonce=hold.original['channel_nonce'];bootstrap_root=hold.original['root_process'];bootstrap_authority=hold.original['authority_process']
         original=control.sign_original_v1(_PENDING_COVERAGE,dict(schema=_PENDING_COVERAGE,

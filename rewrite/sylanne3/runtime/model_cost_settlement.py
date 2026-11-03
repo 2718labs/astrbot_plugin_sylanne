@@ -104,6 +104,53 @@ def read_original_model_cost(
     return OriginalModelCostFactV1(intent, record, admission, receipt)
 
 
+_REPORTED_USAGE_FIELDS_V1 = frozenset({
+    "schema", "call_id", "request_digest", "observation_digest", "original_intent_digest",
+    "terminal_receipt_digest", "installation_id", "manifest_digest", "budget_lease_id",
+    "reservation_operation_id", "reservation_digest", "budget_receipt_digest",
+    "input_tokens", "output_tokens", "cached_input_tokens", "token_semantics",
+    "cache_write_tokens", "total_billed_microusd", "cache_storage_microusd",
+})
+
+
+def reported_model_usage_original_v1(
+    fact: OriginalModelCostFactV1, *, budget_receipt_digest: str,
+) -> dict:
+    """Transcribe the paired terminal metadata, without claiming exact tokens.
+
+    This value grants no read or spend permission. W01 records it only beside
+    the actual C5 settlement; its consumer independently joins the original
+    observation and settlement. V1 terminal metadata supplies no independently
+    verifiable provider bill, cache-write count or cache-storage fee.
+    """
+    if type(fact) is not OriginalModelCostFactV1 or fact.recovery.state != "observed":
+        raise ModelCostUnavailable("observed original terminal required for reported usage")
+    if (type(budget_receipt_digest) is not str or len(budget_receipt_digest) != 64
+            or any(ch not in "0123456789abcdef" for ch in budget_receipt_digest)):
+        raise ModelCostUnavailable("original settlement receipt digest required")
+    intent, record, admission = fact.intent, fact.recovery, fact.admission
+    usage = dict(record.usage)
+    return {
+        "schema": "sylanne.d11.reported-model-usage-original.v1",
+        "call_id": intent.call_id, "request_digest": intent.request_digest,
+        "original_intent_digest": canonical_digest(asdict(intent)),
+        "observation_digest": record.observation_digest,
+        "terminal_receipt_digest": canonical_digest(asdict(fact.receipt)),
+        "installation_id": admission.installation_id,
+        "manifest_digest": admission.manifest_digest,
+        "budget_lease_id": intent.budget_lease_id,
+        "reservation_operation_id": intent.budget_reservation_operation_id,
+        "reservation_digest": intent.budget_reservation_digest,
+        "budget_receipt_digest": budget_receipt_digest,
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "cached_input_tokens": usage.get("cached_input_tokens"),
+        "token_semantics": "provider_reported_not_exact",
+        "cache_write_tokens": None, "total_billed_microusd": None,
+        "cache_storage_microusd": None,
+    }
+
+
 def original_model_budget_actual(
     fact: OriginalModelCostFactV1, quote: ResourceQuote,
     *, work_kind: str = "d06.encode_source",

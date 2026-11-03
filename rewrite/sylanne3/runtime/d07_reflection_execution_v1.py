@@ -68,6 +68,10 @@ def read_actual_d07_reflection_request_v1(db, issuer, namespace, ref):
 
 def stage_reflection_from_actual_cognition_v1(db, *, prepared, issuer):
     """Actual model unknown slots may create one waiting reflection request."""
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+    if type(prepared)in {D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1}:
+        return None, ()
     if not db.in_transaction or prepared.work_kind != "concern":
         return None, ()
     row = read_d07_original_v1(db, issuer, prepared.namespace, "result", "d07-result:" + prepared.call_id)

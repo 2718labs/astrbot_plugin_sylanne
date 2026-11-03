@@ -62,6 +62,73 @@ class InstalledD11LifePortV1:
             return value
         return self.port._submit(self.port._with_session_repair(read))
 
+    def read_d11_character_labor_census_v1(self, *, namespace, permit, body_profile_id):
+        from ..authority_service.v2_contract import to_wire
+        from ..authority_service.character_labor_census_v1 import character_labor_census_from_wire_v1
+        from ..runtime_contracts import canonical_digest
+        async def read():
+            handshake,grant=self.port._identity()
+            response=await self.port._transport._content_rpc(self.port._request,handshake,
+                "d11_character_labor_census_v1",{"namespace":namespace,"permit":to_wire(permit),
+                    "body_profile_id":body_profile_id},
+                protocol=AUTHORITY_V2_PROTOCOL)
+            if (set(response)!={"census","channel_binding_sha256"}
+                    or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+                raise RuntimeError("labor census authenticated channel differs")
+            value=character_labor_census_from_wire_v1(response["census"])
+            if (value.authority_namespace!=namespace or value.anchor!=permit.pinned_anchor
+                    or value.permit_digest!=canonical_digest(permit) or value.operation_id!=permit.operation_id
+                    or value.installation_id!=grant.installation_id or value.authority_id!=grant.authority_id
+                    or value.manifest_digest!=grant.manifest_digest):
+                raise RuntimeError("labor census differs from its actual paired WRITE")
+            return value
+        return self.port._submit(self.port._with_session_repair(read))
+
+    def read_d11_character_labor_segment_page_v1(self, *, namespace, permit, census, cursor=0, limit=1):
+        from ..authority_service.v2_contract import to_wire
+        from ..authority_service.character_labor_census_v1 import (
+            character_labor_census_to_wire_v1, character_labor_segment_page_from_wire_v1)
+        from ..runtime_contracts import canonical_digest
+        async def read():
+            handshake,grant=self.port._identity()
+            response=await self.port._transport._content_rpc(self.port._request,handshake,
+                "d11_character_labor_segment_page_v1",{"namespace":namespace,"permit":to_wire(permit),
+                    "census":character_labor_census_to_wire_v1(census),"cursor":cursor,"limit":limit},
+                protocol=AUTHORITY_V2_PROTOCOL)
+            if (set(response)!={"page","channel_binding_sha256"}
+                    or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+                raise RuntimeError("labor segment page authenticated channel differs")
+            page=character_labor_segment_page_from_wire_v1(response["page"])
+            if (census.authority_namespace!=namespace or census.installation_id!=grant.installation_id
+                    or census.authority_id!=grant.authority_id or census.manifest_digest!=grant.manifest_digest
+                    or page.namespace!=census.namespace or page.operation_id!=permit.operation_id
+                    or page.permit_digest!=canonical_digest(permit) or page.census_digest!=canonical_digest(census)
+                    or page.cursor!=cursor or page.anchor!=permit.pinned_anchor
+                    or page.selection_digest!=census.selection_digest or page.graph_stamp!=census.graph_stamp):
+                raise RuntimeError("labor segment page differs from its actual paired census WRITE")
+            return page
+        return self.port._submit(self.port._with_session_repair(read))
+
+    def read_d11_character_work_segment_v1(self, *, binding, permit):
+        from ..authority_service.v2_contract import to_wire
+        from ..runtime.d11_character_work_segment_v1 import character_work_segment_from_wire_v1
+        async def read():
+            handshake,grant=self.port._identity()
+            if (binding.authority_id,binding.installation_id)!=(grant.authority_id,grant.installation_id):
+                raise RuntimeError("character segment paired installation differs")
+            response=await self.port._transport._content_rpc(self.port._request,handshake,
+                "d11_character_work_segment_v1",{"namespace":binding.authority_namespace,
+                    "binding":life_to_wire_v1(binding),"permit":to_wire(permit)},protocol=AUTHORITY_V2_PROTOCOL)
+            if (set(response)!={"segment","channel_binding_sha256"}
+                    or response["channel_binding_sha256"]!=handshake.channel_binding_sha256):
+                raise RuntimeError("character segment authenticated channel differs")
+            value=character_work_segment_from_wire_v1(response["segment"])
+            if (value.namespace!=binding.namespace or value.binding_digest!=binding.digest
+                    or value.execution_id!=binding.execution_id or value.effect_id!=binding.effect_id):
+                raise RuntimeError("character segment differs from its actual original execution")
+            return value
+        return self.port._submit(self.port._with_session_repair(read))
+
     async def _call(self, binding, method, *, action=None, gate=None, outcome=None):
         if type(binding) not in LIFE_BINDING_TYPES:
             raise TypeError("Life accepts its fixed actual prepared execution selector only")
@@ -102,6 +169,14 @@ class InstalledD11LifePortV1:
         if claim is not None and claim.binding != binding or terminal is not None and (terminal.binding != binding or terminal.claim != claim):
             raise RuntimeError("Life actual original response crossed its binding")
         return claim, terminal
+
+    def read_own_d11_draft_execution_original_v1(self, *, binding):
+        return self.port._submit(self.port._with_session_repair(
+            lambda: self._call(binding, "d11_draft_own_execution_original_v1")))
+
+    def read_own_d11_life_execution_original_v1(self, *, binding):
+        return self.port._submit(self.port._with_session_repair(
+            lambda: self._call(binding, "d11_life_own_execution_original_v1")))
 
     def read_d11_life_original_v1(self, *, binding):
         return self.port._submit(self.port._with_session_repair(lambda: self._call(binding, "d11_life_original_v1")))

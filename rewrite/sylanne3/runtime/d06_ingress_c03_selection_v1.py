@@ -129,7 +129,8 @@ class InstalledIngressC03ReadersV1:
 def read_plan_ingress_c03_selection_v1(db, *, namespace, request, readers):
     handle = require_ingress_c03_read_v1(readers.search, readers.graph, readers.issued, readers.scope, request)
     need = handle.need
-    keys = tuple(version.key for version in handle.closure_versions) + (
+    from .d06_c03_search_source_v3 import require_c03_positive_versions_v3
+    keys = tuple(version.key for version in require_c03_positive_versions_v3(handle)) + (
         AtomKey.from_token(request.job_ref), AtomKey.from_token(need.focus_ref), AtomKey.from_token(need.attention_ticket_ref))
     return production_read_plan_v1((), tuple(sorted(set(keys), key=lambda key: key.token)),
         (request.source_ref,), (handle.routing["adoption_operation_id"],))
@@ -159,9 +160,8 @@ def stage_ingress_c03_selection_v1(db, *, frame, request, installed_readers):
         purpose=frame.envelope.authority.purpose, audiences=frame.envelope.authority.audience, now_utc=frame.now_utc)
     if responsibility is None or responsibility.digest != handle.need.responsibility_digest:
         raise MissingProductionOriginalV1("actual_current_c03_responsibility")
-    for version in handle.closure_versions:
-        if read.head(db, version.key).revision != version.revision:
-            raise ValueError("C03 actual Source/access/correction closure changed before selection")
+    from .d06_c03_search_source_v3 import verify_actual_c03_search_versions_v3
+    verify_actual_c03_search_versions_v3(handle, db, frame)
     candidates = handle.outcome.candidates
     eligible = tuple(item.candidate_id for item in candidates.items
         if item.content_ref != request.source_ref and AtomKey.from_token(item.content_ref).type_name == "memory.source"

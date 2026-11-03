@@ -184,6 +184,8 @@ def stage_current_life_v2_in_transaction_v1(db, *, frame, request, installed_rea
         writes = (GraphWrite(source, record.to_dict()),
             GraphWrite(access, {"source_id": source_id, "audiences": list(plan.audiences), "purposes": ["context", "consolidation"],
                 "status": "active", "recorded_at": frame.now_utc}, life_experience_access_dependencies_v1(prepared,source)))
+        from ..domains.d06.inspection_metadata_v1 import derive_inspection_projection_writes_v1
+        writes = derive_inspection_projection_writes_v1(frame.envelope, writes)
         provider = D06DomainProvider()
         memory = DomainProposal("d06", "d06.contract.v1", provider.descriptor.request_schema_hash, frame.envelope, writes,
             life_experience_dependencies_v1(frame.snapshot,writes),

@@ -162,11 +162,12 @@ async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d
         from sylanne3.runtime.d04_life_encoding_baseline_v1 import PrepareLifeEncodingBaselineRequestV1, life_encoding_baseline_ids_v1, OPERATION as BASELINE_OPERATION
         from sylanne3.runtime.d06_life_numeric_trace_v1 import AdoptLifeNumericTraceRequestV1, life_numeric_trace_operation_v1, life_numeric_trace_keys_v1, OPERATION as TRACE_OPERATION, require_installed_life_numeric_trace_reader_v1, InstalledInternalLifeNumericReaderV1
         from sylanne3.runtime.d04_numeric_math_ticket_v3 import InstalledD04MathQueueV3, _MathTicketV3
-        from sylanne3.runtime.d04_numeric_adoption_v3 import adopt_post_c02_joint_numeric_v3
         from sylanne3.runtime_contracts import canonical_digest, canonical_serialize
         from sylanne3.domains.d01.production_operations_v1 import plain_v1
         graph, namespace = (case['graph'], case['namespace'])
         worker = await case['get_http_worker']()
+        from sylanne3.graph_worker import retained_graph_calls_v3
+        graph_call=read_lifetimes.enter_context(retained_graph_calls_v3(worker))
         bundle = graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
         assert bundle.d04_joint_numeric is not None and bundle.d04_semantic_drive is not None
         assert Path(installed_d04_root).resolve() == Path(case['package_root']).resolve()
@@ -237,7 +238,9 @@ async def run_life_numeric_interval_acceptance_v1(case, *, tmp_path, installed_d
                 assert execution.prepared == prepared
                 assert execution.terminal.measurement.status == 'completed', execution.status
                 assert execution.terminal.measurement.actual_cpu_ms >= 0
-                adoption = await observed('restore_and_adopt', lambda: worker.call(lambda current: adopt_post_c02_joint_numeric_v3(current, case['bootstrap'], bundle, operation_id=joint_ids['operation'])))
+                adoption = await observed('restore_and_adopt', lambda: graph_call(lambda current:
+                    current.adopt_post_c02_joint_numeric_v3(case['bootstrap'],bundle,operation_id=joint_ids['operation']),
+                    slot='numeric-adoption'))
             assert adoption['status'] == 'joint_advance_committed', adoption
             if native_wait_diagnostic:
                 native_stage('DIAGNOSTIC_NOT_FULL_NUMERIC_PASS', actual_adoption_status=adoption['status'])

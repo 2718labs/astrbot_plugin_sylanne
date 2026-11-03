@@ -31,7 +31,9 @@ MAX_JSON_BYTES = 64 * 1024
 PLUGIN_ROUTE_PREFIX = "/astrbot_plugin_sylanne/workbench"
 COMMAND_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/commands"
 SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/session"
+OWNER_SESSION_IDENTITY_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/owner-session-identity"
 REPLY_CONTROL_SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/reply-control-session"
+INSPECTION_MAINTENANCE_SESSION_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/inspection-maintenance-session"
 SCENE_CANDIDATES_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/v1/scene-candidates"
 ASSET_ROUTE = f"{PLUGIN_ROUTE_PREFIX}/<path:asset>"
 SYLANNE_OWNER_SESSION_COOKIE = "sylanne_owner_session"
@@ -139,6 +141,22 @@ class CurrentOwnerDashboardSessions:
                 or any(v!=frozenset({"workbench.package_status"}) for v in session.scope_capabilities.values())):return None
         return session
 
+
+
+    async def resolve_inspection_maintenance(self,*,username,session_hint,operation_id=None,
+            purpose="workbench_view",accept=False):
+        reader=getattr(self._pairing,"resolve_current_inspection_maintenance_session",None)
+        if not callable(reader) or type(username) is not str or not username or type(session_hint) is not str or not session_hint:
+            return None
+        session=reader(username=username,owner_session_token=session_hint,operation_id=operation_id,
+            purpose=purpose,accept=accept)
+        if inspect.isawaitable(session):session=await session
+        required=frozenset({"workbench.read","workbench.maintain","workbench.control"} if accept else {"workbench.read"})
+        if (type(session) is not AuthenticatedSession or session.host_username!=username
+                or session.inspection_operation_id!=operation_id
+                or any(value!=required for value in session.scope_capabilities.values())):
+            return None
+        return session
 
 class CsrfValidator(Protocol):
     """Validate a CSRF token bound to the same server-side session."""
@@ -429,6 +447,17 @@ class WorkbenchHttpTransport:
             except (ValueError, TypeError, KeyError):
                 return self._error("unavailable", "invalid_request", "回复控制请求无效。", 400)
             session = await self._bound_reply_control_session(request)
+        elif type(payload) is dict and payload.get("action") in {"accept_source_inspection_migration_v1","read_source_inspection_migration_v1"}:
+            from .service import WorkbenchService
+            try:
+                command=WorkbenchService._parse(payload)
+            except (ValueError,TypeError,KeyError):
+                return self._error("unavailable","invalid_request","Inspection maintenance request invalid.",400)
+            accept=command["action"]=="accept_source_inspection_migration_v1"
+            operation_id=command["operation_id"] if accept else command["input"]["operation_id"]
+            session=await self._sessions.resolve_inspection_maintenance(username=request.username,
+                session_hint=request.cookies.get(SYLANNE_OWNER_SESSION_COOKIE),operation_id=operation_id,
+                purpose=command["purpose"],accept=accept)
         elif type(payload) is dict and payload.get("action") in {"read_backend_operation","read_package_operation"}:
             # Validate its exact request shape before selecting the separate
             # operation-only resolver. A normal content failure never comes here.
@@ -494,6 +523,18 @@ class WorkbenchHttpTransport:
                 raise
         return response.as_dict()
 
+    async def owner_session_identity(self,request:PluginRequest)->dict[str,Any]:
+        session=await self._bound_session(request)
+        if session is None:
+            return self._error('unauthorized','owner_session_locked','当前 Owner 会话未通过核验。',401)
+        if not self._session_origin_allowed(request):
+            return self._error('unauthorized','origin_denied','请求来源未获允许。',403)
+        from .service import owner_session_identity_view_v1
+        try:projection=owner_session_identity_view_v1(session)
+        except (TypeError,ValueError):
+            return self._error('unavailable','owner_identity_unavailable','当前会话缺少已验证的 Owner 身份。',503)
+        return {'status':'ready','projection':projection}
+
     async def open_session(self, request: PluginRequest) -> dict[str, Any]:
         """Issue a CSRF token only after a current trusted Owner pairing."""
         session = await self._bound_session(request)
@@ -519,6 +560,19 @@ class WorkbenchHttpTransport:
             session = await session
         return session if (type(session) is AuthenticatedSession
                            and session.host_username == request.username) else None
+
+
+    async def open_inspection_maintenance_session(self,request):
+        if not isinstance(request.username,str) or not request.username:
+            return self._error("unauthorized","host_session_missing","Dashboard session required.",401)
+        if not self._session_origin_allowed(request):
+            return self._error("unauthorized","origin_denied","Request origin denied.",403)
+        session=await self._sessions.resolve_inspection_maintenance(username=request.username,
+            session_hint=request.cookies.get(SYLANNE_OWNER_SESSION_COOKIE))
+        if session is None:
+            return self._error("unauthorized","owner_session_locked","Current Owner maintenance session unavailable.",401)
+        return dict(status="ready",dashboard_session="authenticated",owner_session="unlocked",
+            csrf_token=self._csrf.issue(session=session))
 
     async def open_reply_control_session(self, request: PluginRequest):
         """Explicit metadata session; ordinary content resolution is never a fallback."""

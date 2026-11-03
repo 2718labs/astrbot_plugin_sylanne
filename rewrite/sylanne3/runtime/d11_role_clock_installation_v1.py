@@ -38,7 +38,7 @@ def role_clock_mapping_id_v1(namespace):
 
 def _mapping_original(db, namespace, saved):
     body, _digest = saved
-    if body["schema"] != "d11.owner-role-clock-original.v1":
+    if body["schema"] not in {"d11.owner-role-clock-original.v1","d11.owner-role-clock-original.v4"}:
         raise ValueError("D11 role clock original schema differs")
     value = body["mapping"]
     mapping = get_clock_mapping(db, role_clock_mapping_id_v1(namespace))
@@ -62,11 +62,13 @@ def _mapping_original(db, namespace, saved):
 def read_current_role_clock_installation_v1(reader, db, namespace):
     from .d04_semantic_installation_original_v3 import _current_inputs, _read_signed
     inputs = _current_inputs(reader, db, namespace)
-    original = _read_signed(db, reader.graph._GraphCoordinator__d11_issuer, TABLE, SIGN_KIND, namespace)
+    original = _read_signed(db, reader.graph._GraphCoordinator__d11_issuer, TABLE, SIGN_KIND, namespace, reader=reader)
     if original is None:
         raise ValueError("D11 role clock requires explicit Owner rate and origin initialization")
     body = original[0]
-    expected = {"owner_guard": asdict(inputs["guard"]), "role_rows": inputs["role_rows"],
+    from .role_control_signed_metadata_v4 import require_role_control_rows_match_v4
+    require_role_control_rows_match_v4(body,inputs)
+    expected = {"owner_guard": asdict(inputs["guard"]),
         "member_bindings": inputs["member_bindings"],
         "manifest_sha256": reader.qualified_original_manifest_sha256(db, namespace, body),
         "installation_ref": reader.qualified_original_installation_ref(db, namespace, body)}
@@ -93,12 +95,12 @@ def register_current_role_clock_v1(reader, authority, lease, *, operation_id,
                "mapping": _mapping_dict(mapping)}
     def commit(db, inputs, owner):
         issuer = reader.graph._GraphCoordinator__d11_issuer
-        prior = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, operation_id=operation_id)
+        prior = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, operation_id=operation_id, reader=reader)
         if prior is not None:
             if prior[0]["owner"]["request_digest"] != owner["request_digest"]:
                 raise ValueError("D11 role clock Owner operation ID reused with different input")
             return _receipt(prior)
-        current = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace)
+        current = _read_signed(db, issuer, TABLE, SIGN_KIND, namespace, reader=reader)
         if (0 if current is None else current[0]["revision"]) != expected_version:
             raise StaleRead("D11 role clock expected version changed")
         if mapping.character_origin != Decimal.from_float(float(inputs["cursor"])):
@@ -114,16 +116,17 @@ def register_current_role_clock_v1(reader, authority, lease, *, operation_id,
         elif db.execute("SELECT 1 FROM runtime_character_clocks WHERE mapping_id=?", (mapping.mapping_id,)).fetchone():
             raise ValueError("D11 role clock already exists without an Owner original")
         clock_operation = "owner-role-clock:" + operation_id
-        clock_digest = canonical_digest((namespace, operation_id, request, inputs["member_bindings"], inputs["role_rows"]))
+        clock_digest = canonical_digest((namespace, operation_id, request, inputs["member_bindings"], inputs.get("role_control_rows",inputs.get("role_rows"))))
         issue_clock_mapping(db, mapping, clock_operation, clock_digest)
-        body = {"schema": "d11.owner-role-clock-original.v1", "namespace": asdict(namespace),
+        body = {"schema": "d11.owner-role-clock-original.v4" if "role_control_rows"in inputs else "d11.owner-role-clock-original.v1", "namespace": asdict(namespace),
             "operation_id": operation_id, "revision": mapping.version, "mapping": _mapping_dict(mapping),
             "clock_operation_id": clock_operation, "clock_operation_digest": clock_digest,
             "installation_ref": _installation_ref(reader, namespace), "manifest_sha256": reader.manifest_sha256,
-            "owner": owner, "owner_guard": asdict(inputs["guard"]), "role_rows": inputs["role_rows"],
+            "owner": owner, "owner_guard": asdict(inputs["guard"]), **({"role_control_rows":asdict(inputs["role_control_rows"])}if "role_control_rows"in inputs else {"role_rows":inputs["role_rows"]}),
             "member_bindings": inputs["member_bindings"], "graph_revision": inputs["scope"].graph_revision,
             "graph_epoch": inputs["scope"].graph_epoch.revision}
-        saved = _insert_signed(db, issuer, TABLE, SIGN_KIND, namespace, body)
+        from .role_control_signed_metadata_v4 import CLOCK_SIGN_KIND_V4
+        saved = _insert_signed(db, issuer, TABLE, CLOCK_SIGN_KIND_V4 if "role_control_rows"in inputs else SIGN_KIND, namespace, body)
         read_current_role_clock_installation_v1(reader, db, namespace)
         return _receipt(saved)
     return _owner_write(reader, authority, lease, operation_id=operation_id, request=request, commit=commit)

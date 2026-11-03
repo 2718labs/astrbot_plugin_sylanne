@@ -295,6 +295,59 @@ class InstalledC09OriginalVerifierV1:
             and hmac.compare_digest(hmac.new(self._key, payload, hashlib.sha256).hexdigest(), terminal.component_receipt_signature))
 
 
+
+    def verify_character_labor_segment_original_v1(self, segment, *, binding, claim):
+        """Authenticate a retained duration original with its actual Life key."""
+        from dataclasses import fields
+        from ..runtime.d11_character_work_segment_v1 import CharacterWorkSegmentOriginalV1
+        from ..runtime.d11_life_contract_v1 import D11LifeExecutionBindingV1, D11LifeClaimV1, life_to_wire_v1
+        from ..domains.d01.production_operations_v1 import plain_v1
+        if (self.kind != "life" or type(binding) is not D11LifeExecutionBindingV1
+                or type(claim) is not D11LifeClaimV1
+                or type(segment) is not CharacterWorkSegmentOriginalV1
+                or claim.binding != binding or binding.namespace != self.namespace
+                or binding.authority_namespace != self.authority_namespace
+                or binding.authority_id != self.authority_id
+                or binding.installation_id != self.installation_id):
+            raise AuthorityUnavailable("actual same-installation Life claim and labor Segment required")
+        key = self._key
+        if binding.manifest_digest == self.life_manifest_digest:
+            build = self.life_builds.get(binding.recipe_id)
+            if build is None or any(getattr(binding, name) != value for name, value in build.items()):
+                raise AuthorityUnavailable("labor Segment differs from the actual registered Life build")
+        else:
+            from ..host.installed_d11_life_build_v1 import (
+                read_registered_historical_d11_life_build_v1, read_registered_historical_d11_life_key_v1)
+            if self.life_package_files is None:
+                raise AuthorityUnavailable("labor Segment actual registered historical Life package absent")
+            read_registered_historical_d11_life_build_v1(self.life_package_files, binding=binding)
+            key = read_registered_historical_d11_life_key_v1(
+                self.life_package_files, binding=binding, claim=claim.payload)
+        signed_claim = life_to_wire_v1(claim.payload)
+        signature = signed_claim.pop("signature")
+        expected = hmac.new(key, canonical_serialize(signed_claim).encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            raise AuthorityUnavailable("labor Segment actual original claim signature differs")
+        if ((segment.namespace, segment.execution_id, segment.effect_id, segment.binding_digest,
+                segment.prepared_digest, segment.algorithm_build_digest,
+                segment.claim_original_ref, segment.claim_sequence, segment.claim_digest,
+                segment.started_at_utc, segment.from_character,
+                segment.clock_mapping_ref, segment.clock_mapping_version)
+                    != (binding.namespace, binding.execution_id, binding.effect_id, binding.digest,
+                        claim.payload.prepared_digest, binding.algorithm_build_digest,
+                        claim.original_ref, claim.claim_sequence, claim.claim_digest,
+                        claim.payload.claimed_at_utc, claim.payload.character_at,
+                        claim.payload.clock_mapping_ref, claim.payload.clock_mapping_version)):
+            raise AuthorityUnavailable("labor Segment differs from its authenticated original start/binding/clock")
+        material = {field.name:getattr(segment, field.name) for field in fields(segment)
+            if field.name != "signature"}
+        expected = hmac.new(key, canonical_serialize(plain_v1(material)).encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(segment.signature, expected):
+            raise AuthorityUnavailable("labor Segment historical Authority signature differs")
+        return segment
+
+
+
 class InstalledC09D13OriginalVerifierV1:
     """Actual D13 component verifier over frozen rows; no begin or reconcile."""
     def __init__(self,session,execution_reader):

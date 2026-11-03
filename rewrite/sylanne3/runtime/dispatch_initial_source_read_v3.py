@@ -1,7 +1,9 @@
 """Private original JSON and Source witnesses retained by one dispatch prepare work."""
+from contextlib import contextmanager
 from dataclasses import fields
 from hashlib import sha256
 import json
+import sys
 from types import MappingProxyType
 from typing import get_type_hints
 from weakref import WeakKeyDictionary, WeakSet, ref
@@ -9,21 +11,168 @@ from weakref import WeakKeyDictionary, WeakSet, ref
 from ..authority_service.contract import AuthorityUnavailable
 from ..graph_types import AtomKey
 from ..runtime_storage_v3 import begin_runtime_cell_read_v3, runtime_storage_v3
-from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
+from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2,_CanonicalJSONValueBuilderV3
 from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
 from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2, legacy_cell_read_transaction_v2, _quote
 from .source_correction_read_v3 import _heap
+from .owner_material_source_storage_v3 import CanonicalValueStreamV3
 
 _ISSUER=object()
 _MEMBERS=WeakKeyDictionary()
 _SOURCES=WeakKeyDictionary()
 _EVIDENCE=WeakKeyDictionary()
 _COLUMNS=WeakKeyDictionary()
+_COLUMN_COPY_BYTES_V3=WeakKeyDictionary()
 _PAYLOAD_EOF=WeakSet()
 _BIRTH_ORIGINALS=WeakKeyDictionary()
 _HISTORIES=WeakKeyDictionary()
 _ABSENCES=WeakKeyDictionary()
 _MEMBER_PREFIX=('provenance','qualification_evidence','members')
+
+
+_HOST_NATURAL_ROSTERS_V3=WeakKeyDictionary()
+
+
+class _HostNaturalRosterRetentionV3:
+    def __init__(self,reader,work,parent):
+        self.reader,self.work,self.operation=reader,work,reader.operation
+        self.selection_digest,self.parent=reader.operation.selection_digest,parent
+        self.proof=None
+    def require_reader_v3(self,reader):
+        from .d13_natural_original_use_v3 import _actual_work_v3
+        if (reader is not self.reader or _actual_work_v3(reader)is not self.work
+                or reader.operation is not self.operation
+                or self.operation.selection_digest!=self.selection_digest):
+            raise AuthorityUnavailable('Host roster metadata lost its actual Source Work/selection')
+        return self
+
+
+def register_host_natural_roster_parent_v3(reader,parent_original_id):
+    """Register only the parent selected by this actual Source Work's metadata."""
+    from .d13_natural_original_use_v3 import _actual_work_v3
+    work=_actual_work_v3(reader)
+    if type(parent_original_id)is not str or not parent_original_id:
+        raise AuthorityUnavailable('actual Host natural parent metadata required')
+    from .current_graph_full_read_v3 import _OrdinaryFullReadV3
+    from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+    if type(reader)is _OrdinaryFullReadV3:
+        if reader.producer_phase is None or reader.source_locator is None:
+            raise AuthorityUnavailable('Host roster requires the actual natural producer locator')
+        selected_parent=reader.source_locator.c02_operation_id
+    elif type(reader)is _NaturalInitialReadV1:
+        selected_parent=reader.locator_task.result.require_for_v1(reader.bootstrap)['recipe']['generation_parent_original_id']
+    elif type(reader)is _DispatchInventoryReadV3:
+        if reader.family!='natural_reply':
+            raise AuthorityUnavailable('Host roster P2 requires the actual natural family')
+        task=reader.natural_task
+        selected_parent=task.locator.result.require_for_v1(task)['recipe']['generation_parent_original_id']
+    if selected_parent!=parent_original_id:
+        raise AuthorityUnavailable('Host roster parent differs from the actual Work selected locator')
+    state=_HOST_NATURAL_ROSTERS_V3.get(reader.operation)
+    if state is None:
+        _HOST_NATURAL_ROSTERS_V3[reader.operation]=_HostNaturalRosterRetentionV3(reader,work,parent_original_id)
+    elif state.require_reader_v3(reader).parent!=parent_original_id:
+        raise AuthorityUnavailable('Host roster metadata crossed its original parent selection')
+
+
+def prepare_pending_host_natural_roster_metadata_v3(reader):
+    """Finish the installed metadata RPC before the next Graph SQL quantum."""
+    from .d13_natural_original_use_v3 import _actual_work_v3
+    from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+    from .natural_roster_metadata_read_v3 import prepare_host_natural_roster_metadata_v3
+    _actual_work_v3(reader)
+    if reader.db.in_transaction:
+        raise AuthorityUnavailable('Host roster metadata preparation must precede Graph SQL')
+    if type(reader)is _NaturalInitialReadV1:
+        task=reader.locator_task
+        if task is not None and task.result is not None:
+            metadata=task.result.require_for_v1(reader.bootstrap)
+            register_host_natural_roster_parent_v3(reader,metadata['recipe']['generation_parent_original_id'])
+    elif type(reader)is _DispatchInventoryReadV3 and reader.family=='natural_reply':
+        task=reader.natural_task
+        if task is not None and task.locator is not None and task.locator.result is not None:
+            metadata=task.locator.result.require_for_v1(task)
+            register_host_natural_roster_parent_v3(reader,metadata['recipe']['generation_parent_original_id'])
+    state=_HOST_NATURAL_ROSTERS_V3.get(reader.operation)
+    if state is None:return
+    state.require_reader_v3(reader)
+    if state.proof is None:
+        port=reader.graph._GraphCoordinator__content_fence_v2
+        rpc=port.read_natural_roster_metadata_v3(namespace=reader.namespace,
+            authority_namespace=reader.fence.scope.permit.namespace,parent_original_id=state.parent)
+        state.proof=prepare_host_natural_roster_metadata_v3(reader,rpc)
+
+
+@contextmanager
+def bind_host_natural_roster_metadata_v3(reader):
+    """Bind the already prepared parent in each actual Graph transaction."""
+    from .d13_natural_original_use_v3 import _actual_work_v3
+    _actual_work_v3(reader)
+    state=_HOST_NATURAL_ROSTERS_V3.get(reader.operation)
+    if state is None:
+        yield None
+        return
+    state.require_reader_v3(reader)
+    if state.proof is None:
+        raise AuthorityUnavailable('Host roster parent metadata has not completed its outside-SQL RPC')
+    with state.proof.bind_v3(reader.db):yield state.proof
+
+
+def require_host_natural_roster_retained_binding_v3(reader,prepared,db,roster_proof):
+    """Authenticate the two installed prepared-result binders without a new ticket."""
+    from .current_graph_full_read_v3 import PreparedCurrentGraphFullReadV3,_ISSUED as full_issued
+    from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3,_ISSUED as inventory_issued
+    from ..runtime_storage_v3 import _operation
+    state=_HOST_NATURAL_ROSTERS_V3.get(reader.operation)
+    if (state is None or state.reader is not reader or state.proof is not roster_proof
+            or state.operation is not reader.operation or state.work.state is not reader
+            or state.work.coordinator is not reader.graph or state.work.operation is not state.operation
+            or state.operation.closed or state.selection_digest!=state.operation.selection_digest
+            or db is not reader.db or runtime_storage_v3(db)is not state.operation.handle
+            or _operation(state.operation.handle)is not state.operation):
+        raise AuthorityUnavailable('Host roster retained binding lost its private Work/operation/selection')
+    if type(prepared)is PreparedCurrentGraphFullReadV3:
+        if (full_issued.get(prepared)!=prepared._identity_v3()or prepared.work is not state.work):
+            raise AuthorityUnavailable('Host roster retained FULL proof is not the original issued result')
+    elif type(prepared)is PreparedCurrentDispatchInventoryV3:
+        if inventory_issued.get(prepared)!=prepared._identity_v3():
+            raise AuthorityUnavailable('Host roster retained P2 proof is not the original issued result')
+    else:
+        raise AuthorityUnavailable('Host roster retained binding requires the actual FULL or P2 prepared result')
+    if (prepared.operation is not state.operation or prepared.graph is not reader.graph
+            or prepared.db is not db or prepared.namespace!=reader.namespace
+            or prepared.selection_digest!=state.selection_digest or prepared.scope is not reader.fence.scope):
+        raise AuthorityUnavailable('Host roster prepared result crossed its original Source scope')
+    prepared._actual()
+    return state.work,state.operation,prepared.scope
+
+
+@contextmanager
+def bind_host_natural_roster_operation_v3(prepared,db):
+    """Enter only an actual FULL/P2 prepared binder, before its business SQL."""
+    state=_HOST_NATURAL_ROSTERS_V3.get(prepared.operation)
+    if state is None:
+        yield None
+        return
+    if state.proof is None:
+        raise AuthorityUnavailable('Host roster prepared result lacks its completed metadata RPC')
+    from .natural_roster_metadata_read_v3 import _bind_retained_natural_roster_metadata_v3
+    with _bind_retained_natural_roster_metadata_v3(state.proof,db,reader=state.reader,prepared=prepared)as proof:
+        yield proof
+
+
+def release_host_natural_roster_metadata_for_work_v3(work):
+    """Release metadata only after this Work's real final operation retention."""
+    state=_HOST_NATURAL_ROSTERS_V3.get(work.operation)
+    if state is None:return
+    if (work is not state.work or work.operation is not state.operation
+            or work.state is not state.reader or not state.operation.closed):
+        raise AuthorityUnavailable('Host roster metadata requires its actual final retention release')
+    if state.proof is not None:state.proof.release_v3()
+    _HOST_NATURAL_ROSTERS_V3.pop(state.operation,None)
+    state.proof=state.reader=state.work=state.operation=None
 
 def _container_bytes_v3(value):
     from .dispatch_current_inventory_v3 import _FrozenObjectV3,_FrozenArrayV3
@@ -95,12 +244,16 @@ class _OriginalJSONStreamV3(C09CanonicalJSONStreamV2):
             return
         return super()._emit(emit,kind,path,start,end,**values)
 
-class DispatchOriginalJSONReadV3:
+class DispatchOriginalJSONReadV3(_CanonicalJSONValueBuilderV3):
     """One fragment per ordinary quantum; no SQLite transaction survives advance."""
     def __init__(self,owner,*,table,column,key_columns,key,cell_id=None,contact_sources=False,authority_blob_original=None,authority_signature_original=None):
         self.owner,self.db,self.operation=owner,owner.db,owner.operation
         self.table,self.column,self.key_columns,self.key=table,column,key_columns,key
         self.where=' AND '.join(_quote(name)+'=?'for name in key_columns)
+        from .d13_natural_parent_closure_read_v3 import (
+            D13NaturalParentClosureReadV3,require_actual_d13_natural_parent_closure_reader_v3)
+        if type(owner)is D13NaturalParentClosureReadV3:
+            require_actual_d13_natural_parent_closure_reader_v3(owner)
         self.authority_blob_original=authority_blob_original
         self.authority_signature_original=authority_signature_original
         if authority_signature_original is not None:
@@ -118,29 +271,23 @@ class DispatchOriginalJSONReadV3:
             authority_blob_original.require_current_v6(owner,table=table,column=column,key_columns=key_columns,key=key)
         self.cell=begin_runtime_cell_read_v3(self.db,cell_id,erasure_owner_ref=key[0]if table=='graph_history'else None)if cell_id else None
         self.parser=_OriginalJSONStreamV3(self)if contact_sources else C09CanonicalJSONStreamV2(ensure_ascii=True)
-        self.nodes={};self.scalar=bytearray();self.value=None;self.source_members=[]
-        self.offset=0;self.total=None;self.fragment=b'';self.fragment_offset=0;self.complete=False;self.reserved=0
+        from .dispatch_current_inventory_v3 import _FrozenObjectV3,_FrozenArrayV3
+        self._initialize_json_value_v3(incremental_retention=not contact_sources,
+            frozen_object_type=_FrozenObjectV3,frozen_array_type=_FrozenArrayV3)
+        self.offset=0;self.total=None;self.fragment_offset=0;self.complete=False
         self._reserve(65536)
-    def _reserve(self,extra=0):
-        size=_heap((self.nodes,self.scalar,self.fragment))+extra+65536
+    def _json_extra_retained_bytes_v3(self):
+        size=0
         for source in self.source_members:
             if source.record is not None:size+=sum(_heap(k)+_heap(v)for k,v in source.record.metadata.items())+1024
         inner=getattr(self.parser,'source_inner',None)
         if isinstance(inner,C09MemorySourceJSONStreamV3):size+=inner._source_heap_bytes()
+        return size
+    def _reserve(self,extra=0):
+        if self._incremental_retention:return super()._reserve(extra)
+        # Contact keeps its existing specialized metadata/bodyless Source model.
+        size=_heap((self.nodes,self.scalar,self.fragment))+extra+65536+self._json_extra_retained_bytes_v3()
         if size>self.reserved:self.operation.retain(size-self.reserved);self.reserved=size
-    def _put(self,path,value):
-        if not path:self.value=value
-        else:
-            parent=self.nodes[path[:-1]]
-            if type(parent)is list:parent.append(value)
-            else:parent[path[-1]]=value
-    def _emit(self,event):
-        if event.kind in ('object_start','array_start'):
-            self._reserve(1024);value={}if event.kind=='object_start'else[];self.nodes[event.path]=value;self._put(event.path,value)
-        elif event.kind=='scalar_start':self.scalar=bytearray()
-        elif event.kind=='scalar_chunk':self._reserve(len(event.raw)*4+1024);self.scalar.extend(event.raw)
-        elif event.kind=='scalar_end':
-            self._reserve(len(self.scalar)*4+1024);value=json.loads(self.scalar);self.scalar=bytearray();self._put(event.path,value)
     def advance(self,meter):
         if self.complete:return True
         if self.authority_blob_original is not None:
@@ -178,8 +325,14 @@ class DispatchOriginalJSONReadV3:
                 self.authority_blob_original.sha256,self.authority_blob_original.byte_count):
             raise AuthorityUnavailable('Authority derived BLOB actual full SHA/byte EOF differs from original metadata')
         from .dispatch_current_inventory_v3 import _freeze_value_v3
-        self.operation.retain(_container_bytes_v3(self.value)+1024)
-        self._frozen_value=_freeze_value_v3(self.value)
+        if self._incremental_retention:
+            # Completed containers are already immutable; EOF still controls
+            # publication, after every original byte/SHA/signature/BLOB gate.
+            self._frozen_value=self.value
+            _COLUMN_COPY_BYTES_V3[self]=self._detached_container_bytes
+        else:
+            self.operation.retain(_container_bytes_v3(self.value)+1024)
+            self._frozen_value=_freeze_value_v3(self.value)
         self.sha256,self.byte_count=parsed.sha256,parsed.byte_count;self.complete=True
         self.value=None;self.nodes={};self.scalar=bytearray();self.fragment=b'';self.parser=None
         _COLUMNS[self]=(self.owner,self.table,self.column,self.key,self.sha256,self.byte_count,self._frozen_value)
@@ -190,7 +343,8 @@ class DispatchOriginalJSONReadV3:
                 or self.owner is not owner or not self.complete or self.operation.closed):
             raise AuthorityUnavailable('actual same-work complete original JSON required')
         from .dispatch_current_inventory_v3 import _detach_value_v3
-        self.operation.retain(_container_bytes_v3(self._frozen_value)+1024)
+        copy_bytes=_COLUMN_COPY_BYTES_V3.get(self)
+        self.operation.retain((_container_bytes_v3(self._frozen_value)if copy_bytes is None else copy_bytes)+1024)
         return _detach_value_v3(self._frozen_value)
 
 class PreparedContactSourcesV3:
@@ -271,6 +425,20 @@ class _ContactHistoryCellReadV3:
             raise AuthorityUnavailable('actual independent historical Source header/fullPK/SHA/EOF required')
         return self
 
+def _natural_dispatch_original_selector_v1(owner):
+    """Closed selector for two independent actual Natural read Work owners."""
+    from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    if type(owner)is _DispatchInventoryReadV3:
+        if owner.family!='natural_reply':
+            raise AuthorityUnavailable('actual Natural P2 original selector required')
+        return owner.binding.operation_id,owner.binding.origin.activity_id
+    from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+    if type(owner)is not _NaturalInitialReadV1:
+        raise AuthorityUnavailable('actual independent Natural initial original selector required')
+    owner.require_actual_v1()
+    return owner.selected_operation_id,owner.selected_activity_id
+
+
 class DispatchInitialSourceReadsV3:
     """Actual auxiliary producer originals; selected by the fixed trusted Host caller."""
     def __init__(self,owner,family,now_utc):
@@ -278,6 +446,8 @@ class DispatchInitialSourceReadsV3:
         self.owner,self.family,self.now_utc=owner,family,now_utc
         self.phase='initial';self.complete=False;self.descriptors=();self.birth=None;self.natural=None
         self.artifact_task=None;self.original=None;self.history=None;self.history_cursor='';self.history_heads={};self.written_heads={};self.meta=None
+        self.named_commitment_task=None
+        self.named_commitment_selected=False
         self.owner.operation.retain(65536)
     def _contact_initial(self,meter):
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
@@ -383,6 +553,15 @@ class DispatchInitialSourceReadsV3:
         owner._require_source_roots_v3(event.source_refs,'context',admission.audience)
         self.complete=True
     def _private_route(self,meter):
+        if not self.named_commitment_selected:
+            from .d08_commitment_dispatch_read_v1 import begin_named_commitment_dispatch_read_v1
+            self.named_commitment_task=begin_named_commitment_dispatch_read_v1(self.owner)
+            self.named_commitment_selected=True
+        if self.named_commitment_task is not None:
+            if self.named_commitment_task.advance(meter):
+                self.descriptors=self.named_commitment_task.descriptors
+                self.complete=True
+            return
         from .first_ingress_v2 import scene_ref_for_conversation
         owner=self.owner;admission=owner.admission.admission;ns=owner.namespace
         rows=owner.db.execute('SELECT ingress_operation_id,c02_operation_id,source_ref,target_entity_ref,account_ref,destination_ref,'
@@ -409,24 +588,43 @@ class DispatchInitialSourceReadsV3:
         owner._require_source_roots_v3((source,),'context',admission.audience)
         self.complete=True
     def _natural_initial(self,meter):
+        operation_id,_=_natural_dispatch_original_selector_v1(self.owner)
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
         owner=self.owner;ns=owner.namespace
         if owner.request.proactive_contact:raise AuthorityUnavailable('natural original cannot use Contact scope')
         self.natural_bundle=_runtime_bounded_fixed_row_v3(owner.db,meter,'graph_bundle_operations',
-            ('digest','activity_id','effect_id','commit_seq'),'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,owner.binding.operation_id))
+            ('digest','activity_id','effect_id','commit_seq'),'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,operation_id))
         if self.natural_bundle is None:raise AuthorityUnavailable('actual natural producer COMMIT absent')
         self.original=DispatchOriginalJSONReadV3(owner,table='graph_bundle_operations',column='receipt_json',
-            key_columns=('bot','persona','operation_id'),key=(*ns.as_tuple,owner.binding.operation_id))
+            key_columns=('bot','persona','operation_id'),key=(*ns.as_tuple,operation_id))
         self.phase='natural_bundle'
     def _natural_columns_initial(self,meter):
+        operation_id,activity_id=_natural_dispatch_original_selector_v1(self.owner)
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
         owner=self.owner;data=self.original.require_v3(owner).get('natural_dispatch_candidate')
         if (type(data)is not dict or data.get('schema')!='sylanne.d11.natural_dispatch_candidate.v2'
                 or data.get('status')!='natural_paid_review_current_hold' or len(data.get('refs',()))!=4):
             raise AuthorityUnavailable('actual natural candidate original schema/footprint differs')
         self.natural_candidate=data;self.natural_refs=list(data['refs']);self.natural_cells={};self.natural_cell_rows={};self.column=None
+        self.natural_event_columns={};self.natural_event_queue=['reads','revisions','invalidated']
+        self.natural_event_epoch=_runtime_bounded_fixed_row_v3(owner.db,meter,'graph_events',('epoch_revision',),
+            'bot=? AND persona=? AND session=? AND event_id=?',
+            (*owner.namespace.as_tuple,activity_id,operation_id))
+        if self.natural_event_epoch is None:raise AuthorityUnavailable('actual natural producing graph event absent')
+        self.phase='natural_event_columns'
+    def _natural_event_columns(self,meter):
+        operation_id,activity_id=_natural_dispatch_original_selector_v1(self.owner)
+        if self.column is not None:
+            if self.column.advance(meter):self.natural_event_columns[self.column.column]=self.column;self.column=None
+            return
+        if self.natural_event_queue:
+            self.column=DispatchOriginalJSONReadV3(self.owner,table='graph_events',column=self.natural_event_queue.pop(0),
+                key_columns=('bot','persona','session','event_id'),
+                key=(*self.owner.namespace.as_tuple,activity_id,operation_id))
+            return
         self.phase='natural_candidate_cells'
     def _natural_candidate_cells(self,meter):
+        operation_id,activity_id=_natural_dispatch_original_selector_v1(self.owner)
         from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
         owner=self.owner
         if self.column is not None:
@@ -438,13 +636,13 @@ class DispatchInitialSourceReadsV3:
             row=owner.db.execute('SELECT value_cell_id,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?',
                 (token,revision)).fetchone()
             meter.charge_read(1024)
-            if row is None or row[1]!=1 or tuple(row[2:])!=(*owner.namespace.as_tuple,owner.binding.origin.activity_id,owner.binding.operation_id):
+            if row is None or row[1]!=1 or tuple(row[2:])!=(*owner.namespace.as_tuple,activity_id,operation_id):
                 raise AuthorityUnavailable('actual natural member producing event/COMMIT differs')
             self.natural_cell_rows[(token,revision)]=row
             self.column=DispatchOriginalJSONReadV3(owner,table='graph_history',column='value',key_columns=('token','revision'),key=(token,revision),cell_id=row[0]);return
         from .natural_dispatch_current_read_v2 import recover_natural_dispatch_candidate_in_transaction_v2
         self.natural_history=PreparedNaturalHistoryV3(_ISSUER,self)
-        recovered=recover_natural_dispatch_candidate_in_transaction_v2(owner.db,owner.namespace,owner.binding.operation_id,prepared_history=self.natural_history)
+        recovered=recover_natural_dispatch_candidate_in_transaction_v2(owner.db,owner.namespace,operation_id,prepared_history=self.natural_history)
         if recovered is None:raise AuthorityUnavailable('actual natural candidate full typed qualification absent')
         self.natural_evidence=recovered.evidence
         table='graph_natural_generation_preparations_v2'
@@ -452,6 +650,7 @@ class DispatchInitialSourceReadsV3:
             'state','typed_request_digest','worker_fence','terminal_receipt_digest','terminal_output_digest'),
             'bot=? AND persona=? AND original_operation_id=?',(*owner.namespace.as_tuple,self.natural_evidence.generation_original_operation_id))
         if row is None or row[4]!='terminal':raise AuthorityUnavailable('actual natural generation is not completed')
+        register_host_natural_roster_parent_v3(owner,row[0])
         self.natural_meta=row;self.natural_json={};self.natural_column_queue=['seal_json','frozen_json','read_versions_json','query_epochs_json','typed_request_wire']
         self.column=None;self.phase='natural_columns'
     def _natural_columns(self,meter):
@@ -464,10 +663,49 @@ class DispatchInitialSourceReadsV3:
         if self.phase=='natural_bundle':
             if self.original.advance(meter):self.phase='natural_columns_initial'
         elif self.phase=='natural_columns_initial':self._natural_columns_initial(meter)
+        elif self.phase=='natural_event_columns':self._natural_event_columns(meter)
         elif self.phase=='natural_candidate_cells':self._natural_candidate_cells(meter)
         elif self.phase=='natural_columns':self._natural_columns(meter)
         elif self.phase=='natural_frozen':self._natural_frozen_step(meter)
-        elif self.phase=='natural_digests':self._natural_digest_step(meter)
+        elif self.phase=='natural_digests':
+            self._natural_digest_step(meter)
+            if self.complete:self.complete=False;self.phase='natural_scope_start'
+        elif self.phase=='natural_scope_start':
+            self.natural_scope_header=meter.read_fixed_row(self.owner.db,'graph_natural_generation_scopes_v2',
+                ('original_seal_digest',),'bot=? AND persona=? AND parent_original_id=?',
+                (*self.owner.namespace.as_tuple,self.natural_meta[0]))
+            if self.natural_scope_header is None:raise AuthorityUnavailable('actual natural scoped original absent')
+            self.column=DispatchOriginalJSONReadV3(self.owner,table='graph_natural_generation_scopes_v2',column='proof_json',
+                key_columns=('bot','persona','parent_original_id'),key=(*self.owner.namespace.as_tuple,self.natural_meta[0]))
+            self.phase='natural_scope_column'
+        elif self.phase=='natural_scope_column':
+            if self.column.advance(meter):
+                from .natural_scoped_query_proof_v2 import natural_scoped_query_proof_from_wire_v2,assert_original_scoped_d06_projection_v2
+                from dataclasses import asdict
+                if self.natural_scope_header!=(canonical_digest_small_v3(asdict(self.natural.seal)),):
+                    raise AuthorityUnavailable('actual natural scoped seal differs')
+                self.natural_scope_value=natural_scoped_query_proof_from_wire_v2(self.column.require_v3(self.owner))
+                assert_original_scoped_d06_projection_v2(self.natural_scope_value,self.natural.frozen)
+                self.scope_stream=CanonicalValueStreamV3(asdict(self.natural_scope_value));self.phase='natural_scope_digest'
+        elif self.phase=='natural_scope_digest':
+            self.scope_stream.read_fragment(meter)
+            if self.scope_stream.complete:
+                if(self.scope_stream.hash.hexdigest(),self.scope_stream.offset)!=(self.column.sha256,self.column.byte_count):
+                    raise AuthorityUnavailable('actual natural scoped canonical bytes differ')
+                self.natural_scope_original=PreparedNaturalScopeOriginalV3(_ISSUER,self)
+                self.scope_stream=None;self.column=None
+                self.review_reader=DispatchNaturalReviewOriginalReadV3(_ISSUER,self.owner,self.natural_meta[0],self.natural_values)
+                self.phase='natural_review'
+        elif self.phase=='natural_review':
+            if self.review_reader.advance(meter):
+                if self.review_reader.natural is None or self.review_reader.natural.state!='terminal':
+                    raise AuthorityUnavailable('actual natural paid review is not completed')
+                self.natural_review_originals=self.review_reader.natural_values
+                from .natural_same_batch_history_v3 import begin_dispatch_parent_stop_read_v3
+                self.stop_reader=begin_dispatch_parent_stop_read_v3(self.owner,self.natural_values)
+                self.phase='natural_parent_stop'
+        elif self.phase=='natural_parent_stop':
+            if self.stop_reader.advance(meter):self.natural_parent_stop=self.stop_reader.result;self.complete=True
         else:raise AuthorityUnavailable('actual initial Source original phase differs')
     def advance(self,meter):
         if self.family=="artifact_receipt":
@@ -560,7 +798,8 @@ _NATURAL_ORIGINALS=WeakKeyDictionary()
 class _PreparedNaturalPayloadEOFV3:
     def __init__(self,issuer,columns,raw,envelope):
         from .dispatch_current_inventory_v3 import _freeze_value_v3,_SOURCE_ISSUED
-        if issuer is not _ISSUER or type(columns)is not PreparedNaturalOriginalsV3:
+        if issuer is not _ISSUER or not (type(columns)is PreparedNaturalOriginalsV3
+                or type(self)is _PreparedDispatchReviewPayloadEOFV3 and type(columns)is PreparedDispatchNaturalReviewOriginalsV3):
             raise AuthorityUnavailable('actual natural original payload EOF issuer required')
         original=columns.columns['typed_request_wire'];original.require_v3(columns.owner)
         if (_freeze_value_v3(raw)!=original._frozen_value or envelope.authority.namespace!=columns.owner.namespace
@@ -584,6 +823,10 @@ class _PreparedNaturalPayloadEOFV3:
 
 
 def require_prepared_model_payload_eof_v3(witness,request):
+    if type(witness)is _PreparedDispatchReviewPayloadEOFV3:
+        require_dispatch_review_original_v3(witness.columns)
+        witness.require_for_v3(request)
+        return
     if type(witness)is not _PreparedNaturalPayloadEOFV3:
         from ..authority_service.current_authority_graph_read_v3 import require_prepared_authority_model_payload_eof_v3
         require_prepared_authority_model_payload_eof_v3(witness,request)
@@ -645,23 +888,68 @@ class PreparedNaturalOriginalsV3:
 
 
 
+_NATURAL_SCOPES=WeakKeyDictionary()
+class PreparedNaturalScopeOriginalV3:
+    """Exact existing paid-generation scoped original; no new access power."""
+    def __init__(self,issuer,producer):
+        if (issuer is not _ISSUER or type(producer)is not DispatchInitialSourceReadsV3
+                or producer.phase!='natural_scope_digest' or not producer.scope_stream.complete):
+            raise AuthorityUnavailable('actual full natural scope original issuer required')
+        self.owner,self.column,self.header=producer.owner,producer.column,producer.natural_scope_header
+        self.saved,self.value=producer.natural,producer.natural_scope_value
+        _NATURAL_SCOPES[self]=(self.owner,self.column,self.header,self.saved,self.value)
+    def read_v3(self,db,saved):
+        if (_NATURAL_SCOPES.get(self)!=(self.owner,self.column,self.header,self.saved,self.value)
+                or db is not self.owner.db or self.owner.operation.closed or not db.in_transaction
+                or saved!=self.saved or saved.seal.namespace!=self.owner.namespace):
+            raise AuthorityUnavailable('actual same-Work natural scope original required')
+        row=db.execute('SELECT original_seal_digest FROM graph_natural_generation_scopes_v2 '
+            'WHERE bot=? AND persona=? AND parent_original_id=?',(*self.owner.namespace.as_tuple,saved.parent_original_id)).fetchone()
+        if row!=self.header:raise AuthorityUnavailable('natural scope original seal identity changed')
+        return self.value
+
+
 _NATURAL_HISTORIES=WeakKeyDictionary()
 class PreparedNaturalHistoryV3:
     def __init__(self,issuer,producer):
-        if issuer is not _ISSUER or len(producer.natural_cells)!=4:raise TypeError('actual natural four-member cell EOF required')
+        if issuer is not _ISSUER or type(producer)is not DispatchInitialSourceReadsV3 or len(producer.natural_cells)!=4:
+            raise TypeError('actual natural four-member cell EOF required')
+        _natural_dispatch_original_selector_v1(producer.owner)
         self.owner,self.cells,self.rows=producer.owner,MappingProxyType(dict(producer.natural_cells)),MappingProxyType(dict(producer.natural_cell_rows))
         self.original=producer.original
+        self.events=MappingProxyType(dict(producer.natural_event_columns))
+        self.event_epoch=producer.natural_event_epoch
+        self.bundle=producer.natural_bundle
+        from ..graph_types import GraphVersion
+        versions={}
+        for name in ('reads','revisions','invalidated'):
+            parsed=self.events[name].require_v3(self.owner)
+            if type(parsed)is not list:raise AuthorityUnavailable('actual natural event version array required')
+            versions[name]=tuple(GraphVersion(AtomKey.from_token(token),revision)for token,revision in parsed)
+        self.event_versions=MappingProxyType(versions)
         for value in self.cells.values():value.require_v3(self.owner)
-        _NATURAL_HISTORIES[self]=(self.owner,self.cells,self.rows,self.original)
+        _NATURAL_HISTORIES[self]=(self.owner,self.cells,self.rows,self.original,self.events,self.event_epoch,self.event_versions,self.bundle)
     def receipt_v3(self,db,namespace,operation):
-        if (_NATURAL_HISTORIES.get(self)!=(self.owner,self.cells,self.rows,self.original)
-                or db is not self.owner.db or namespace!=self.owner.namespace or operation!=self.owner.binding.operation_id):
+        selected_operation,_=_natural_dispatch_original_selector_v1(self.owner)
+        if (_NATURAL_HISTORIES.get(self)!=(self.owner,self.cells,self.rows,self.original,self.events,self.event_epoch,self.event_versions,self.bundle)
+                or db is not self.owner.db or namespace!=self.owner.namespace or operation!=selected_operation):
             raise AuthorityUnavailable('natural receipt belongs to another actual work')
         return self.original.require_v3(self.owner)
+    def event_v3(self,db,namespace,activity,operation):
+        selected_operation,selected_activity=_natural_dispatch_original_selector_v1(self.owner)
+        if (_NATURAL_HISTORIES.get(self)!=(self.owner,self.cells,self.rows,self.original,self.events,self.event_epoch,self.event_versions,self.bundle)
+                or self.owner.operation.closed or db is not self.owner.db or namespace!=self.owner.namespace
+                or operation!=selected_operation or activity!=selected_activity):
+            raise AuthorityUnavailable('actual same-work natural producing event required')
+        row=db.execute('SELECT epoch_revision FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?',
+            (*namespace.as_tuple,activity,operation)).fetchone()
+        if row!=self.event_epoch:raise AuthorityUnavailable('natural producing event epoch changed')
+        return self.event_versions['reads'],self.event_versions['revisions'],self.event_epoch[0]
     def read_history_json_v3(self,db,namespace,token,revision,activity,operation):
+        selected_operation,selected_activity=_natural_dispatch_original_selector_v1(self.owner)
         key=(token,revision)
-        if (_NATURAL_HISTORIES.get(self)!=(self.owner,self.cells,self.rows,self.original)or db is not self.owner.db or namespace!=self.owner.namespace
-                or operation!=self.owner.binding.operation_id or activity!=self.owner.binding.origin.activity_id or key not in self.cells):
+        if (_NATURAL_HISTORIES.get(self)!=(self.owner,self.cells,self.rows,self.original,self.events,self.event_epoch,self.event_versions,self.bundle)or db is not self.owner.db or namespace!=self.owner.namespace
+                or operation!=selected_operation or activity!=selected_activity or key not in self.cells):
             raise AuthorityUnavailable('actual same-work natural producing history required')
         row=db.execute('SELECT value_cell_id,valid,event_bot,event_persona,event_session,event_id FROM graph_history WHERE token=? AND revision=?',key).fetchone()
         if row!=self.rows[key]:raise AuthorityUnavailable('natural actual producing cell/event identity changed')
@@ -681,6 +969,9 @@ def detach_dispatch_preparation_workspace_v3(reader):
 def require_dispatch_source_originals_current_v3(inventory,db):
     """Independent mutable originals are checked at the real final transaction."""
     if inventory.family=='private_reply':
+        if inventory.named_commitment_task is not None:
+            inventory.named_commitment_task.require_for_v1(inventory,db)
+            return
         for roots,purpose,audiences,origin in inventory.source_descriptors:
             if origin[0]!='graph_post_c02_reply_ownership_v1':
                 raise AuthorityUnavailable('actual private route original descriptor required')
@@ -710,7 +1001,14 @@ def _advance_host_saved_natural_columns_v3(self,meter):
     table='graph_natural_generation_preparations_v2';owner=self.owner
     if self.column is None:
         if self.natural_column_queue:
-            name=self.natural_column_queue.pop(0)
+            name=self.natural_column_queue[0]
+            if name == 'frozen_json':
+                from .d13_natural_original_sources_v3 import advance_host_natural_original_source_all_v3
+                if not advance_host_natural_original_source_all_v3(self, meter=meter):
+                    return
+                from .d13_natural_original_use_v3 import require_graph_natural_original_before_body_v3
+                require_graph_natural_original_before_body_v3(self, meter=meter)
+            self.natural_column_queue.pop(0)
             self.column=DispatchOriginalJSONReadV3(owner,table=table,column=name,key_columns=('bot','persona','parent_original_id'),
                 key=(*owner.namespace.as_tuple,self.natural_meta[0]));return
         from .natural_frozen_original_read_v3 import begin_natural_frozen_original_read_v3,begin_authority_natural_frozen_original_read_v3
@@ -782,7 +1080,13 @@ def _advance_host_saved_natural_digest_step_v3(self,meter):
     self.natural_values.qualify_saved_v3(_ISSUER,self.natural)
     self.descriptors=(((self.natural.seal.source_ref,),'context',owner.admission.admission.audience,
         (table,*owner.namespace.as_tuple,self.natural.parent_original_id,self.natural_json['seal_json'].sha256)),)
-    owner._require_source_roots_v3((self.natural.seal.source_ref,),'context',owner.admission.admission.audience)
+    from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    if type(owner)is _DispatchInventoryReadV3:
+        owner._require_source_roots_v3((self.natural.seal.source_ref,),'context',owner.admission.admission.audience)
+    else:
+        # Initial READ reached original EOF only after its independent actual
+        # SourceALL barrier; do not borrow P2's source-family method or binding.
+        _natural_dispatch_original_selector_v1(owner)
     self.complete=True;return
 
 class HostNaturalSavedOriginalReadV3:
@@ -810,6 +1114,7 @@ class HostNaturalSavedOriginalReadV3:
                 'bot=? AND persona=? AND parent_original_id=?',
                 (*self.owner.namespace.as_tuple,self.parent_original_id))
             if self.natural_meta is None:self.complete=True;return True
+            register_host_natural_roster_parent_v3(self.owner,self.natural_meta[0])
             self.natural_json={};self.natural_column_queue=['seal_json','frozen_json','read_versions_json','query_epochs_json']
             if self.natural_meta[4]!='queued':self.natural_column_queue.append('typed_request_wire')
             self.phase='natural_columns'
@@ -948,68 +1253,7 @@ class AuthorityNaturalReviewOriginalReadV3:
         self.column=None;self.natural=None;self.natural_values=None;self.natural_frozen_read=None
         _AUTHORITY_SAVED_READERS_V3.add(self)
     def advance(self,meter):
-        self.owner.require_current(meter=meter)
-        table='graph_natural_review_preparations_v2';owner=self.owner
-        if self.complete:return True
-        if self.phase=='locate':
-            from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
-            self.natural_meta=_runtime_bounded_fixed_row_v3(owner.db,meter,table,
-                ('parent_original_id','graph_epoch','access_epoch','deletion_epoch','state',
-                 'typed_request_digest','worker_fence','terminal_receipt_digest','terminal_output_digest'),
-                'bot=? AND persona=? AND parent_original_id=?',(*owner.namespace.as_tuple,self.parent_original_id))
-            if self.natural_meta is None:self.complete=True;return True
-            self.natural_json={};self.queue=['seal_json','frozen_json','read_versions_json','query_epochs_json']
-            if self.natural_meta[4]!='queued':self.queue.append('typed_request_wire')
-            self.phase='columns';return False
-        if self.phase=='columns':
-            if self.column is not None:
-                if self.column.advance(meter):self.natural_json[self.column.column]=self.column;self.column=None
-                return False
-            if self.queue:
-                name=self.queue.pop(0)
-                self.column=DispatchOriginalJSONReadV3(owner,table=table,column=name,
-                    key_columns=('bot','persona','parent_original_id'),key=(*owner.namespace.as_tuple,self.parent_original_id))
-                return False
-            from ..authority_service.current_authority_graph_read_v3 import begin_authority_review_canonical_read_v3
-            self.natural_frozen_read=begin_authority_review_canonical_read_v3(owner,self.natural_json['frozen_json'],
-                generation=self.generation_original.saved.seal)
-            self.phase='canonical';return False
-        if self.phase=='canonical':
-            if not self.natural_frozen_read.advance(meter):return False
-            self.natural_digests={'frozen_wire':self.natural_frozen_read.wire_digest}
-            if self.natural_meta[4]=='queued':self.phase='publish';return False
-            raw=self.natural_json['typed_request_wire'].require_v3(owner)
-            self.request_raw=raw
-            from .natural_reply_job_v2 import _envelope_from_wire_v3
-            from .natural_frozen_original_read_v3 import _CanonicalComparisonV3
-            value={'envelope':_envelope_from_wire_v3(raw),'call_id':raw['call_id'],'provider_id':raw['provider_id'],
-                'model_id':raw['model_id'],'purpose':raw['envelope']['authority']['purpose'],
-                'required_capabilities':sorted(raw['required_capabilities']),'privacy_tier':raw['privacy_tier'],
-                'template':raw['prompt_template_digest'],'payload':raw['payload'],
-                'timeout_seconds':float(raw['timeout_seconds']),'max_output_tokens':raw['max_output_tokens']}
-            self.comparison=_CanonicalComparisonV3(value,operation=owner.operation)
-            self.phase='request';return False
-        if self.phase=='request':
-            if not self.comparison.advance(meter):return False
-            self.natural_digests['typed_request']=self.comparison.digest
-            from .natural_frozen_original_read_v3 import _CanonicalComparisonV3
-            self.comparison=_CanonicalComparisonV3(self.request_raw['payload'],operation=owner.operation)
-            self.phase='payload';return False
-        if self.phase=='payload':
-            if not self.comparison.advance(meter):return False
-            self.natural_digests['payload']=self.comparison.digest
-            if self.comparison.digest!=self.natural_frozen_read.expected_payload_digest:
-                raise AuthorityUnavailable('Authority review actual paid payload differs from frozen provider wire')
-            self.phase='publish';return False
-        if self.phase=='publish':
-            self.natural_values=PreparedAuthorityNaturalOriginalsV3(_AUTHORITY_NATURAL_ISSUER_V3,self)
-            from .natural_reply_job_v2 import read_original_preparation
-            self.natural=read_original_preparation(owner.db,owner.namespace,self.parent_original_id,'review',
-                prepared_originals=self.natural_values)
-            if self.natural is None:raise AuthorityUnavailable('actual Authority review original disappeared')
-            self.natural_values.qualify_saved_v3(_ISSUER,self.natural)
-            self.complete=True;return True
-        raise AuthorityUnavailable('unregistered Authority review original phase')
+        return _advance_natural_review_original_v3(self,meter)
     def require_v3(self,owner):
         from ..authority_service.current_authority_graph_read_v3 import require_actual_authority_graph_attachment_owner_v3
         require_actual_authority_graph_attachment_owner_v3(owner,db=owner.db)
@@ -1020,3 +1264,203 @@ class AuthorityNaturalReviewOriginalReadV3:
 
 def begin_authority_natural_review_original_read_v3(owner,*,parent_original_id,generation_original):
     return AuthorityNaturalReviewOriginalReadV3(_AUTHORITY_NATURAL_ISSUER_V3,owner,parent_original_id,generation_original)
+
+
+_DISPATCH_REVIEW_READERS_V3=WeakSet()
+_DISPATCH_REVIEW_ORIGINALS_V3=WeakKeyDictionary()
+_DISPATCH_REVIEW_CANONICAL_V3=WeakKeyDictionary()
+
+
+def _require_dispatch_review_owner_v3(owner):
+    from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+    if type(owner)is _DispatchInventoryReadV3:
+        if (owner.family!='natural_reply' or owner.operation.closed
+                or owner.graph._v2_graph_stamp(owner.namespace)!=owner.graph_stamp):
+            raise AuthorityUnavailable('actual live Natural P2 review owner required')
+        return owner
+    from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+    if type(owner)is not _NaturalInitialReadV1:
+        raise AuthorityUnavailable('actual independent Natural initial review owner required')
+    owner.require_actual_v1()
+    return owner
+
+
+from .natural_frozen_original_read_v3 import _NaturalReviewCanonicalStateV3
+
+
+class _PreparedDispatchReviewCanonicalV3(_NaturalReviewCanonicalStateV3):
+    def __init__(self,issuer,owner,column,generation):
+        if issuer is not _ISSUER or type(column)is not DispatchOriginalJSONReadV3:
+            raise AuthorityUnavailable('actual Host review canonical issuer required')
+        _require_dispatch_review_owner_v3(owner)
+        if column.owner is not owner or column.table!='graph_natural_review_preparations_v2'or column.column!='frozen_json':
+            raise AuthorityUnavailable('Host review canonical original column differs')
+        self.owner,self.column=owner,column
+        super().__init__(column.require_v3(owner),generation,owner.operation,column.sha256,column.byte_count)
+        _DISPATCH_REVIEW_CANONICAL_V3[self]=(owner,column,owner.operation,owner.fence.scope,generation,self.raw)
+    def _actual_v3(self):
+        if (_DISPATCH_REVIEW_CANONICAL_V3.get(self)!=(self.owner,self.column,self.owner.operation,
+                self.owner.fence.scope,self.generation,self.raw)or self.owner.operation.closed):
+            raise AuthorityUnavailable('Host review canonical original lost its actual Work')
+    def advance(self,meter):
+        self._actual_v3();_require_dispatch_review_owner_v3(self.owner)
+        return super().advance(meter)
+    def require_for_v3(self,raw):
+        self._actual_v3()
+        from .dispatch_current_inventory_v3 import _freeze_value_v3
+        if not self.complete or _freeze_value_v3(raw)!=self.column._frozen_value:
+            raise AuthorityUnavailable('Host review canonical original requires complete EOF')
+        return self.result
+
+
+class PreparedDispatchNaturalReviewOriginalsV3(PreparedNaturalOriginalsV3):
+    def __init__(self,issuer,producer):
+        if issuer is not _ISSUER or type(producer)is not DispatchNaturalReviewOriginalReadV3 or producer not in _DISPATCH_REVIEW_READERS_V3:
+            raise AuthorityUnavailable('actual P2 review original producer required')
+        _require_dispatch_review_owner_v3(producer.owner)
+        super().__init__(_ISSUER,producer)
+        self.stage='review';self.generation_original=producer.generation_original
+        _DISPATCH_REVIEW_ORIGINALS_V3[self]=(self.owner,self.owner.operation,self.owner.fence.scope,self.generation_original)
+    def require_for_v3(self,db,namespace,parent,stage):
+        require_dispatch_review_original_v3(self)
+        if(db is not self.owner.db or namespace!=self.owner.namespace or parent!=self.meta[0]
+                or stage!='review' or not db.in_transaction):
+            raise AuthorityUnavailable('actual same-Work Host review original required')
+        row=db.execute('SELECT parent_original_id,graph_epoch,access_epoch,deletion_epoch,state,typed_request_digest,'
+            'worker_fence,terminal_receipt_digest,terminal_output_digest FROM graph_natural_review_preparations_v2 '
+            'WHERE bot=? AND persona=? AND parent_original_id=?',(*namespace.as_tuple,parent)).fetchone()
+        if row!=self.meta:raise AuthorityUnavailable('Host review original mutable state changed')
+        return(None,None,None,None,*self.meta[1:7],None,*self.meta[7:])
+    def saved_v3(self,db,namespace,parent,stage):
+        self.require_for_v3(db,namespace,parent,stage)
+        if self.saved is not None:
+            from .jobs import get_job
+            job=get_job(db,self.saved.seal.job_id)
+            if job is None or job.work_kind!='natural_review' or job.operation_id!=self.saved.seal.original_operation_id:
+                raise AuthorityUnavailable('actual saved review job identity changed')
+        return self.saved
+    def qualify_saved_v3(self,issuer,saved):
+        from .natural_reply_job_v2 import SavedNaturalPreparationV2
+        if (issuer is not _ISSUER or self.saved is not None or type(saved)is not SavedNaturalPreparationV2
+                or saved.stage!='review' or saved.parent_original_id!=self.meta[0]or saved.seal.namespace!=self.owner.namespace):
+            raise AuthorityUnavailable('actual fully typed Host review original required')
+        self.saved=saved
+        _NATURAL_ORIGINALS[self]=(self.owner,self.meta,self.columns,self.digests,self.saved,self.frozen_eof)
+    def require_payload_v3(self,payload):
+        require_dispatch_review_original_v3(self)
+        from .dispatch_current_inventory_v3 import _freeze_value_v3
+        original=dict(self.columns['typed_request_wire']._frozen_value.items)['payload']
+        if self.digests.get('payload')!=self.frozen_eof.expected_payload_digest or _freeze_value_v3(payload)!=original:
+            raise AuthorityUnavailable('Host review full provider payload differs')
+        return True
+    def payload_eof_v3(self,raw,envelope):
+        require_dispatch_review_original_v3(self)
+        return _PreparedDispatchReviewPayloadEOFV3(_ISSUER,self,raw,envelope)
+
+
+def require_dispatch_review_original_v3(original):
+    if (type(original)is not PreparedDispatchNaturalReviewOriginalsV3
+            or _DISPATCH_REVIEW_ORIGINALS_V3.get(original)!=(original.owner,original.owner.operation,
+                original.owner.fence.scope,original.generation_original)
+            or original.owner.operation.closed or original.generation_original.owner is not original.owner):
+        raise AuthorityUnavailable('actual independently issued Host review original required')
+    return original
+
+
+class _PreparedDispatchReviewPayloadEOFV3(_PreparedNaturalPayloadEOFV3):
+    def __init__(self,issuer,columns,raw,envelope):
+        require_dispatch_review_original_v3(columns)
+        super().__init__(issuer,columns,raw,envelope)
+
+
+class DispatchNaturalReviewOriginalReadV3:
+    def __init__(self,issuer,owner,parent_original_id,generation_original):
+        if issuer is not _ISSUER:raise AuthorityUnavailable('actual Host review reader issuer required')
+        _require_dispatch_review_owner_v3(owner)
+        if (type(generation_original)is not PreparedNaturalOriginalsV3 or generation_original not in _NATURAL_ORIGINALS
+                or generation_original.owner is not owner or generation_original.meta[0]!=parent_original_id
+                or generation_original.saved is None):
+            raise AuthorityUnavailable('Host review requires its actual completed generation original')
+        self.owner,self.parent_original_id,self.generation_original=owner,parent_original_id,generation_original
+        self.stage='review';self.phase='locate';self.complete=False
+        self.column=None;self.natural=None;self.natural_values=None;self.natural_frozen_read=None
+        _DISPATCH_REVIEW_READERS_V3.add(self)
+
+    def advance(self,meter):
+        return _advance_natural_review_original_v3(self,meter)
+
+
+def _advance_natural_review_original_v3(self,meter):
+    if type(self)is AuthorityNaturalReviewOriginalReadV3:
+        if self not in _AUTHORITY_SAVED_READERS_V3:raise AuthorityUnavailable('actual Authority review reader required')
+        self.owner.require_current(meter=meter)
+    elif type(self)is DispatchNaturalReviewOriginalReadV3:
+        if self not in _DISPATCH_REVIEW_READERS_V3:raise AuthorityUnavailable('actual Host review reader required')
+        _require_dispatch_review_owner_v3(self.owner)
+    else:raise AuthorityUnavailable('registered natural review original reader required')
+    table='graph_natural_review_preparations_v2';owner=self.owner
+    if self.complete:return True
+    if self.phase=='locate':
+        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
+        self.natural_meta=_runtime_bounded_fixed_row_v3(owner.db,meter,table,
+            ('parent_original_id','graph_epoch','access_epoch','deletion_epoch','state',
+             'typed_request_digest','worker_fence','terminal_receipt_digest','terminal_output_digest'),
+            'bot=? AND persona=? AND parent_original_id=?',(*owner.namespace.as_tuple,self.parent_original_id))
+        if self.natural_meta is None:self.complete=True;return True
+        self.natural_json={};self.queue=['seal_json','frozen_json','read_versions_json','query_epochs_json']
+        if self.natural_meta[4]!='queued':self.queue.append('typed_request_wire')
+        self.phase='columns';return False
+    if self.phase=='columns':
+        if self.column is not None:
+            if self.column.advance(meter):self.natural_json[self.column.column]=self.column;self.column=None
+            return False
+        if self.queue:
+            name=self.queue.pop(0)
+            self.column=DispatchOriginalJSONReadV3(owner,table=table,column=name,
+                key_columns=('bot','persona','parent_original_id'),key=(*owner.namespace.as_tuple,self.parent_original_id))
+            return False
+        if type(self)is AuthorityNaturalReviewOriginalReadV3:
+            from ..authority_service.current_authority_graph_read_v3 import begin_authority_review_canonical_read_v3
+            self.natural_frozen_read=begin_authority_review_canonical_read_v3(owner,self.natural_json['frozen_json'],
+                generation=self.generation_original.saved.seal)
+        else:
+            self.natural_frozen_read=_PreparedDispatchReviewCanonicalV3(_ISSUER,owner,self.natural_json['frozen_json'],
+                self.generation_original.saved.seal)
+        self.phase='canonical';return False
+    if self.phase=='canonical':
+        if not self.natural_frozen_read.advance(meter):return False
+        self.natural_digests={'frozen_wire':self.natural_frozen_read.wire_digest}
+        if self.natural_meta[4]=='queued':self.phase='publish';return False
+        raw=self.natural_json['typed_request_wire'].require_v3(owner)
+        self.request_raw=raw
+        from .natural_reply_job_v2 import _envelope_from_wire_v3
+        from .natural_frozen_original_read_v3 import _CanonicalComparisonV3
+        value={'envelope':_envelope_from_wire_v3(raw),'call_id':raw['call_id'],'provider_id':raw['provider_id'],
+            'model_id':raw['model_id'],'purpose':raw['envelope']['authority']['purpose'],
+            'required_capabilities':sorted(raw['required_capabilities']),'privacy_tier':raw['privacy_tier'],
+            'template':raw['prompt_template_digest'],'payload':raw['payload'],
+            'timeout_seconds':float(raw['timeout_seconds']),'max_output_tokens':raw['max_output_tokens']}
+        self.comparison=_CanonicalComparisonV3(value,operation=owner.operation)
+        self.phase='request';return False
+    if self.phase=='request':
+        if not self.comparison.advance(meter):return False
+        self.natural_digests['typed_request']=self.comparison.digest
+        from .natural_frozen_original_read_v3 import _CanonicalComparisonV3
+        self.comparison=_CanonicalComparisonV3(self.request_raw['payload'],operation=owner.operation)
+        self.phase='payload';return False
+    if self.phase=='payload':
+        if not self.comparison.advance(meter):return False
+        self.natural_digests['payload']=self.comparison.digest
+        if self.comparison.digest!=self.natural_frozen_read.expected_payload_digest:
+            raise AuthorityUnavailable('Authority review actual paid payload differs from frozen provider wire')
+        self.phase='publish';return False
+    if self.phase=='publish':
+        self.natural_values=(PreparedAuthorityNaturalOriginalsV3(_AUTHORITY_NATURAL_ISSUER_V3,self)
+            if type(self)is AuthorityNaturalReviewOriginalReadV3 else PreparedDispatchNaturalReviewOriginalsV3(_ISSUER,self))
+        from .natural_reply_job_v2 import read_original_preparation
+        self.natural=read_original_preparation(owner.db,owner.namespace,self.parent_original_id,'review',
+            prepared_originals=self.natural_values)
+        if self.natural is None:raise AuthorityUnavailable('actual Authority review original disappeared')
+        self.natural_values.qualify_saved_v3(_ISSUER,self.natural)
+        self.complete=True;return True
+    raise AuthorityUnavailable('unregistered Authority review original phase')

@@ -4,17 +4,49 @@ No native FFI, Authority RPC, model provider or platform sender runs here.
 """
 from datetime import datetime, timezone
 from fractions import Fraction
-import logging
 import math
 from types import SimpleNamespace
 
 import pytest
 
+from sylanne3.diagnostic_channel_v1 import (
+    StderrDiagnosticSinkV1, install_diagnostic_sink_v1, render_diagnostic_message_v1,
+)
 from sylanne3.native_runtime.d04_fixed_trajectory_v2 import (
     MAX_STEP, exact_d04_series_step_plan_v1, fixed_d04_step_plan_v2,
 )
 from sylanne3.runtime.d04_installed_stage_fence_v3 import _D04PhaseTimingsV1
 from sylanne3.runtime.d04_series_execution_v1 import _require_d04_series_cpu_deadline_v1
+
+
+class _DiagnosticRecordV1:
+    def __init__(self, level, message, args, module, exc_text):
+        self.level, self.message, self.args = level, message, args
+        self.module, self.exc_text = module, exc_text
+
+    @property
+    def rendered(self):
+        return render_diagnostic_message_v1(self.message, self.args)
+
+
+class _DiagnosticCaptureV1:
+    """Test sink for the production channel; the runtime itself imports no logging."""
+
+    def __init__(self):
+        self.records = []
+
+    def emit(self, level, message, args, *, module, exc_text):
+        self.records.append(_DiagnosticRecordV1(level, message, args, module, exc_text))
+
+
+@pytest.fixture
+def diagnostics():
+    capture = _DiagnosticCaptureV1()
+    install_diagnostic_sink_v1(capture, minimum_level="info")
+    try:
+        yield capture
+    finally:
+        install_diagnostic_sink_v1(StderrDiagnosticSinkV1())
 
 
 def _guard_inputs():
@@ -65,32 +97,32 @@ def test_small_compact_chunks_preserve_exact_original_binary64_step_sequence(sta
         compact.chunk(index)
 
 
-def test_timing_uses_monotonic_wall_and_only_bound_paired_clock(caplog, monkeypatch):
+def test_timing_uses_monotonic_wall_and_only_bound_paired_clock(diagnostics, monkeypatch):
     current = [10.0]
     monkeypatch.setattr("sylanne3.runtime.d04_installed_stage_fence_v3.time.monotonic", lambda: current[0])
     timings = _D04PhaseTimingsV1("fixture-root", deadline_utc="2030-01-01T00:00:00Z")
-    caplog.set_level(logging.INFO, logger="sylanne3.runtime.d04_installed_stage_fence_v3")
     with timings.measure("prepare_inspect", chunk_start=0):
         current[0] = 11.0
-    assert "trusted_utc_upper_start=None" in caplog.records[-1].getMessage()
-    assert "trusted_utc_upper_end=None" in caplog.records[-1].getMessage()
+    assert "trusted_utc_upper_start=None" in diagnostics.records[-1].rendered
+    assert "trusted_utc_upper_end=None" in diagnostics.records[-1].rendered
     timings.bind_clock(SimpleNamespace(utc_upper_bound_seconds=100.0, monotonic_after_seconds=11.0))
     with timings.measure("sql_transaction", chunk_start=0):
         current[0] = 13.0
-    record = caplog.records[-1]
+    record = diagnostics.records[-1]
+    assert record.module == "sylanne3.runtime.d04_installed_stage_fence_v3"
+    assert record.level == "info"
     assert timings.seconds["sql_transaction"] == 2.0 and timings.counts["sql_transaction"] == 1
     assert record.args[6] >= 100.0 and record.args[7] >= 102.0
-    assert "wall_seconds=2.000000000" in record.getMessage()
+    assert "wall_seconds=2.000000000" in record.rendered
     assert not hasattr(timings, "actual_cpu_ms")
 
 
-def test_diagnostics_preserve_rejection_and_use_finite_phase_labels(caplog):
+def test_diagnostics_preserve_rejection_and_use_finite_phase_labels(diagnostics):
     timings = _D04PhaseTimingsV1("fixture-root")
-    caplog.set_level(logging.INFO, logger="sylanne3.runtime.d04_installed_stage_fence_v3")
     with pytest.raises(ValueError, match="original refusal"):
         with timings.measure("stage_callback"):
             raise ValueError("original refusal")
-    assert "outcome=ValueError" in caplog.records[-1].getMessage()
+    assert "outcome=ValueError" in diagnostics.records[-1].rendered
     assert timings.counts["stage_callback"] == 1
     count = len(timings.counts)
     with pytest.raises(ValueError, match="finite D04 timing phase"):

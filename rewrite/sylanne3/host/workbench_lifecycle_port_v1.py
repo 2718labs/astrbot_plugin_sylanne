@@ -189,6 +189,40 @@ class WorkbenchLifecyclePortV1:
         self.lifecycle = lifecycle
         self.experiment_port, self.support_export_port = experiment_port, support_export_port
 
+    def backend_route_installed_v1(self, action: str) -> bool:
+        """Report installed providers only; current Owner/peer admission is separate."""
+        if type(action) is not str or action not in {
+                "prepare_transfer", "execute_transfer", "configure_or_control",
+                "run_experiment", "diagnose_and_export_support"}:
+            raise ValueError("unknown D12 lifecycle backend action")
+        if action in {"run_experiment", "diagnose_and_export_support"}:
+            port, method = ((self.experiment_port, "run_current_experiment_v1")
+                if action == "run_experiment" else
+                (self.support_export_port, "export_current_support_v1"))
+            return all(callable(getattr(port, name, None)) for name in
+                (method, "owns_original_ref_v1", "read_current_backend_operation_original_v1"))
+        lifecycle = self.lifecycle
+        if not (callable(lifecycle.command_executor) and callable(lifecycle.status_reader)):
+            return False
+        if action == "configure_or_control":
+            # Exact job cancellation is built into the installed command executor.
+            # Individual whole-Host/domain controls retain their own admission.
+            return True
+        port = lifecycle.transfer_port
+        if type(port) is not InstalledCurrentTransferPortV1:
+            return False
+        if (port.credential is None or not port.source_subject
+                or port.target_credential is None or not port.target_subject):
+            return False
+        return all(callable(getattr(provider, method, None)) for provider, method in (
+            (port.registry, "resolve_current_transfer_plan_v1"),
+            (port.registry, "validate_current_transfer_execution_v1"),
+            (port.registry, "current_resolution_scope_v1"),
+            (port.target_factory, "open_isolated_target_v1"),
+            (port.target_lease_reader, "read_current_target_lease_v1"),
+            (port.target_lease_reader, "read_current_target_lease_digest_v1"),
+            (port.reconciliation_reader, "read_current_constraints_v1")))
+
     def prepare_current_transfer_v1(self, *args, **kwargs):
         return self.lifecycle.prepare_current_transfer_v1(*args, **kwargs)
 

@@ -136,25 +136,28 @@ class AuthorityD04NumericServiceV3:
                 or not hmac.compare_digest(claim.signature, self._sign(claim))):
             raise AuthorityUnavailable("D04 original signed claim differs")
 
-    def _graph_read(self, binding, claim=None):
-        if claim is None:self._binding(binding)
-        else:self._require_historical_binding(binding,claim)
+    def _graph_read(self, binding, claim=None,*,permit=None,owner=None):
+        if claim is None:
+            from .d04_numeric_owner_selectors_metadata_v4 import numeric_owner_selectors_metadata_read_v4
+            from .current_d04_numeric_prepared_v3 import read_current_d04_numeric_prepared_v3
+            with numeric_owner_selectors_metadata_read_v4(self,binding,permit=permit,owner=owner) as reader:
+                with reader.quantum_v4():
+                    return read_current_d04_numeric_prepared_v3(reader.db,binding,self.resource_issuer,
+                        self._clock(),budget_issuer=self.budget_issuer)
+
+        self._require_historical_binding(binding,claim)
         if self.graph_path.resolve(strict=True) != self.graph_path:
             raise AuthorityUnavailable("D04 installed Graph path changed")
         db = sqlite3.connect(f"file:{self.graph_path.as_posix()}?mode=ro", uri=True)
         try:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
-            if claim is None:
-                from .current_d04_numeric_prepared_v3 import read_current_d04_numeric_prepared_v3
-                value = read_current_d04_numeric_prepared_v3(db, binding, self.resource_issuer, self._clock(),budget_issuer=self.budget_issuer)
-            else:
-                from ..runtime.d04_numeric_cost_v3 import read_installed_d04_numeric_measurement_original_v3
-                from ..runtime.d04_numeric_accounting_prepared_v3 import read_numeric_accounting_prepared_v3
-                retained=read_numeric_accounting_prepared_v3(db,binding.namespace,binding.operation_id,issuer=self.resource_issuer)
-                if retained is None or retained.binding!=binding:
-                    raise AuthorityUnavailable("numeric historical signed accounting basis absent/changed")
-                value = read_installed_d04_numeric_measurement_original_v3(db, binding, claim)
+            from ..runtime.d04_numeric_cost_v3 import read_installed_d04_numeric_measurement_original_v3
+            from ..runtime.d04_numeric_accounting_prepared_v3 import read_numeric_accounting_prepared_v3
+            retained=read_numeric_accounting_prepared_v3(db,binding.namespace,binding.operation_id,issuer=self.resource_issuer)
+            if retained is None or retained.binding!=binding:
+                raise AuthorityUnavailable("numeric historical signed accounting basis absent/changed")
+            value = read_installed_d04_numeric_measurement_original_v3(db, binding, claim)
             db.commit()
             return value
         except (ValueError, TypeError, sqlite3.Error, OSError) as exc:
@@ -201,18 +204,10 @@ class AuthorityD04NumericServiceV3:
             if actor.revision!=admission.target_actor_revision:
                 raise AuthorityUnavailable("numeric target actor pairing changed")
 
-    def _read_source_owner_selectors(self,binding):
-        from .current_d04_numeric_prepared_v3 import read_numeric_policy_owner_selectors_v3
-        from ..runtime.d04_numeric_cost_v3 import read_d04_numeric_prepared_v3
-        db=sqlite3.connect(self.graph_path.as_uri()+"?mode=ro",uri=True,isolation_level=None)
-        try:
-            db.execute("BEGIN")
-            prepared=read_d04_numeric_prepared_v3(db,binding.namespace,binding.operation_id)
-            if prepared is None or prepared.binding!=binding:raise AuthorityUnavailable("numeric accepting Owner preparation absent")
-            return read_numeric_policy_owner_selectors_v3(db,binding,self.budget_issuer,json.loads(prepared.input_payload_json),
-                now_utc=self._clock(),require_current_budget=False)[0]
-        finally:
-            db.close()
+    def _read_source_owner_selectors(self,binding,*,permit,gate=None,owner=None):
+        from .d04_numeric_owner_selectors_metadata_v4 import numeric_owner_selectors_metadata_read_v4
+        with numeric_owner_selectors_metadata_read_v4(self,binding,permit=permit,gate=gate,owner=owner) as reader:
+            return reader.read_selectors_v4()
 
     def _require_accepting_owners_locked(self,db,binding,selectors,observation=None):
         from .v2_owner_contract import OwnerPrincipalV1
@@ -421,8 +416,8 @@ class AuthorityD04NumericServiceV3:
             try:
                 # The exclusive durable permit now excludes cancellation/source
                 # writes. Graph reads and any target Owner RPC are outside Core SQL.
-                prepared=self._graph_read(binding)
                 owner=self._owner_observation(permit,binding)
+                prepared=self._graph_read(binding,permit=permit,owner=owner)
                 claim=D04NumericClaimV3(binding.digest,binding.execution_id,numeric_mutation_id_v3(binding,"claim"),
                     permit.pinned_anchor.execution_seq+1,self.installation_id,executor_incarnation,"pending")
                 claim=replace(claim,signature=self._sign(claim))
@@ -699,8 +694,8 @@ class AuthorityD04NumericServiceV3:
                 permit=bridge.fences.begin_fence_locked(db,subject=self._subject,holder=holder,operation="write",current_anchor=after,
                     operation_id=numeric_gate_operation_id_v3(binding,"adoption"))
             try:
-                prepared=self._graph_read(binding)
                 owner=self._owner_observation(permit,binding)
+                prepared=self._graph_read(binding,permit=permit,owner=owner)
                 old=json.loads(prepared.authority_anchor_json)
                 if (not self._graph_location_matches(old,before)
                         or (old["execution_seq"],old["execution_digest"])!=(before.execution_seq,before.execution_digest)):
@@ -736,7 +731,7 @@ class AuthorityD04NumericServiceV3:
                     or revision!=gate.before_graph_revision):
                 raise AuthorityUnavailable("numeric gate old Graph requirements/revision changed")
             owner=(self._owner_observation(gate.permit,binding) if type(gate) is D04NumericAdoptionBridgeV3 or gate.content_artifact_permitted else None)
-            selectors=self._read_source_owner_selectors(binding) if owner is not None else ()
+            selectors=self._read_source_owner_selectors(binding,permit=gate.permit,gate=gate,owner=owner) if owner is not None else ()
             with self._frozen() as (db,deletion,execution):
                 anchor,_=self._current_anchor_locked(db,deletion,execution,
                     action="accounting" if type(gate) is D04NumericOriginalAppendV3 else "business")

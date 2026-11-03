@@ -177,12 +177,19 @@ def issue_natural_dispatch_admission_v2(
         "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
         namespace.as_tuple,
     ).fetchone() == (query.revision,), "natural dispatch graph head changed")
-    _require(read_current_dispatch_projection(db, namespace, snapshot, query)
-             == projection, "natural dispatch D03/D05 projection changed")
-
     types = {spec.name: spec.validator for spec in GoalExecutionProvider().register_types()}
     action = types["d08.action_intent.v1"](_atom(
         db, namespace, evidence.action_ref, "d08.action_intent.v1"))
+    request=RoleBindingRequest('persona:'+namespace.persona_id,action.target_ref,None,
+        route.scene_ref,action.action_kind,action.purpose,now_utc,True)
+    from .dispatch_current_projection import read_current_dispatch_policy_route_v3
+    policy_route=read_current_dispatch_policy_route_v3(db,namespace,query,
+        source_ref=route.source_ref,c02_operation_id=route.c02_operation_id,
+        platform_ref=route.platform_ref,conversation_ref=route.conversation_ref,
+        sender_ref=route.sender_ref,scene_ref=route.scene_ref)
+    _require(read_current_dispatch_projection(db,namespace,snapshot,query,
+        policy_request=request,policy_route=policy_route)==projection,
+        "natural dispatch D03/D05 projection changed")
     schema = types["d08.action_schema.v1"](_atom(
         db, namespace, evidence.schema_ref, "d08.action_schema.v1"))
     grant = types["d08.communication_intent_grant.v1"](_atom(

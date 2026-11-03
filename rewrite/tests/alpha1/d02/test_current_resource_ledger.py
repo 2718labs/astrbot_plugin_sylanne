@@ -26,11 +26,9 @@ class CurrentResourceLedgerTests(unittest.TestCase):
         self.domain = BodyDomain()
         self.quote = self.domain.quote_work(
             self.profile, self.state, "activity:one", "thinking", 5.0,
-            (WorkComponent("work", "duration", duration_rate=0.1),), valid_until=20.0,
-        )
+            (WorkComponent("work", "duration", duration_rate=0.1),), valid_until=20.0, now_utc=10.0)
         self.reservation = self.domain.reserve_work(
-            self.state, (), self.quote, "reservation:one", "effect:one",
-        )
+            self.state, (), self.quote, "reservation:one", "effect:one", now_utc=10.0)
         self.state_atom = GraphAtom(self.domain.state_write(self.namespace, self.state).key,
                                     1, self.domain.state_write(self.namespace, self.state).value)
         reservation_write = self.domain.reservation_write(

@@ -21,7 +21,10 @@ class InstalledDomainOperationRuntimeV1:
             raise TypeError("installed domain runtime requires the concrete W01 coordinator")
         graph._admin(bootstrap)
         self.graph, self._bootstrap = graph, bootstrap
+        self._active_ingress_c03_read_v1 = None
         self._active_life_execution_inventory_v1 = None
+        self._active_character_labor_census_v1 = None
+        self._active_character_labor_segment_pages_v1 = None
         self._active_habit_issuance_v1 = None
         self._active_foreground_issuance_v1 = None
         self._active_foreground_process_lease_v1 = None
@@ -242,6 +245,10 @@ class InstalledDomainOperationRuntimeV1:
             authority=replace(envelope.authority, purpose=identity.purpose,
                 audience=life_audiences if life_audiences is not None else offline.authority.audience if offline is not None else
                     followup.authority.audience if followup is not None else (identity.audience_ref,)))
+        if operation.operation_kind == 'cancel_action':
+            from .d08_action_cancellation_v1 import bind_current_action_cancellation_identity_v1
+            envelope = bind_current_action_cancellation_identity_v1(self.graph, db,
+                request=request, envelope=envelope, scope=scope, owner_guard=guard, owner_binding=owner)
         if operation.operation_kind == 'prepare_source_note_action':
             from .d08_source_note_action_v1 import PrepareSourceNoteActionRequestV1, source_note_attempt_id_v1
             if type(request) is not PrepareSourceNoteActionRequestV1:
@@ -804,7 +811,7 @@ class InstalledDomainOperationRuntimeV1:
             activity_id, audience_ref, parent_budget_lease_ref, _background_followup=None,
             _background_host_lifecycle=None, _background_offline=None, _background_contact_recovery=None,
             _owner_material_command_v3=None, _owner_material_work_v3=None, _method_inputs_v3=None, _contact_plan_parent_v3=None,
-            _contact_owner_source_v3=None):
+            _contact_owner_source_v3=None, _read_deadline_utc=None):
         self._current()
         self._last_refusal_exception_v1 = None
         graph = self.graph
@@ -899,6 +906,31 @@ class InstalledDomainOperationRuntimeV1:
                 raise ValueError("material Source command witness cannot alter another operation")
             request_digest = canonical_digest(("sylanne.domain-production-command.v1", namespace,
                 authority.actor, operation_kind, request, operation_id, activity_id, audience_ref, parent_budget_lease_ref))
+        ordinary_continuity_background=False
+        if _background_followup is not None:
+            from .domain_followup_consumer_v1 import ordinary_continuity_child_command_allowed_v1
+            ordinary_continuity_background=ordinary_continuity_child_command_allowed_v1(
+                _background_followup,graph,_background_followup.command)
+            if ordinary_continuity_background and (request is not _background_followup.command.request
+                    or operation_kind!=_background_followup.command.operation_kind):
+                raise ValueError('ordinary continuity child changed its exact native command')
+        single_event_review_background=False
+        if _background_followup is not None and operation_kind=='review_single_event_growth_v1':
+            from .domain_followup_consumer_v1 import require_background_followup_v1,single_event_review_command_v1
+            from .domain_background_read_v3 import _active_v3,require_background_followup_handoff_v3
+            from .d01_single_event_growth_v1 import require_current_single_event_background_source_v1
+            require_background_followup_v1(_background_followup,graph,authority,operation_id)
+            actual_review_reader=_active_v3(graph._GraphCoordinator__store._db)
+            if (not single_event_review_command_v1(_background_followup.event,_background_followup.command)
+                    or actual_review_reader is None or actual_review_reader.kind!='followup_child'
+                    or actual_review_reader.handoff.command is not _background_followup.command
+                    or request is not _background_followup.command.request
+                    or authority!=_background_followup.authority or operation_id!=_background_followup.operation_id):
+                raise ValueError('single-event review lost its exact independent Source child issuance')
+            require_background_followup_handoff_v3(actual_review_reader.handoff,graph,actual_review_reader.bundle)
+            with graph._GraphCoordinator__store._lock:
+                require_current_single_event_background_source_v1(actual_review_reader)
+            single_event_review_background=True
         general_trial_background=False
         if _background_followup is not None and operation_kind=='derive_general_growth_trial_v1':
             from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
@@ -917,6 +949,29 @@ class InstalledDomainOperationRuntimeV1:
                 general_trial_background=True
         from .current_method_learning_read_v3 import (METHOD_INPUT_OPERATIONS_V3, PreparedMethodDomainInputsV3)
         from .current_beta1_source_read_v3 import beta1_source_operation_v3
+        saved_commitment_scope = False
+        if operation_kind == 'input:register_commitment_communication' and _method_inputs_v3 is None:
+            from ..runtime_storage_v3 import runtime_storage_operation_v3, runtime_storage_quantum_v3
+            store = graph._GraphCoordinator__store
+            with runtime_storage_operation_v3(store._db, operation_id='owner-scope-replay-selector:' + operation_id):
+                with store._lock, runtime_storage_quantum_v3(store._db) as meter:
+                    meter.require_available(64)
+                    saved_scope = store._db.execute('SELECT receipt_json IS NOT NULL '
+                        'FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?',
+                        (*namespace.as_tuple, operation_id)).fetchone()
+                    meter.charge_read(8)
+                    saved_commitment_scope = saved_scope is not None and bool(saved_scope[0])
+        if _method_inputs_v3 is None and operation_kind=='register_single_event_review_attention_v1':
+            return graph._prepare_current_method_operation_v3(self,authority,lease,
+                operation_kind=operation_kind,request=request,operation_id=operation_id,
+                activity_id=activity_id,audience_ref=audience_ref,parent_budget_lease_ref=parent_budget_lease_ref,
+                request_digest=request_digest,background_followup=_background_followup)
+        if _method_inputs_v3 is None and ordinary_continuity_background:
+            return graph._prepare_current_method_operation_v3(self,authority,lease,
+                operation_kind=operation_kind,request=request,operation_id=operation_id,
+                activity_id=activity_id,audience_ref=audience_ref,
+                parent_budget_lease_ref=parent_budget_lease_ref,request_digest=request_digest,
+                background_followup=_background_followup)
         if _method_inputs_v3 is not None:
             if (type(_method_inputs_v3) is not PreparedMethodDomainInputsV3
                     or _method_inputs_v3.owner.runtime is not self
@@ -931,7 +986,8 @@ class InstalledDomainOperationRuntimeV1:
                     or _method_inputs_v3.owner.parent_budget_lease_ref != parent_budget_lease_ref):
                 raise ValueError("method prepared inputs changed their actual installed command")
             _method_inputs_v3._actual_v3()
-        elif beta1_source_operation_v3(operation_kind)and not(operation_kind=="serve_concern"and _background_followup is not None):
+        elif (beta1_source_operation_v3(operation_kind) and not saved_commitment_scope and not single_event_review_background
+                and not(operation_kind=="serve_concern"and _background_followup is not None)):
             if any(v is not None for v in (_background_followup,_background_host_lifecycle,_background_offline,
                     _background_contact_recovery,_owner_material_command_v3,_owner_material_work_v3,_contact_plan_parent_v3,_contact_owner_source_v3)):
                 raise ValueError("Source commands require their actual independent Owner/session issuer")
@@ -941,13 +997,13 @@ class InstalledDomainOperationRuntimeV1:
                 classified=current_d07_classified_command_v3(graph,authority=authority,lease=lease,request=request,
                     operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
                     parent_budget_lease_ref=parent_budget_lease_ref)
-            if operation_kind!="serve_concern"or classified is None or classified["locator"][-1]=="world":
+            if operation_kind!="serve_concern"or classified is None or classified["locator"][-1]in {"world","ordinary_continuity_owner","single_event_review_owner"}:
                 return graph._prepare_current_method_operation_v3(self,authority,lease,operation_kind=operation_kind,
                     request=request,operation_id=operation_id,activity_id=activity_id,audience_ref=audience_ref,
                     parent_budget_lease_ref=parent_budget_lease_ref,request_digest=request_digest,
                     d07_dispatch_classify_v3=operation_kind=="serve_concern"and classified is None,
-                    d07_dispatch_v3=classified)
-        elif (operation_kind in METHOD_INPUT_OPERATIONS_V3 and not general_trial_background
+                    d07_dispatch_v3=classified,read_deadline_utc=_read_deadline_utc)
+        elif (operation_kind in METHOD_INPUT_OPERATIONS_V3 and not general_trial_background and not single_event_review_background
                 and runtime_storage_v3(graph._GraphCoordinator__store._db) is not None):
             with graph._GraphCoordinator__store._lock:
                 saved_method = graph._GraphCoordinator__store._db.execute(
@@ -991,12 +1047,18 @@ class InstalledDomainOperationRuntimeV1:
         def fence_context(scope, guard, owner):
             context.update(scope=scope, guard=guard, owner=owner)
             with ExitStack() as contact_domain_write_lifetime:
+                contact_domain_write_lifetime.callback(setattr,self,'_active_character_labor_census_v1',None)
+                contact_domain_write_lifetime.callback(setattr,self,'_active_character_labor_segment_pages_v1',None)
                 if _contact_owner_source_v3 is not None:
                     from .contact_owner_command_source_v3 import bind_contact_owner_command_write_v3
                     contact_domain_write_lifetime.enter_context(bind_contact_owner_command_write_v3(self,
                         state=_contact_owner_source_v3,authority=authority,lease=lease,operation_kind=operation_kind,
                         request=request,operation_id=operation_id,request_digest=request_digest,
                         scope=scope,guard=guard,owner=owner))
+                if single_event_review_background:
+                    from .domain_background_read_v3 import bind_single_event_fresh_write_v1
+                    contact_domain_write_lifetime.enter_context(bind_single_event_fresh_write_v1(
+                        actual_review_reader,issued=_background_followup,scope=scope,guard=guard,current_owner=owner))
                 from .domain_production_followups_v1 import GeneralGrowthTrialFollowupCommandV1
                 if _background_followup is not None and type(_background_followup.command)is GeneralGrowthTrialFollowupCommandV1:
                     from .domain_background_read_v3 import _active_v3,bind_general_growth_trial_fresh_write_v1
@@ -1063,6 +1125,32 @@ class InstalledDomainOperationRuntimeV1:
                 originals.append(observe_structured_self_identity_v1(graph, namespace=namespace,
                     operation_id=operation_id, scope=scope, owner_guard=guard))
             port = getattr(graph, "_GraphCoordinator__c04_authority_port_v3", None)
+            if operation.operation_kind in {'prepare_character_labor_body','rebuild_character_labor_body'}:
+                from .d02_character_labor_read_v1 import require_character_labor_body_profile_v1
+                from ..host.d11_life_port_v1 import InstalledD11LifePortV1
+                if _method_inputs_v3 is None:
+                    raise ValueError('labor B census requires its actual Source-qualified Method inputs')
+                assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+                if assembly is None or assembly.installation_policy.namespace!=namespace:
+                    raise ValueError('labor B census has no actual installed namespace/build')
+                profile=require_character_labor_body_profile_v1(_method_inputs_v3.owner)
+                census=InstalledD11LifePortV1(graph._GraphCoordinator__content_fence_v2).read_d11_character_labor_census_v1(
+                    namespace=assembly.installation_policy.authority_namespace,permit=scope.permit,body_profile_id=profile)
+                self._active_character_labor_census_v1=(census,scope)
+                if operation.operation_kind=='rebuild_character_labor_body':
+                    from ..authority_service.character_labor_census_v1 import verify_character_labor_segment_page_v1
+                    actual_port=InstalledD11LifePortV1(graph._GraphCoordinator__content_fence_v2)
+                    cursor=0;pages=[]
+                    while True:
+                        page=actual_port.read_d11_character_labor_segment_page_v1(
+                            namespace=assembly.installation_policy.authority_namespace,permit=scope.permit,
+                            census=census,cursor=cursor,limit=1)
+                        verify_character_labor_segment_page_v1(graph._GraphCoordinator__d11_issuer,page,
+                            census=census,permit=scope.permit,cursor=cursor,limit=1)
+                        pages.append(page)
+                        if page.next_cursor is None:break
+                        cursor=page.next_cursor
+                    self._active_character_labor_segment_pages_v1=tuple(pages)
             if operation.operation_kind == "prepare_life":
                 from ..host.d11_life_port_v1 import InstalledD11LifePortV1
                 assembly = graph._GraphCoordinator__d04_installed_joint_assembly
@@ -1071,6 +1159,13 @@ class InstalledDomainOperationRuntimeV1:
                 self._active_life_execution_inventory_v1 = InstalledD11LifePortV1(
                     graph._GraphCoordinator__content_fence_v2).read_d11_life_execution_inventory_v1(
                         namespace=assembly.installation_policy.authority_namespace, permit=scope.permit)
+                from .d02_character_labor_read_v1 import (
+                    is_character_labor_prepare_profile_v1, require_character_labor_prepare_body_profile_v1)
+                if _method_inputs_v3 is not None and is_character_labor_prepare_profile_v1(_method_inputs_v3.owner):
+                    profile=require_character_labor_prepare_body_profile_v1(_method_inputs_v3.owner)
+                    census=InstalledD11LifePortV1(graph._GraphCoordinator__content_fence_v2).read_d11_character_labor_census_v1(
+                        namespace=assembly.installation_policy.authority_namespace,permit=scope.permit,body_profile_id=profile)
+                    self._active_character_labor_census_v1=(census,scope)
             if operation.operation_kind == "input:set_contact_policy":
                 if _background_followup is not None or _background_offline is not None or lease is None:
                     raise ValueError("background work cannot issue contact consent")
@@ -1277,7 +1372,7 @@ class InstalledDomainOperationRuntimeV1:
                 'workbench_user_action' if management_cancel else
                 "consolidation" if operation.operation_kind == "adopt_owner_artifact_project_context_v1" else
                     authority.purpose if _background_offline is not None else
-                    "consolidation" if _background_followup is not None and _background_followup.general_growth_parent_metadata is not None else "context",
+                    "consolidation" if ordinary_continuity_background or (_background_followup is not None and _background_followup.general_growth_parent_metadata is not None) else "context",
                 authority.audience if _background_offline is not None or _background_followup is not None
                     else (audience_ref,),
                 grant.policy_ref, authority.activation_generation)
@@ -1311,6 +1406,11 @@ class InstalledDomainOperationRuntimeV1:
                 from .d07_general_growth_attention_v1 import actual_general_growth_child_deadline_v1
                 deadline = min(deadline,actual_general_growth_child_deadline_v1(_background_followup,graph))
                 if now>=deadline:raise ValueError("General original absolute deadline expired before WRITE")
+            if ordinary_continuity_background:
+                from .domain_followup_consumer_v1 import actual_ordinary_continuity_child_deadline_v1
+                deadline=min(deadline,actual_ordinary_continuity_child_deadline_v1(_background_followup,graph))
+                if now>=deadline:
+                    raise ValueError('ordinary continuity original absolute deadline expired before WRITE')
             if _owner_material_command_v3 is not None:
                 deadline = min(deadline, _owner_material_command_v3.deadline_utc)
             if _contact_owner_source_v3 is not None:

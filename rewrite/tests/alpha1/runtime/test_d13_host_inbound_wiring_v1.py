@@ -69,3 +69,40 @@ async def test_host_wrapper_commits_once_and_rejects_unrelated_ingress(
         "type_name IN ('d09.turn_order.v1','d09.turn_slot.v1',"
         "'d09.turn_completion.v1')", namespace.as_tuple).fetchall()
     assert len(rows) == 3
+
+
+@pytest.mark.parametrize('paid_state',['exception','pending_confirmation','absent'])
+@pytest.mark.asyncio
+async def test_actual_main_d13_drain_does_not_fallback_after_unknown_paid_attempt(paid_state):
+    """Execute the actual Main method body; host/provider services are controlled."""
+    import ast
+    import asyncio
+    from pathlib import Path
+    from types import SimpleNamespace
+    source=Path(__file__).resolve().parents[4]/'main.py'
+    tree=ast.parse(source.read_text(encoding='utf-8'))
+    methods=[node for node in ast.walk(tree)if isinstance(node,ast.AsyncFunctionDef)
+             and node.name=='_drain_d13_precompression_v2']
+    assert len(methods)==1
+    calls=[];logs=[]
+    async def paid(*args,**kwargs):
+        calls.append('paid')
+        if paid_state=='exception':raise RuntimeError('original paid outcome unknown')
+        if paid_state=='pending_confirmation':return SimpleNamespace(status='pending_confirmation')
+        return None
+    async def deterministic(**kwargs):
+        calls.append('deterministic');host._encoding_stopping=True
+        return None,SimpleNamespace(job_id='original:deterministic')
+    runtime=SimpleNamespace(schedule_d13_deterministic_precompression_v2=deterministic)
+    installation=object();envelope=SimpleNamespace(conversation_ref='conversation:one')
+    host=SimpleNamespace(_runtime=runtime,_v2_installation=installation,context=object(),
+        _d13_pending_jobs={},_d13_pending_expiries={},_d13_pending_schedules={'operation:one':(envelope,'umo:one')},
+        _d13_scan_needed=False,_encoding_stopping=False,_d13_drain_task=None)
+    namespace={'asyncio':asyncio,'run_installed_d13_paid_precompression_v1':paid,
+        'logger':SimpleNamespace(warning=lambda *args:logs.append(args),exception=lambda *args:logs.append(args))}
+    module=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),methods[0]],type_ignores=[])
+    exec(compile(ast.fix_missing_locations(module),str(source),'exec'),namespace)
+    await namespace['_drain_d13_precompression_v2'](host,runtime,installation)
+    assert calls==(['paid','deterministic']if paid_state=='absent'else['paid'])
+    assert bool(host._d13_pending_jobs)==(paid_state=='absent')
+    assert not host._d13_pending_schedules

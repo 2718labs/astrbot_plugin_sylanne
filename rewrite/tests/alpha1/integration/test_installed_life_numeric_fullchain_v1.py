@@ -886,6 +886,9 @@ async def run_installed_life_numeric_fullchain_v1(tmp_path,installed_d04_root, *
                 else:prepared,binding,request,draft,anchor=await asyncio.to_thread(draft_read)
                 record_stage('numeric_draft', request_digest=request.digest, prepared_digest=prepared.digest,
                              binding_digest=binding.digest, ceiling=dict(draft.budget_ceiling))
+                from beta1_fixture_phase_controller_v1 import assert_current_beta1_numeric_role_manifest_v3
+                role_evidence=assert_current_beta1_numeric_role_manifest_v3(case,prepared)
+                record_stage('numeric_ordinary_role_source_issued',**role_evidence)
                 frozen=prepared.frozen
                 from sylanne3.domains.d01.production_operations_v1 import plain_v1
                 candidate=json.loads(explicit_subjective_reply(plain_v1(frozen.appraisal),0.5))
@@ -903,6 +906,10 @@ async def run_installed_life_numeric_fullchain_v1(tmp_path,installed_d04_root, *
                 record,permit=await executor.prepare_once(draft=draft,expected_anchor=anchor,request=request)
                 intent=record.intent
                 assert record.state=='prepared'
+                # Real Authority preparation has completed its independent current
+                # event and role Source groups. Any earlier HOLD fails this donor.
+                assert assert_current_beta1_numeric_role_manifest_v3(case,prepared)==role_evidence
+                record_stage('numeric_authority_ordinary_role_requalified',**role_evidence)
                 def seal():
                     actual,state=port.get_fence_operation(namespace=ns,authority_namespace=policy.authority_namespace,
                         operation_id=intent.operation_id)

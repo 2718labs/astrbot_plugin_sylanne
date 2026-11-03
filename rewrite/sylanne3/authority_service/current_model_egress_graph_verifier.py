@@ -112,6 +112,7 @@ class PinnedCurrentModelEgressGraphVerifier:
         self._artifact_draft_bundle = artifact_draft_bundle
         self._artifact_model_reader_v3 = None
         self._d13_paid_reader_v3 = None
+        self._d04_source_reader_v3 = None
         self._owner_stop_reply_service_v1 = None
 
     def install_owner_stop_reply_service_v1(self, service):
@@ -157,6 +158,7 @@ class PinnedCurrentModelEgressGraphVerifier:
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8
         from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+        from ..host.model_workflows_v10 import AdminModelWorkflowsV10,is_installed_ordinary_continuity_cognition_slot_v1
         from ..runtime.d07_execution_v1 import (D07PreparedExecutionV1,D07RelationshipPreparedV2,
             D07IngressRecallPreparedV1,D07ReflectionPreparedV3)
         from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
@@ -166,7 +168,7 @@ class PinnedCurrentModelEgressGraphVerifier:
         from .contract import AuthorityUnavailable
         bundle=self._artifact_draft_bundle
         if (bundle is None or type(bundle.model_workflows)not in {AdminModelWorkflowsV5,AdminModelWorkflowsV6,
-                AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}or type(request)is not ModelCallRequest
+                AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}or type(request)is not ModelCallRequest
                 or type(source_material)is not PreparedD07AuthoritySourceMaterialV3):
             raise AuthorityUnavailable("named D07 workflow requires its actual retained qualified Source material")
         work=source_material.work
@@ -175,30 +177,44 @@ class PinnedCurrentModelEgressGraphVerifier:
             raise AuthorityUnavailable("named D07 policy crossed its actual verifier/intent/installed Source Work")
         from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
         prepared,job,frozen,actual_request,basis=source_material.require_for_observer_v3(work)
-        if type(prepared)is D07RelationshipPreparedV2:
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1,configured_ordinary_continuity_workflow_v1
+        from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+        if type(prepared)is D07SingleEventReviewPreparedV1:
+            workflow=bundle.model_workflows.d07_cognition
+            if basis.kind!="single_event_review_owner":
+                raise AuthorityUnavailable("review workflow requires its exact independently qualified Case parentage")
+        elif type(prepared)is D07OrdinaryContinuityPreparedV1:
+            workflow=configured_ordinary_continuity_workflow_v1(bundle,prepared.phase)
+            if basis.kind!="ordinary_continuity_owner":
+                raise AuthorityUnavailable("ordinary continuity workflow requires its own actual qualified phase parentage")
+        elif type(prepared)is D07RelationshipPreparedV2:
             workflow=bundle.model_workflows.d07_relationship_cognition
         elif type(prepared)is D07MethodGrowthPreparedV2 and type(bundle.model_workflows)in{
-                AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+                AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
             workflow=bundle.model_workflows.growth_cognition
         elif type(prepared)is D07ArtifactObservationPreparedV3:
             from ..host.model_workflows_v9 import is_installed_artifact_observation_cognition_slot_v1
-            workflow=bundle.model_workflows.artifact_observation_cognition if type(bundle.model_workflows)is AdminModelWorkflowsV9 else None
+            workflow=bundle.model_workflows.artifact_observation_cognition if type(bundle.model_workflows)in (AdminModelWorkflowsV9,AdminModelWorkflowsV10) else None
             if not is_installed_artifact_observation_cognition_slot_v1(bundle,workflow):
                 raise AuthorityUnavailable("Artifact observation lost its exact installed V9 workflow slot")
             if basis.kind!="artifact_observation_self":
                 raise AuthorityUnavailable("Artifact workflow requires its dedicated actual qualified parentage")
-        elif type(prepared)is D07GeneralGrowthPreparedV1 and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+        elif type(prepared)is D07GeneralGrowthPreparedV1 and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
             workflow=bundle.model_workflows.general_growth_cognition
         elif type(prepared)in {D07PreparedExecutionV1,D07IngressRecallPreparedV1,D07ReflectionPreparedV3}:
             workflow=bundle.model_workflows.d07_cognition
         else:
             raise AuthorityUnavailable("actual D07 prepared variant has no installed workflow slot")
+        source=basis.effective_source_authority
+        if(source.namespace!=prepared.namespace or source.purpose!=prepared.purpose
+                or source.audience!=prepared.audience or source.activation_generation!=prepared.activation_generation):
+            raise AuthorityUnavailable("D07 workflow lost its separately qualified actual Source context")
         if (workflow is None or prepared.digest!=intent.binding_digest or actual_request.digest!=request.digest
                 or request.digest!=intent.request_digest or prepared.call_id!=intent.call_id or job.job_id!=intent.job_id
                 or (workflow.provider_id,workflow.model_id,workflow.provider_config_ref,workflow.provider_config_digest,
                     workflow.max_output_tokens)!=(frozen.installation.provider_id,frozen.installation.model_id,
                     frozen.installation.provider_config_ref,frozen.installation.provider_config_digest,
-                    frozen.installation.max_output_tokens)or workflow.purpose!=prepared.purpose):
+                    frozen.installation.max_output_tokens)or workflow.purpose!=request.envelope.authority.purpose):
             raise AuthorityUnavailable("named D07 policy differs from its actual signed kind/provider/source purpose")
         return workflow
 
@@ -375,6 +391,18 @@ class PinnedCurrentModelEgressGraphVerifier:
             raise ValueError("actual contact policy service must be installed exactly once")
         self._contact_policy_service = service
 
+    def install_d04_source_reader_v3(self,reader):
+        from .d04_ordinary_source_v3 import InstalledD04AuthoritySourceReaderV3
+        if (type(reader)is not InstalledD04AuthoritySourceReaderV3 or self._d04_source_reader_v3 is not None
+                or reader.issuer is not self._issuer or reader.bundle is not self._artifact_draft_bundle
+                or reader.owner_storage.graph_path != self._path
+                or reader.model_service._graph_verifier is not self
+                or reader.result_service._d04_source_reader_v3 is not None):
+            raise ValueError('D04 Source reader requires its actual installed same-Graph model/result services')
+        self._d04_source_reader_v3=reader
+        reader.result_service._d04_source_reader_v3=reader
+        reader.result_service._artifact_draft_bundle=reader.bundle
+
     def install_d13_paid_reader_v3(self,reader):
         from .d13_authority_model_source_v3 import InstalledD13AuthorityModelReaderV3
         if (type(reader)is not InstalledD13AuthorityModelReaderV3 or self._d13_paid_reader_v3 is not None
@@ -473,14 +501,47 @@ class PinnedCurrentModelEgressGraphVerifier:
             controller=require_authority_graph_read_controller_v3(self)
             if controller.fences.core._runtime_storage_v3 is not None:
                 if model_service is not controller.service or permit is None:return False
+                from .d13_original_owner_v3 import refuse_closed_d13_natural_original_before_body_v3
+                refuse_closed_d13_natural_original_before_body_v3(model_service, intent)
                 work=begin_authority_model_graph_read_work_v3(self,model_service=model_service,credential=credential,
                     subject=subject,permit=permit,intent=intent,now_utc=now)
+                natural_owner = None
                 try:
                     from .contact_model_work_v3 import read_contact_model_work_current_v3
-                    return read_contact_model_work_current_v3(work,lambda db:self._current_graph_in_db_v3(db,intent,
+                    result = read_contact_model_work_current_v3(work,lambda db:self._current_graph_in_db_v3(db,intent,
                         now,clock_epoch,include_binding=include_binding,source_location=source_location,
                         location_observation=location_observation))
-                finally:finish_authority_graph_read_work_v3(work)
+                    if result is True and work.model_natural:
+                        from .d13_original_owner_v3 import (
+                            prepare_d13_natural_stage_owner_v3, register_d13_natural_stage_owner_v3)
+                        natural_owner = prepare_d13_natural_stage_owner_v3(work)
+                        register_d13_natural_stage_owner_v3(natural_owner)
+                        if natural_owner is not None:
+                            from ..runtime.d13_cache_use_admission_v2 import bind_authority_d13_source_successor_v3
+                            bind_authority_d13_source_successor_v3(work, natural_owner.registration)
+                    return result
+                except BaseException as error:
+                    if work.failure is None:work.failure=error
+                    raise
+                finally:
+                    first=work.failure
+                    cleanup_failure=None
+                    try:
+                        finish_authority_graph_read_work_v3(work)
+                    except BaseException as error:
+                        cleanup_failure=error
+                    try:
+                        from .current_authority_graph_read_v3 import actual_authority_graph_release_v3
+                        if (actual_authority_graph_release_v3(work) is work.operation
+                                and work.operation is not None and work.operation.closed):
+                            from .d13_original_owner_v3 import record_d13_natural_scope_retention_v3
+                            record_d13_natural_scope_retention_v3(natural_owner)
+                    except BaseException as error:
+                        if cleanup_failure is None:cleanup_failure=error
+                        else:cleanup_failure.add_note('D13 natural retention also failed: '+type(error).__name__)
+                    if cleanup_failure is not None:
+                        if first is None:raise cleanup_failure
+                        first.add_note('D13 natural final retention failed: '+type(cleanup_failure).__name__)
             # UTC upper bound and epoch must come from one trusted sample.
             # The persisted monotonic deadline is only request identity.
             with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:

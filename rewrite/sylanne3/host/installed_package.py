@@ -119,8 +119,7 @@ def _qualify_verified_backend_candidate_v1(
             raise ValueError("qualification_schema_invalid")
         production = schemas[qualification["schema"]]
         if is_snapshot:
-            from .alpha1_test_snapshot_v1 import (QUALIFICATION_SCHEMA, ALPHA2_QUALIFICATION_SCHEMA, BETA1_QUALIFICATION_SCHEMA,
-                validate_test_snapshot_manifest_v1, validate_alpha2_candidate_manifest_v1, validate_beta1_candidate_manifest_v1)
+            from .package_qualification_v1 import QUALIFICATION_SCHEMA, ALPHA2_QUALIFICATION_SCHEMA, BETA1_QUALIFICATION_SCHEMA, validate_test_snapshot_manifest_v1, validate_alpha2_candidate_manifest_v1, validate_beta1_candidate_manifest_v1
             expected_schema = BETA1_QUALIFICATION_SCHEMA if is_beta1 else ALPHA2_QUALIFICATION_SCHEMA if is_alpha2 else QUALIFICATION_SCHEMA
             if qualification["schema"] != expected_schema:
                 raise ValueError("candidate_qualification_schema_invalid")
@@ -142,10 +141,10 @@ def _qualify_verified_backend_candidate_v1(
             "formal_alpha1_source_freeze", "full_host_acceptance",
         ]
         if is_beta1:
-            from .alpha1_test_snapshot_v1 import BETA1_UNMET_GATES
+            from .package_qualification_v1 import BETA1_UNMET_GATES
             expected_gates = BETA1_UNMET_GATES
         elif is_alpha2:
-            from .alpha1_test_snapshot_v1 import ALPHA2_UNMET_GATES
+            from .package_qualification_v1 import ALPHA2_UNMET_GATES
             expected_gates = ALPHA2_UNMET_GATES
         if (not isinstance(qualification, dict)
                 or qualification.get("status") != ("beta1_candidate" if is_beta1 else "alpha2_candidate" if is_alpha2 else "alpha1_test_snapshot" if is_snapshot else "backend_candidate")
@@ -491,19 +490,19 @@ def verify_installed_package(
     scope = manifest.get("candidate_scope")
     if mode == "snapshot-alpha1-test":
         try:
-            from .alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
+            from .package_qualification_v1 import validate_test_snapshot_manifest_v1
             validate_test_snapshot_manifest_v1(manifest)
         except (ValueError, TypeError, KeyError):
             return invalid
     elif mode == "alpha2-candidate":
         try:
-            from .alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+            from .package_qualification_v1 import validate_alpha2_candidate_manifest_v1
             validate_alpha2_candidate_manifest_v1(manifest)
         except (ValueError, TypeError, KeyError):
             return invalid
     elif mode == "beta1-candidate":
         try:
-            from .alpha1_test_snapshot_v1 import validate_beta1_candidate_manifest_v1
+            from .package_qualification_v1 import validate_beta1_candidate_manifest_v1
             validate_beta1_candidate_manifest_v1(manifest)
         except (ValueError, TypeError, KeyError):
             return invalid

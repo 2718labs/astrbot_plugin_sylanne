@@ -1,6 +1,6 @@
 """Two-stage Beta1 fixture locators; these originals convey no executable grant."""
 from dataclasses import asdict
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from contextvars import ContextVar
 from hashlib import sha256
 from pathlib import Path
@@ -587,6 +587,7 @@ async def run_current_beta1_d13_business_phase_v3(*,scenario,setup_file,setup_sh
         raise ValueError("Root-prepared D13 setup differs from its original pin")
     initial=M1PhaseFixtureInstallationV2.from_protected_setup_v2(setup)
     if (initial.package_root!=Path(installed_root) or initial.c04_component_key is None
+            or initial.initial_bundle.d13_precompression is None
             or initial.initial_bundle.d13_paid_precompression is None):
         raise ValueError("actual current protected D13 installation required")
     outcome=None
@@ -829,6 +830,46 @@ async def read_current_beta1_numeric_accepted_metadata_v3(case,*,job_id,adopted)
     return await _read_current_beta1_metadata_request_v3(case,request,audience=case["life_audience"])
 
 
+
+
+def assert_current_beta1_numeric_role_manifest_v3(case,prepared):
+    """Observe a real retained Numeric Work result; never mint a Source proof.
+
+    Missing/changed role provenance is a broken positive fixture, even when a
+    later negative case would refuse. No legacy prepared DTO is promoted here.
+    """
+    from sylanne3.runtime.d06_life_numeric_task_v1 import InternalLifeNumericPreparedV1
+    from sylanne3.runtime.d06_ordinary_readout_v3 import validate_life_role_manifest_wire_v3
+    from sylanne3.runtime_contracts import canonical_digest
+    assert type(prepared)is InternalLifeNumericPreparedV1
+    raw=prepared.role_support_manifest
+    assert raw is not None,'fresh Numeric donor lacks actual Life ordinary Source issuance; HOLD is not a positive precondition'
+    manifest=validate_life_role_manifest_wire_v3(raw,case['namespace'])
+    role=prepared.frozen.appraisal.input.role
+    assert manifest.purpose=='consolidation' and manifest.audience==(case['life_audience'],)
+    assert manifest.head_id==role.head_id and manifest.namespace==role.namespace==prepared.namespace
+    assert role.blocks and raw['origins'],'fresh Numeric fixture must disclose actual ordinary initial blocks'
+    disclosed={b.block_id:canonical_digest(b.claim)for b in role.blocks}
+    origins={o['block']['block_id']:o for o in raw['origins']}
+    assert len(origins)==len(raw['origins']) and set(origins)==set(disclosed)
+    for block_id,origin in origins.items():
+        assert origin['block']['claim_digest']==disclosed[block_id]
+        assert origin['origin_kind']=='authored_initial' and origin['producing_operation_id']=='role-init-reply'
+        assert origin['active_head']==origin['initial_head']==manifest.head_id
+        assert not origin['support'] and origin['initial_receipt_digest']
+    initial=case.get('ordinary_initialization')
+    if initial is not None:
+        assert initial['head_id']==manifest.head_id
+        assert all(o['initial_receipt_digest']==initial['receipt_digest']for o in origins.values())
+    # Role support has its own manifest. The actual appraisal event stays the
+    # single authenticated internal occurrence, even if future roles add support.
+    assert tuple(s.source_ref.ref for s in prepared.frozen.appraisal.input.sources)==(prepared.frozen.identity.source_ref,)
+    return {'schema':manifest.schema,'manifest_digest':manifest.digest,
+        'head_id':manifest.head_id,'origin_count':len(origins),
+        'support_head_count':len(manifest.support_heads),
+        'purpose':manifest.purpose,'audience_count':len(manifest.audience)}
+
+
 @asynccontextmanager
 async def current_beta1_numeric_model_draft_read_v3(case,*,job_id):
     """Acquire before MODEL preparation; retain this same real Owner through seal."""
@@ -850,6 +891,7 @@ async def current_beta1_numeric_model_draft_read_v3(case,*,job_id):
         owned=await asyncio.shield(pending)
         if type(owned)is not OwnedGraphStorageResultV3:raise TypeError("actual retained model draft result required")
         value,retention=owned.take_value_v3()
+        assert_current_beta1_numeric_role_manifest_v3(case,value.prepared)
         yield value,binding[0],binding[1]
     finally:
         try:
@@ -901,3 +943,56 @@ async def run_current_beta1_d13_paid_cold_phase_v4(*,scenario,node,setup_file,se
             storage_generation=current.storage_generation,manifest_digest=current.manifest_digest,
             source_kind='current_selected_v3',fresh_original_key_capped_login=case['beta1_fresh_original_key_login'],
             paid_cold_original_sha256=followup_sha256,paid_cold_checks_passed=True,paid_cold_evidence=checked,exit_code=0)
+
+
+@asynccontextmanager
+async def current_beta1_d13_paid_method_decision_v3(case, runtime, envelope):
+    """Obtain the real installed pre-write method result; never synthesize a grant."""
+    from sylanne3.runtime.d13_deterministic_applicability_v3 import (
+        D13DeterministicNoReductionV3, require_issued_d13_deterministic_no_reduction_v3,
+    )
+    from sylanne3.runtime.first_ingress_v2 import ingress_ids
+    from sylanne3.runtime_context import RuntimeContext
+    observed = await runtime.schedule_d13_deterministic_precompression_v2(
+        ingress_operation_id=ingress_ids(envelope.lineage.source_ref)[2], envelope=envelope)
+    with RuntimeContext._background_graph_result_v3(observed) as decision:
+        try:
+            if type(decision) is not D13DeterministicNoReductionV3:
+                # A real deterministic admission is retained as a first fixture
+                # mismatch. It is never abandoned and replaced with paid work.
+                kind = "deterministic_queued" if type(decision) is tuple else type(decision).__name__
+                raise ValueError("D13 paid fixture requires actual no-reduction before any paid job; actual=" + kind)
+            require_issued_d13_deterministic_no_reduction_v3(decision)
+            assert decision.reason == "deterministic_no_reduction"
+            assert decision.rendered_bytes >= decision.original_bytes > 0
+            assert decision.source_operation_id and decision.source_selection_digest
+            assert decision.plan.first_sequence < decision.plan.last_sequence
+            yield decision
+        finally:
+            decision = observed = None
+
+
+async def drive_current_beta1_d13_paid_v3(case, runtime, installation, envelope):
+    """Use the same production classification/decision/paid entry as Main."""
+    from sylanne3.host.installed_d13_paid_driver import run_installed_d13_paid_precompression_v1
+    from sylanne3.runtime.d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+    from sylanne3.runtime.first_ingress_v2 import ingress_ids
+    from sylanne3.runtime_context import RuntimeContext
+    operation = ingress_ids(envelope.lineage.source_ref)[2]
+    observed = await runtime.inspect_d13_precompression_priority_v1(ingress_operation_id=operation, envelope=envelope)
+    with RuntimeContext._background_graph_result_v3(observed) as priority:
+        try:
+            if type(priority) is not D13PrecompressionPriorityV1:
+                raise TypeError("actual installed D13 metadata priority required")
+            if priority.status in {"existing_paid", "pending_paid_schedule"}:
+                return await run_installed_d13_paid_precompression_v1(runtime, installation,
+                    context=case["model_context"], trusted_umo=json.loads(envelope.conversation_ref)[0],
+                    envelope=envelope, ingress_operation_id=operation, priority=priority)
+            if priority.status != "no_outstanding_paid":
+                raise ValueError("D13 paid fixture priority HOLD: " + priority.reason)
+        finally:
+            priority = observed = None
+    async with current_beta1_d13_paid_method_decision_v3(case, runtime, envelope) as decision:
+        return await run_installed_d13_paid_precompression_v1(runtime, installation,
+            context=case["model_context"], trusted_umo=json.loads(envelope.conversation_ref)[0],
+            envelope=envelope, ingress_operation_id=operation, deterministic_decision=decision)

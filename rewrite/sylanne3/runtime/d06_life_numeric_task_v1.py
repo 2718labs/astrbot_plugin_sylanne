@@ -72,6 +72,7 @@ class InternalLifeNumericPreparedV1:
     access_epoch: int
     delete_epoch: int
     schema: str = 'd06.internal-life-numeric-prepared.v1'
+    role_support_manifest: dict | None = None
 
     def __post_init__(self):
         from .d06_internal_life_episode_v2 import _sha
@@ -93,12 +94,17 @@ class InternalLifeNumericPreparedV1:
         if (type(self.activation_generation) is not int or self.activation_generation < 1
                 or any(type(v) is not int or v < 0 for v in (self.access_epoch, self.delete_epoch))):
             raise ValueError('Life numeric preparation epochs differ')
+        if self.role_support_manifest is not None:
+            from .d06_ordinary_readout_v3 import validate_life_role_manifest_wire_v3
+            validate_life_role_manifest_wire_v3(self.role_support_manifest,self.namespace)
         if any(NamespaceId.from_key(AtomKey.from_token(r.ref)) != self.namespace for r in self.read_rows):
             raise ValueError('Life numeric preparation crosses namespace')
 
     @property
     def digest(self):
-        return canonical_digest(plain_v1(self))
+        wire=plain_v1(self)
+        if self.role_support_manifest is None:wire.pop('role_support_manifest')
+        return canonical_digest(wire)
 
     @property
     def quote_version(self):
@@ -127,14 +133,17 @@ class InternalLifeNumericPreparedV1:
 
 
 def decode_life_numeric_prepared_v1(raw):
-    if type(raw) is not dict or set(raw) != set(InternalLifeNumericPreparedV1.__dataclass_fields__):
+    fields=set(InternalLifeNumericPreparedV1.__dataclass_fields__)
+    if type(raw) is not dict or set(raw) not in (fields,fields-{'role_support_manifest'}):
         raise ValueError('Life numeric prepared wire fields differ')
     result = InternalLifeNumericPreparedV1(**{**raw,
         'namespace': NamespaceId(**raw['namespace']),
         'frozen': thaw_internal_life_numeric_request_v1(raw['frozen']),
         'read_rows': tuple(D04GraphReadV3(**r) for r in raw['read_rows']),
         'audience': tuple(raw['audience'])})
-    if canonical_serialize(plain_v1(result)) != canonical_serialize(raw):
+    wire=plain_v1(result)
+    if 'role_support_manifest'not in raw:wire.pop('role_support_manifest')
+    if canonical_serialize(wire) != canonical_serialize(raw):
         raise ValueError('Life numeric preparation noncanonical')
     return result
 
@@ -185,7 +194,7 @@ def read_plan_life_numeric_prepare_v1(db, *, namespace, activity_id, operation_k
     if raw is None: raise MissingProductionOriginalV1('actual_life_numeric_context')
     original = decode_life_numeric_context_original_v1(raw)
     ids = internal_life_numeric_ids_v1(_identity(original))
-    return production_read_plan_v1(plan.fixed_type_ids,
+    return production_read_plan_v1(tuple(dict.fromkeys((*plan.fixed_type_ids,'d01.persona_activation.v1','d01.persona_plan.v1'))),
         (*plan.exact_keys, runtime_job_key(*namespace.as_tuple, activity_id, ids['job'])),
         plan.source_roots, plan.required_original_refs)
 
@@ -263,11 +272,13 @@ def stage_prepare_life_numeric_in_transaction_v1(db, *, frame, request, installe
     create_job(db, job, 'create:' + ids['prepare'], reservation)
     rows = tuple(D04GraphReadV3(a.key.token, a.revision, a.valid, canonical_serialize(a.value))
                  for a in frame.snapshot.atoms if a.key != key)
+    from .d06_ordinary_readout_v3 import require_bound_life_ordinary_readout_v3,life_role_manifest_wire_v3
+    role_manifest=life_role_manifest_wire_v3(require_bound_life_ordinary_readout_v3(db,frame=frame).manifest)
     original = InternalLifeNumericPreparedV1(ns, ids['prepare'], ids['job'], ids['call'],
         job.activity_id, request.causal_operation_id, frozen, rows, frame.owner_guard.owner_head_digest,
         frame.activation_generation, context.original.graph_incarnation, frame.envelope.authority.audience,
         quote.quote_id, canonical_digest(quote), reservation, frame.envelope.version_guard.access_epoch,
-        frame.envelope.version_guard.delete_epoch)
+        frame.envelope.version_guard.delete_epoch,role_support_manifest=role_manifest)
     provider = D11RuntimeProvider()
     primary = stage_result_v1(frame, 'd11', OPERATION, request, writes=(job_graph_write(job),),
         provenance={'prepared_digest': original.digest, 'numeric_input_digest': frozen.digest,
@@ -355,6 +366,7 @@ class LifeNumericAppraisalAcceptanceV1:
     suggestion_json: str
     read_rows: tuple[D04GraphReadV3, ...]
     schema: str = 'd04.life-numeric-appraisal-acceptance.v1'
+    role_support_manifest: dict | None = None
 
     def __post_init__(self):
         from .d06_internal_life_episode_v2 import _sha
@@ -377,13 +389,25 @@ class LifeNumericAppraisalAcceptanceV1:
             raise ValueError('Life numeric acceptance original once family differs')
 
     @property
-    def digest(self): return canonical_digest(plain_v1(self))
+    def digest(self):
+        wire=plain_v1(self)
+        if self.role_support_manifest is None:wire.pop('role_support_manifest')
+        return canonical_digest(wire)
 
 
 def decode_life_numeric_appraisal_acceptance_v1(raw):
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
-    value = decode_typed_production_value_v1(raw, LifeNumericAppraisalAcceptanceV1)
-    if canonical_serialize(plain_v1(value)) != canonical_serialize(raw):
+    if type(raw)is not dict:raise ValueError('Life numeric acceptance requires actual wire')
+    manifest=raw.get('role_support_manifest')
+    base={**raw,'role_support_manifest':None}
+    value=decode_typed_production_value_v1(base,LifeNumericAppraisalAcceptanceV1)
+    value=replace(value,role_support_manifest=manifest)
+    if manifest is not None:
+        from .d06_ordinary_readout_v3 import validate_life_role_manifest_wire_v3
+        validate_life_role_manifest_wire_v3(manifest,value.namespace)
+    wire=plain_v1(value)
+    if 'role_support_manifest'not in raw:wire.pop('role_support_manifest')
+    if canonical_serialize(wire) != canonical_serialize(raw):
         raise ValueError('Life numeric acceptance noncanonical')
     return value
 
@@ -405,7 +429,8 @@ def read_life_numeric_appraisal_acceptance_v1(db, namespace, appraisal_ref, issu
             or set(adopted['receipt'].write_versions) != {GraphVersion(key, 1), GraphVersion(job_key, 3)}
             or adopted['payload']['provenance']['acceptance_digest'] != value.digest
             or p.digest != value.prepared_digest or p.frozen.identity.context_digest != value.context_digest
-            or p.frozen.identity.before_digest != value.before_digest):
+            or p.frozen.identity.before_digest != value.before_digest
+            or p.role_support_manifest!=value.role_support_manifest):
         raise ValueError('Life numeric acceptance lacks its actual composite adoption')
     from .current_life_numeric_native_read_v3 import read_bound_native_numeric_history_v3
     handled,history=read_bound_native_numeric_history_v3(db,appraisal_ref,1,('value', 'valid', 'event_id'))
@@ -446,6 +471,10 @@ def require_current_life_numeric_appraisal_acceptance_v1(db, *, frame, context, 
     if (value.context_digest != context.original.digest or value.before_digest != context.before.digest
             or atom.revision != value.appraisal_revision or canonical_serialize(atom.value) != value.appraisal_value_json):
         raise ValueError('Life numeric appraisal current context/actual value differs')
+    from .d06_ordinary_readout_v3 import require_bound_life_ordinary_readout_v3,life_role_manifest_wire_v3
+    proof=require_bound_life_ordinary_readout_v3(db,frame=frame)
+    if value.role_support_manifest!=life_role_manifest_wire_v3(proof.manifest):
+        raise ValueError('Life adopted appraisal ordinary support differs from current independent proof')
     # Later D04 advances may change old checkpoints. Their exact old read set
     # remains historical evidence; current context/Source/Owner is requalified.
     return value
@@ -526,7 +555,7 @@ def stage_adopt_life_numeric_appraisal_in_transaction_v1(db, *, frame, request, 
     acceptance = LifeNumericAppraisalAcceptanceV1(p.namespace, ids['adopt'], p.job_id,
         context.original.digest, context.before.digest, write.key.token, 1, canonical_serialize(write.value),
         p.digest, p.job_id, canonical_digest(life_numeric_result_to_wire_v1(result)), p.job_id,
-        paid_digest, canonical_serialize(plain_v1(suggestion)), rows)
+        paid_digest, canonical_serialize(plain_v1(suggestion)), rows,role_support_manifest=p.role_support_manifest)
     primary = stage_result_v1(frame, 'd04', ADOPT_OPERATION, request, writes=(write,),
         provenance={'acceptance_digest': acceptance.digest, 'acceptance': plain_v1(acceptance)},
         proposal_schema=APPRAISAL_SCHEMA, proposal_hash=APPRAISAL_HASH)

@@ -99,7 +99,21 @@ def _current_deployment_assets_v3(config,setup_file,control,namespace):
         if isinstance(value,dict):return {key:wire(item) for key,item in value.items()}
         if isinstance(value,(tuple,list)):return [wire(item) for item in value]
         return value
-    return dict(schema='sylanne.test.c09.current-deployment-assets.v3',
+    from d11_offline_authority_acceptance_support_v1 import read_current_d13_fixture_assets_v3
+    d13_fields={}
+    schema='sylanne.test.c09.current-deployment-assets.v3'
+    if initial.d13_installation_assets is not None:
+        d13_raw,_use,_counter=read_current_d13_fixture_assets_v3(initial)
+        schema='sylanne.test.c09.current-deployment-assets.v4'
+        d13_fields=dict(d13_installation_assets_path=str(initial.d13_installation_assets),
+            d13_installation_assets_sha256=hashlib.sha256(d13_raw).hexdigest())
+    if initial.initial_segmented_genesis_v4:
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        cert=x509.load_pem_x509_certificate(read_installed_bytes_v1(initial.administrator_certificate,limit=65536))
+        schema='sylanne.test.c09.current-deployment-assets.v5'
+        d13_fields['administrator_certificate_sha256']=hashlib.sha256(cert.public_bytes(Encoding.DER)).hexdigest()
+    return dict(schema=schema,**d13_fields,
         fixture_policy='current_life_fixture_policy_v3',phase_setup_path=str(setup),phase_setup_sha256=setup_digest,
         authority_db=str(config.authority_db),deletion_db=str(config.deletion_db),graph_db=str(config.graph_db),
         instance_lock=str(config.instance_lock),execution_journals={key:wire(asdict(value)) for key,value in config.execution_journals.items()},
@@ -142,7 +156,10 @@ def current_life_deployment_from_original_v3(raw):
     fields={'schema','fixture_policy','phase_setup_path','phase_setup_sha256','authority_db','deletion_db','graph_db','instance_lock',
         'execution_journals','tls','bind_host','bind_port','installations','namespace_bindings','reverse_profiles','reverse_issuers',
         'self_readers','worker_fact_committers','onebot_observations','observer_peer','clock','c04'}
-    if set(asset)!=fields or asset['schema']!='sylanne.test.c09.current-deployment-assets.v3' or asset['fixture_policy']!='current_life_fixture_policy_v3':
+    if asset['schema']in {'sylanne.test.c09.current-deployment-assets.v4','sylanne.test.c09.current-deployment-assets.v5'}:
+        fields|={'d13_installation_assets_path','d13_installation_assets_sha256'}
+    if asset['schema']=='sylanne.test.c09.current-deployment-assets.v5':fields.add('administrator_certificate_sha256')
+    if set(asset)!=fields or asset['schema']not in {'sylanne.test.c09.current-deployment-assets.v3','sylanne.test.c09.current-deployment-assets.v4','sylanne.test.c09.current-deployment-assets.v5'} or asset['fixture_policy']!='current_life_fixture_policy_v3':
         raise ValueError('exact original current deployment asset inventory required')
     setup=Path(asset['phase_setup_path']).resolve(strict=True)
     if hashlib.sha256(read_installed_bytes_v1(setup,limit=262144)).hexdigest()!=asset['phase_setup_sha256']:
@@ -170,10 +187,28 @@ def current_life_deployment_from_original_v3(raw):
         provider_cache_cleanup=cache.installed_disposition(),budget_job_issuer=d11)
     installations={tuple(item['peer']):AdministratorInstallationV2(**item['value']) for item in asset['installations']}
     bindings={(*item['peer'],NamespaceId(*item['namespace'])):item['authority_namespace'] for item in asset['namespace_bindings']}
-    admin=[key for key,value in installations.items() if value.installation_id=='installation-admin'];assert len(admin)==1
+    if asset['schema']=='sylanne.test.c09.current-deployment-assets.v5':
+        from cryptography import x509
+        from cryptography.hazmat.primitives.serialization import Encoding
+        if not initial.initial_segmented_genesis_v4 or len(installations)!=1 or len(bindings)!=1:
+            raise ValueError('initial segmented cold original changed its actual single installed peer/cohort')
+        cert=x509.load_pem_x509_certificate(read_installed_bytes_v1(initial.administrator_certificate,limit=65536))
+        admin_digest=hashlib.sha256(cert.public_bytes(Encoding.DER)).hexdigest()
+        if admin_digest!=asset['administrator_certificate_sha256']:
+            raise ValueError('cold actual Root administrator certificate changed')
+    else:
+        admin=[key for key,value in installations.items() if value.installation_id=='installation-admin'];assert len(admin)==1
+        admin_digest=admin[0][0]
     peer=MtlsPeerCredential(raw['peer_certificate'])
-    authorize,administrator,credential=current_life_fixture_policy_v3(peer,MtlsPeerCredential(admin[0][0]),ans,raw['control']['installation_id'])
+    authorize,administrator,credential=current_life_fixture_policy_v3(peer,MtlsPeerCredential(admin_digest),ans,raw['control']['installation_id'])
     values=raw['control'];clock=LinuxKernelClockProviderV1(**asset['clock'])
+    use_assets=counter_assets=None
+    if asset['schema']in {'sylanne.test.c09.current-deployment-assets.v4','sylanne.test.c09.current-deployment-assets.v5'}:
+        from d11_offline_authority_acceptance_support_v1 import read_current_d13_fixture_assets_v3
+        d13_raw,use_assets,counter_assets=read_current_d13_fixture_assets_v3(initial)
+        if (str(initial.d13_installation_assets)!=asset['d13_installation_assets_path']
+                or hashlib.sha256(d13_raw).hexdigest()!=asset['d13_installation_assets_sha256']):
+            raise ValueError('signed cold D13 asset source differs from its original protected cohort')
     cfg=AuthorityDeploymentConfig(authority_db=Path(asset['authority_db']),deletion_db=Path(asset['deletion_db']),graph_db=Path(asset['graph_db']),
         instance_lock=Path(asset['instance_lock']),execution_journals={key:ExecutionJournalInstallation(**value) for key,value in asset['execution_journals'].items()},
         tls=AuthorityServerTlsConfig(**asset['tls']),bind_host=asset['bind_host'],bind_port=asset['bind_port'],installations_v2=installations,
@@ -185,6 +220,7 @@ def current_life_deployment_from_original_v3(raw):
         self_identity_readers_v2={key:tuple(value) for key,value in asset['self_readers'].items()},
         worker_result_fact_committers_v2={key:tuple(value) for key,value in asset['worker_fact_committers'].items()},
         host_onebot_observations_v2={key:HostOneBotObservationInstallationV2(**value) for key,value in asset['onebot_observations'].items()},
+        d13_counter_assets_v1=counter_assets,d13_cache_use_assets_v2=use_assets,
         c04_installations_v3={ans:installed},c09_storage_v1=InstalledC09AuthorityV1(values['control_path'],values['key_path'],values['installation_id'],
             values['authority_id'],values['control_store_id'],values['key_id'],tuple(Path(item) for item in values['resource_roots'])),c09_maintenance_factory=factory)
     from sylanne3.host.c09_controlled_sdk_bootstrap_v3 import read_controlled_sdk_root_descriptor_v3

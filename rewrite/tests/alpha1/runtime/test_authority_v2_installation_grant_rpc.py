@@ -40,12 +40,12 @@ def server(tmp_path, *, mapped=True, trusted=True):
 
 
 def paired(rpc, request=REQUEST, peer=PEER, channel=b"channel-a"):
-    handshake = rpc._dispatch_for_test("handshake", request, peer, channel)
+    handshake = rpc.dispatch("handshake", request, peer, channel)
     return handshake["channel_binding_sha256"]
 
 
 def grant(rpc, binding, request=REQUEST, peer=PEER, channel=b"channel-a", command=None):
-    return rpc._dispatch_for_test(
+    return rpc.dispatch(
         "installation_grant_v2", request, peer, channel,
         handshake_binding=binding, command={} if command is None else command,
     )

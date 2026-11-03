@@ -8,10 +8,10 @@ export type ViewType = typeof VIEW_TYPES[number]
 export type ProjectionStatus = 'loading' | 'empty' | 'unauthorized' | 'stale' | 'partial' | 'unavailable' | 'ready'
 export interface Problem { code: string; retryable: boolean }
 export interface Namespace { bot: string; persona: string }
-export interface ViewAvailability { view_type: ViewType; status: 'available' | 'unavailable'; snapshot_epoch?: number }
+export interface ViewAvailability { view_type: ViewType; status: 'readable_not_loaded' | 'unsupported' | 'unavailable'; reason_code: string }
 export interface WorkspaceProjection {
   namespace: Namespace; access_generation: number; views: ViewAvailability[]
-  view_diagnostics: { view_type: ViewType; read_status: ProjectionStatus; coverage?: string; problem_code?: string; snapshot_epoch?: number }[]
+  view_diagnostics: { view_type: ViewType; read_status: 'readable_not_loaded' | 'unsupported' | 'unavailable'; reason_code: string; coverage?: string; problem_code?: string; snapshot_epoch?: number }[]
   unavailable_domains: Record<string, string>
   command_routes: { action: string; status: 'route_installed' | 'partial_route_installed' | 'unavailable' }[]
 }

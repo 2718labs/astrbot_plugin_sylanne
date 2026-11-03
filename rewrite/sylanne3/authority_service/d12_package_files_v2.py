@@ -13,11 +13,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import re
 import stat
 from uuid import UUID, uuid4
 
 from .contract import AuthorityUnavailable
+from .d12_package_maintenance_contract_v2 import is_package_digest_v2 as _sha
 from .linux_installation_security_v1 import read_installed_json_v1, require_linux_administrator_v1
 from ..host.installed_package import verify_installed_backend_runtime_v1
 
@@ -33,8 +33,6 @@ def _digest(value):
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _sha(value):
-    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
 
 
 @dataclass(frozen=True, slots=True)

@@ -122,10 +122,10 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
         self.assertNotIn(str(self.request.package_root), str(response))
 
     def test_grant_rejects_different_request_or_channel_binding(self) -> None:
-        handshake = self.server._dispatch_for_test(
+        handshake = self.server.dispatch(
             "handshake", self.request, self.peer, b"channel-a"
         )
-        grant = self.server._dispatch_for_test(
+        grant = self.server.dispatch(
             "capability_grant", self.request, self.peer, b"channel-a",
             handshake_binding=handshake["channel_binding_sha256"],
         )
@@ -143,19 +143,19 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
             publisher_package=PublisherPackageIdentity("c" * 64),
         )
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            self.server._dispatch_for_test(
+            self.server.dispatch(
                 "capability_grant", changed, self.peer, b"channel-a",
                 handshake_binding=handshake["channel_binding_sha256"],
             )
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            self.server._dispatch_for_test(
+            self.server.dispatch(
                 "capability_grant", self.request, self.peer, b"channel-b",
                 handshake_binding=handshake["channel_binding_sha256"],
             )
 
     def test_unknown_or_oversize_rpc_never_returns_content_diagnostics(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            self.server._dispatch_for_test("unknown", self.request, self.peer, b"channel")
+            self.server.dispatch("unknown", self.request, self.peer, b"channel")
         secret = "credential and signing key: /role/content"
         try:
             try:
@@ -178,17 +178,17 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
             self.server.dispatch("handshake", self.request, object(), b"channel")
 
     def test_content_rpc_calls_core_with_bound_namespace_holder_and_generation(self) -> None:
-        handshake = self.server._dispatch_for_test(
+        handshake = self.server.dispatch(
             "handshake", self.request, self.peer, b"content-channel"
         )
         bound = handshake["channel_binding_sha256"]
-        current = self.server._dispatch_for_test(
+        current = self.server.dispatch(
             "current", self.request, self.peer, b"content-channel",
             handshake_binding=bound, command={"namespace": "ns:role"},
         )
         self.assertEqual(current["namespace"], "ns:role")
         self.assertEqual(current["holder"], "host:one")
-        checked = self.server._dispatch_for_test(
+        checked = self.server.dispatch(
             "check", self.request, self.peer, b"content-channel",
             handshake_binding=bound,
             command={
@@ -197,7 +197,7 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
             },
         )
         self.assertEqual(checked["generation"], 1)
-        anchor = self.server._dispatch_for_test(
+        anchor = self.server.dispatch(
             "current_anchor", self.request, self.peer, b"content-channel",
             handshake_binding=bound, command={"namespace": "ns:role"},
         )
@@ -207,18 +207,18 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
             if key != "channel_binding_sha256"
         }
         forged_anchor["proof"] = "forged-proof"
-        verified = self.server._dispatch_for_test(
+        verified = self.server.dispatch(
             "verify_current", self.request, self.peer, b"content-channel",
             handshake_binding=bound, command={"anchor": forged_anchor},
         )
         self.assertFalse(verified["verified"])
-        execution = self.server._dispatch_for_test(
+        execution = self.server.dispatch(
             "verify_execution_chain", self.request, self.peer, b"content-channel",
             handshake_binding=bound, command={"namespace": "ns:role"},
         )
         self.assertEqual(execution["execution_seq"], 0)
         self.assertTrue(execution["verified"])
-        permit = self.server._dispatch_for_test(
+        permit = self.server.dispatch(
             "begin_content_operation", self.request, self.peer, b"content-channel",
             handshake_binding=bound,
             command={
@@ -232,13 +232,13 @@ class AuthorityMtlsTransportTests(unittest.TestCase):
             key: permit[key]
             for key in ("token", "namespace", "holder", "generation", "operation")
         }
-        ended = self.server._dispatch_for_test(
+        ended = self.server.dispatch(
             "end_content_operation", self.request, self.peer, b"content-channel",
             handshake_binding=bound, command={"permit": permit_request},
         )
         self.assertEqual(ended["ended"], True)
         with self.assertRaisesRegex(RuntimeError, "unavailable"):
-            self.server._dispatch_for_test(
+            self.server.dispatch(
                 "begin_content_operation", self.request, self.peer, b"content-channel",
                 handshake_binding=bound,
                 command={

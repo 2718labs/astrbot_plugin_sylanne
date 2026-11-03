@@ -1,6 +1,7 @@
 """D08 never derives a current conflict PASS from an unbound effect DTO."""
 
 from dataclasses import replace
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,13 @@ from sylanne3.runtime.dispatch_current_commitments import (
     read_current_d08_observed_versions,
 )
 from sylanne3.runtime_contracts import QueryEpoch
+
+
+def _sqlite_tx_case():
+    """Current readers require an actual SQLite connection in a transaction."""
+    db = sqlite3.connect(":memory:")
+    db.execute("BEGIN")
+    return db
 
 
 def test_d08_observed_versions_rejects_effect_outside_snapshot_head():
@@ -28,7 +36,7 @@ def test_d08_observed_versions_rejects_effect_outside_snapshot_head():
     graph = GraphSnapshot((), (NamespaceEpoch(*namespace.as_tuple, 0),))
     with pytest.raises(ValueError, match="claimed P2 effect"):
         read_current_d08_observed_versions(
-            SimpleNamespace(in_transaction=True), namespace, graph,
+            _sqlite_tx_case(), namespace, graph,
             QueryEpoch(namespace, "all", 0), "action:test", context, witness,
             authority_snapshot, effect)
 
@@ -48,7 +56,7 @@ def test_d08_observed_versions_rejects_foreign_owner_snapshot():
     graph = GraphSnapshot((), (NamespaceEpoch(*namespace.as_tuple, 0),))
     with pytest.raises(RuntimeError, match="snapshot differs"):
         read_current_d08_observed_versions(
-            SimpleNamespace(in_transaction=True), namespace, graph,
+            _sqlite_tx_case(), namespace, graph,
             QueryEpoch(namespace, "all", 0), "action:test", context,
             replace(witness, grant_id="grant:foreign"), authority_snapshot,
             effect)

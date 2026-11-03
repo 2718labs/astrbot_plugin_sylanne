@@ -493,7 +493,8 @@ def stage_select_current_personal_step_in_transaction_v1(db, *, frame, request, 
             for b in (*values["unresolved"], *values["rejected"]) if a != b}
         # Retain each actually applicable value rule separately. Opposing
         # rules can produce a real SCC; a flattened support count cannot.
-        for rule in evaluation["payload"]["provenance"]["persona_view"]["values"]:
+        from .d08_personal_candidate_v1 import read_evaluation_value_rules_v1
+        for rule in read_evaluation_value_rules_v1(evaluation):
             supported = {ref for ref in rule["supports_candidates"] if ref in candidate_ids
                 and rule["label"] in values["reasons"][ref]}
             opposed = {ref for ref in rule["rejects_candidates"] if ref in candidate_ids
@@ -1159,7 +1160,8 @@ def stage_select_current_personal_step_in_transaction_v2(db, *, frame, request, 
         values = evaluation["payload"]["provenance"]["evaluation"]
         candidate_refs = {row.binding.candidate_ref for row in prepared.candidates}
         edges = {(a, b) for a in values["preferred"] for b in (*values["unresolved"], *values["rejected"]) if a != b}
-        for rule in evaluation["payload"]["provenance"]["persona_view"]["values"]:
+        from .d08_personal_candidate_v1 import read_evaluation_value_rules_v1
+        for rule in read_evaluation_value_rules_v1(evaluation):
             supported = {ref for ref in rule["supports_candidates"] if ref in candidate_refs and rule["label"] in values["reasons"][ref]}
             opposed = {ref for ref in rule["rejects_candidates"] if ref in candidate_refs and rule["label"] in values["reasons"][ref]}
             edges.update((a, b) for a in supported for b in opposed if a != b)

@@ -1,12 +1,15 @@
 """Independent Life locator bridge to the real installed D04 CPU protocol.
 
 One current Owner SQL preparation reserves an actual CPU quote, commits the
-running job, then freezes the actual root/component. Execution is separately
+running job only after freezing the current root/component. The exact job CAS
+rebinds its original input without reopening Source Body. Execution is separately
 issued by the existing installed math queue after an actual Authority claim.
 No C02 source or message-arrival identity is manufactured. Policies and clocks
 are the unchanged installed originals; incomplete native work remains HOLD.
 """
 from dataclasses import asdict, dataclass, replace
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
 import time
@@ -21,7 +24,7 @@ from ..host.installed_d04_numeric_build_v3 import read_installed_d04_numeric_ide
 from .budget import get_budget_lease, require_budget_family_admissible, reserve_budget
 from .d04_appraisal_driver_v3 import record_d04_original_in_transaction_v3
 from .d04_current_joint_replay_input_v2 import read_current_joint_replay_input_in_transaction_v2
-from .d04_installed_numeric_v3 import D04PreparedExecutionV3, _advance_numeric_job_observation_v3
+from .d04_installed_numeric_v3 import D04PreparedExecutionV3
 from .d04_joint_product_assembly_v3 import D04JointProductPreparationV3
 from .d04_numeric_cost_v3 import D04NumericPreparedV3, build_d04_numeric_input_payload_v3, read_d04_numeric_prepared_v3
 from .d04_numeric_policy_v3 import AdminD04JointNumericPolicyV3
@@ -369,7 +372,7 @@ def _current_life_joint_source_for_commit_v1(graph, db, witness):
 
 
 def _freeze_life_product_v1(graph, db, bundle, identity, *, metadata, epoch, clock, root_ref,
-        qualification, audience, deadline, job, topology_verifier, life_source_bridge):
+        qualification, audience, deadline, monotonic_deadline, job, topology_verifier, life_source_bridge):
     namespace, policy = bundle.installation_policy.namespace, bundle.installation_policy
     store = graph._GraphCoordinator__store
     rights = graph._deletion_epochs_locked(db, namespace)
@@ -396,17 +399,22 @@ def _freeze_life_product_v1(graph, db, bundle, identity, *, metadata, epoch, clo
         raise ValueError("D04 numeric actual CPU already has a Graph settlement")
     keys[cost_key] = 0
     projected_job = job_graph_write(job)
-    job_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (projected_job.key.token,)).fetchone()
-    if job_row is None or job_row[2] != 1 or json.loads(job_row[1]) != projected_job.value:
-        raise ValueError("D04 numeric running job projection is missing")
-    keys[projected_job.key] = job_row[0]
+    if db.execute("SELECT revision FROM graph_atoms WHERE token=?", (projected_job.key.token,)).fetchone() is not None:
+        raise ValueError("Life numeric input requires its actual new-job negative read")
+    keys[projected_job.key] = 0
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    read = CurrentDomainReadV1(life_source_bridge.frame)
     atoms = []
     for key, revision in sorted(keys.items(), key=lambda row: row[0].token):
-        row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
-        if (0 if row is None else row[0]) != revision:
-            raise ValueError("D04 actual numeric read changed during prepare")
-        atoms.append(GraphAtom(key, 0, {}, False) if row is None
-            else GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])))
+        if revision == 0:
+            if db.execute("SELECT revision FROM graph_atoms WHERE token=?", (key.token,)).fetchone() is not None:
+                raise ValueError("Life numeric negative dependency changed during prepare")
+            atom = GraphAtom(key, 0, {}, False)
+        else:
+            atom = read.head(db, key, required=True)
+            if atom.revision != revision:
+                raise ValueError("Life numeric input differs from its actual selected Source frame")
+        atoms.append(atom)
     snapshot = GraphSnapshot(tuple(atoms), (epoch,))
     predecessors = []
     for block, checkpoint in zip(current.component.block_drives, current.checkpoints):
@@ -431,10 +439,241 @@ def _freeze_life_product_v1(graph, db, bundle, identity, *, metadata, epoch, clo
         authority, VersionGuard(reads, (current.component.query_epoch,), rights[0], rights[1],
             store._registry.catalogue_hash, policy.scheme_version, policy.operator_version, policy.policy_version,
             (), (), (VersionedRef(identity["quote"], 1),)),
-        qualification, inputs, job.budget_ref, deadline, time.monotonic() + max(0, deadline - time.time()),
+        qualification, inputs, job.budget_ref, deadline, monotonic_deadline,
         "d04-role-interval:" + canonical_digest(asdict(clock))[:48], (identity["input"],))
     return D04JointProductPreparationV3(envelope, current,
         JointStateFrozenPredecessorsV1(namespace, identity["operation"], tuple(predecessors)), snapshot)
+
+
+_LIFE_JOB_INPUT_ISSUER_V1 = object()
+_LIFE_JOB_INPUTS_V1 = weakref.WeakKeyDictionary()
+_LIFE_JOB_AFTER_V1 = weakref.WeakKeyDictionary()
+_LIFE_JOB_ORIGINAL_WRITE_V1 = ContextVar("sylanne_life_joint_original_write_v1", default=None)
+
+
+class _LifeJointBeforeJobV1:
+    """Actual sealed Life input held only across this transaction's new-job CAS."""
+    def __init__(self, issuer, db, stage, job, preparation, evidence, owner_atom, reader, phase):
+        if issuer is not _LIFE_JOB_INPUT_ISSUER_V1:
+            raise ValueError('Life job input requires its actual private Source producer')
+        self.db, self.stage, self.job = db, stage, job
+        self.preparation, self.evidence, self.owner_atom = preparation, evidence, owner_atom
+        self.reader, self.phase, self.operation = reader, phase, reader.operation
+        self.used = False
+        self.rebound = None
+        self.digest = canonical_digest((preparation, evidence, owner_atom))
+        self.operation.register_retained_state_v3(self)
+        _LIFE_JOB_INPUTS_V1[self] = self._identity_v1()
+
+    def _identity_v1(self):
+        return (self.db, self.stage, self.job, self.preparation, self.evidence,
+            self.owner_atom, self.reader, self.phase, self.operation, self.digest)
+
+    def _runtime_retained_heap_bytes_v3(self):
+        from .current_character_labor_adoption_v1 import _payload_heap_v1
+        return 4096 + _payload_heap_v1((self.preparation, self.evidence, self.owner_atom, self.rebound))
+
+    def seal_after_job_v1(self, receipt, metadata, epoch):
+        from .current_method_learning_read_v3 import (
+            _method_active, _READERS, _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1)
+        from .d04_installed_numeric_v3 import _require_numeric_job_commit_v3
+        from .first_ingress_v2 import trusted_upper_at_v4
+        from ..runtime_storage_v3 import runtime_storage_v3
+        r, stage, db = self.reader, self.stage, self.db
+        issued = _STAGES.get(id(stage))
+        if (_LIFE_JOB_INPUTS_V1.get(self) != self._identity_v1() or self.used
+                or issued is None or issued[0]() is not stage or issued[1] is not db
+                or _method_active(db) is not r or r not in _READERS
+                or _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1.get(r) is not self.phase
+                or r.work.state is not r or r.work.operation is not self.operation
+                or self.operation.closed or runtime_storage_v3(db) is not self.operation.handle
+                or not db.in_transaction or not r.store._lock._is_owned()
+                or self.digest != canonical_digest((self.preparation, self.evidence, self.owner_atom))):
+            raise ValueError('Life job successor lost its actual sealed Source/WRITE/input')
+        r.work._require_invocation(stage.graph)
+        now = trusted_upper_at_v4(r.initial_clock, time.monotonic())
+        if now >= min(self.operation.deadline_utc, stage.frame.envelope.deadline_utc,
+                self.preparation.envelope.deadline_utc):
+            raise ValueError('Life job successor exceeded its original Source or job deadline')
+        identity = life_numeric_joint_ids_v1(r.namespace, stage.request.episode_ref, stage.request.appraisal_ref)
+        scope, observed, _derived, _header, _cell = _require_numeric_job_commit_v3(
+            stage.graph, db, stage.topology, stage.metadata, stage.epoch,
+            metadata, epoch, self.job, receipt, identity)
+        if (scope is not self.phase[1] or scope is not stage.installed_readers.life_numeric_scope
+                or observed.guard != stage.installed_readers.life_numeric_owner_guard):
+            raise ValueError('Life job successor changed its independently observed Owner WRITE')
+        self.used = True
+        fields = dict(self.evidence.field_payloads)
+        growth = 65536 + len(self.preparation.snapshot.atoms) * 512
+        growth += 16 * sum(len(fields[name].encode('utf-8')) for name in (
+            'snapshot_stamp_digest', 'closure_digest', 'read_versions_digest', 'absent_reads_digest'))
+        growth += 16 * len(canonical_serialize(job_graph_write(self.job).value).encode('utf-8'))
+        self.operation.reserve_retained_state_growth_v3(self, growth)
+        try:
+            self.rebound = _rebase_life_joint_job_input_v1(self.preparation, self.evidence, self.job, metadata, epoch)
+            _LIFE_JOB_AFTER_V1[self] = ((metadata, epoch), self.rebound, canonical_digest(self.rebound))
+            return self.rebound
+        finally:
+            self.operation.finish_retained_state_growth_v3(self)
+
+    @contextmanager
+    def original_write_v1(self):
+        self.require_after_job_v1(self.db)
+        token = _LIFE_JOB_ORIGINAL_WRITE_V1.set(self)
+        try:
+            yield
+        finally:
+            _LIFE_JOB_ORIGINAL_WRITE_V1.reset(token)
+
+    def require_after_job_v1(self, db):
+        from .current_method_learning_read_v3 import _method_active, _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1
+        from .first_ingress_v2 import trusted_upper_at_v4
+        from ..runtime_storage_v3 import runtime_storage_v3
+        after = _LIFE_JOB_AFTER_V1.get(self)
+        r = self.reader
+        issued = _STAGES.get(id(self.stage))
+        if (after is None or _LIFE_JOB_INPUTS_V1.get(self) != self._identity_v1() or not self.used
+                or after[1] is not self.rebound or after[2] != canonical_digest(self.rebound)
+                or issued is None or issued[0]() is not self.stage or issued[1] is not db
+                or db is not self.db or not db.in_transaction or not r.store._lock._is_owned()
+                or _method_active(db) is not r or _GENERAL_METHOD_SOURCE_WRITE_PHASES_V1.get(r) is not self.phase
+                or r.work.state is not r or r.work.operation is not self.operation or self.operation.closed
+                or runtime_storage_v3(db) is not self.operation.handle
+                or self.stage.graph._v2_graph_stamp(r.namespace) != after[0]):
+            raise ValueError('Life new-original write lost its actual same-CAS producer')
+        r.work._require_invocation(self.stage.graph)
+        if trusted_upper_at_v4(r.initial_clock, time.monotonic()) >= min(
+                self.operation.deadline_utc, self.stage.frame.envelope.deadline_utc,
+                self.preparation.envelope.deadline_utc):
+            raise ValueError('Life new-original write exceeded its unchanged original deadline')
+        return self
+
+    def release_v1(self):
+        _LIFE_JOB_INPUTS_V1.pop(self, None)
+        _LIFE_JOB_AFTER_V1.pop(self, None)
+        self.operation.unregister_retained_state_v3(self)
+        self.preparation = self.evidence = self.owner_atom = self.reader = self.stage = self.rebound = None
+
+
+def read_bound_life_joint_new_original_v1(db, *, table, columns, key_columns, key):
+    frozen = _LIFE_JOB_ORIGINAL_WRITE_V1.get()
+    if frozen is None:
+        return False, None
+    ns = frozen.stage.bundle.installation_policy.namespace
+    operation = frozen.job.operation_id
+    if (table != 'graph_d04_originals_v3' or tuple(columns) != ('payload_json', 'payload_digest')
+            or tuple(key_columns) != ('bot', 'persona', 'kind', 'original_ref')
+            or tuple(key) not in tuple((*ns.as_tuple, kind, operation)
+                for kind in ('numeric_prepared', 'numeric_accounting_prepared'))):
+        return False, None
+    frozen.require_after_job_v1(db)
+    # Both immutable keys were observed absent before this actual single-job CAS.
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3, _runtime_bounded_fixed_row_v3
+    with runtime_storage_quantum_v3(db) as meter:
+        row = _runtime_bounded_fixed_row_v3(db, meter, table, ('payload_digest',),
+            'bot=? AND persona=? AND kind=? AND original_ref=?', tuple(key))
+    if row is not None:
+        raise ValueError('Life new-original key is occupied; require independent original recovery')
+    return True, None
+
+
+def _freeze_life_joint_before_job_v1(db, stage, current_drive, job, identity, *, deadline,
+        output_policy, mapping_reader):
+    from .current_method_learning_read_v3 import (
+        _method_active, _MethodLearningReadV3, require_actual_method_learning_attachment_owner_v3,
+        _require_current_general_method_source_write_phase_v1)
+    from .current_life_numeric_metadata_v1 import require_numeric_method_sources_v1
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    from .first_ingress_v2 import trusted_upper_at_v4
+    from ..host.v2_fence_port import VerifiedIngressClockV2
+    r = _method_active(db)
+    if type(r) is not _MethodLearningReadV3 or r.operation_kind != OPERATION:
+        raise ValueError('Life numeric input requires its independent actual Owner Method Work')
+    require_actual_method_learning_attachment_owner_v3(r, db=db)
+    phase = _require_current_general_method_source_write_phase_v1(r)
+    require_numeric_method_sources_v1(r)
+    if (phase[1] is not stage.installed_readers.life_numeric_scope
+            or r.graph is not stage.graph or r.request != stage.request
+            or stage.frame.snapshot != r.frame_fields[1] or stage.frame.owner_guard != r.material_owner_guard
+            or r.graph_stamp != (stage.metadata, stage.epoch)
+            or stage.frame.snapshot.epochs != (stage.epoch,)
+            or type(r.initial_clock) is not VerifiedIngressClockV2):
+        raise ValueError('Life input crossed its real Source/Owner/clock preparation')
+    sample = time.monotonic()
+    now = trusted_upper_at_v4(r.initial_clock, sample)
+    if now >= min(deadline, r.operation.deadline_utc, stage.frame.envelope.deadline_utc):
+        raise ValueError('Life input original Source or CPU deadline expired before freezing')
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3, _runtime_bounded_fixed_row_v3
+    with runtime_storage_quantum_v3(db) as meter:
+        for kind in ('numeric_prepared', 'numeric_accounting_prepared'):
+            head = _runtime_bounded_fixed_row_v3(db, meter, 'graph_d04_originals_v3', ('payload_digest',),
+                'bot=? AND persona=? AND kind=? AND original_ref=?',
+                (*r.namespace.as_tuple, kind, identity['operation']))
+            if head is not None:
+                raise ValueError('Life numeric preparation original already exists; use actual original recovery')
+    owner_atom = CurrentDomainReadV1(stage.frame).head(db, owner_grant_key(*r.namespace.as_tuple), required=True)
+    bridge = _issue_life_joint_source_bridge_v1(db, current_drive, stage.frame, stage=stage)
+    preparation = _freeze_life_product_v1(stage.graph, db, stage.bundle, identity,
+        metadata=stage.metadata, epoch=stage.epoch, clock=current_drive.original.clock,
+        root_ref=current_drive.original.root_ref, qualification=current_drive.context.source_qualification,
+        audience=stage.frame.envelope.authority.audience, deadline=deadline,
+        monotonic_deadline=sample + deadline - now, job=job, topology_verifier=stage.topology,
+        life_source_bridge=bridge)
+    evidence = freeze_current_d04_joint_evidence_inputs_v3(db, preparation,
+        clock=current_drive.original.clock, installed_output_policy=output_policy,
+        installed_mapping_reader=mapping_reader)
+    return _LifeJointBeforeJobV1(_LIFE_JOB_INPUT_ISSUER_V1, db, stage, job,
+        preparation, evidence, owner_atom, r, phase)
+
+
+def _rebase_life_joint_job_input_v1(preparation, evidence, job, metadata, epoch):
+    """Serialize only the already verified job delta; this function grants no read."""
+    from .joint_numeric_component import joint_numeric_component_digest_v1
+    from .d04_appraisal_driver_v3 import graph_read_rows_v3
+    write = job_graph_write(job)
+    before = preparation.snapshot.get(write.key)
+    if (before is None or before.revision != 0 or before.valid
+            or evidence.read_rows != graph_read_rows_v3(preparation.snapshot, preparation.snapshot.versions)):
+        raise ValueError('Life job delta does not replace its actual frozen negative read')
+    atoms = tuple(GraphAtom(write.key, 1, write.value, True) if atom.key == write.key else atom
+        for atom in preparation.snapshot.atoms)
+    snapshot = GraphSnapshot(atoms, (epoch,))
+    prior_component = preparation.current.component
+    namespace = prior_component.namespace
+    changes = {}
+    if any(version.key == write.key for version in prior_component.read_versions):
+        versions = tuple(GraphVersion(write.key, 1) if version.key == write.key else version
+            for version in prior_component.read_versions)
+        changes['read_versions'] = versions
+        changes['read_values_digest'] = canonical_digest(tuple(sorted(
+            (atom.key.token, atom.revision, canonical_digest(atom.value), atom.valid)
+            for atom in (snapshot.get(version.key) for version in versions))))
+    component = replace(prior_component, query_epoch=QueryEpoch(
+        namespace, 'all', epoch.revision), graph_revision=metadata.graph_revision, **changes)
+    component = replace(component, candidate_digest=joint_numeric_component_digest_v1(component))
+    current = replace(preparation.current, component=component)
+    envelope = replace(preparation.envelope, version_guard=replace(preparation.envelope.version_guard,
+        read_versions=snapshot.versions, query_epochs=(component.query_epoch,)))
+    result = replace(preparation, envelope=envelope, current=current, snapshot=snapshot)
+    from .d04_appraisal_driver_v3 import D04GraphReadV3
+    rows = tuple(D04GraphReadV3(row.ref, 1, True, canonical_serialize(write.value))
+        if row.ref == write.key.token else row for row in evidence.read_rows)
+    payloads = dict(evidence.field_payloads)
+    changed = {name: json.loads(payloads[name]) for name in (
+        'snapshot_stamp_digest', 'closure_digest', 'read_versions_digest', 'absent_reads_digest')}
+    stamp = changed['snapshot_stamp_digest']['payload']
+    if (stamp['graph_revision'] != preparation.current.component.graph_revision
+            or stamp['query_epoch'] != asdict(preparation.current.component.query_epoch)
+            or stamp['namespace'] != asdict(namespace)):
+        raise ValueError('Life evidence stamp differs from its actual frozen component')
+    stamp['graph_revision'], stamp['query_epoch'] = metadata.graph_revision, asdict(component.query_epoch)
+    changed['closure_digest']['payload']['snapshot_stamp'] = stamp
+    changed['read_versions_digest']['payload']['versions'] = [
+        {'ref': row.ref, 'revision': row.revision} for row in rows]
+    changed['absent_reads_digest']['payload']['absent_rows'] = [asdict(row) for row in rows if row.revision == 0]
+    payloads.update((name, canonical_serialize(body)) for name, body in changed.items())
+    return result, replace(evidence, component_digest=component.candidate_digest, read_rows=rows,
+        field_payloads=tuple(sorted(payloads.items())))
 
 
 def prepare_life_numeric_joint_in_transaction_v1(db, *, stage):
@@ -458,7 +697,8 @@ def prepare_life_numeric_joint_in_transaction_v1(db, *, stage):
     if type(policy) is not AdminD04JointNumericPolicyV3:
         raise ValueError('explicit installed D04 numerical policy required')
     identity = life_numeric_joint_ids_v1(namespace, stage.request.episode_ref, stage.request.appraisal_ref)
-    if read_d04_numeric_prepared_v3(db, namespace, identity['operation']) is not None:
+    if db.execute('SELECT payload_digest FROM graph_d04_originals_v3 WHERE bot=? AND persona=? '
+            "AND kind='numeric_prepared' AND original_ref=?", (*namespace.as_tuple, identity['operation'])).fetchone() is not None:
         raise ValueError('Life joint already prepared; resume its actual original')
     assembly = graph._GraphCoordinator__d04_installed_joint_assembly
     installed = read_installed_d04_numeric_identity_v3(assembly.package_root, installation.manifest_digest)
@@ -504,55 +744,49 @@ def prepare_life_numeric_joint_in_transaction_v1(db, *, stage):
     write = job_graph_write(job)
     if db.execute('SELECT 1 FROM graph_atoms WHERE token=?', (write.key.token,)).fetchone():
         raise ValueError('Life new CPU job already has a Graph projection')
-    receipt = _commit(graph, db, stage.metadata, stage.epoch, 'd04-numeric-running:' + identity['operation'],
-        identity['activity'], now, (write,), (GraphVersion(write.key, 0),), 'd04.numeric_running_preparation.v3')
-    metadata, epoch = graph._v2_graph_stamp(namespace)
-    _advance_numeric_job_observation_v3(graph, db, stage.topology, stage.metadata, stage.epoch,
-        metadata, epoch, job, receipt, identity)
-    from .domain_production_inputs_v1 import _post_commit_frame
-    post_frame = _post_commit_frame(db, frame, stage.request)
-    post_drive = read_current_life_numeric_drive_v1(db, frame=post_frame,
-        request=_drive_request(stage.request), installed_readers=stage.installed_readers)
-    life_source_bridge = _issue_life_joint_source_bridge_v1(db, post_drive, post_frame, stage=stage)
-    preparation = _freeze_life_product_v1(graph, db, bundle, identity, metadata=metadata, epoch=epoch,
-        clock=clock, root_ref=drive.root_ref, qualification=context.source_qualification,
-        audience=frame.envelope.authority.audience, deadline=deadline, job=job, topology_verifier=stage.topology,
-        life_source_bridge=life_source_bridge)
-    evidence = freeze_current_d04_joint_evidence_inputs_v3(db, preparation, clock=clock,
-        installed_output_policy=output_policy, installed_mapping_reader=reader)
-    if set(preparation.current.component.checkpoint_refs) != {m.checkpoint.ref for m in context.before.members}:
-        raise ValueError('Life numerical preparation changed the explicit before-root member inventory')
-    grant_ref = owner_grant_key(*namespace.as_tuple).token
-    owner_row = db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?', (grant_ref,)).fetchone()
-    if owner_row is None or owner_row[2] != 1: raise ValueError('Life joint actual Owner graph grant unavailable')
-    owner_digest = canonical_digest(json.loads(owner_row[1]))
-    payload, _ = build_d04_numeric_input_payload_v3(preparation, evidence,
-        installation_id=installation.installation_id, owner_grant_ref=grant_ref,
-        owner_grant_revision=owner_row[0], owner_grant_digest=owner_digest, **installed,
-        max_iterations=policy.max_iterations, tolerance=policy.tolerance)
-    payload['command_envelope'] = evidence_payload_v3(preparation.envelope)
-    payload['worker_original'] = {'holder': job.lease_holder, 'fence': job.fence,
-        'cancel_epoch': job.cancel_epoch, 'lease_expires_utc': job.lease_expires_utc, 'deadline_utc': job.deadline_utc}
-    payload['numeric_policy'] = evidence_payload_v3(policy)
-    binding = D04NumericBindingV3(namespace, metadata.requirements.authority_id,
-        metadata.requirements.authority_namespace, installation.installation_id,
-        metadata.requirements.activation_generation, grant_ref, owner_row[0], owner_digest,
-        identity['operation'], identity['execution'], job.job_id, identity['activity'], identity['input'],
-        canonical_digest(payload), installed['algorithm_id'], installed['algorithm_build_digest'],
-        installed['native_manifest_sha256'], installed['native_sha256'], installed['output_policy_digest'],
-        quote.quote_id, quote.version, canonical_digest(quote), lease.lease_id,
-        identity['reservation'], reserve_digest, policy.cpu_ceiling_ms,
-        tuple(sorted({item.family_id for item in preparation.current.families})), job.deadline_utc)
-    reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
-        (*namespace.as_tuple, identity['reservation'])).fetchone()
-    if reserve is None: raise ValueError('Life numerical CPU reservation original disappeared')
-    prepared = D04NumericPreparedV3(binding, canonical_serialize(payload), canonical_serialize(quote),
-        reserve[0], canonical_serialize(asdict(job)), identity['input'])
-    record_d04_original_in_transaction_v3(db, namespace, 'numeric_prepared', binding.operation_id, asdict(prepared))
-    from .d04_numeric_accounting_prepared_v3 import record_numeric_accounting_prepared_v3
-    record_numeric_accounting_prepared_v3(db, prepared)
-    ready = D04PreparedExecutionV3(prepared, preparation, evidence, job.lease_holder, job.fence)
-    return ready, receipt
+    frozen = _freeze_life_joint_before_job_v1(db, stage, current_drive, job, identity,
+        deadline=deadline, output_policy=output_policy, mapping_reader=reader)
+    try:
+        owner_atom = frozen.owner_atom
+        receipt = _commit(graph, db, stage.metadata, stage.epoch, 'd04-numeric-running:' + identity['operation'],
+            identity['activity'], now, (write,), (GraphVersion(write.key, 0),), 'd04.numeric_running_preparation.v3')
+        metadata, epoch = graph._v2_graph_stamp(namespace)
+        preparation, evidence = frozen.seal_after_job_v1(receipt, metadata, epoch)
+        if set(preparation.current.component.checkpoint_refs) != {m.checkpoint.ref for m in context.before.members}:
+            raise ValueError('Life numerical preparation changed the explicit before-root member inventory')
+        grant_ref = owner_atom.key.token
+        owner_revision = owner_atom.revision
+        owner_digest = canonical_digest(owner_atom.value)
+        payload, _ = build_d04_numeric_input_payload_v3(preparation, evidence,
+            installation_id=installation.installation_id, owner_grant_ref=grant_ref,
+            owner_grant_revision=owner_revision, owner_grant_digest=owner_digest, **installed,
+            max_iterations=policy.max_iterations, tolerance=policy.tolerance)
+        payload['command_envelope'] = evidence_payload_v3(preparation.envelope)
+        payload['worker_original'] = {'holder': job.lease_holder, 'fence': job.fence,
+            'cancel_epoch': job.cancel_epoch, 'lease_expires_utc': job.lease_expires_utc, 'deadline_utc': job.deadline_utc}
+        payload['numeric_policy'] = evidence_payload_v3(policy)
+        binding = D04NumericBindingV3(namespace, metadata.requirements.authority_id,
+            metadata.requirements.authority_namespace, installation.installation_id,
+            metadata.requirements.activation_generation, grant_ref, owner_revision, owner_digest,
+            identity['operation'], identity['execution'], job.job_id, identity['activity'], identity['input'],
+            canonical_digest(payload), installed['algorithm_id'], installed['algorithm_build_digest'],
+            installed['native_manifest_sha256'], installed['native_sha256'], installed['output_policy_digest'],
+            quote.quote_id, quote.version, canonical_digest(quote), lease.lease_id,
+            identity['reservation'], reserve_digest, policy.cpu_ceiling_ms,
+            tuple(sorted({item.family_id for item in preparation.current.families})), job.deadline_utc)
+        reserve = db.execute("SELECT receipt_json FROM runtime_budget_operations WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='reserve'",
+            (*namespace.as_tuple, identity['reservation'])).fetchone()
+        if reserve is None: raise ValueError('Life numerical CPU reservation original disappeared')
+        prepared = D04NumericPreparedV3(binding, canonical_serialize(payload), canonical_serialize(quote),
+            reserve[0], canonical_serialize(asdict(job)), identity['input'])
+        with frozen.original_write_v1():
+            record_d04_original_in_transaction_v3(db, namespace, 'numeric_prepared', binding.operation_id, asdict(prepared))
+            from .d04_numeric_accounting_prepared_v3 import record_numeric_accounting_prepared_v3
+            record_numeric_accounting_prepared_v3(db, prepared)
+        ready = D04PreparedExecutionV3(prepared, preparation, evidence, job.lease_holder, job.fence)
+        return ready, receipt
+    finally:
+        frozen.release_v1()
 
 
 def read_life_numeric_joint_prepared_v1(db, *, namespace, request):

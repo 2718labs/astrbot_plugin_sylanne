@@ -7,6 +7,7 @@ terminal and accounting. This driver retains only content-free progress.
 from __future__ import annotations
 
 import asyncio
+from ..graph_worker import retained_graph_calls_v3
 
 from ..model_broker.artifact_draft_v1 import (
     ArtifactDraftTaskSelectorV1, artifact_draft_model_ids_v1,
@@ -20,31 +21,6 @@ from .authority_profile import AdminInstallationBundle
 from .v2_installation import V2InstallationAssembly
 
 
-def _retained_artifact_graph_calls_v3(worker):
-    """Consume each actual result once; replacement drops only its previous DTO lease."""
-    from contextlib import contextmanager,ExitStack
-    from ..graph_worker import OwnedGraphStorageResultV3
-
-    @contextmanager
-    def retain():
-        slots={}
-        with ExitStack()as lifetime:
-            async def call(callback,*,slot):
-                result=await worker.call(callback)
-                current=None
-                if type(result)is OwnedGraphStorageResultV3:
-                    value,retention=result.take_value_v3()
-                    current=ExitStack();current.callback(retention.release)
-                    lifetime.callback(current.close)
-                else:value=result
-                previous=slots.pop(slot,None)
-                if previous is not None:previous.close()
-                if current is not None:
-                    if value is None:current.close()
-                    else:slots[slot]=current
-                return value
-            yield call
-    return retain()
 
 
 async def run_installed_post_c02_artifact_draft_v1(
@@ -80,7 +56,7 @@ async def run_installed_post_c02_artifact_draft_v1(
     installed_artifact_draft_workflow_v1(bundle)
     arguments = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
     progress = None
-    with _retained_artifact_graph_calls_v3(model.worker)as artifact_call:
+    with retained_graph_calls_v3(model.worker)as artifact_call:
 
         def held(missing, *, reason_code=None):
             value = {"status": "held", **arguments, "missing_inputs": [missing]}
@@ -175,7 +151,7 @@ async def run_installed_post_c02_artifact_draft_v1(
 
 async def _run_installed_artifact_phase_model_v2(model, progress, *, c02_operation_id, source_ref, fresh_cause_hint, runtime):
     """Consume one real selected generation phase with its original once call."""
-    with _retained_artifact_graph_calls_v3(model.worker)as artifact_call:
+    with retained_graph_calls_v3(model.worker)as artifact_call:
         from ..model_broker.artifact_draft_v1 import ArtifactDraftPhaseSelectorV2, artifact_draft_model_ids_v2
         from ..runtime.d11_artifact_draft_model_v1 import (installed_artifact_draft_workflow_v2,
             execute_prepared_artifact_draft_model_v2)

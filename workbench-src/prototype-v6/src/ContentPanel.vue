@@ -4,7 +4,11 @@ import RelationsPanel from './RelationsPanel.vue'
 import OwnerArtifactPanel from './OwnerArtifactPanel.vue'
 import OwnerSourceNoteTaskPanel from './OwnerSourceNoteTaskPanel.vue'
 import ProjectControlsPanel from './ProjectControlsPanel.vue'
-import SourceCorrectionPanel from './SourceCorrectionPanel.vue'
+import GrowthReviewOwnerPanel from './GrowthReviewOwnerPanel.vue'
+import CommitmentCommunicationOwnerPanel from './CommitmentCommunicationOwnerPanel.vue'
+import CommitmentFulfillmentOwnerPanel from './CommitmentFulfillmentOwnerPanel.vue'
+import CharacterLaborRebuildOwnerPanel from './CharacterLaborRebuildOwnerPanel.vue'
+import SourcesPanel from './SourcesPanel.vue'
 import { VIEW_LABELS, type BackendController } from './use-backend.ts'
 import { ARCHIVE_META, CONTENT_STATUS_LABELS, dashboardLabel, ownerLabel, visibleProjection } from './access-content-state.ts'
 const props = defineProps<{ backend: BackendController; entryId: string }>()
@@ -21,7 +25,7 @@ const isLife = computed(() => props.entryId === 'demo-life')
 const isContact = computed(() => props.entryId === 'demo-contact')
 const isAccess = computed(() => props.entryId === 'demo-access')
 const offline = computed(() => state.value.mode === 'offline')
-const scope = ref(state.value.scope), correctingSourceId = ref('')
+const scope = ref(state.value.scope)
 const statusCopy = computed(() => isContact.value ? 'HOLD · 联系操作暂停' : offline.value ? '未连接 · 零后端请求' : state.value.auth !== 'authenticated' ? '未获授权 · 等待会话核验' : !props.backend.runtimeReadable.value && (meta.value.view || isAccess.value || isLife.value) ? '角色读取暂不可用 · 请核验运行状态' : !props.backend.scopeValid.value ? '等待授权角色范围' : isAccess.value ? `可用功能 · ${CONTENT_STATUS_LABELS[state.value.workspace.status]}` : isLife.value ? '项目控制 · 当前计划待核验' : !meta.value.view ? 'UNAVAILABLE · 内容未接入' : capability.value?.status === 'unavailable' ? '当前功能不可用' : CONTENT_STATUS_LABELS[loadStatus.value])
 const coverage = computed(() => currentProjection.value?.data.coverage === 'complete' ? '本次信息覆盖完整' : currentProjection.value?.coverage ? currentProjection.value.coverage.truncated ? '本次返回的信息已截断' : '本次返回的信息未截断' : '覆盖信息未公开')
 const readDisabled = computed(() => !props.backend.canRead.value || state.value.view.pending || capability.value?.status === 'unavailable')
@@ -30,10 +34,8 @@ const safeCode = (code: string) => /^[A-Za-z0-9_.:-]{1,128}$/.test(code) ? code 
 const routeLabel = (status: string) => ({ route_installed: '路由已安装', partial_route_installed: '路由部分安装', unavailable: '不可用' }[status] ?? '未核验')
 async function load() { if (meta.value.view) await props.backend.readView(meta.value.view) }
 function updateScope() { props.backend.setScope(scope.value) }
-watch(() => props.entryId, entryId => { correctingSourceId.value = ''; props.backend.selectArchive(entryId) }, { immediate: true, flush: 'sync' })
-watch(() => state.value.scope, value => { scope.value = value; correctingSourceId.value = '' })
-watch(() => state.value.auth, auth => { if (auth !== 'authenticated') correctingSourceId.value = '' }, { flush: 'sync' })
-watch(() => state.value.view.pending, pending => { if (pending) correctingSourceId.value = '' }, { flush: 'sync' })
+watch(() => props.entryId, entryId => { props.backend.selectArchive(entryId) }, { immediate: true, flush: 'sync' })
+watch(() => state.value.scope, value => { scope.value = value })
 onBeforeUnmount(() => props.backend.invalidateView())
 </script>
 <template>
@@ -51,28 +53,27 @@ onBeforeUnmount(() => props.backend.invalidateView())
         <template v-if="isAccess">
           <div v-if="catalogue" class="capability-summary">
             <dl class="catalogue-facts"><div><dt>命名空间</dt><dd>{{ catalogue.namespace.bot }}/{{ catalogue.namespace.persona }}</dd></div><div><dt>访问版本</dt><dd>{{ catalogue.access_generation }}</dd></div></dl>
-            <ul v-if="catalogue.views.length" class="capability-list"><li v-for="view in catalogue.views" :key="view.view_type"><div><strong>{{ VIEW_LABELS[view.view_type] }}</strong><small>{{ view.view_type }}</small></div><span class="capability-status" :class="{ available: view.status === 'available' }">{{ view.status === 'available' ? '可读取' : '不可用' }}</span></li></ul><p v-else class="empty-copy">当前授权目录没有返回公开视图。</p>
-            <div v-if="catalogue.view_diagnostics.length" class="catalogue-detail"><h4>视图读取状态</h4><dl><div v-for="diagnostic in catalogue.view_diagnostics" :key="diagnostic.view_type"><dt>{{ VIEW_LABELS[diagnostic.view_type] }}</dt><dd>{{ CONTENT_STATUS_LABELS[diagnostic.read_status] }}{{ diagnostic.coverage === 'partial' ? ' · 部分覆盖' : diagnostic.coverage === 'complete' ? ' · 完整覆盖' : '' }}</dd></div></dl></div>
+            <ul v-if="catalogue.views.length" class="capability-list"><li v-for="view in catalogue.views" :key="view.view_type"><div><strong>{{ VIEW_LABELS[view.view_type] }}</strong><small>{{ view.view_type }}</small></div><span class="capability-status" :class="{ available: view.status === 'readable_not_loaded' }">{{ view.status === 'readable_not_loaded' ? '入口可读取 · 尚未加载' : view.status === 'unsupported' ? '待接通来源读取' : '不可用' }}</span></li></ul><p v-else class="empty-copy">当前授权目录没有返回公开视图。</p>
+            <div v-if="catalogue.view_diagnostics.length" class="catalogue-detail"><h4>视图读取状态</h4><dl><div v-for="diagnostic in catalogue.view_diagnostics" :key="diagnostic.view_type"><dt>{{ VIEW_LABELS[diagnostic.view_type] }}</dt><dd>{{ diagnostic.read_status === 'readable_not_loaded' ? '尚未加载内容' : diagnostic.read_status === 'unsupported' ? '待接通来源读取' : '不可用' }} · {{ safeCode(diagnostic.reason_code) }}{{ diagnostic.coverage === 'partial' ? ' · 部分覆盖' : diagnostic.coverage === 'complete' ? ' · 完整覆盖' : '' }}</dd></div></dl></div>
             <div v-if="catalogue.command_routes.length" class="catalogue-detail"><h4>接口状态</h4><dl><div v-for="route in catalogue.command_routes" :key="route.action"><dt>{{ safeCode(route.action) }}</dt><dd>{{ routeLabel(route.status) }}</dd></div></dl><p class="boundary-note">功能入口存在不代表操作已执行，也不会解除主动联系 HOLD。</p></div>
             <p v-if="Object.keys(catalogue.unavailable_domains).length" class="boundary-note">部分领域暂不可用。这里只显示当前账户可查看的功能与状态。</p>
-            <RelationsPanel v-if="catalogue.views.some(view => view.view_type === 'relations' && view.status === 'available')" :backend="backend"/>
+            <RelationsPanel v-if="catalogue.views.some(view => view.view_type === 'relations' && view.status === 'readable_not_loaded')" :backend="backend"/>
           </div>
           <div v-else class="empty-state"><span aria-hidden="true">—</span><h4>{{ offline ? '可用功能尚未连接' : state.auth !== 'authenticated' ? '先核验所有者会话' : '尚未读取可用功能' }}</h4><p>当前账户可用的功能将在读取后显示。</p></div>
           <p v-if="state.workspace.status !== 'ready' && state.workspace.message" class="content-message" :role="state.workspace.status === 'error' ? 'alert' : 'status'">{{ state.workspace.message }}</p>
         </template>
+        <SourcesPanel v-else-if="meta.view === 'd06.memory_sources.v1'" :backend="backend"/>
         <template v-else-if="meta.view">
           <div v-if="currentProjection && count" class="record-list"><p class="record-meta">第 {{ backend.viewPaging.page }} 页 · 本次返回 {{ count }} 条 · {{ coverage }}</p>
             <article v-for="candidate in currentProjection.data.candidates" :key="candidate.plan_id + ':' + candidate.version" class="record-card"><h4>{{ candidate.plan_id }}</h4><dl><div><dt>方案标识 <small>plan_id</small></dt><dd>{{ candidate.plan_id }}</dd></div><div><dt>版本 <small>version</small></dt><dd>{{ candidate.version }}</dd></div><div><dt>作者资格 <small>authored</small></dt><dd>{{ candidate.authored ? '是（true）' : '否（false）' }}</dd></div><div><dt>组成数量 <small>block_count</small></dt><dd>{{ candidate.block_count }}</dd></div><div><dt>价值规则数量 <small>value_rule_count</small></dt><dd>{{ candidate.value_rule_count }}</dd></div></dl></article>
-            <article v-for="source in currentProjection.data.sources" :key="source.source_id" class="record-card"><h4>{{ source.source_id }}</h4><dl><div><dt>来源标识 <small>source_id</small></dt><dd>{{ source.source_id }}</dd></div><div><dt>来源类型 <small>source_kind</small></dt><dd>{{ source.source_kind }}</dd></div><div><dt>断言状态 <small>assertion_status</small></dt><dd>{{ source.assertion_status }}</dd></div><div><dt>记录时间 <small>recorded_at</small></dt><dd>{{ source.recorded_at }}</dd></div><div><dt>资格记录 <small>qualification</small></dt><dd>未记录 · not_recorded</dd></div></dl><button class="text-action" :disabled="!backend.canRead.value" @click="correctingSourceId = source.source_id">查看更正依据</button></article>
             <p v-if="currentProjection.coverage?.truncated || currentProjection.next_cursor" class="boundary-note">当前结果有截断或后续游标；返回条数不能视为全部记录。可使用下一页继续读取，页面只保留当前页。</p>
           </div>
           <div v-else class="empty-state"><span aria-hidden="true">{{ loadStatus === 'loading' ? '·' : '—' }}</span><h4>{{ offline ? '真实内容尚未连接' : state.auth !== 'authenticated' ? '角色内容尚未授权' : loadStatus === 'empty' ? '本次读取没有记录' : loadStatus === 'loading' ? '正在读取角色信息' : '尚无可查看的角色记录' }}</h4><p>{{ offline ? '离线界面只展示结构与字段说明。' : state.auth !== 'authenticated' ? '先完成会话核验，再读取当前范围。' : '读取结果、覆盖状态与错误会按后端实际返回显示。' }}</p></div>
           <p v-if="showMessage" class="content-message" :role="loadStatus === 'error' ? 'alert' : 'status'" aria-live="polite">{{ state.view.message }}</p>
           <div v-if="!currentProjection" class="field-catalogue"><h4>可查看的五项信息</h4><dl><div v-for="field in meta.fields" :key="field.key"><dt>{{ field.label }}</dt><dd>{{ field.key }}</dd></div></dl><p class="boundary-note">以上仅为信息类型说明，尚未读取真实记录。</p></div>
         </template>
-        <template v-else-if="isLife"><ProjectControlsPanel :backend="backend"/><OwnerArtifactPanel :backend="backend"/><OwnerSourceNoteTaskPanel :backend="backend"/></template>
+        <template v-else-if="isLife"><CharacterLaborRebuildOwnerPanel :backend="backend"/><CommitmentFulfillmentOwnerPanel :backend="backend"/><CommitmentCommunicationOwnerPanel :backend="backend"/><GrowthReviewOwnerPanel :backend="backend"/><ProjectControlsPanel :backend="backend"/><OwnerArtifactPanel :backend="backend"/><OwnerSourceNoteTaskPanel :backend="backend"/></template>
         <div v-else class="empty-state"><span aria-hidden="true">{{ isContact ? 'Ⅱ' : '—' }}</span><h4>{{ isContact ? '联系操作保持 HOLD' : '生活内容尚未接入' }}</h4><p>{{ meta.boundary }}</p></div>
-        <SourceCorrectionPanel v-if="meta.view === 'd06.memory_sources.v1' && backend.canRead.value" :backend="backend" :source-id="correctingSourceId" @select-source="correctingSourceId = $event"/>
       </div>
       <aside class="operations-column" aria-labelledby="archive-operations-title">
         <p class="section-kicker">03 / OPERATIONS</p><h3 id="archive-operations-title">{{ isContact ? '联系操作' : isLife ? '读取与控制' : '只读操作' }}</h3>
@@ -82,7 +83,7 @@ onBeforeUnmount(() => props.backend.invalidateView())
           <form v-if="state.auth === 'authenticated'" class="scope-form" @submit.prevent="updateScope"><label for="content-role-scope">授权角色范围</label><input id="content-role-scope" v-model="scope" placeholder="bot/persona" maxlength="192" autocomplete="off" spellcheck="false" :disabled="state.busy" aria-describedby="content-scope-hint"><p id="content-scope-hint" class="field-hint">按当前安装记录填写。后端仍需核验此范围。</p><button class="text-action" :disabled="state.busy || !scope.trim()" type="submit">应用范围</button></form>
           <template v-if="meta.view || isAccess || isLife"><button class="text-action" :disabled="!backend.management.canRuntime.value" @click="backend.management.checkRuntime">{{ backend.management.active.runtime ? '正在核验运行状态…' : '核验运行状态' }}</button><p class="field-hint" role="status">{{ backend.management.state.runtime.data ? `runtime_stage：${backend.management.state.runtime.data.stage} · reason_code：${backend.management.state.runtime.data.reason}` : '实际运行阶段尚未读取。' }}运行就绪只允许发起请求，角色权限仍由后端逐次核验。</p></template>
           <button class="read-action" :disabled="!backend.canRead.value || state.workspace.pending" @click="backend.openWorkspace">{{ state.workspace.pending ? '正在读取目录…' : catalogue ? '重新读取可用功能' : '读取可用功能' }}</button>
-          <button v-if="meta.view" class="read-action" :disabled="readDisabled" @click="load">{{ state.view.pending ? '正在读取信息…' : currentProjection ? '从第一页刷新档案' : ['error', 'stale', 'partial', 'unavailable', 'loading'].includes(loadStatus) ? '重试读取档案信息' : '发起授权只读读取' }}</button>
+          <button v-if="meta.view && meta.view !== 'd06.memory_sources.v1'" class="read-action" :disabled="readDisabled" @click="load">{{ state.view.pending ? '正在读取信息…' : currentProjection ? '从第一页刷新档案' : ['error', 'stale', 'partial', 'unavailable', 'loading'].includes(loadStatus) ? '重试读取档案信息' : '发起授权只读读取' }}</button>
           <button v-if="meta.view && currentProjection?.next_cursor" class="read-action" :disabled="!backend.canNextView.value" @click="backend.nextView">读取下一页</button>
           <p v-if="offline" class="field-hint">后端未连接，所有读取按钮停用。离线演示不会调用 API。</p><p v-else-if="state.auth !== 'authenticated'" class="field-hint">会话未核验，不显示保护内容。</p><p v-else-if="!backend.scopeValid.value" class="field-hint">需要有效的 bot/persona 才能发起只读请求。</p>
           <p v-if="state.workspace.status !== 'ready' && state.workspace.message && !isAccess" class="content-message" :role="state.workspace.status === 'error' ? 'alert' : 'status'">{{ state.workspace.message }}</p>

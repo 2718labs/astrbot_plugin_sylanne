@@ -5,6 +5,10 @@ from __future__ import annotations
 from dataclasses import asdict
 from contextlib import ExitStack, nullcontext
 import secrets
+from weakref import WeakKeyDictionary
+
+_D13_ACCOUNTING_PRODUCERS_V3 = WeakKeyDictionary()
+_D13_ACCOUNTING_ORIGINALS_V3 = WeakKeyDictionary()
 
 from ..runtime.restore_anchor import RestoreAnchor
 from ..runtime_contracts import canonical_digest
@@ -16,6 +20,7 @@ from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+from ..host.model_workflows_v10 import AdminModelWorkflowsV10,is_installed_ordinary_continuity_cognition_slot_v1
 from ..host.authority_profile import AdminIngressModelPolicy, AdminModelWorkflowsV2
 from ..model_broker.broker import ModelCallRequest
 from ..model_broker.first_ingress_encoding import (
@@ -36,12 +41,208 @@ from .v2_terminal_c02_recovery_contract import OriginalC02ResultKeyV1
 from .v2_fence_service import AuthorityV2FenceService
 
 
+
+_D13_ACCOUNTING_ISSUER_V3 = object()
+
+
+def install_d13_accounting_metadata_producer_v3(model_service, *, server, bundle):
+    """The named installed composition selects this metadata-only protocol."""
+    from weakref import ref
+    from .mtls_server import AuthorityRpcServer
+    from ..host.authority_profile import AdminInstallationBundle
+    from .d13_accounting_metadata_v3 import (
+        record_d13_admission_accounting_lineage_v3, record_d13_terminal_accounting_metadata_v3,
+        verify_recorded_d13_terminal_accounting_metadata_v3)
+    if (type(model_service) is not AuthorityV2ModelEgressService or type(server) is not AuthorityRpcServer
+            or type(bundle) is not AdminInstallationBundle or model_service._fences is None
+            or model_service._graph_verifier is None
+            or server._core is not model_service._fences.core
+            or server._v2_model_egress.get(model_service._fences.namespace) is not model_service
+            or server._v2_fences.get(model_service._fences.namespace) is not model_service._fences
+            or model_service._store._db is not server._core._db
+            or model_service._graph_verifier._artifact_draft_bundle is not bundle
+            or bundle.installation_policy.authority_namespace != model_service._fences.namespace):
+        raise AuthorityUnavailable('actual named same-Core model/accounting composition required')
+    db = model_service._store._db
+    if db.in_transaction:
+        raise AuthorityUnavailable('accounting producer installation must precede business transactions')
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+            ('authority_d13_provider_http_bindings_v1',)).fetchone() is None:
+        raise AuthorityUnavailable('selected accounting metadata protocol has no installed immutable store')
+    previous = _D13_ACCOUNTING_PRODUCERS_V3.get(model_service)
+    if previous is not None:
+        return require_installed_d13_accounting_metadata_producer_v3(
+            model_service, server=server, bundle=bundle)
+    producer = _InstalledD13AccountingProducerV3(_D13_ACCOUNTING_ISSUER_V3,
+        ref(model_service), ref(server), ref(bundle), model_service._graph_verifier._issuer,
+        record_d13_admission_accounting_lineage_v3, record_d13_terminal_accounting_metadata_v3,
+        verify_recorded_d13_terminal_accounting_metadata_v3)
+    _D13_ACCOUNTING_PRODUCERS_V3[model_service] = producer
+    return producer.require_v3(model_service, server=server, bundle=bundle)
+
+
+class _InstalledD13AccountingProducerV3:
+    def __init__(self, issuer, service, server, bundle, budget_issuer, admission_writer, terminal_writer, replay_verifier):
+        if issuer is not _D13_ACCOUNTING_ISSUER_V3:
+            raise TypeError('actual installed accounting producer required')
+        self.service, self.server, self.bundle, self.budget_issuer = service, server, bundle, budget_issuer
+        self.admission_writer, self.terminal_writer, self.replay_verifier = admission_writer, terminal_writer, replay_verifier
+
+    def require_v3(self, service, *, server, bundle):
+        if (_D13_ACCOUNTING_PRODUCERS_V3.get(service) is not self or self.service() is not service
+                or self.server() is not server or self.bundle() is not bundle
+                or server._core is not service._fences.core
+                or server._v2_model_egress.get(service._fences.namespace) is not service
+                or server._v2_fences.get(service._fences.namespace) is not service._fences
+                or service._store._db is not server._core._db
+                or service._graph_verifier._artifact_draft_bundle is not bundle
+                or service._graph_verifier._issuer is not self.budget_issuer):
+            raise AuthorityUnavailable('installed accounting producer changed actual service/policy/issuer')
+        return self
+
+    @property
+    def binding_digest(self):
+        service, server, bundle = self.service(), self.server(), self.bundle()
+        self.require_v3(service, server=server, bundle=bundle)
+        return canonical_digest(('sylanne3.d13.installed-model-accounting-producer.v3',
+            service._fences.namespace, bundle.installation_policy.installation_id,
+            bundle.installation_policy.manifest_digest, canonical_digest(bundle.installation_policy)))
+
+
+def require_installed_d13_accounting_metadata_producer_v3(model_service, *, server, bundle):
+    producer = _D13_ACCOUNTING_PRODUCERS_V3.get(model_service)
+    if type(producer) is not _InstalledD13AccountingProducerV3:
+        raise AuthorityUnavailable('new accounting cohort lacks its actual installed model producer')
+    return producer.require_v3(model_service, server=server, bundle=bundle)
+
+
+class _ActualD13AccountingModelOriginalV3:
+    def __init__(self, issuer, kind, service, db, intent, admission, permit,
+                 *, request=None, report=None, record=None, terminal_receipt=None):
+        from threading import get_ident
+        if issuer is not _D13_ACCOUNTING_ISSUER_V3 or kind not in ('admission', 'terminal', 'terminal_replay'):
+            raise TypeError('actual model lifecycle accounting producer required')
+        self.kind, self.service, self.db = kind, service, db
+        self.intent, self.admission, self.permit = intent, admission, permit
+        self.request, self.report, self.record, self.receipt = request, report, record, terminal_receipt
+        self.thread = get_ident()
+        self.producer = _D13_ACCOUNTING_PRODUCERS_V3[service]
+        _D13_ACCOUNTING_ORIGINALS_V3[self] = self._identity_v3()
+
+    def _identity_v3(self):
+        return (self.kind, self.service, self.db, self.intent, self.admission, self.permit,
+                self.request, self.report, self.record, self.receipt, self.thread, self.producer)
+
+    def release_v3(self):
+        _D13_ACCOUNTING_ORIGINALS_V3.pop(self, None)
+        self.service = self.db = self.intent = self.admission = self.permit = None
+        self.request = self.report = self.record = self.receipt = self.producer = None
+
+
+def _require_d13_accounting_model_original_v3(proof, kind):
+    from threading import get_ident
+    if (type(proof) is not _ActualD13AccountingModelOriginalV3
+            or _D13_ACCOUNTING_ORIGINALS_V3.get(proof) != proof._identity_v3()
+            or proof.kind != kind or proof.thread != get_ident()):
+        raise AuthorityUnavailable('actual same-transaction model accounting original required')
+    service, db = proof.service, proof.db
+    producer = proof.producer
+    server, bundle = producer.server(), producer.bundle()
+    producer.require_v3(service, server=server, bundle=bundle)
+    if (db is not service._fences.core._db or not db.in_transaction
+            or not service._fences.core._lock._is_owned()
+            or proof.admission.installation_id != bundle.installation_policy.installation_id):
+        raise AuthorityUnavailable('model accounting original left its actual Core transaction')
+    actual, report_digest, receipt = service._store.read_admission_locked(db, proof.intent)
+    if actual != proof.admission:
+        raise AuthorityUnavailable('model accounting producer lost its actual immutable admission')
+    row = service._fences.fences._row(db, proof.intent.operation_id)
+    if (row is None or service._fences.fences._permit(row) != proof.permit
+            or proof.permit.subject != proof.intent.subject or row[10] is not None):
+        raise AuthorityUnavailable('model accounting producer lost its actual original model fence')
+    if kind == 'admission':
+        if (type(proof.request) is not ModelCallRequest or report_digest is not None or receipt is not None
+                or row[6] != 'active'):
+            raise AuthorityUnavailable('accounting admission lineage is not the actual first dispatch')
+    else:
+        ledger = db.execute('SELECT state,observation_digest FROM authority_model_egress_v1 WHERE call_id=?',
+            (proof.intent.call_id,)).fetchone()
+        if (type(proof.report) is not HostObservedModelCompletionV2
+                or receipt != proof.receipt or report_digest != proof.receipt.report_digest
+                or ledger != ('observed', proof.receipt.observation_digest)
+                or proof.record.state != 'observed' or proof.record.intent != proof.intent
+                or proof.record.usage != proof.report.usage or proof.record.cost != proof.report.cost
+                or proof.record.observation_digest != proof.receipt.observation_digest
+                or row[6] != 'finished' or row[8:10] != (proof.intent.call_id, proof.receipt.finish_digest)):
+            raise AuthorityUnavailable('accounting terminal is not its actual observed/finished Core original')
+    return service, db, bundle, producer.budget_issuer._signer
+
+
+def require_actual_d13_admission_accounting_producer_v3(proof):
+    service, db, bundle, signer = _require_d13_accounting_model_original_v3(proof, 'admission')
+    return service, db, proof.intent, proof.request, proof.admission, proof.permit, bundle, signer
+
+
+def require_actual_d13_terminal_accounting_producer_v3(proof):
+    service, db, bundle, signer = _require_d13_accounting_model_original_v3(proof, 'terminal')
+    return (service, db, proof.intent, proof.admission, proof.report, proof.record,
+            proof.receipt, bundle, signer)
+
+
+
+def require_actual_d13_terminal_accounting_replay_v3(proof):
+    service, db, bundle, signer = _require_d13_accounting_model_original_v3(proof, 'terminal_replay')
+    return (service, db, proof.intent, proof.admission, proof.report, proof.record,
+            proof.receipt, bundle, signer)
+
+
+def _record_actual_d13_admission_accounting_v3(service, db, *, intent, request, admission, permit):
+    if service not in _D13_ACCOUNTING_PRODUCERS_V3 or request is None or admission is None:
+        return
+    from ..runtime_storage_v3 import runtime_storage_operation_v3
+    proof = _ActualD13AccountingModelOriginalV3(_D13_ACCOUNTING_ISSUER_V3,
+        'admission', service, db, intent, admission, permit, request=request)
+    try:
+        with runtime_storage_operation_v3(db, operation_id=intent.call_id + ':accounting-admission-v3'):
+            proof.producer.admission_writer(proof)
+    finally:
+        proof.release_v3()
+
+
+def _record_actual_d13_terminal_accounting_v3(service, db, *, intent, admission, report, record, receipt, permit):
+    if service not in _D13_ACCOUNTING_PRODUCERS_V3:
+        return
+    from ..runtime_storage_v3 import runtime_storage_operation_v3
+    proof = _ActualD13AccountingModelOriginalV3(_D13_ACCOUNTING_ISSUER_V3,
+        'terminal', service, db, intent, admission, permit,
+        report=report, record=record, terminal_receipt=receipt)
+    try:
+        with runtime_storage_operation_v3(db, operation_id=intent.call_id + ':accounting-terminal-v3'):
+            proof.producer.terminal_writer(proof)
+    finally:
+        proof.release_v3()
+
+
+def _verify_actual_d13_terminal_accounting_v3(service, db, *, intent, admission, report, record, receipt, permit):
+    if service not in _D13_ACCOUNTING_PRODUCERS_V3:
+        return
+    from ..runtime_storage_v3 import runtime_storage_operation_v3
+    proof = _ActualD13AccountingModelOriginalV3(_D13_ACCOUNTING_ISSUER_V3,
+        'terminal_replay', service, db, intent, admission, permit,
+        report=report, record=record, terminal_receipt=receipt)
+    try:
+        with runtime_storage_operation_v3(db, operation_id=intent.call_id + ':accounting-replay-v3'):
+            proof.producer.replay_verifier(proof)
+    finally:
+        proof.release_v3()
+
+
 class AuthorityV2ModelEgressService:
     def __init__(self, store: AuthorityV2ModelEgressStore,
                  fences: AuthorityV2FenceService | None = None, *,
                  graph_verifier: PinnedCurrentModelEgressGraphVerifier | None = None,
                  admin_model_policy: (AdminIngressModelPolicy | AdminModelWorkflowsV2 |
-                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | None) = None,
+                                      AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | AdminModelWorkflowsV10 | None) = None,
                  source_location=None):
         if type(store) is not AuthorityV2ModelEgressStore:
             raise TypeError("Authority-owned model egress store required")
@@ -53,7 +254,7 @@ class AuthorityV2ModelEgressService:
                 and type(graph_verifier) is not PinnedCurrentModelEgressGraphVerifier):
             raise TypeError("administrator-pinned model egress graph verifier required")
         if (admin_model_policy is not None
-                and type(admin_model_policy) not in (AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)):
+                and type(admin_model_policy) not in (AdminIngressModelPolicy, AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)):
             raise TypeError("administrator-installed model policy required")
         self._store = store
         self._fences = fences
@@ -88,7 +289,7 @@ class AuthorityV2ModelEgressService:
         from .d13_core_counter_service_v1 import InstalledD13CoreCounterServiceV1
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         if (type(counter) is not InstalledD13CoreCounterServiceV1
-                or type(self._admin_model_policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+                or type(self._admin_model_policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 or counter.core._db is not self._store._db or counter.fences is not self._fences
                 or self._d13_provider_http_counter_v1 is not None):
             raise AuthorityUnavailable('provider HTTP counter must be the exact installed model/Core instance')
@@ -123,6 +324,8 @@ class AuthorityV2ModelEgressService:
             self._source_location.require_current_in_tx_v1(db,location)
             from .d12_lifecycle_gate_v1 import require_lifecycle_admission_in_tx_v1
             require_lifecycle_admission_in_tx_v1(db,intent.namespace,action='first_model_dispatch')
+            from .d13_original_owner_v3 import require_d13_natural_model_execution_in_tx_v3
+            require_d13_natural_model_execution_in_tx_v3(db, self, intent)
             from .d13_provider_http_admission_v1 import record_observed_provider_http_v1
             return record_observed_provider_http_v1(db,counter=counter,intent=intent,admission=admission,
                 actual_content=content,now_utc=self._graph_verifier._clock())
@@ -161,7 +364,7 @@ class AuthorityV2ModelEgressService:
             TEMPLATE_DIGEST, TEMPLATE_VERSION, WORK_KIND, artifact_draft_from_wire_v1,
             artifact_draft_model_ids_v1, artifact_draft_provider_messages_v1)
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle
@@ -220,7 +423,7 @@ class AuthorityV2ModelEgressService:
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.artifact_draft_paired_policy_v4 import AdminArtifactDraftPairedPolicyV4, require_paired_phase_frozen_target_v4
         verifier = self._graph_verifier
-        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+        if verifier is None or type(self._admin_model_policy) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
             return False
         bundle = verifier._artifact_draft_bundle
         if (type(bundle) is not AdminInstallationBundle or bundle.model_workflows is not self._admin_model_policy
@@ -281,7 +484,7 @@ class AuthorityV2ModelEgressService:
                 return self._artifact_draft_admin_matches_v2(intent, request)
             return self._artifact_draft_admin_matches_v1(intent, request)
         authority = request.envelope.authority
-        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+        if type(policy) in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
             if request.identity.phase == "d13.precompress":
                 from ..model_broker.d13_precompression import (
                     TEMPLATE_DIGEST as D13_TEMPLATE_DIGEST,
@@ -317,13 +520,22 @@ class AuthorityV2ModelEgressService:
                 )
             if authority.purpose=="consolidation" and request.identity.phase=="d07.cognition":
                 from ..model_broker.general_growth_cognition_v1 import TEMPLATE_VERSION as GENERAL_VERSION,TEMPLATE_DIGEST as GENERAL_DIGEST
-                if type(policy) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9) or request.prompt_template_digest!=GENERAL_DIGEST:
+                if type(policy) not in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
                     return False
                 verifier=self._graph_verifier
                 if verifier is None:return False
                 workflow=verifier.read_current_named_d07_model_workflow_v3(intent,request,source_material=d07_source_material)
-                if workflow is not policy.general_growth_cognition:return False
-                expected=("d07.cognition","consolidation",GENERAL_VERSION,GENERAL_DIGEST)
+                phases=tuple(phase for phase in("ordinary_screen","deep_review")
+                    if is_installed_ordinary_continuity_cognition_slot_v1(self._graph_verifier._artifact_draft_bundle,workflow,phase))
+                if phases:
+                    from ..model_broker.ordinary_continuity_cognition_v1 import (
+                        ordinary_continuity_template_v1,ordinary_continuity_template_digest_v1)
+                    if len(phases)!=1:return False
+                    expected=("d07.cognition","consolidation",ordinary_continuity_template_v1(phases[0])[0],
+                        ordinary_continuity_template_digest_v1(phases[0]))
+                else:
+                    if workflow is not policy.general_growth_cognition or request.prompt_template_digest!=GENERAL_DIGEST:return False
+                    expected=("d07.cognition","consolidation",GENERAL_VERSION,GENERAL_DIGEST)
             elif authority.purpose == "proposal":
                 if request.identity.phase == "context_reply":
                     from ..model_broker.context_reply import (
@@ -358,7 +570,7 @@ class AuthorityV2ModelEgressService:
                         TEMPLATE_VERSION, TEMPLATE_DIGEST = V6_TEMPLATE_VERSION, V6_TEMPLATE_DIGEST
                     from ..model_broker.natural_reply_history_v7 import TEMPLATE_DIGEST as V7_TEMPLATE_DIGEST,TEMPLATE_VERSION as V7_TEMPLATE_VERSION
                     if request.prompt_template_digest==V7_TEMPLATE_DIGEST:
-                        if type(policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
+                        if type(policy) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} or workflow is None or workflow.template_version!=V7_TEMPLATE_VERSION:
                             raise AuthorityUnavailable('V7 natural wire requires its actual named installed V7 workflow')
                         TEMPLATE_VERSION,TEMPLATE_DIGEST=V7_TEMPLATE_VERSION,V7_TEMPLATE_DIGEST
                     expected = ("natural_generation", "proposal",
@@ -377,7 +589,7 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.contact_expression_v1 import (GENERATION_TEMPLATE_VERSION,
                         GENERATION_TEMPLATE_DIGEST, REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
                         REVIEW_TEMPLATE_DIGEST as CONTACT_REVIEW_DIGEST)
-                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+                    if type(policy) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
                         from ..model_broker.contact_expression_v2 import (
                             GENERATION_TEMPLATE_VERSION, GENERATION_TEMPLATE_DIGEST,
                             REVIEW_TEMPLATE_VERSION as CONTACT_REVIEW_VERSION,
@@ -397,13 +609,13 @@ class AuthorityV2ModelEgressService:
                     from ..model_broker.d07_cognition_v1 import D07_COGNITION_TEMPLATE_DIGESTS_V1
                     workflow = policy.d07_cognition
                     from ..model_broker.d07_cognition_v1 import TEMPLATE_DIGEST
-                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and request.prompt_template_digest == TEMPLATE_DIGEST:
+                    if type(policy) in {AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and request.prompt_template_digest == TEMPLATE_DIGEST:
                         verifier = self._graph_verifier
                         if verifier is None:
                             return False
                         workflow = verifier.read_current_named_d07_model_workflow_v3(intent, request,source_material=d07_source_material)
                         installed_named = (policy.d07_cognition,policy.d07_relationship_cognition,)
-                        if type(policy)in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+                        if type(policy)in {AdminModelWorkflowsV6,AdminModelWorkflowsV7,AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
                             installed_named += (policy.growth_cognition,)
                         if workflow is None or not any(workflow is named for named in installed_named):
                             return False
@@ -420,13 +632,13 @@ class AuthorityV2ModelEgressService:
             else:
                 if request.identity.phase == "internal_life_content_v2":
                     from ..model_broker.internal_life_content_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
                         return False
                     workflow = policy.life_content
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
                 elif request.identity.phase == "internal_life_numeric_v1":
                     from ..model_broker.internal_life_numeric_v1 import WORK_KIND, TEMPLATE_VERSION, TEMPLATE_DIGEST
-                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+                    if type(policy) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
                         return False
                     workflow = policy.life_numeric
                     expected = (WORK_KIND, "consolidation", TEMPLATE_VERSION, TEMPLATE_DIGEST)
@@ -1120,6 +1332,8 @@ class AuthorityV2ModelEgressService:
                     from .model_capacity_v1 import require_model_capacity_locked_v1
                     require_model_capacity_locked_v1(db,self._fences.namespace,
                         exclude=(intent.namespace,intent.call_id,intent.operation_id,intent.request_digest))
+                    from .d13_original_owner_v3 import require_d13_natural_model_execution_in_tx_v3
+                    require_d13_natural_model_execution_in_tx_v3(db, self, intent)
                     record = self._store._record_dispatch_started_fenced_locked(
                         db, intent, permit, self._fences.fences, anchor)
                     if admission is not None:
@@ -1131,6 +1345,8 @@ class AuthorityV2ModelEgressService:
                             from .d13_provider_http_admission_v1 import stage_expected_provider_http_v1
                             stage_expected_provider_http_v1(db,counter=self._d13_provider_http_counter_v1,
                                 intent=intent,request=request,admission=admission,now_utc=self._graph_verifier._clock())
+                    _record_actual_d13_admission_accounting_v3(self,db,intent=intent,request=request,
+                        admission=admission,permit=permit)
                     if request is not None and request.identity.phase == "d07.cognition":
                         from .d07_model_timing_v1 import record_d07_model_start_locked_v1
                         record_d07_model_start_locked_v1(db, intent, admission)
@@ -1216,7 +1432,7 @@ class AuthorityV2ModelEgressService:
             saved, report_digest, receipt = self._store.read_admission_locked(db, intent)
             if saved != admission:
                 raise AuthorityUnavailable("original model admission differs")
-            if type(self._admin_model_policy) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and intent.job_id.startswith('natural-generation-job:'):
+            if type(self._admin_model_policy) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and intent.job_id.startswith('natural-generation-job:'):
                 if self._d13_provider_http_counter_v1 is None:
                     raise AuthorityUnavailable('V7 completion requires actual installed HTTP original verifier')
                 from .d13_provider_http_admission_v1 import require_recorded_provider_http_binding_v1
@@ -1232,7 +1448,10 @@ class AuthorityV2ModelEgressService:
                     or row is None or row[6] != "finished"
                     or (row[8], row[9]) != (intent.call_id, receipt.finish_digest)):
                 raise AuthorityUnavailable("model terminal replay conflicts")
-            return record, self._fences.fences._permit(row), receipt
+            saved_permit = self._fences.fences._permit(row)
+            _verify_actual_d13_terminal_accounting_v3(self,db,intent=intent,admission=admission,
+                report=report,record=record,receipt=receipt,permit=saved_permit)
+            return record, saved_permit, receipt
 
         with self._fences.core._tx() as db:
             replay = checked_replay(db)
@@ -1265,6 +1484,8 @@ class AuthorityV2ModelEgressService:
             self._store.record_terminal_receipt_locked(db, admission, receipt)
             from .d07_model_timing_v1 import record_d07_model_end_locked_v1
             record_d07_model_end_locked_v1(db, intent, receipt)
+            _record_actual_d13_terminal_accounting_v3(self,db,intent=intent,admission=admission,
+                report=report,record=record,receipt=receipt,permit=permit)
             return record, permit, receipt
 
     async def begin_handoff(self, request, request_digest):

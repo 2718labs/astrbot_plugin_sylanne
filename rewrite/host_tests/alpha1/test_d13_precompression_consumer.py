@@ -116,6 +116,8 @@ async def test_installed_d13_consumer_acquires_and_completes_original(monkeypatc
     assert graph.events == [
         ("grant", holder, "d11"),
         ("acquire", holder, "original-job", 30),
+        "release",
+        ("grant", holder, "d11"),
         ("complete", holder, "original-job", 7),
         "release",
     ]
@@ -179,48 +181,54 @@ async def test_live_c02_queues_background_then_prepares_natural_without_waiting(
 
 
 @pytest.mark.asyncio
-async def test_optional_d13_drain_runs_without_blocking_reply_task(monkeypatch):
-    from astrbot.api.star import Context
-    from rewrite.host_tests.alpha1.test_runtime_bootstrap import load_plugin_module
+async def test_optional_d13_drain_runs_without_blocking_reply_task():
+    """Execute actual Main method; this unit does not load or certify the Host."""
+    import ast
+    import logging
+    from pathlib import Path
+    from sylanne3.runtime.d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+    from sylanne3.runtime_contracts import NamespaceId
 
-    module = load_plugin_module()
+    root = Path(__file__).resolve().parents[3]
+    tree = ast.parse((root / "main.py").read_text())
+    method = next(node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)
+                  and node.name == "_drain_d13_precompression_v2")
     events = []
     release = asyncio.Event()
-
     class Runtime:
+        async def inspect_d13_precompression_priority_v1(self, **_kwargs):
+            events.append("priority")
+            return D13PrecompressionPriorityV1("no_outstanding_paid", NamespaceId("bot", "persona"),
+                "scene:one", "conversation", None, None, None, None, "a" * 64, "paid_metadata_complete_absence")
         async def schedule_d13_deterministic_precompression_v2(self, **_kwargs):
             events.append("schedule")
             return object(), SimpleNamespace(job_id="original-job")
-
         async def consume_d13_deterministic_precompression_job_v2(self, **_kwargs):
             events.append("consume")
-            return object()
-
+            return object(), object(), SimpleNamespace(job_id="original-job", phase="completed")
+    async def paid(*_args, **_kwargs):
+        pytest.fail("metadata absence must go deterministic before constructing a paid executor")
+    namespace = {"asyncio": asyncio, "RuntimeContext": RuntimeContext,
+                 "V2InstallationAssembly": object, "logger": logging.getLogger(__name__),
+                 "run_installed_d13_paid_precompression_v1": paid}
+    module = ast.fix_missing_locations(ast.Module(body=[method], type_ignores=[]))
+    exec(compile(module, str(root / "main.py"), "exec"), namespace)
+    runtime, installation = Runtime(), object()
+    envelope = SimpleNamespace(conversation_ref="conversation")
+    plugin = SimpleNamespace(_runtime=runtime, _v2_installation=installation,
+        _encoding_stopping=False, _d13_scan_needed=False, _d13_pending_expiries={},
+        _d13_pending_schedules={"ingress-original": (envelope, "trusted-umo")},
+        _d13_pending_jobs={}, _d13_attempted_jobs=set(), _d13_drain_task=None)
     async def reply():
         await release.wait()
-
-    plugin = module.Sylanne3Plugin(
-        Context(asyncio.Queue(), {}, None, None, None, None, None, None, None, None, None),
-        {"enabled": True})
-    async def no_paid_configuration(*_args, **_kwargs):
-        return None
-    monkeypatch.setattr(module, "run_installed_d13_paid_precompression_v1", no_paid_configuration)
-    runtime = Runtime()
-    installation = SimpleNamespace(
-        installation_policy=SimpleNamespace(namespace=module.NamespaceId("bot", "persona")))
-    plugin._runtime = runtime
-    plugin._v2_installation = installation
     reply_task = asyncio.create_task(reply())
-    plugin._reply_tasks[reply_task] = "reply-job"
-    envelope = SimpleNamespace(namespace=installation.installation_policy.namespace,
-                               conversation_ref="conversation")
     try:
-        plugin._queue_d13_schedule_v2(
-            runtime, installation, "ingress-original", envelope, trusted_umo="trusted-umo")
-        await plugin._d13_drain_task
+        task = asyncio.create_task(namespace["_drain_d13_precompression_v2"](plugin, runtime, installation))
+        plugin._d13_drain_task = task
+        await task
         assert not reply_task.done()
-        assert events == ["schedule", "consume"]
-        release.set()
+        assert events == ["priority", "schedule", "consume"]
+        assert plugin._d13_pending_jobs == {}
     finally:
         release.set()
         await reply_task

@@ -15,8 +15,9 @@ from ..domains.d01.production_operations_v1 import plain_v1, require_locator_v1,
 from ..domains.d01 import PersonaDomain
 from ..domains.d02 import BodyDomain
 from ..domains.d02.body_quote_original import FixedBodyPolicyV1
+from ..domains.d02.character_labor_v1 import CharacterLaborPolicyV1
 from ..domains.d05.relationship import RelationshipProvider
-from ..domains.d08.execution import Goal, GoalExecutionProvider
+from ..domains.d08.execution import Aspiration, Commitment, Goal, GoalExecutionProvider
 from ..domains.d10 import (
     ActivityRecipe, ContactPolicy, LifeDomain, LifeProject, ProactiveOpportunity,
     contact_policy_graph_write, proactive_opportunity_graph_write,
@@ -28,8 +29,10 @@ from .d02_production_operations_v1 import PassiveBodyPolicyV1, SettledBodyEffect
 from .d05_production_operations_v1 import InstalledRelationshipPolicyV1, BoundaryIntentOriginalV1
 from ..domains.d05.relationship_revision_v2 import InstalledRelationshipPolicyV2
 from .d08_production_operations_v1 import JointPlanIntentOriginalV1, PartyConsentEvidenceV1
+from ..domains.d08.commitment_fulfillment_v1 import CreateCurrentCommitmentWithFulfillmentTermsInputRequestV1, RegisterCurrentCommitmentTermsCommunicationInputRequestV1
+from ..domains.d08.commitment_communication_v1 import RegisterCurrentCommitmentCommunicationInputRequestV1
 from .d10_production_operations_v1 import RegisteredLifePlanV1, RegisteredLifeOutcomeV1, RegisteredOfflineIntervalV1
-from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2
+from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredLifeOutcomeV2, RegisteredCharacterLaborLifePlanV1
 from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
 from .domain_production_contracts_v1 import ProductionPolicyRefV1, ProductionQueryCoverageV1, StagedDomainOperationV1
 from .d07_execution_v1 import D07SemanticQuestionV1, D07RelationshipSemanticQuestionV2
@@ -94,6 +97,15 @@ class InstallCurrentBodyEffectInputRequestV1:
 
 
 @dataclass(frozen=True, slots=True)
+class InstallCurrentCharacterLaborPolicyInputV1:
+    policy: CharacterLaborPolicyV1
+
+    def __post_init__(self):
+        if type(self.policy)is not CharacterLaborPolicyV1:
+            raise TypeError('explicit installed character-labor policy required')
+
+
+@dataclass(frozen=True, slots=True)
 class RecordCurrentBodyComponentInputRequestV1:
     component: CompletedActionBodyComponentV1
 
@@ -125,6 +137,45 @@ class RegisterCurrentPartyConsentInputRequestV1:
 class CreateCurrentGoalInputRequestV1:
     source_ref: str
     goal: Goal
+
+
+@dataclass(frozen=True, slots=True)
+class CreateCurrentAspirationInputRequestV1:
+    aspiration: Aspiration
+
+    def __post_init__(self):
+        if type(self.aspiration) is not Aspiration or self.aspiration.revision != 1:
+            raise ValueError("aspiration birth requires its exact initial typed Owner record")
+        keys = tuple(AtomKey.from_token(ref) for ref in self.aspiration.source_refs)
+        if (any(key.type_name != "memory.source" for key in keys)
+                or len({NamespaceId.from_key(key) for key in keys}) != 1):
+            raise ValueError("aspiration roots require canonical actual Sources in one namespace")
+
+
+@dataclass(frozen=True, slots=True)
+class CreateCurrentCommitmentInputRequestV1:
+    commitment_id: str
+    counterparty_ref: str
+    semantic_scope: str
+    establishment_kind: str
+    source_refs: tuple[str, ...]
+    deadline_ref: str | None = None
+
+    def __post_init__(self):
+        require_locator_v1(self.commitment_id, "commitment_id")
+        require_locator_v1(self.counterparty_ref, "counterparty_ref")
+        require_locator_v1(self.semantic_scope, "semantic_scope")
+        if (not self.commitment_id.startswith("commitment:")
+                or not self.counterparty_ref.startswith("entity:")
+                or self.establishment_kind not in {"unilateral", "bilateral"}
+                or type(self.source_refs) is not tuple or not self.source_refs
+                or len(set(self.source_refs)) != len(self.source_refs)):
+            raise ValueError("commitment creation requires exact private intent and actual Source roots")
+        for ref in self.source_refs:
+            if AtomKey.from_token(ref).type_name != "memory.source":
+                raise ValueError("commitment intent roots must be actual D06 Sources")
+        if self.deadline_ref is not None:
+            require_locator_v1(self.deadline_ref, "deadline_ref")
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +211,17 @@ class RegisterCurrentLifeOutcomeInputRequestV1:
 class RegisterCurrentLifePlanInputRequestV2:
     original_ref: str
     plan: RegisteredLifePlanV2
+
+
+@dataclass(frozen=True, slots=True)
+class RegisterCurrentCharacterLaborLifePlanInputV1:
+    original_ref: str
+    plan: RegisteredCharacterLaborLifePlanV1
+
+    def __post_init__(self):
+        require_locator_v1(self.original_ref,"character labor plan original_ref")
+        if type(self.plan)is not RegisteredCharacterLaborLifePlanV1:
+            raise TypeError('explicit independent character-labor plan required')
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,10 +294,16 @@ _PRODUCERS = {
     "initialize_body": ("d02", InstallCurrentBodyInputRequestV1),
     "install_passive_body_policy": ("d02", InstallCurrentPassiveBodyInputRequestV1),
     "install_body_effect_policy": ("d02", InstallCurrentBodyEffectInputRequestV1),
+    "install_character_labor_policy_v1": ("d02", InstallCurrentCharacterLaborPolicyInputV1),
     "record_body_component": ("d02", RecordCurrentBodyComponentInputRequestV1),
     "install_relationship_policy": ("d05", InstallCurrentRelationshipInputRequestV1),
     "register_boundary_intent": ("d05", RegisterCurrentBoundaryInputRequestV1),
     "create_goal": ("d08", CreateCurrentGoalInputRequestV1),
+    "create_aspiration": ("d08", CreateCurrentAspirationInputRequestV1),
+    "create_commitment": ("d08", CreateCurrentCommitmentInputRequestV1),
+    "create_commitment_with_fulfillment_terms": ("d08", CreateCurrentCommitmentWithFulfillmentTermsInputRequestV1),
+    "register_commitment_communication": ("d08", RegisterCurrentCommitmentCommunicationInputRequestV1),
+    "register_commitment_terms_communication": ("d08", RegisterCurrentCommitmentTermsCommunicationInputRequestV1),
     "register_joint_plan_intent": ("d08", RegisterCurrentJointPlanInputRequestV1),
     "register_party_consent": ("d08", RegisterCurrentPartyConsentInputRequestV1),
     "create_life_project": ("d10", CreateCurrentLifeProjectInputRequestV1),
@@ -244,6 +312,7 @@ _PRODUCERS = {
     "register_life_plan": ("d10", RegisterCurrentLifePlanInputRequestV1),
     "register_life_outcome": ("d10", RegisterCurrentLifeOutcomeInputRequestV1),
     "register_life_plan_v2": ("d10", RegisterCurrentLifePlanInputRequestV2),
+    "register_character_labor_life_plan_v1": ("d10", RegisterCurrentCharacterLaborLifePlanInputV1),
     "register_artifact_draft_plan_v3": ("d10", RegisterCurrentDraftFilePlanInputRequestV3),
     "register_artifact_phase_draft_plan_v2": ("d10", RegisterCurrentPhaseDraftFilePlanInputRequestV2),
     "register_life_outcome_v2": ("d10", RegisterCurrentLifeOutcomeInputRequestV2),
@@ -275,10 +344,10 @@ def input_operation_for_request_v1(producer_kind):
     domain, request_type = _PRODUCERS[producer_kind]
     capability = ("d02.body_policy.install" if producer_kind == "initialize_body" else
         "workbench.activate" if producer_kind in {
-            "install_passive_body_policy", "install_body_effect_policy",
+            "install_passive_body_policy", "install_body_effect_policy", "install_character_labor_policy_v1",
             "install_relationship_policy", "set_contact_policy", "register_offline_schedule",
             "register_artifact_phase_price_policy", "register_identity_plasticity_policy_v3",
-            "register_identity_trial_observer_policy_v3"} else "workbench.create")
+            "register_identity_trial_observer_policy_v3", "register_commitment_communication"} else "workbench.create")
     return DomainInputProducerRegistrationV1(domain, producer_kind, request_type, capability)
 
 
@@ -326,6 +395,14 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
             (request.policy_ref,) if request.expected_revision else ())
     if producer_kind in IDENTITY_INPUT_KINDS_V3:
         return read_plan_identity_input_v3(db,namespace=namespace,producer_kind=producer_kind,request=request)
+    if producer_kind=='register_boundary_intent':
+        from .current_relationship_source_read_v3 import read_plan_relationship_source_v3
+        return read_plan_relationship_source_v3(db,namespace=namespace,activity_id=activity_id,
+            operation_kind='input:register_boundary_intent',request=request)
+    if producer_kind in {"create_aspiration", "create_commitment", "create_commitment_with_fulfillment_terms", "register_commitment_communication", "register_commitment_terms_communication"}:
+        from .current_commitment_input_source_v3 import commitment_input_read_plan_v3
+        return commitment_input_read_plan_v3(db, namespace=namespace, activity_id=activity_id,
+            operation_kind="input:" + producer_kind, request=request)
     types, keys, roots, originals = [], [owner_grant_key(*namespace.as_tuple)], [], []
     persona = Owner("persona", *namespace.as_tuple)
     if registration.domain == "d01":
@@ -401,10 +478,12 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         if request.policy.profile.namespace != namespace:
             raise ValueError("body input namespace differs from the real Owner")
         keys += [BodyDomain.profile_write(request.policy.profile).key, BodyDomain.state_write(namespace, request.policy.initial_state).key]
-    elif producer_kind in {"install_passive_body_policy", "install_body_effect_policy"}:
+    elif producer_kind in {"install_passive_body_policy", "install_body_effect_policy", "install_character_labor_policy_v1"}:
         if request.policy.namespace != namespace:
             raise ValueError("body policy namespace differs from real Owner")
         keys += [AtomKey(persona, "d02.body_profile.v1", request.policy.profile_id), AtomKey(persona, "d02.body_state.v1", request.policy.profile_id)]
+        if producer_kind=='install_character_labor_policy_v1':
+            keys.append(AtomKey.from_token(request.policy.recipe_ref))
     elif producer_kind == "record_body_component":
         component = request.component
         keys += [AtomKey.from_token(getattr(component, name)) for name in ("action_intent_ref", "action_outcome_ref", "reservation_ref", "settlement_ref")]
@@ -415,12 +494,6 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         if type(request.policy) is InstalledRelationshipPolicyV2:
             roots.extend(request.policy.policy_source_refs)
             roots.extend(rule.authored_prior_source_ref for rule in request.policy.dimension_rules if rule.authored_prior_source_ref is not None)
-    elif producer_kind == "register_boundary_intent":
-        keys.append(AtomKey.from_token(request.intent.boundary_ref))
-        roots += list(request.intent.next_rule.source_refs)
-        keys += [AtomKey.from_token(ref) for ref in request.intent.acceptance_interpretation_refs]
-        originals += [*request.intent.acceptance_interpretation_refs, *request.intent.outbound_receipt_refs]
-        types += ["d03.entity_anchor", "d03.account_binding", "d05.boundary_rule"]
     elif producer_kind == "create_goal":
         roots.append(request.source_ref)
         keys.append(AtomKey(Owner("activity", *namespace.as_tuple, activity_id), "d08.goal.v1", request.goal.goal_id))
@@ -443,7 +516,7 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         keys.append(AtomKey(persona, "d10.proactive_opportunity.v1", request.opportunity.opportunity_id))
         originals.append(request.opportunity.opportunity_id)
         types += ["d03.entity_anchor", "d03.account_binding"]
-    elif producer_kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3"}:
+    elif producer_kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3", "register_character_labor_life_plan_v1"}:
         from .d11_life_product_adapter_v1 import life_plan_read_inputs_v1
         return life_plan_read_inputs_v1(db, namespace=namespace, plan=request.plan)
     elif producer_kind == "register_life_outcome_v2":
@@ -544,7 +617,10 @@ def read_plan_current_domain_input_v1(db, *, namespace, activity_id, producer_ki
         if row:
             value = json.loads(row[0])
             roots += list(value.get("source_refs", ()))
-    return production_read_plan_v1(types, keys, roots, originals)
+    from .persona_growth_birth_v1 import augment_persona_birth_plan_v1
+    return augment_persona_birth_plan_v1(db, namespace=namespace,
+        operation_kind="input:" + producer_kind,
+        plan=production_read_plan_v1(types, keys, roots, originals))
 
 
 def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installed_readers):
@@ -622,6 +698,67 @@ def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installe
         if read.head(db, key).revision != 0:
             raise ValueError("goal input requires a genuinely absent goal")
         writes = (GraphWrite(key, plain_v1(request.goal), (AtomKey.from_token(request.source_ref),)),)
+    elif producer_kind == "create_aspiration":
+        from .persona_growth_birth_v1 import current_persona_birth_control_v1
+        control = current_persona_birth_control_v1(db, namespace=ns)
+        if not {control.activation_version, control.persona_head_version}.issubset(frame.envelope.version_guard.read_versions):
+            raise ValueError("aspiration birth lost its exact current persona metadata readset")
+        aspiration = request.aspiration
+        if any(NamespaceId.from_key(AtomKey.from_token(ref)) != ns for ref in aspiration.source_refs):
+            raise ValueError("aspiration birth crossed its actual Owner Source namespace")
+        read.source_family(db, aspiration.source_refs)
+        key = AtomKey(Owner("activity", *ns.as_tuple, frame.envelope.identity.activity_id),
+            "d08.aspiration.v1", aspiration.aspiration_id)
+        if read.head(db, key).revision != 0:
+            raise ValueError("aspiration birth requires a genuinely absent target")
+        writes = (GraphWrite(key, plain_v1(aspiration), tuple(AtomKey.from_token(ref) for ref in aspiration.source_refs)),)
+    elif producer_kind in {"create_commitment", "create_commitment_with_fulfillment_terms"}:
+        from .persona_growth_birth_v1 import current_persona_birth_control_v1
+        control = current_persona_birth_control_v1(db, namespace=ns)
+        if not {control.activation_version, control.persona_head_version}.issubset(frame.envelope.version_guard.read_versions):
+            raise ValueError("commitment birth lost its exact active persona metadata readset")
+        subject = "persona:" + ns.persona_id
+        read.source_family(db, request.source_refs)
+        from .current_commitment_input_source_v3 import read_current_commitment_applicable_inventory_v3
+        entities = tuple(atom for atom in read_current_commitment_applicable_inventory_v3(db,frame,"d03.entity_anchor")
+            if atom.valid and atom.value["entity_id"] == request.counterparty_ref
+            and atom.value["status"] == "active")
+        if len(entities) != 1:
+            raise MissingProductionOriginalV1("exact_current_commitment_counterparty_entity")
+        key = AtomKey(Owner("persona", *ns.as_tuple), "d08.commitment.v1", request.commitment_id)
+        if read.head(db, key).revision != 0:
+            raise ValueError("commitment input requires a genuinely absent commitment")
+        if producer_kind == "create_commitment_with_fulfillment_terms":
+            from ..domains.d08.commitment_fulfillment_v1 import terms_key_v1, semantic_scope_v1
+            semantic_scope = semantic_scope_v1(request.fulfillment_kind,request.counterparty_ref,request.deliverable_literal,request.deadline_utc)
+            deadline_ref = terms_key_v1(ns,request.commitment_id).token if request.deadline_utc is not None else None
+        else:
+            semantic_scope,deadline_ref = request.semantic_scope,request.deadline_ref
+        commitment = Commitment(request.commitment_id, 1, subject, request.counterparty_ref,
+            semantic_scope, request.establishment_kind, "private_intention", "pending",
+            deadline_ref, (), (), None, request.source_refs)
+        writes = (GraphWrite(key, plain_v1(commitment),
+            tuple(AtomKey.from_token(ref) for ref in request.source_refs)),)
+        if producer_kind == "create_commitment_with_fulfillment_terms":
+            from .d08_commitment_fulfillment_v1 import commitment_terms_birth_write_v1
+            writes += (commitment_terms_birth_write_v1(db,frame=frame,request=request,commitment=commitment,commitment_key=key),)
+    elif producer_kind == "register_commitment_terms_communication":
+        from .d08_commitment_fulfillment_v1 import derive_commitment_terms_communication_input_v1
+        from ..domains.d08.commitment_communication_v1 import communication_scope_version_key_v1
+        scope=derive_commitment_terms_communication_input_v1(db,frame=frame,request=request)
+        key=communication_scope_version_key_v1(scope)
+        if read.head(db,key).revision != 0:
+            raise ValueError("structured terms communication requires its absent immutable V2 scope")
+        dependencies=(scope.commitment.key,scope.fulfillment_terms.key,*(()if scope.terms_acceptance is None else(scope.terms_acceptance.key,)),*(AtomKey.from_token(ref)for ref in (*scope.source_refs,*scope.policy_source_refs)),*(v.key for v in scope.policy_read_versions))
+        writes=(GraphWrite(key,plain_v1(scope),dependencies),)
+    elif producer_kind == "register_commitment_communication":
+        from .d08_commitment_communication_v1 import derive_commitment_communication_input_v1
+        from ..domains.d08.commitment_communication_v1 import communication_scope_key_v1
+        approved = derive_commitment_communication_input_v1(db, frame=frame, request=request)
+        key = communication_scope_key_v1(ns, approved.scope_id)
+        if read.head(db, key).revision:
+            raise ValueError("Owner communication approval requires an absent immutable scope")
+        writes = (GraphWrite(key, plain_v1(approved), (approved.commitment.key, AtomKey.from_token(request.source_ref))),)
     elif producer_kind == "create_life_project":
         if request.project.namespace != ns or request.project.next_step not in request.recipe.allowed_steps:
             raise ValueError("life plan input project/recipe differs")
@@ -692,6 +829,9 @@ def stage_current_domain_input_v1(db, *, frame, producer_kind, request, installe
             if write.key.owner.kind not in spec.owner_kinds:
                 raise ValueError("Owner input contains another registered write owner")
             spec.validator(write.value)
+    if producer_kind in {"create_commitment_with_fulfillment_terms","register_commitment_terms_communication"}:
+        from .d08_commitment_fulfillment_v1 import register_actual_commitment_terms_stage_v1
+        register_actual_commitment_terms_stage_v1(db,frame=frame,request=request,stage=stage)
     return StagedDomainInputV1(registration, request, stage)
 
 
@@ -724,7 +864,7 @@ def _post_commit_frame(db, frame, request, *, _successor_v3=None):
                 tuple(GraphVersion(AtomKey.from_token(ref), rev) for ref, rev in rows), True, None))
     policies = list(frame.installed_policy_refs)
     policy = getattr(request, "policy", None)
-    if type(policy) in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, InstalledRelationshipPolicyV1, InstalledRelationshipPolicyV2}:
+    if type(policy) in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, CharacterLaborPolicyV1, InstalledRelationshipPolicyV1, InstalledRelationshipPolicyV2}:
         policies = [item for item in policies if not (item.policy_ref == policy.policy_ref and item.revision == policy.revision)]
         policies.append(ProductionPolicyRefV1(policy.policy_ref, policy.revision, canonical_digest(plain_v1(policy))))
     envelope = replace(frame.envelope, version_guard=replace(frame.envelope.version_guard,
@@ -756,6 +896,14 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         from .joint_prevalidated_input_v1 import record_prevalidated_joint_input_after_commit_v1
         return record_prevalidated_joint_input_after_commit_v1(db,frame=frame,staged_input=staged_input,
             actual_receipt=actual_receipt,readers=installed_readers)
+    if registration.producer_kind=='register_boundary_intent':
+        from .current_relationship_source_read_v3 import record_boundary_input_after_commit_v3
+        return record_boundary_input_after_commit_v3(db,frame=frame,staged_input=staged_input,
+            actual_receipt=actual_receipt,installed_readers=installed_readers)
+    if registration.producer_kind in {'create_aspiration','create_commitment','create_commitment_with_fulfillment_terms','register_commitment_communication','register_commitment_terms_communication'}:
+        # These are fully represented by their actual typed Graph writes and the
+        # same-transaction W01 Original. No post-CAS Body reread is needed.
+        return ()
     CurrentDomainReadV1(frame).committed_operation(db, actual_receipt.operation_id)
     kind, operation = registration.producer_kind, actual_receipt.operation_id
     if kind == "register_artifact_task_text_extent":
@@ -787,15 +935,12 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
     if kind == "initialize_body":
         installed_readers.body_quote_authority.install_policy(db, request.policy)
         return ()
-    if kind in {"install_passive_body_policy", "install_body_effect_policy", "install_relationship_policy"}:
+    if kind in {"install_passive_body_policy", "install_body_effect_policy", "install_character_labor_policy_v1", "install_relationship_policy"}:
         installed_readers.install_policy(db, frame=frame, policy=request.policy)
         return ()
     if kind == "record_body_component":
         return (installed_readers.record_current_action_body_component_v1(db, frame=frame,
             producing_operation_id=operation, component=request.component),)
-    if kind == "register_boundary_intent":
-        return (installed_readers.record_boundary_intent(db, frame=frame, original_ref=request.original_ref,
-            producing_operation_id=operation, intent=request.intent),)
     if kind == "register_joint_plan_intent":
         return (installed_readers.record_joint_plan_intent(db, frame=frame, original_ref=request.original_ref,
             producing_operation_id=operation, intent=request.intent),)
@@ -817,7 +962,7 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
         return (record_registered_life_plan_v2(db, frame=frame, issuer=installed_readers.issuer,
             original_ref=artifact_phase_draft_plan_ref_v2(request.selector), producing_operation_id=operation,
             plan=plan, installed_build=build, body_quote_authority=graph._GraphCoordinator__body_quote_authority),)
-    if kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3"}:
+    if kind in {"register_life_plan_v2", "register_artifact_draft_plan_v3", "register_character_labor_life_plan_v1"}:
         from .d11_life_preparation_v1 import record_registered_life_plan_v2
         from ..host.installed_d11_life_build_v1 import read_installed_d11_life_build_v1
         assembly = installed_readers.role_clock_reader.graph._GraphCoordinator__d04_installed_joint_assembly
@@ -858,3 +1003,41 @@ def record_current_domain_input_after_commit_v1(db, *, frame, staged_input, actu
 def rebuild_current_domain_input_v1(db, *, frame, producer_kind, request, installed_readers):
     return stage_current_domain_input_v1(db, frame=frame, producer_kind=producer_kind,
                                         request=request, installed_readers=installed_readers)
+
+
+def committed_commitment_scope_summary_v1(staged_input, actual_receipt):
+    """Ephemeral actual-stage Body projection; never persist this in a receipt."""
+    if (type(staged_input)is not StagedDomainInputV1 or type(actual_receipt)is not CommitReceipt
+            or staged_input.registration.producer_kind not in {'register_commitment_communication','register_commitment_terms_communication'}):
+        return None
+    stage=staged_input.stage
+    if actual_receipt.status!='committed' or stage.operation_id!=actual_receipt.operation_id or stage.activity_id!=actual_receipt.activity_id:
+        raise ValueError('Scope summary requires its actual same-commit stage receipt')
+    from ..domains.d08.commitment_communication_v1 import SCOPE_TYPES,CommitmentTermsCommunicationIntentV2,decode_communication_scope_v1,scope_route_source_v1
+    writes=tuple(write for proposal in stage.proposals for write in proposal.typed_writes)
+    if len(writes)!=1 or writes[0].key.type_name not in SCOPE_TYPES or GraphVersion(writes[0].key,1)not in actual_receipt.write_versions:
+        raise ValueError('Scope summary differs from the actual committed sole Scope write')
+    scope=decode_communication_scope_v1(writes[0].value)
+    if scope.approval_operation_id!=actual_receipt.operation_id:
+        raise ValueError('Scope summary approval differs from its actual producer')
+    result={'scope_ref':writes[0].key.token,'commitment_ref':scope.commitment.key.token,
+        'commitment_revision':scope.commitment.revision,'target_ref':scope.target_ref,
+        'source_ref':scope_route_source_v1(scope),'platform_ref':scope.platform_ref,
+        'conversation_ref':scope.conversation_ref,'scene_ref':scope.scene_ref,
+        'approved_literal':scope.approved_literal,'valid_until_utc':scope.valid_until_utc,
+        'approval_operation_id':scope.approval_operation_id}
+    if type(scope)is CommitmentTermsCommunicationIntentV2:
+        result.update(schema='d08.commitment-terms-communication-summary.v2',terms_ref=scope.fulfillment_terms.key.token,
+            terms_revision=scope.fulfillment_terms.revision,terms_digest=scope.fulfillment_terms_digest,role=scope.role,source_refs=list(scope.source_refs))
+    return result
+
+
+def committed_commitment_scope_metadata_v1(staged_input, actual_receipt):
+    """Persist only metadata derived from the actual same-commit Scope stage."""
+    summary=committed_commitment_scope_summary_v1(staged_input,actual_receipt)
+    if summary is None:return None
+    from ..domains.d08.commitment_communication_v1 import decode_communication_scope_v1
+    write=staged_input.stage.proposals[0].typed_writes[0]
+    scope=decode_communication_scope_v1(write.value)
+    return {'scope_ref':write.key.token,'revision':1,'digest':canonical_digest(scope),
+        'approval_operation_id':scope.approval_operation_id}

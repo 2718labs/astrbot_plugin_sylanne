@@ -263,6 +263,43 @@ class BoundOwnerSessions:
             return None
         return session
 
+
+    async def resolve_current_inspection_maintenance_session(self,*,username,owner_session_token,
+            operation_id=None,purpose="workbench_view",accept=False):
+        """Current signed identity plus the actual fixed Owner grant metadata."""
+        from uuid import UUID
+        if purpose not in {"workbench_user_action","workbench_view"} or self._package_maintenance_port is None:
+            return None
+        if operation_id is not None:
+            parsed=UUID(operation_id)
+            if parsed.version!=4 or str(parsed)!=operation_id:return None
+        identity=await self._identity.resolve_current_identity(username=username,owner_session_token=owner_session_token)
+        if identity is None:return None
+        key=self._key(owner_session_token)
+        with self._lock:
+            binding=self._bindings.get(key)
+        if binding is None or binding.username!=username or binding.request!=identity.request:
+            return None
+        scope="/".join(self._namespace.as_tuple)
+        required=frozenset({"workbench.read","workbench.maintain","workbench.control"} if accept else {"workbench.read"})
+        session=AuthenticatedSession(binding.actor_id,binding.session_id,{scope:required},
+            {scope:frozenset({"owner"})},{scope:frozenset({purpose})},host_username=username,
+            owner_session_token=owner_session_token,owner_session_request=binding.request,
+            inspection_operation_id=operation_id)
+        try:
+            access=await asyncio.to_thread(self._package_maintenance_port.read_session_inspection_access_v1,
+                session=session,scope=scope)
+        except (RuntimeError,ValueError,TypeError,PermissionError,LookupError):
+            return None
+        if (not required<=set(access["capabilities"]) or purpose not in access["purposes"]
+                or "owner" not in access["audiences"]):
+            return None
+        with self._lock:
+            if self._bindings.get(key)!=binding:return None
+        if await self._identity.resolve_current_identity(username=username,owner_session_token=owner_session_token)!=identity:
+            return None
+        return session
+
     async def resolve_current_package_status_session(self,*,username,owner_session_token,operation_id,purpose):
         """Explicit exact-operation auth after package admission closes."""
         if await self._identity.resolve_current_identity(username=username, owner_session_token=owner_session_token) is None:

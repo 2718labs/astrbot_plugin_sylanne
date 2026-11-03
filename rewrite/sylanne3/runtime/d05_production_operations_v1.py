@@ -154,6 +154,9 @@ def _relationship_trigger_sources_v1(namespace, key, value):
 def _relationship_canonical_identity_v1(db, namespace, request, roots, source):
     if request.semantics != "recollection":
         return source.provenance_root, ()
+    from .current_relationship_source_read_v3 import read_relationship_recollection_identity_v3
+    prepared,result=read_relationship_recollection_identity_v3(db,namespace,request,roots,source)
+    if prepared:return result
     from .domain_production_read_plans_v1 import read_committed_recollection_original_v1
     _, identity = read_committed_recollection_original_v1(db, namespace, request.trigger_original_ref)
     legacy = RelationshipContribution("persona:" + namespace.persona_id, source.provenance_root,
@@ -282,6 +285,9 @@ class InstalledD05ProductionReadersV1:
                 (*policy.namespace.as_tuple, policy.policy_ref, policy.revision, *expected))
 
     def _policy(self, db, read, policy_ref):
+        from .current_relationship_source_read_v3 import read_relationship_policy_v3
+        prepared=read_relationship_policy_v3(db,read,policy_ref,self.issuer)
+        if prepared is not None:return prepared
         pin = tuple(item for item in read.frame.installed_policy_refs if item.policy_ref == policy_ref)
         if len(pin) != 1 or not table_exists_v1(db, "graph_d05_production_policies_v1"):
             raise MissingProductionOriginalV1("installed_relationship_policy:" + policy_ref)
@@ -306,6 +312,9 @@ class InstalledD05ProductionReadersV1:
         return policy, ProductionOriginalRefV1("d05.installed_policy", policy_ref, row[1])
 
     def _entity(self, db, read, entity):
+        from .current_relationship_source_read_v3 import read_current_relationship_contribution_entity_v3
+        selected=read_current_relationship_contribution_entity_v3(db,read,entity)
+        if selected is not None:return selected
         entities = tuple(atom for atom in read.complete_inventory(db, "d03.entity_anchor")
             if atom.valid and atom.value.get("entity_id") == entity and atom.value.get("status") == "active")
         if len(entities) != 1:
@@ -317,7 +326,8 @@ class InstalledD05ProductionReadersV1:
                                       (next(version for version in read.frame.snapshot.versions if version.key == atom.key),))
 
     def read_contribution(self, db, frame, request):
-        read = CurrentDomainReadV1(frame)
+        from .current_relationship_source_read_v3 import relationship_domain_read_v3
+        read = relationship_domain_read_v3(db,frame)
         read.check(db)
         policy, policy_original = self._policy(db, read, request.policy_ref)
         entity = self._entity(db, read, request.subject_entity_ref)
@@ -351,6 +361,11 @@ class InstalledD05ProductionReadersV1:
         elif key.type_name == "d07.simulation_branch.v1":
             if trigger.kind != "d07.adopted_simulation":
                 raise MissingProductionOriginalV1("actual_adopted_simulation_trigger")
+            from .current_relationship_source_read_v3 import _active,read_committed_simulation_branch_original_v3
+            source_work=_active(db)
+            if(source_work is not None and source_work.operation_kind=='adopt_relationship_contribution'
+                    and read_committed_simulation_branch_original_v3(db,frame.envelope.authority.namespace,key.token)!=trigger):
+                raise ValueError('simulation trigger differs from its actual same-Work D07 producer')
             roots = tuple(atom.value.get("snapshot_refs", ()))
             records = read.source_family(db, roots)
             source = records[roots[0]]
@@ -372,8 +387,12 @@ class InstalledD05ProductionReadersV1:
             schema_version=2, kind=CONTRIBUTION_KINDS_V2[request.semantics],
             recollection_activity_ref=key.token if request.semantics == "recollection" else None,
             identity_status="resolved", legacy_alias_keys=aliases)
-        read.complete_inventory(db, "d05.contribution")
-        read.complete_inventory(db, "d05.relationship_projection")
+        from .current_relationship_source_read_v3 import _active,read_current_relationship_contribution_facts_v3
+        source_work=_active(db)
+        facts=read_current_relationship_contribution_facts_v3(db,frame)if source_work is not None and source_work.operation_kind=='adopt_relationship_contribution'else None
+        if facts is None:
+            read.complete_inventory(db, "d05.contribution")
+            read.complete_inventory(db, "d05.relationship_projection")
         item_key = AtomKey(Owner("relation", *frame.envelope.authority.namespace.as_tuple, request.subject_entity_ref),
                            "d05.contribution", item.key)
         prior_atom = read.head(db, item_key)
@@ -387,7 +406,7 @@ class InstalledD05ProductionReadersV1:
             for key in (AtomKey.from_token(ref), access_key(*ns.as_tuple, record.source_id),
                         source_correction_head_key(ns, record.source_id))))
         return CurrentRelationshipContributionInputsV1(item, policy.dimensions, policy.semantics,
-            trigger, policy_original, entity, prior, qualification_keys, prior_atom.valid)
+            trigger, policy_original, entity, prior, qualification_keys, prior_atom.valid, facts)
 
     def record_boundary_intent(self, db, *, frame, original_ref, producing_operation_id, intent):
         if type(intent) is not BoundaryIntentOriginalV1:
@@ -411,14 +430,18 @@ class InstalledD05ProductionReadersV1:
         return ProductionOriginalRefV1("d05.boundary_intent", original_ref, digest)
 
     def read_boundary(self, db, frame, request):
-        read = CurrentDomainReadV1(frame)
+        from .current_relationship_source_read_v3 import relationship_domain_read_v3,relationship_point_v3
+        read = relationship_domain_read_v3(db,frame)
         read.check(db)
         policy, policy_original = self._policy(db, read, request.policy_ref)
         if not table_exists_v1(db, "graph_d05_boundary_intents_v1"):
             raise MissingProductionOriginalV1("actual_boundary_intent_original")
-        row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature "
-            "FROM graph_d05_boundary_intents_v1 WHERE bot=? AND persona=? AND original_ref=?",
-            (*frame.envelope.authority.namespace.as_tuple, request.intent_original_ref)).fetchone()
+        prepared,row=relationship_point_v3(db,'graph_d05_boundary_intents_v1',('producing_operation_id','payload_json','payload_digest','signature'),
+            ('bot','persona','original_ref'),(*frame.envelope.authority.namespace.as_tuple,request.intent_original_ref))
+        if not prepared:
+            row = db.execute("SELECT producing_operation_id,payload_json,payload_digest,signature "
+                "FROM graph_d05_boundary_intents_v1 WHERE bot=? AND persona=? AND original_ref=?",
+                (*frame.envelope.authority.namespace.as_tuple, request.intent_original_ref)).fetchone()
         if row is None:
             raise MissingProductionOriginalV1("actual_boundary_intent_original:" + request.intent_original_ref)
         self.issuer._signer.verify("d11.d05-boundary-intent.v1", row[1], row[3])
@@ -473,8 +496,11 @@ def stage_adopt_current_relationship_contribution_in_transaction_v1(db, *, frame
     if type(installed_readers) is not InstalledD05ProductionReadersV1:
         raise TypeError("installed D05 readers required")
     try:
-        stage = compile_adopt_current_relationship_contribution_v1(frame, request,
-            installed_readers.read_contribution(db, frame, request))
+        inputs=installed_readers.read_contribution(db,frame,request)
+        if inputs.current_facts is not None:
+            from .current_relationship_source_read_v3 import require_current_relationship_contribution_facts_v3
+            require_current_relationship_contribution_facts_v3(db,frame,inputs.current_facts)
+        stage = compile_adopt_current_relationship_contribution_v1(frame,request,inputs)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d05", "adopt_relationship_contribution", request, missing)
     return verify_d05_production_stage_v1(stage)
@@ -493,13 +519,14 @@ def stage_revise_current_boundary_in_transaction_v1(db, *, frame, request, insta
 def stage_reevaluate_current_relationship_in_transaction_v1(db, *, frame, request, installed_readers):
     if type(installed_readers) is not InstalledD05ProductionReadersV1:
         raise TypeError("installed D05 readers required")
-    read = CurrentDomainReadV1(frame)
+    from .current_relationship_source_read_v3 import relationship_domain_read_v3,read_current_relationship_reevaluation_inventory_v3
+    read = relationship_domain_read_v3(db,frame)
     try:
         read.check(db)
         correction = read.head(db, request.correction_head_ref, required=True)
         read.source_family(db, (correction.value["correction_source_ref"],), allow_corrected=True)
         for type_name in ("d05.boundary_rule", "d05.contribution", "d05.relationship_projection"):
-            read.complete_inventory(db, type_name)
+            read_current_relationship_reevaluation_inventory_v3(db,frame,type_name)
         stage = compile_reevaluate_current_relationship_v1(frame, request)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d05", "reevaluate_relationship", request, missing)
@@ -515,57 +542,10 @@ D05_PRODUCTION_STORAGE_INVENTORY_V1 = {
 
 
 def read_plan_current_d05_operation_v1(db, *, namespace, activity_id, operation_kind, request):
-    from .d01_production_operations_v1 import production_read_plan_v1, raw_registered_input_v1, raw_head_value_v1
-    from ..graph_types import owner_grant_key
-    if not db.in_transaction or type(namespace) is not NamespaceId:
-        raise ValueError("D05 fixed read plan requires current W01 transaction")
-    keys, roots, originals = [owner_grant_key(*namespace.as_tuple)], [], []
-    types = ["d03.entity_anchor", "d03.account_binding", "d05.contribution", "d05.boundary_rule", "d05.relationship_projection"]
-    if operation_kind == "adopt_relationship_contribution" and type(request) is AdoptCurrentRelationshipContributionRequestV1:
-        originals.extend((request.trigger_original_ref, request.policy_ref))
-        trigger_key = AtomKey.from_token(request.trigger_original_ref)
-        keys.append(trigger_key)
-        trigger = raw_head_value_v1(db, namespace, trigger_key)
-        if trigger:
-            refs = _relationship_trigger_sources_v1(namespace, trigger_key, trigger)
-            roots.extend(refs)
-            source = raw_head_value_v1(db, namespace, AtomKey.from_token(refs[0])) if refs else None
-            if source:
-                identity, aliases = _relationship_canonical_identity_v1(db, namespace, request, refs, SourceRecord.from_dict(source))
-                contribution = RelationshipContribution("persona:" + namespace.persona_id, identity,
-                    request.subject_entity_ref, request.dimension, request.semantics, 1, refs,
-                    schema_version=2, kind=CONTRIBUTION_KINDS_V2[request.semantics],
-                    recollection_activity_ref=trigger_key.token if request.semantics == "recollection" else None,
-                    identity_status="resolved", legacy_alias_keys=aliases)
-                owner = Owner("relation", *namespace.as_tuple, request.subject_entity_ref)
-                keys.extend((AtomKey(owner, "d05.contribution", contribution.key),
-                             AtomKey(owner, "d05.relationship_projection", request.dimension)))
-        entity_key = AtomKey(Owner("persona", *namespace.as_tuple), "d03.entity_anchor", request.subject_entity_ref)
-        keys.append(entity_key)
-        entity = raw_head_value_v1(db, namespace, entity_key)
-        if entity:
-            roots.extend(entity["creation_evidence_refs"])
-    elif operation_kind == "revise_boundary" and type(request) is ReviseCurrentBoundaryRequestV1:
-        keys.append(AtomKey.from_token(request.boundary_ref))
-        originals.extend((request.intent_original_ref, request.policy_ref))
-        intent = raw_registered_input_v1(db, "graph_d05_boundary_intents_v1", namespace, request.intent_original_ref)
-        if intent:
-            roots.extend(intent["next_rule"]["source_refs"])
-            originals.extend((*intent["acceptance_interpretation_refs"], *intent["outbound_receipt_refs"]))
-            keys.extend(AtomKey.from_token(ref) for ref in intent["acceptance_interpretation_refs"])
-            for ref in intent["acceptance_interpretation_refs"]:
-                semantic = raw_head_value_v1(db, namespace, AtomKey.from_token(ref))
-                if semantic:
-                    roots.extend(semantic["source_refs"])
-    elif operation_kind == "reevaluate_relationship" and type(request) is ReevaluateCurrentRelationshipRequestV1:
-        key = AtomKey.from_token(request.correction_head_ref)
-        keys.append(key)
-        head = raw_head_value_v1(db, namespace, key)
-        if head:
-            keys.extend(AtomKey.from_token(head[name]) for name in ("source_ref", "correction_source_ref"))
-            # The correction compiler preserves old history; the current
-            # correction source and every parent still need their access read.
-            roots.append(head["correction_source_ref"])
-    else:
-        raise ValueError("unregistered exact D05 production request")
-    return production_read_plan_v1(types, keys, roots, originals)
+    from .current_relationship_source_read_v3 import read_plan_relationship_source_v3
+    if not db.in_transaction or type(namespace)is not NamespaceId:
+        raise ValueError('D05 fixed read plan requires its current W01 transaction')
+    if operation_kind not in {'adopt_relationship_contribution','revise_boundary','reevaluate_relationship'}:
+        raise ValueError('unregistered exact D05 production request')
+    return read_plan_relationship_source_v3(db,namespace=namespace,activity_id=activity_id,
+        operation_kind=operation_kind,request=request)

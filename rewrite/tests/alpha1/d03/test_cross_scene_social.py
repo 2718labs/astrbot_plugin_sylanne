@@ -2,7 +2,7 @@ from dataclasses import asdict
 
 from sylanne3.domains.d03.context import AccountBinding, EntityAnchor, RoleBinding, WorldEvent
 from sylanne3.domains.d03.cross_scene_social import project_cross_scene_social_v1
-from sylanne3.domains.d05.relationship import RelationshipContribution
+from sylanne3.domains.d05.relationship import CONTRIBUTION_KINDS_V2, RelationshipContribution
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner
 from sylanne3.memory_types import SourceRecord, access_key, source_key
 from sylanne3.runtime_contracts import NamespaceId, QueryEpoch
@@ -16,7 +16,8 @@ SPEAKER = "entity:sender"
 DESTINATION = "group:project"
 CONTRIBUTION = RelationshipContribution(
     "persona:persona", "family:one", SPEAKER, "closeness",
-    "external_observation", 1, (SOURCE.token,))
+    "external_observation", 1, (SOURCE.token,), schema_version=2,
+    kind=CONTRIBUTION_KINDS_V2["external_observation"], identity_status="resolved")
 
 
 def graph(*, source_audiences=("direct:sender",),
@@ -55,7 +56,8 @@ def graph(*, source_audiences=("direct:sender",),
         }),
         GraphAtom(AtomKey(Owner("relation", *NS.as_tuple, SPEAKER),
                           "d05.contribution", CONTRIBUTION.key), 2,
-                  asdict(CONTRIBUTION) | {"source_refs": [SOURCE.token]}),
+                  asdict(CONTRIBUTION) | {"source_refs": [SOURCE.token],
+                                           "legacy_alias_keys": list(CONTRIBUTION.legacy_alias_keys)}),
         GraphAtom(AtomKey(Owner("event", *NS.as_tuple, "world:arrival"),
                           "d03.world_event", "current"), 1,
                   asdict(arrival) | {"participant_roles": [[SPEAKER, "sender_account"]],

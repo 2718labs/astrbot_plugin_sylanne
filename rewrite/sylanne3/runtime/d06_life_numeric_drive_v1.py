@@ -20,7 +20,7 @@ from .d06_life_numeric_context_v1 import (PrepareLifeNumericContextRequestV1, re
     require_current_life_numeric_context_v1, life_numeric_context_ids_v1, decode_life_numeric_context_original_v1,
     OPERATION as CONTEXT_OPERATION, KIND as CONTEXT_KIND)
 from .d04_life_before_original_v1 import decode_life_d04_before_original_v1, KIND as BEFORE_KIND
-from .d04_life_encoding_baseline_v1 import COMPONENT_TYPES
+from .d04_life_encoding_baseline_v1 import LIFE_NUMERIC_COMPONENT_TYPES
 from .d04_semantic_mapping_v3 import (read_current_d04_role_clock_v3, stage_current_d04_drive_in_transaction_v3,
     record_d04_mapping_acceptance_after_cas_v3, read_d04_mapping_acceptance_v3, D04RoleClockOriginalV3)
 
@@ -168,12 +168,11 @@ def read_plan_life_numeric_drive_v1(db, *, namespace, activity_id, operation_kin
     base = read_plan_life_numeric_context_v1(db, namespace=namespace, activity_id=activity_id,
         operation_kind=CONTEXT_OPERATION, request=PrepareLifeNumericContextRequestV1(request.episode_ref, request.causal_operation_id))
     context, before, adopted, clock, keys = _plan_inputs(db, namespace, request)
-    return production_read_plan_v1(tuple(dict.fromkeys((*base.fixed_type_ids, *COMPONENT_TYPES))),
+    return production_read_plan_v1(tuple(dict.fromkeys((*base.fixed_type_ids, 'd01.persona_activation.v1','d01.persona_plan.v1', *LIFE_NUMERIC_COMPONENT_TYPES))),
         (*base.exact_keys, AtomKey.from_token(request.appraisal_ref), *keys), base.source_roots, base.required_original_refs)
 
 
 def _compile(db, frame, request, installed_readers):
-    from ..domains.d01 import PersonaDomain
     from ..host.installed_d04_semantic_mapping_v3 import InstalledD04SemanticMappingReaderV3
     from .d06_life_numeric_task_v1 import require_current_life_numeric_appraisal_acceptance_v1
     from .budget import get_budget_lease, require_budget_family_admissible
@@ -200,7 +199,7 @@ def _compile(db, frame, request, installed_readers):
     if reader.current_role_clock_identity(db, ns) != (clock.mapping_id, clock.mapping_version):
         raise ValueError('Life drive actual Owner-approved clock changed')
     read = CurrentDomainReadV1(frame); read.check(db)
-    for kind in COMPONENT_TYPES: read.complete_inventory(db, kind)
+    for kind in LIFE_NUMERIC_COMPONENT_TYPES: read.complete_inventory(db, kind)
     for key in keys:
         atom = read.head(db, key)
         if atom.revision or atom.valid: raise ValueError('Life source dose already mapped; read original')
@@ -213,7 +212,8 @@ def _compile(db, frame, request, installed_readers):
             or grant.version != policy.grant_version or grant.lease_id != lease.lease_id):
         raise ValueError('Life drive current signed dose grant is unavailable')
     require_budget_family_admissible(db, lease.lease_id)
-    role = PersonaDomain.resolve_active_role(frame.snapshot, namespace=ns, current_guard=installed_readers.life_numeric_owner_guard)
+    from .d06_ordinary_readout_v3 import require_bound_life_ordinary_readout_v3
+    role = require_bound_life_ordinary_readout_v3(db,frame=frame).control
     stage = stage_current_d04_drive_in_transaction_v3(db, namespace=ns, appraisal_ref=request.appraisal_ref,
         frozen=frozen, snapshot=frame.snapshot, role=role, condition=reader.current_role_condition(db, ns),
         installed_mapping=installed, installed_mapping_reader=reader, dose_policy=policy,

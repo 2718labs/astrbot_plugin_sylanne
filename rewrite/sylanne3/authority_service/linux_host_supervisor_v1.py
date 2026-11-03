@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 from pathlib import Path
 import re
@@ -14,6 +13,7 @@ import subprocess
 import time
 import traceback
 
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from .contract import AuthorityUnavailable
 from .c09_process_identity_v1 import read_process_identity_v1, require_process_retired_v1
 from .linux_installation_security_v1 import require_linux_administrator_v1
@@ -38,6 +38,7 @@ class InstalledLinuxHostSupervisorV1:
                     or process_supervisor.config.expected_gid != host_gid):
                 raise AuthorityUnavailable("exact installed process Host provider required")
         self.listener = None
+        self._host_graph_custodies_v4=set()
         daemon.c09_gate.install_peer_retirement_handler_v1(self.retire_peers_v1)
 
     def _systemctl(self, *arguments):
@@ -64,6 +65,7 @@ class InstalledLinuxHostSupervisorV1:
         stage_started = started
         stage = "request_read"
         stages = []
+        custody=None
 
         def advance_stage(next_stage):
             nonlocal stage_started, stage
@@ -77,9 +79,11 @@ class InstalledLinuxHostSupervisorV1:
                 raise AuthorityUnavailable("Host admission request exceeds bound")
             request = json.loads(raw)
             fields = {"schema", "profile_id", "installation_id", "authority_id"}
-            selected_request = request.get('schema') == 'sylanne3.c09.host-admission-request.v2'
-            if (set(request) != fields | ({'package_selection'} if selected_request else set())
-                    or request['schema'] not in {'sylanne3.c09.host-admission-request.v1','sylanne3.c09.host-admission-request.v2'}):
+            binding_request=request.get('schema')=='sylanne3.c09.host-admission-request.v3'
+            selected_request = 'package_selection'in request
+            if (not binding_request and selected_request!=(request.get('schema')=='sylanne3.c09.host-admission-request.v2')
+                    or set(request) != fields | ({'package_selection'} if selected_request else set())
+                    or request['schema'] not in {'sylanne3.c09.host-admission-request.v1','sylanne3.c09.host-admission-request.v2','sylanne3.c09.host-admission-request.v3'}):
                 raise AuthorityUnavailable("Host admission schema differs")
             pid, uid, _gid = struct.unpack("3i", writer.get_extra_info("socket").getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
             if uid != self.uid:
@@ -190,6 +194,21 @@ class InstalledLinuxHostSupervisorV1:
                 result['schema'] = 'sylanne3.c09.host-admission.v2'
                 result['package_selection'] = asdict(selected)
                 result['package_bootstrap'] = package_bootstrap
+            if binding_request:
+                observed_host=await asyncio.to_thread(service.supervisor.read_current_host_state_v1)
+                if observed_host.main_process_original!=original or observed_host.active_state!='active':
+                    raise AuthorityUnavailable('actual Host binding lost its installed process invocation')
+                gate=self.daemon.c09_gate
+                with gate._condition:
+                    if gate._operation is not None:raise AuthorityUnavailable('Host storage admission entered maintenance')
+                    wire=_actual_host_graph_material_v4(self,context=context,bundle=bundle,peer=matches[0][0],
+                        process_original=original,invocation_id=observed_host.invocation_id,admission_original=admission_original)
+                    result['schema']='sylanne3.c09.host-admission.v3';result['graph_storage_binding']=wire
+                    if wire is not None:
+                        custody=_InstalledHostGraphCustodyV4(supervisor=self,writer=writer,context=context,
+                            epoch=gate._epoch,process_original=original,package_selection=selected)
+                        gate.register_host_graph_custody_v4(custody)
+                        self._host_graph_custodies_v4.add(custody)
         except Exception as exc:
             advance_stage("response_write")
             diagnostic = traceback.TracebackException.from_exception(exc, capture_locals=False)
@@ -200,7 +219,7 @@ class InstalledLinuxHostSupervisorV1:
                     for frame in diagnostic.stack]})
                 diagnostic = diagnostic.__cause__ or (
                     None if diagnostic.__suppress_context__ else diagnostic.__context__)
-            logging.getLogger(__name__).error("Sylanne C09 Host admission cause metadata: " +
+            diagnostic_channel_v1(__name__).error("Sylanne C09 Host admission cause metadata: " +
                 json.dumps({"elapsed_ns": time.monotonic_ns() - started,
                     "stages": stages, "chain": chain}, separators=(",", ":")))
             result = {"status": "hold"}
@@ -208,12 +227,17 @@ class InstalledLinuxHostSupervisorV1:
             advance_stage("response_write")
             elapsed = time.monotonic_ns() - started
             if elapsed >= 10_000_000_000:
-                logging.getLogger(__name__).warning("Sylanne C09 Host admission duration metadata: " +
+                diagnostic_channel_v1(__name__).warning("Sylanne C09 Host admission duration metadata: " +
                     json.dumps({"elapsed_ns": elapsed, "stages": stages}, separators=(",", ":")))
         try:
             writer.write(json.dumps(result, separators=(",", ":")).encode() + b"\n")
             await writer.drain()
+            if custody is not None and result.get('status')=='admitted':
+                await custody.wait_closed_v4(reader)
         finally:
+            if custody is not None:
+                custody.revoke_v4();self.daemon.c09_gate.unregister_host_graph_custody_v4(custody)
+                self._host_graph_custodies_v4.discard(custody)
             writer.close()
             await writer.wait_closed()
 
@@ -278,7 +302,80 @@ class InstalledLinuxHostSupervisorV1:
         return True
 
     async def aclose(self):
+        for custody in tuple(self._host_graph_custodies_v4):custody.revoke_v4()
         if self.listener is not None:
             self.listener.close()
             await self.listener.wait_closed()
             self.listener = None
+
+
+class _InstalledHostGraphCustodyV4:
+    def __init__(self,*,supervisor,writer,context,epoch,process_original,package_selection):
+        self.supervisor,self.writer,self.context=supervisor,writer,context
+        self.gate=supervisor.daemon.c09_gate;self.epoch=epoch
+        self.process_original,self.package_selection=process_original,package_selection
+        self.closed=False
+    def require_current_v4(self):
+        daemon=self.supervisor.daemon;gate=self.gate
+        daemon.c09_control.lease.require_held()
+        if (self.closed or daemon._closed or gate._operation is not None or gate._epoch!=self.epoch
+                or read_process_identity_v1(self.process_original['pid'])!=self.process_original):
+            raise AuthorityUnavailable('actual Host Graph selection custody ended')
+        self.context.require_current('business')
+        if self.package_selection is not None and getattr(daemon.server,'_package_selection_v2',None)!=self.package_selection:
+            raise AuthorityUnavailable('actual Host package selection custody changed')
+    def revoke_v4(self):
+        if self.closed:return
+        self.closed=True
+        endpoint=self.writer.get_extra_info('socket')
+        if endpoint is not None and endpoint.fileno()>=0:
+            with socket.socket(fileno=os.dup(endpoint.fileno()))as duplicate:
+                duplicate.shutdown(socket.SHUT_RDWR)
+    async def wait_closed_v4(self,reader):
+        try:
+            while not self.closed:
+                self.require_current_v4()
+                try:
+                    data=await asyncio.wait_for(reader.read(1),timeout=.25)
+                except asyncio.TimeoutError:continue
+                if data:raise AuthorityUnavailable('Host custody channel accepts no business payload')
+                return
+        finally:
+            self.revoke_v4()
+            self.gate.unregister_host_graph_custody_v4(self)
+
+
+def _actual_host_graph_material_v4(supervisor,*,context,bundle,peer,process_original,invocation_id,admission_original):
+    from ..runtime_contracts import canonical_digest
+    from uuid import uuid4
+    from ..host.c09_storage_admission_v1 import _validate_host_graph_wire_v4
+    from ..runtime_storage_v3 import runtime_storage_basis_identity_v4
+    control=supervisor.daemon.c09_control
+    if not context.manifest.get('segmented_layouts'):return None
+    with control._resource_sql_quantum_v3()as meter:
+        from .c09_initial_segmented_genesis_v4 import INITIAL_MANIFEST_SCHEMA_V4,read_initial_segmented_storage_v4
+        if context.manifest['schema']==INITIAL_MANIFEST_SCHEMA_V4:
+            source=read_initial_segmented_storage_v4(control,meter=meter)
+            identity=runtime_storage_basis_identity_v4(source,role='graph',meter=meter)
+            genesis,plan=source.genesis_digest,source.plan['plan_digest']
+            prepared=applied=None
+        else:
+            from .c09_close_apply_v1 import read_selected_storage_applied_original_v3
+            source=control._selected_history_read_v3
+            identity=runtime_storage_basis_identity_v4(source,role='graph',meter=meter)
+            release=read_selected_storage_applied_original_v3(control,view=source,meter=meter)
+            genesis=plan=None;prepared=source.basis.prepared['prepared_digest'];applied=canonical_digest(release)
+        member={key:identity.member[key]for key in ('role','resolved_path','device','file_id','incarnation_or_journal_id')}
+        material=dict(schema='sylanne3.c09.host-graph-storage-binding.v4',mode='production_root',
+            admission_basis_kind='writer_peer_admission_v3',certificate_digest=None if genesis is not None else context.manifest['certificate_digest'],
+            authority_id=control.authority_id,installation_id=control.installation_id,
+            namespace=list(identity.namespace.as_tuple),authority_namespace=identity.authority_namespace,
+            profile_id=peer[1],peer=list(peer),host_process_original=process_original,host_invocation_id=invocation_id,
+            authority_process_original=read_process_identity_v1(os.getpid()),admission_digest=admission_original['admission_digest'],
+            gate_epoch=supervisor.daemon.c09_gate._epoch,selection_kind=identity.origin_kind,pointer_version=context.pointer_version,
+            storage_generation=context.storage_generation,manifest_digest=context.manifest_digest,graph_member=member,
+            graph_layout=context.manifest['segmented_layouts']['graph'],initial_genesis_digest=genesis,initial_plan_digest=plan,
+            selected_prepared_digest=prepared,selected_applied_digest=applied,capture_scope_digest=identity.capture_scope_digest,
+            selection_digest=identity.selection_digest,binding_nonce=uuid4().hex)
+        material['binding_digest']=canonical_digest(material)
+        return _validate_host_graph_wire_v4(material)

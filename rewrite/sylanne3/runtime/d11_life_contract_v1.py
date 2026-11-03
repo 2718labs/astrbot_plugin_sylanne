@@ -84,23 +84,67 @@ class RegisteredLifePlanV2:
                 or type(self.audiences) is not tuple or not self.audiences
                 or len(set(self.audiences)) != len(self.audiences)):
             raise ValueError("exact finite installed life recipe required")
-        for name in ("project", "recipe", "action_intent", "input_source", "input_access"):
-            if type(getattr(self, name)) is not LifeInputRefV1:
-                raise TypeError("life plan freezes actual typed input commitments")
-        if (AtomKey.from_token(self.input_source.ref).type_name != "memory.source"
-                or AtomKey.from_token(self.input_access.ref).type_name != "memory.access"):
-            raise ValueError("life source and access kinds differ")
-        for name in ("activity_id", "effect_id", "attempt_id", "operation_id", "parent_budget_lease_ref"):
-            _text(getattr(self, name))
-        for value in self.audiences:
-            _text(value)
-        _utc(self.deadline_utc)
-        _digest(self.algorithm_build_digest)
-        _digest(self.postcondition_build_digest)
-        if self.body_effect_request_json is not None:
-            if canonical_serialize(json.loads(self.body_effect_request_json)) != self.body_effect_request_json:
-                raise ValueError("life Body request must preserve canonical actual component references")
-            LifeBodyComponentContractV1(**json.loads(self.body_effect_request_json))
+        _validate_life_plan_inputs_v1(self)
+
+
+def _validate_life_plan_inputs_v1(self):
+    for name in ("project", "recipe", "action_intent", "input_source", "input_access"):
+        if type(getattr(self, name)) is not LifeInputRefV1:
+            raise TypeError("life plan freezes actual typed input commitments")
+    if (AtomKey.from_token(self.input_source.ref).type_name != "memory.source"
+            or AtomKey.from_token(self.input_access.ref).type_name != "memory.access"):
+        raise ValueError("life source and access kinds differ")
+    for name in ("activity_id", "effect_id", "attempt_id", "operation_id", "parent_budget_lease_ref"):
+        _text(getattr(self, name))
+    for value in self.audiences:
+        _text(value)
+    _utc(self.deadline_utc)
+    _digest(self.algorithm_build_digest)
+    _digest(self.postcondition_build_digest)
+    if self.body_effect_request_json is not None:
+        if canonical_serialize(json.loads(self.body_effect_request_json)) != self.body_effect_request_json:
+            raise ValueError("life Body request must preserve canonical actual component references")
+        LifeBodyComponentContractV1(**json.loads(self.body_effect_request_json))
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredCharacterLaborLifePlanV1:
+    project: LifeInputRefV1
+    recipe: LifeInputRefV1
+    action_intent: LifeInputRefV1
+    input_source: LifeInputRefV1
+    input_access: LifeInputRefV1
+    activity_id: str
+    effect_id: str
+    attempt_id: str
+    operation_id: str
+    audiences: tuple[str, ...]
+    parent_budget_lease_ref: str
+    cpu_ceiling_ms: int
+    deadline_utc: str
+    algorithm_build_digest: str
+    postcondition_build_digest: str
+    body_effect_request_json: str | None
+    labor_body_preparation_original: object
+    executor_protocol: str = 'source_note_nonpreemptible_segment.v1'
+    step: str = 'source_note'
+    recipe_id: str = RECIPE_ID
+    executor_id: str = ALGORITHM_ID
+    recipe_version: int = 2
+    schema: str = 'd10.registered-character-labor-life-plan.v1'
+
+    def __post_init__(self):
+        from .domain_production_contracts_v1 import ProductionOriginalRefV1
+        if (self.schema!='d10.registered-character-labor-life-plan.v1' or self.step!='source_note'
+                or self.recipe_id!=RECIPE_ID or self.executor_id!=ALGORITHM_ID or self.recipe_version!=2
+                or self.executor_protocol!='source_note_nonpreemptible_segment.v1'
+                or self.body_effect_request_json is not None or type(self.cpu_ceiling_ms)is not int
+                or not 1<=self.cpu_ceiling_ms<=60000 or type(self.audiences)is not tuple or not self.audiences
+                or len(set(self.audiences))!=len(self.audiences)
+                or type(self.labor_body_preparation_original)is not ProductionOriginalRefV1
+                or self.labor_body_preparation_original.kind!='d11.life_character_labor_body_preparation_v1'):
+            raise ValueError('explicit nonpreemptible character-labor recipe and actual B original required')
+        _validate_life_plan_inputs_v1(self)
 
 
 @dataclass(frozen=True, slots=True)
@@ -519,12 +563,12 @@ def life_work_kind_v1(value):
     from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3, WORK_KIND as DRAFT_WORK
     if type(value) in {RegisteredDraftFilePlanV3, D11DraftExecutionBindingV1}:
         return DRAFT_WORK
-    if type(value) in {RegisteredLifePlanV2, D11LifeExecutionBindingV1}:
+    if type(value) in {RegisteredLifePlanV2, RegisteredCharacterLaborLifePlanV1, D11LifeExecutionBindingV1}:
         return WORK_KIND
     raise TypeError("closed registered Life recipe required")
 
 
-_TYPES = {LifeInputRefV1, LifeBodyComponentContractV1, RegisteredLifePlanV2, RegisteredLifeOutcomeV2, D11LifeExecutionBindingV1,
+_TYPES = {LifeInputRefV1, LifeBodyComponentContractV1, RegisteredLifePlanV2, RegisteredCharacterLaborLifePlanV1, RegisteredLifeOutcomeV2, D11LifeExecutionBindingV1,
           RoleSegmentStartV1, LifeTerminalPayloadV1, D11LifeClaimV1, D11LifeTerminalV1,
           D11DraftExecutionBindingV1, DraftRoleSegmentStartV1, DraftTerminalPayloadV1, D11DraftClaimV1, D11DraftTerminalV1}
 
@@ -560,10 +604,15 @@ def life_from_wire_v1(raw, kind):
     value = dict(raw)
     if kind in LIFE_BINDING_TYPES:
         value["namespace"] = NamespaceId(**value["namespace"])
-    if kind is RegisteredLifePlanV2:
+    if kind in {RegisteredLifePlanV2,RegisteredCharacterLaborLifePlanV1}:
         for name in ("project", "recipe", "action_intent", "input_source", "input_access"):
             value[name] = life_from_wire_v1(value[name], LifeInputRefV1)
         value["audiences"] = tuple(value["audiences"])
+        if kind is RegisteredCharacterLaborLifePlanV1:
+            from .domain_production_contracts_v1 import ProductionOriginalRefV1
+            from .domain_production_erasure_v1 import decode_typed_production_value_v1
+            value['labor_body_preparation_original']=decode_typed_production_value_v1(
+                value['labor_body_preparation_original'],ProductionOriginalRefV1)
     if kind is RegisteredLifeOutcomeV2:
         value["paid_cost_refs"] = tuple(value["paid_cost_refs"])
     if kind in LIFE_CLAIM_TYPES | LIFE_TERMINAL_TYPES:

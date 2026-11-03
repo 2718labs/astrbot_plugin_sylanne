@@ -216,19 +216,120 @@ def _require_index_schema(db):
 
 
 
-def _index_header(db,counter,operation,payload,digest,classification):
-    from ..runtime_storage_v3 import runtime_storage_v3
+def _initial_runtime_counter_index_material_v4(counter,db,meter):
+    from .d13_core_counter_service_v1 import InstalledD13CoreCounterServiceV1
+    from ..runtime_storage_v3 import runtime_storage_v3,runtime_source_identity_v4
+    if (type(counter)is not InstalledD13CoreCounterServiceV1 or db is not counter.core._db
+            or not db.in_transaction or not counter.core._lock._is_owned()):
+        raise AuthorityUnavailable('actual same-Core Counter initialization transaction required')
     handle=runtime_storage_v3(db)
+    identity=runtime_source_identity_v4(handle,meter=meter)
+    if (identity.origin_kind!='initial_segmented_v4' or identity.role!='core'
+            or identity.namespace!=counter.namespace or identity.authority_namespace!=counter.bridge.namespace):
+        raise AuthorityUnavailable('actual signed initial Core Counter scope required')
+    return _initial_runtime_counter_prefix_material_v4(db,identity,handle.initial.original,meter)
+
+
+def _initial_runtime_counter_prefix_material_v4(db,identity,original,meter):
+    empty=original['core_counter_empty_eof']
+    fields={'schema','core_storage_instance_id','namespace','header_table','header_count','header_schema_digest',
+        'index_table','index_count','index_schema_digest','empty_root'}
+    if (type(empty)is not dict or set(empty)!=fields or empty['schema']!='sylanne3.c09.initial-counter-empty-eof.v4'
+            or empty['core_storage_instance_id']!=identity.instance or empty['namespace']!=identity.authority_namespace
+            or empty['header_table']!='authority_d13_counter_originals_v1'
+            or empty['index_table']!='runtime_d13_counter_calls_v3'
+            or type(empty['header_count'])is not int or empty['header_count']!=0
+            or type(empty['index_count'])is not int or empty['index_count']!=0):
+        raise AuthorityUnavailable('initial Counter prefix lacks its actual signed zero-history EOF')
+    for table,digest in ((empty['header_table'],empty['header_schema_digest']),
+            (empty['index_table'],empty['index_schema_digest'])):
+        row=meter.read_fixed_row(db,'sqlite_master',('sql',),"type='table' AND name=?",(table,))
+        if row is None or canonical_digest(row[0])!=digest:
+            raise AuthorityUnavailable('initial Counter empty EOF differs from its actual installed schema')
+    if empty['empty_root']!=canonical_digest((empty['header_table'],empty['header_schema_digest'],0,
+            empty['index_table'],empty['index_schema_digest'],0)):
+        raise AuthorityUnavailable('initial Counter signed zero-history root differs')
+    marker=canonical_digest(('sylanne3.d13.initial-counter-empty-prefix.v4',identity.genesis_digest,
+        identity.selection_digest,identity.instance,identity.authority_namespace))
+    root=canonical_digest(('sylanne3.d13.initial-counter-index-empty-root.v4',identity.genesis_digest,
+        marker,empty['empty_root']))
+    eof=canonical_digest(('sylanne3.d13.initial-counter-index-eof.v4',identity.selection_digest,
+        marker,identity.instance,identity.authority_namespace,0,root))
+    cursor=(identity.selection_digest,marker,identity.instance,identity.authority_namespace,'',0,root,'sealed',1)
+    seal=(identity.selection_digest,marker,identity.instance,identity.authority_namespace,0,root,eof)
+    return cursor,seal
+
+
+def _read_initial_runtime_counter_index_v4(db,meter,selection):
+    cursor=meter.read_fixed_row(db,'runtime_d13_counter_index_cursor_v3',
+        ('selection_digest','cutoff_scope_digest','storage_instance_id','namespace','last_operation_id',
+            'record_count','prefix_root','phase','cursor_revision'),'selection_digest=?',(selection,))
+    seal=meter.read_fixed_row(db,'runtime_d13_counter_index_seals_v3',
+        ('selection_digest','cutoff_scope_digest','storage_instance_id','namespace','record_count',
+            'ordered_root','eof_digest'),'selection_digest=?',(selection,))
+    return cursor,seal
+
+
+def install_actual_initial_runtime_counter_index_v4(counter,*,db):
+    """Record only the actual initial empty prefix; later runtime headers are delta rows."""
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    with runtime_storage_quantum_v3(db)as meter:
+        cursor,seal=_initial_runtime_counter_index_material_v4(counter,db,meter)
+        actual=_read_initial_runtime_counter_index_v4(db,meter,seal[0])
+        if actual==(cursor,seal):return seal
+        if actual!=(None,None):
+            raise AuthorityUnavailable('initial Counter prefix has a partial or different immutable seal')
+        header=meter.read_fixed_row(db,'authority_d13_counter_originals_v1',
+            ('namespace','counter_operation_id','phase'),'1=1',())
+        indexed=meter.read_fixed_row(db,'runtime_d13_counter_calls_v3',
+            ('selection_digest','namespace','counter_operation_id'),'1=1',())
+        if header is not None or indexed is not None:
+            raise AuthorityUnavailable('initial Counter prefix cannot be backfilled after actual Counter production')
+        meter.charge_write(sum(len(str(value).encode('utf8'))for value in cursor+seal))
+        meter.count_mutation()
+        db.execute('INSERT INTO runtime_d13_counter_index_cursor_v3 VALUES(?,?,?,?,?,?,?,?,?)',cursor)
+        meter.count_mutation()
+        db.execute('INSERT INTO runtime_d13_counter_index_seals_v3 VALUES(?,?,?,?,?,?,?)',seal)
+        return seal
+
+
+def require_actual_initial_runtime_counter_index_v4(counter,*,db):
+    """Verify the signed genesis prefix and its actual durable seal without replaying it."""
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    with runtime_storage_quantum_v3(db)as meter:
+        cursor,seal=_initial_runtime_counter_index_material_v4(counter,db,meter)
+        if _read_initial_runtime_counter_index_v4(db,meter,seal[0])!=(cursor,seal):
+            raise AuthorityUnavailable('actual initial Counter zero-history prefix seal required')
+        return seal
+
+
+def _index_header(db,counter,operation,payload,digest,classification):
+    from ..runtime_storage_v3 import runtime_storage_v3,runtime_source_identity_v4
+    handle=runtime_storage_v3(db)
+    identity=runtime_source_identity_v4(handle)
     frame=d13_core_counter_from_wire_v1(payload,D13CoreFrameIntentHeaderV7)
     if (frame.counter_operation_id!=operation or frame.authority_namespace!=counter.bridge.namespace
             or frame.install_id!=counter.policy.installation.installation_id
-            or frame.authority_id!=handle.selected.basis.control.authority_id):
+            or frame.authority_id!=identity.control.authority_id):
         raise AuthorityUnavailable('counter index header crosses its actual installed producer')
     actual=db.execute("SELECT c.origin_scope_digest FROM authority_d13_counter_originals_v1 o JOIN segmented_cells_v1 c "
         "ON c.cell_id=o.payload_cell_id WHERE o.namespace=? AND o.counter_operation_id=? AND o.phase='header'",
         (counter.bridge.namespace,operation)).fetchone()
     if actual is None:raise AuthorityUnavailable('counter index needs its actual immutable header producer')
-    cutoff=actual[0] if actual[0]==handle.selected.scope.scope_digest else None
+    if identity.origin_kind=='initial_segmented_v4':
+        require_actual_initial_runtime_counter_index_v4(counter,db=db)
+        from ..runtime_storage_v3 import read_runtime_cell_origin_v3,runtime_storage_quantum_v3
+        with runtime_storage_quantum_v3(db)as meter:
+            cell=meter.read_fixed_row(db,'authority_d13_counter_originals_v1',('payload_cell_id','payload_digest'),
+                "namespace=? AND counter_operation_id=? AND phase='header'",(counter.bridge.namespace,operation))
+            if cell is None or cell[1]!=digest:
+                raise AuthorityUnavailable('initial Counter delta differs from its actual immutable header')
+            origin=read_runtime_cell_origin_v3(db,cell[0],meter=meter)
+            if origin is None or origin['operation_id']!=operation:
+                raise AuthorityUnavailable('initial Counter delta lacks its actual runtime header producer')
+        cutoff=None
+    else:
+        cutoff=actual[0]if actual[0]==identity.capture_scope_digest else None
     row=(handle.selection_digest,counter.bridge.namespace,operation,frame.generation_call_id,digest,classification,cutoff)
     prior=db.execute('SELECT selection_digest,namespace,counter_operation_id,generation_call_id,header_digest,classification,cutoff_scope_digest '
         'FROM runtime_d13_counter_calls_v3 WHERE selection_digest=? AND namespace=? AND counter_operation_id=?',
@@ -265,8 +366,15 @@ class RuntimeCounterCallIndexBuilderV3:
         self.handle=runtime_storage_v3(self.db)
         if self.handle is None or self.handle.role!='core':
             raise AuthorityUnavailable('counter bootstrap requires its actual selected Core')
-        self.scope=self.handle.selected.scope.scope_digest
-        self.selection=self.handle.selection_digest
+        from ..runtime_storage_v3 import runtime_source_identity_v4
+        identity=runtime_source_identity_v4(self.handle)
+        self.selection=identity.selection_digest
+        if identity.origin_kind=='initial_segmented_v4':
+            self.scope=self.genesis=self.root=None
+            self.after,self.count='',0
+            self.complete=False;self.saved=None;self.phase='initial_zero'
+            return
+        self.scope=identity.capture_scope_digest
         self.genesis=canonical_digest(('sylanne3.d13.counter-index-genesis.v3',self.selection,self.scope,
             self.handle.instance,counter.bridge.namespace))
         self.after,self.count,self.root='',0,self.genesis
@@ -305,6 +413,12 @@ class RuntimeCounterCallIndexBuilderV3:
         if self.complete:
             return dict(status='complete',selection_digest=self.selection,record_count=self.count,ordered_root=self.root)
         with runtime_storage_operation_v3(self.db,operation_id='d13-index:'+self.selection),runtime_storage_quantum_v3(self.db):
+            if self.phase=='initial_zero':
+                with self.counter.core._tx()as db:
+                    seal=require_actual_initial_runtime_counter_index_v4(self.counter,db=db)
+                self.scope,self.root=seal[1],seal[5]
+                self.complete=True
+                return dict(status='complete',selection_digest=self.selection,record_count=0,ordered_root=self.root)
             if self.phase=='initialize':
                 with self.counter.core._tx() as db:
                     _require_index_schema(db)
@@ -374,24 +488,37 @@ class RuntimeCounterCallIndexBuilderV3:
 
 
 def read_runtime_counter_operations_for_call_v3(db,*,counter,namespace,call_id):
-    from ..runtime_storage_v3 import runtime_storage_v3
+    from ..runtime_storage_v3 import runtime_storage_v3,runtime_source_identity_v4
     handle=runtime_storage_v3(db)
     if handle is None:
         return db.execute('SELECT counter_operation_id FROM authority_d13_counter_originals_v1 '
             "WHERE namespace=? AND phase='header' AND json_extract(payload_json,'$.generation_call_id')=? LIMIT 2",
             (namespace,call_id)).fetchall()
-    seal=db.execute('SELECT cutoff_scope_digest,storage_instance_id,namespace FROM runtime_d13_counter_index_seals_v3 '
-        'WHERE selection_digest=?',(handle.selection_digest,)).fetchone()
-    if seal!=(handle.selected.scope.scope_digest,handle.instance,namespace):
-        raise AuthorityUnavailable('counter call lookup requires the actual complete selected cutoff index')
-    rows=db.execute('SELECT counter_operation_id,header_digest FROM runtime_d13_counter_calls_v3 '
+    identity=runtime_source_identity_v4(handle)
+    initial=identity.origin_kind=='initial_segmented_v4'
+    if initial:
+        require_actual_initial_runtime_counter_index_v4(counter,db=db)
+        if namespace!=identity.authority_namespace:
+            raise AuthorityUnavailable('initial Counter call lookup crossed its actual namespace')
+    else:
+        seal=db.execute('SELECT cutoff_scope_digest,storage_instance_id,namespace FROM runtime_d13_counter_index_seals_v3 '
+            'WHERE selection_digest=?',(handle.selection_digest,)).fetchone()
+        if seal!=(identity.capture_scope_digest,identity.instance,namespace):
+            raise AuthorityUnavailable('counter call lookup requires the actual complete selected cutoff index')
+    rows=db.execute('SELECT counter_operation_id,header_digest,classification,cutoff_scope_digest FROM runtime_d13_counter_calls_v3 '
         'WHERE selection_digest=? AND namespace=? AND generation_call_id=? ORDER BY counter_operation_id LIMIT 2',
         (handle.selection_digest,namespace,call_id)).fetchall()
-    for operation,digest in rows:
+    for operation,digest,classification,cutoff in rows:
         actual=read_core_payload_row_v3(db,'authority_d13_counter_originals_v1',(namespace,operation,'header'))
-        if actual is None or actual[1]!=digest or json.loads(actual[0])['generation_call_id']!=call_id:
+        if actual is None or actual[1]!=digest:
             raise AuthorityUnavailable('counter call derived index no longer matches its actual header')
-    return [(operation,) for operation,digest in rows]
+        frame=d13_core_counter_from_wire_v1(json.loads(actual[0]),D13CoreFrameIntentHeaderV7)
+        if (frame.generation_call_id!=call_id or frame.counter_operation_id!=operation
+                or frame.authority_namespace!=namespace or frame.authority_id!=identity.control.authority_id
+                or frame.install_id!=counter.policy.installation.installation_id
+                or initial and (cutoff is not None or classification not in ('header_only','signed_full_wire'))):
+            raise AuthorityUnavailable('counter call derived index differs from its actual typed runtime producer')
+    return [(operation,)for operation,digest,classification,cutoff in rows]
 
 
 _SELECTED_INDEX_ISSUER_V3 = object()
@@ -422,17 +549,7 @@ class SelectedRuntimeCounterIndexReadV3:
         return result
 
     def _begin(self,db,meter,cell_id,digest):
-        from ..runtime_storage_v3 import read_selected_runtime_cell_origin_v3
-        header=meter.read_fixed_row(db,'segmented_cells_v1',
-            ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
-             'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(cell_id,))
-        if header is None or header[5]!=digest or header[0]!='canonical-json.ascii.v1':
-            raise AuthorityUnavailable('selected derived counter index actual immutable cell differs')
-        if header[3]*8+131072>meter.budget.reserved_arena_bytes:
-            raise AuthorityUnavailable('counter header/evidence typed decode exceeds actual reserved arena')
-        read_selected_runtime_cell_origin_v3(db,selected_basis=self.basis,role='core',cell_id=cell_id,header=header,meter=meter)
-        self.header,self.cell_id=header,cell_id;self.ordinal=self.offset=0;self.hash=sha256()
-        self.root=canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell_id));self.encoded=bytearray()
+        _begin_runtime_counter_cell_v4(self,db,meter,cell_id,digest)
 
     def advance(self,*,db,meter):
         from pathlib import Path
@@ -448,58 +565,83 @@ class SelectedRuntimeCounterIndexReadV3:
             ('selection_digest','namespace','counter_operation_id','generation_call_id','header_digest','classification','cutoff_scope_digest'),
             'selection_digest=? AND namespace=? AND counter_operation_id=?',self.row[:3])
         if row!=self.row:raise AuthorityUnavailable('actual derived index immutable row changed')
-        if self.complete:return {'status':'complete','row':self.row,'classification':self.row[5]}
-        if self.header is None:
-            self._begin(db,meter,*self.header_ref)
-            return {'status':'progress'}
-        if self.ordinal<self.header[4]:
-            lengths=db.execute('SELECT length(payload) FROM segmented_cell_segments_v1 WHERE cell_id=? AND ordinal=?',
-                (self.cell_id,self.ordinal)).fetchone()
-            if lengths is None or not 0<lengths[0]<=16384:
-                raise AuthorityUnavailable('counter index actual segment byte bound differs')
-            segment=meter.read_fixed_row(db,'segmented_cell_segments_v1',('byte_offset','payload','payload_sha256'),
-                'cell_id=? AND ordinal=?',(self.cell_id,self.ordinal))
-            if segment[0]!=self.offset or sha256(segment[1]).hexdigest()!=segment[2]:
-                raise AuthorityUnavailable('counter index actual segment offset/SHA differs')
-            self.root=canonical_digest(('sylanne3.segmented-cell-link.v1',self.root,self.cell_id,
-                self.ordinal,self.offset,len(segment[1]),segment[2]))
-            self.hash.update(segment[1]);self.encoded.extend(segment[1]);self.ordinal+=1;self.offset+=len(segment[1])
-            return {'status':'progress'}
-        extra=db.execute('SELECT ordinal FROM segmented_cell_segments_v1 WHERE cell_id=? AND ordinal>=? LIMIT 1',
-            (self.cell_id,self.ordinal)).fetchone();meter.charge_read(8 if extra else 0)
-        if (extra is not None or self.offset!=self.header[3] or self.hash.hexdigest()!=self.header[5]
-                or self.root!=self.header[6]):
-            raise AuthorityUnavailable('counter index complete original cell SHA/root/count/EOF differs')
-        raw=json.loads(self.encoded)
-        encoded=canonical_serialize(raw).encode('ascii');meter.charge_encode(len(encoded))
-        if encoded!=self.encoded:
-            raise AuthorityUnavailable('counter index original canonical bytes differ')
-        if self.phase=='header':
-            if self.row[6] is not None and self.header[7]!=self.row[6]:
-                raise AuthorityUnavailable('derived cutoff membership differs from actual captured header origin')
-            self.frame=d13_core_counter_from_wire_v1(raw,D13CoreFrameIntentHeaderV7)
-            if (self.frame.authority_id!=self.basis.control.authority_id
-                    or self.frame.install_id!=self.basis.control.installation_id
-                    or self.frame.authority_namespace!=self.row[1]
-                    or self.frame.counter_operation_id!=self.row[2] or self.frame.generation_call_id!=self.row[3]
-                    or self.row[4]!=self.header[5]):
-                raise AuthorityUnavailable('counter derived index changed actual typed V7 header identity')
-            if self.row[5]=='signed_full_wire':
-                evidence=meter.read_fixed_row(db,'authority_d13_counter_originals_v1',('payload_cell_id','payload_digest'),
-                    "namespace=? AND counter_operation_id=? AND phase='evidence'",self.row[1:3])
-                if evidence is None or self.policy is None:
-                    raise AuthorityUnavailable('signed counter index needs actual installed public wire policy and evidence')
-                self.phase='evidence';self._begin(db,meter,*evidence);return {'status':'progress'}
-            if self.row[5]!='header_only':raise AuthorityUnavailable('unregistered counter index classification')
-        else:
-            envelope=d13_core_counter_from_wire_v1(raw,D13CoreFullWireEnvelopeV1)
-            selector=D13CurrentWireCountSelectorV1(self.frame.install_id,self.frame.authority_namespace,
-                self.frame.frame_intent_id,self.frame.frame_intent_digest,self.frame.counter_operation_id,
-                self.frame.raw_authority_digest,self.frame.compressed_authority_digest,
-                self.frame.raw_http_template_digest,self.frame.compressed_http_template_digest)
-            verify_historical_d13_core_wire_origin_v1(self.policy,envelope,selector=selector,frame=self.frame)
-        self.complete=True;self.encoded=bytearray()
-        return {'status':'complete','row':self.row,'classification':self.row[5]}
+        return _advance_runtime_counter_original_v4(self,db=db,meter=meter,control=self.basis.control)
+
+
+def _begin_runtime_counter_cell_v4(self,db,meter,cell_id,digest):
+    from ..runtime_storage_v3 import read_selected_runtime_cell_origin_v3
+    header=meter.read_fixed_row(db,'segmented_cells_v1',
+        ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
+         'payload_sha256','ordered_segment_root','origin_scope_digest'),'cell_id=?',(cell_id,))
+    if header is None or header[5]!=digest or header[0]!='canonical-json.ascii.v1':
+        raise AuthorityUnavailable('selected derived counter index actual immutable cell differs')
+    if header[3]*8+131072>meter.budget.reserved_arena_bytes:
+        raise AuthorityUnavailable('counter header/evidence typed decode exceeds actual reserved arena')
+    if type(self)is SelectedRuntimeCounterIndexReadV3:
+        read_selected_runtime_cell_origin_v3(db,selected_basis=self.basis,role='core',cell_id=cell_id,header=header,meter=meter)
+    elif type(self)is InitialRuntimeCounterIndexReadV4:
+        from ..runtime_storage_v3 import read_initial_runtime_cell_origin_v4
+        origin=read_initial_runtime_cell_origin_v4(db,initial=self.view,role='core',cell_id=cell_id,header=header,meter=meter)
+        if origin is None:raise AuthorityUnavailable('initial Counter cell requires its actual runtime producer')
+    else:raise AuthorityUnavailable('actual private Counter cell decoder required')
+    self.header,self.cell_id=header,cell_id;self.ordinal=self.offset=0;self.hash=sha256()
+    self.root=canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell_id));self.encoded=bytearray()
+
+
+
+def _advance_runtime_counter_original_v4(self,*,db,meter,control):
+    if self.complete:return {'status':'complete','row':self.row,'classification':self.row[5]}
+    if self.header is None:
+        self._begin(db,meter,*self.header_ref)
+        return {'status':'progress'}
+    if self.ordinal<self.header[4]:
+        lengths=db.execute('SELECT length(payload) FROM segmented_cell_segments_v1 WHERE cell_id=? AND ordinal=?',
+            (self.cell_id,self.ordinal)).fetchone()
+        if lengths is None or not 0<lengths[0]<=16384:
+            raise AuthorityUnavailable('counter index actual segment byte bound differs')
+        segment=meter.read_fixed_row(db,'segmented_cell_segments_v1',('byte_offset','payload','payload_sha256'),
+            'cell_id=? AND ordinal=?',(self.cell_id,self.ordinal))
+        if segment[0]!=self.offset or sha256(segment[1]).hexdigest()!=segment[2]:
+            raise AuthorityUnavailable('counter index actual segment offset/SHA differs')
+        self.root=canonical_digest(('sylanne3.segmented-cell-link.v1',self.root,self.cell_id,
+            self.ordinal,self.offset,len(segment[1]),segment[2]))
+        self.hash.update(segment[1]);self.encoded.extend(segment[1]);self.ordinal+=1;self.offset+=len(segment[1])
+        return {'status':'progress'}
+    extra=db.execute('SELECT ordinal FROM segmented_cell_segments_v1 WHERE cell_id=? AND ordinal>=? LIMIT 1',
+        (self.cell_id,self.ordinal)).fetchone();meter.charge_read(8 if extra else 0)
+    if (extra is not None or self.offset!=self.header[3] or self.hash.hexdigest()!=self.header[5]
+            or self.root!=self.header[6]):
+        raise AuthorityUnavailable('counter index complete original cell SHA/root/count/EOF differs')
+    raw=json.loads(self.encoded)
+    encoded=canonical_serialize(raw).encode('ascii');meter.charge_encode(len(encoded))
+    if encoded!=self.encoded:
+        raise AuthorityUnavailable('counter index original canonical bytes differ')
+    if self.phase=='header':
+        if self.row[6] is not None and self.header[7]!=self.row[6]:
+            raise AuthorityUnavailable('derived cutoff membership differs from actual captured header origin')
+        self.frame=d13_core_counter_from_wire_v1(raw,D13CoreFrameIntentHeaderV7)
+        if (self.frame.authority_id!=control.authority_id
+                or self.frame.install_id!=control.installation_id
+                or self.frame.authority_namespace!=self.row[1]
+                or self.frame.counter_operation_id!=self.row[2] or self.frame.generation_call_id!=self.row[3]
+                or self.row[4]!=self.header[5]):
+            raise AuthorityUnavailable('counter derived index changed actual typed V7 header identity')
+        if self.row[5]=='signed_full_wire':
+            evidence=meter.read_fixed_row(db,'authority_d13_counter_originals_v1',('payload_cell_id','payload_digest'),
+                "namespace=? AND counter_operation_id=? AND phase='evidence'",self.row[1:3])
+            if evidence is None or self.policy is None:
+                raise AuthorityUnavailable('signed counter index needs actual installed public wire policy and evidence')
+            self.phase='evidence';self._begin(db,meter,*evidence);return {'status':'progress'}
+        if self.row[5]!='header_only':raise AuthorityUnavailable('unregistered counter index classification')
+    else:
+        envelope=d13_core_counter_from_wire_v1(raw,D13CoreFullWireEnvelopeV1)
+        selector=D13CurrentWireCountSelectorV1(self.frame.install_id,self.frame.authority_namespace,
+            self.frame.frame_intent_id,self.frame.frame_intent_digest,self.frame.counter_operation_id,
+            self.frame.raw_authority_digest,self.frame.compressed_authority_digest,
+            self.frame.raw_http_template_digest,self.frame.compressed_http_template_digest)
+        verify_historical_d13_core_wire_origin_v1(self.policy,envelope,selector=selector,frame=self.frame)
+    self.complete=True;self.encoded=bytearray()
+    return {'status':'complete','row':self.row,'classification':self.row[5]}
 
 
 def read_selected_runtime_counter_index_v3(db,*,basis,selection_digest,namespace,counter_operation_id,meter,policy=None):
@@ -647,3 +789,123 @@ def begin_selected_runtime_counter_cutoff_read_v3(db,*,basis,selection_digest,me
     if cursor[0]!=selection_digest or cursor[3]!=basis.prepared['namespace'] or cursor[5]<0 or cursor[8]<0 or cursor[7] not in ('scan','sealed'):
         raise AuthorityUnavailable('counter cutoff actual namespace/progress identity differs')
     return SelectedRuntimeCounterCutoffReadV3(_SELECTED_INDEX_ISSUER_V3,basis,cursor,seal)
+
+
+_INITIAL_INDEX_ISSUER_V4=object()
+_INITIAL_INDEX_READS_V4=__import__('weakref').WeakSet()
+
+
+def _initial_counter_source_material_v4(db,qualification,selection_digest,meter,view):
+    from .c09_source_physical_read_v3 import InitialPhysicalSourceReadQualificationV3
+    from ..runtime_storage_v3 import runtime_storage_basis_identity_v4
+    if (type(qualification)is not InitialPhysicalSourceReadQualificationV3 or qualification.role!='core'
+            or view.qualification is not qualification):
+        raise AuthorityUnavailable('actual initial Core physical Source qualification required')
+    view.require_current(db=db,meter=meter)
+    identity=runtime_storage_basis_identity_v4(view,role='core',meter=meter)
+    if (identity.origin_kind!='initial_segmented_v4' or identity.selection_digest!=selection_digest
+            or identity.authority_namespace!=qualification.scope.session.scope.authority_namespace):
+        raise AuthorityUnavailable('initial Counter Source differs from its actual signed genesis selection')
+    cursor,seal=_initial_runtime_counter_prefix_material_v4(db,identity,view.original,meter)
+    if _read_initial_runtime_counter_index_v4(db,meter,selection_digest)!=(cursor,seal):
+        raise AuthorityUnavailable('initial physical Source lacks its actual immutable zero-history prefix seal')
+    return view,identity,cursor,seal
+
+
+class InitialRuntimeCounterIndexReadV4(SelectedRuntimeCounterIndexReadV3):
+    """The shared cell decoder under an actual INTENT Source qualification."""
+    def __init__(self,key,qualification,view,row,header_ref,policy):
+        if key is not _INITIAL_INDEX_ISSUER_V4:
+            raise AuthorityUnavailable('actual initial Counter Source reader issuer required')
+        self.qualification,self.view=qualification,view
+        self.row,self.header_ref,self.policy=row,header_ref,policy
+        self.header=None;self.ordinal=self.offset=0;self.root=None;self.hash=sha256()
+        self.encoded=bytearray();self.phase='header';self.frame=None;self.complete=False
+        _INITIAL_INDEX_READS_V4.add(self)
+    def copy_for_c09_quantum_v3(self,*,meter):
+        from copy import copy
+        from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
+        if (type(self)is not InitialRuntimeCounterIndexReadV4 or self not in _INITIAL_INDEX_READS_V4
+                or meter is not require_c09_reserved_meter_v3(meter.budget)):
+            raise AuthorityUnavailable('actual initial Counter Source continuation/Root quantum required')
+        self.qualification.require_current(meter=meter)
+        self.view.control.require_c09_retained_arena_v3(meter=meter,additional_bytes=len(self.encoded)+4096)
+        meter.charge_encode(len(self.encoded))
+        result=copy(self);result.hash=self.hash.copy();result.encoded=bytearray(self.encoded)
+        _INITIAL_INDEX_READS_V4.add(result)
+        return result
+    def advance(self,*,db,meter):
+        if type(self)is not InitialRuntimeCounterIndexReadV4 or self not in _INITIAL_INDEX_READS_V4:
+            raise AuthorityUnavailable('actual private initial Counter Source reader required')
+        self.view.require_current(db=db,meter=meter)
+        view,identity,cursor,seal=_initial_counter_source_material_v4(db,self.qualification,self.row[0],meter,self.view)
+        if view.original!=self.view.original or view.db is not self.view.db:
+            raise AuthorityUnavailable('initial Counter Source changed its actual genesis/connection')
+        row=meter.read_fixed_row(db,'runtime_d13_counter_calls_v3',
+            ('selection_digest','namespace','counter_operation_id','generation_call_id','header_digest',
+                'classification','cutoff_scope_digest'),'selection_digest=? AND namespace=? AND counter_operation_id=?',self.row[:3])
+        if row!=self.row or row[6]is not None:
+            raise AuthorityUnavailable('initial Counter delta changed its actual immutable locator')
+        return _advance_runtime_counter_original_v4(self,db=db,meter=meter,control=self.view.control)
+
+
+def read_initial_runtime_counter_index_v4(db,*,qualification,selection_digest,namespace,counter_operation_id,meter):
+    from .c09_initial_segmented_genesis_v4 import require_initial_segmented_physical_metadata_v4
+    view=require_initial_segmented_physical_metadata_v4(qualification,db=db,meter=meter)
+    view,identity,cursor,seal=_initial_counter_source_material_v4(db,qualification,selection_digest,meter,view)
+    if namespace!=identity.authority_namespace:
+        raise AuthorityUnavailable('initial Counter index crossed its actual Source namespace')
+    row=meter.read_fixed_row(db,'runtime_d13_counter_calls_v3',
+        ('selection_digest','namespace','counter_operation_id','generation_call_id','header_digest',
+            'classification','cutoff_scope_digest'),'selection_digest=? AND namespace=? AND counter_operation_id=?',
+        (selection_digest,namespace,counter_operation_id))
+    if row is None:return None
+    if row[6]is not None or row[5]not in ('header_only','signed_full_wire'):
+        raise AuthorityUnavailable('initial Counter runtime delta cannot claim a captured cutoff')
+    header=meter.read_fixed_row(db,'authority_d13_counter_originals_v1',('payload_cell_id','payload_digest'),
+        "namespace=? AND counter_operation_id=? AND phase='header'",(namespace,counter_operation_id))
+    if header is None:
+        raise AuthorityUnavailable('initial Counter delta has no actual header; an independently qualified retirement original is required')
+    if header[1]!=row[4]:
+        raise AuthorityUnavailable('initial Counter delta differs from its actual immutable header digest')
+    policy=view.control.read_selected_installed_d13_policy_v3(namespace,meter=meter)
+    return InitialRuntimeCounterIndexReadV4(_INITIAL_INDEX_ISSUER_V4,qualification,view,row,header,policy)
+
+
+class InitialRuntimeCounterEmptyPrefixReadV4:
+    def __init__(self,key,qualification,view,cursor,seal):
+        if key is not _INITIAL_INDEX_ISSUER_V4:
+            raise AuthorityUnavailable('actual initial zero-history prefix issuer required')
+        self.qualification,self.view,self.cursor,self.seal=qualification,view,cursor,seal
+        self.root=seal[5];self.complete=False
+        _INITIAL_INDEX_READS_V4.add(self)
+    def copy_for_c09_quantum_v3(self,*,meter):
+        from copy import copy
+        from ..runtime.c09_paged_sql_v2 import require_c09_reserved_meter_v3
+        if (type(self)is not InitialRuntimeCounterEmptyPrefixReadV4 or self not in _INITIAL_INDEX_READS_V4
+                or meter is not require_c09_reserved_meter_v3(meter.budget)):
+            raise AuthorityUnavailable('actual initial prefix continuation/Root quantum required')
+        self.qualification.require_current(meter=meter)
+        result=copy(self);_INITIAL_INDEX_READS_V4.add(result)
+        return result
+    def advance(self,*,db,meter):
+        if type(self)is not InitialRuntimeCounterEmptyPrefixReadV4 or self not in _INITIAL_INDEX_READS_V4:
+            raise AuthorityUnavailable('actual private initial zero-history prefix required')
+        self.view.require_current(db=db,meter=meter)
+        view,identity,cursor,seal=_initial_counter_source_material_v4(db,self.qualification,self.cursor[0],meter,self.view)
+        if (view.original!=self.view.original or view.db is not self.view.db
+                or (cursor,seal)!=(self.cursor,self.seal)or self.root!=seal[5]):
+            raise AuthorityUnavailable('initial Counter prefix changed its actual signed zero-history commitment')
+        extra=meter.read_fixed_row(db,'runtime_d13_counter_calls_v3',('counter_operation_id',),
+            'selection_digest=? AND namespace=? AND cutoff_scope_digest IS NOT NULL',(seal[0],seal[3]))
+        if extra is not None:
+            raise AuthorityUnavailable('initial Counter delta contains a falsely captured prefix member')
+        self.complete=True
+        return {'status':'complete','record_count':0,'ordered_root':self.root}
+
+
+def begin_initial_runtime_counter_empty_prefix_read_v4(db,*,qualification,selection_digest,meter):
+    from .c09_initial_segmented_genesis_v4 import require_initial_segmented_physical_metadata_v4
+    view=require_initial_segmented_physical_metadata_v4(qualification,db=db,meter=meter)
+    view,identity,cursor,seal=_initial_counter_source_material_v4(db,qualification,selection_digest,meter,view)
+    return InitialRuntimeCounterEmptyPrefixReadV4(_INITIAL_INDEX_ISSUER_V4,qualification,view,cursor,seal)

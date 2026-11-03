@@ -9,6 +9,7 @@ import math
 from ..domains.d01.production_operations_v1 import plain_v1
 from ..domains.d02 import BodyDomain, BodyPassiveRates, BodyProfile, BodyState, _reservation
 from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
+from ..domains.d02.character_labor_v1 import CharacterLaborPolicyV1, character_labor_policy_from_wire_v1
 from ..domains.d02.production_operations_v1 import (
     AdvanceCurrentBodyRequestV1, ApplyCurrentBodyEffectRequestV1, CurrentBodyAdvanceInputsV1,
     CurrentBodyEffectInputsV1, PassiveBodySegmentV1, compile_advance_current_body_v1,
@@ -103,7 +104,7 @@ def install_d02_production_schema_v1(db):
 
 
 class InstalledD02ProductionReadersV1:
-    def __init__(self, *, issuer, body_quote_authority, role_clock_reader, installed_bundle=None):
+    def __init__(self, *, issuer, body_quote_authority, role_clock_reader, installed_bundle=None, labor_census=None, labor_scope=None, labor_pages=None):
         from ..host.installed_d04_semantic_mapping_v3 import InstalledD04SemanticMappingReaderV3
         if (type(issuer) is not D11BudgetJobIssuer or type(body_quote_authority) is not D02BodyQuoteAuthority
                 or type(role_clock_reader) is not InstalledD04SemanticMappingReaderV3):
@@ -112,11 +113,98 @@ class InstalledD02ProductionReadersV1:
         self.body_quote_authority = body_quote_authority
         self.role_clock_reader = role_clock_reader
         self.installed_bundle = installed_bundle
+        if (labor_census is None) != (labor_scope is None):
+            raise TypeError("labor metadata requires its actual same-call census/scope pair")
+        if labor_census is not None:
+            from ..authority_service.character_labor_census_v1 import CharacterLaborCensusV1
+            from ..runtime_contracts import FenceScope
+            from ..host.authority_profile import AdminInstallationBundle
+            if (type(labor_census) is not CharacterLaborCensusV1 or type(labor_scope) is not FenceScope
+                    or type(installed_bundle) is not AdminInstallationBundle):
+                raise TypeError("labor census requires its exact installed packet and original WRITE scope")
+        self.labor_census, self.labor_scope = labor_census, labor_scope
+        if labor_pages is not None and (labor_census is None or type(labor_pages) is not tuple):
+            raise TypeError("labor pages require their actual same-call census/scope")
+        self.labor_pages = labor_pages
+
+    def require_labor_census_v1(self, db, read, state):
+        """Current metadata evidence, never an execution or balance permission."""
+        from ..authority_service.character_labor_census_v1 import verify_character_labor_census_v1
+        from ..runtime_storage_v3 import runtime_storage_v3
+        from .c09_paged_sql_v2 import current_c09_sql_meter_v2
+        if type(read) is not CurrentDomainReadV1 or type(state) is not BodyState:
+            raise TypeError("labor census must be consumed by its actual D02 production read")
+        read.check(db)
+        from .current_character_labor_adoption_v1 import (
+            is_character_labor_adoption_body_reader_v1,require_character_labor_adoption_body_reader_scope_v1)
+        adoption = is_character_labor_adoption_body_reader_v1(self)
+        census, scope = self.labor_census, self.labor_scope
+        if adoption:
+            actual_census,actual_scope = require_character_labor_adoption_body_reader_scope_v1(
+                self,db=db,read=read,state=state)
+            if actual_census is not census or actual_scope is not scope:
+                raise ValueError("labor adoption Body reader changed its original private census/scope")
+        if census is None or scope is None:
+            raise MissingProductionOriginalV1("actual_complete_character_labor_census")
+        frame = read.frame
+        ns, operation = frame.envelope.authority.namespace, frame.envelope.identity.operation_id
+        policy = self.installed_bundle.installation_policy
+        if (scope.operation != "write" or scope.permit.operation != "write"
+                or scope.namespace != ns
+                or not adoption and (scope.operation_id != operation or scope.permit.operation_id != operation)
+                or scope.pinned_anchor != scope.permit.pinned_anchor
+                or policy.namespace != ns or policy.authority_namespace != scope.authority_namespace
+                or census.namespace != ns or census.authority_namespace != scope.authority_namespace
+                or census.installation_id != policy.installation_id
+                or census.manifest_digest != policy.manifest_digest
+                or census.authority_id != scope.pinned_anchor.authority_id):
+            raise ValueError("labor census left its actual current operation/namespace/protected installation")
+        verify_character_labor_census_v1(self.issuer, census, permit=scope.permit)
+        handle, meter = runtime_storage_v3(db), current_c09_sql_meter_v2()
+        if handle is None or meter is None or handle.selection_digest != census.selection_digest:
+            raise MissingProductionOriginalV1("actual_same_selected_bounded_labor_census")
+        handle.require_current(meter)
+        guard = frame.envelope.version_guard
+        if census.graph_stamp != (frame.snapshot.epochs[0].revision, guard.access_epoch, guard.delete_epoch):
+            raise ValueError("labor census Graph/source/deletion stamp changed before W01")
+        key = AtomKey(Owner("persona", *ns.as_tuple), "d02.body_state.v1", state.profile_id)
+        atom = read.head(db, key, required=True)
+        if (not atom.valid or census.body_state.ref != key.token
+                or census.body_state.version != atom.revision or atom.revision != state.version
+                or census.body_state_value_digest != canonical_digest(atom.value)
+                or BodyState(**atom.value) != state or census.body_state_cursor != state.cursor):
+            raise ValueError("labor census no longer describes this actual current Body version/cursor")
+        return census
+
+
+    def require_labor_pages_v1(self, db, read, state):
+        from ..authority_service.character_labor_census_v1 import (
+            CharacterLaborSegmentPageV1, verify_character_labor_segment_page_v1)
+        census = self.require_labor_census_v1(db,read,state)
+        pages = self.labor_pages
+        if type(pages) is not tuple or not pages:
+            raise MissingProductionOriginalV1("actual_complete_character_labor_census_segment_pages")
+        cursor = 0
+        for index,page in enumerate(pages):
+            if type(page) is not CharacterLaborSegmentPageV1:
+                raise TypeError("actual signed census segment pages required")
+            end = census.life_entry_count if page.next_cursor is None else page.next_cursor
+            limit = max(1,end-cursor)
+            verify_character_labor_segment_page_v1(self.issuer,page,census=census,
+                permit=self.labor_scope.permit,cursor=cursor,limit=limit)
+            if page.next_cursor is None:
+                if index != len(pages)-1:
+                    raise ValueError("labor pages continued after their actual complete EOF")
+            else:
+                if index == len(pages)-1:
+                    raise MissingProductionOriginalV1("remaining_actual_character_labor_census_segment_pages")
+                cursor = page.next_cursor
+        return pages
 
     def install_policy(self, db, *, frame, policy):
         """W01's fixed administrator-policy installation, never a data command."""
-        if type(policy) not in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1}:
-            raise TypeError("exact D02 passive/effect policy required")
+        if type(policy) not in {PassiveBodyPolicyV1, SettledBodyEffectPolicyV1, CharacterLaborPolicyV1}:
+            raise TypeError("exact D02 passive/effect or explicit character-labor policy required")
         read = CurrentDomainReadV1(frame)
         read.check(db)
         if policy.namespace != frame.envelope.authority.namespace:
@@ -125,7 +213,7 @@ class InstalledD02ProductionReadersV1:
         digest = canonical_digest(plain_v1(policy))
         if len(pinned) != 1 or pinned[0].revision != policy.revision or pinned[0].policy_digest != digest:
             raise ValueError("D02 policy was not selected by current installed policy authority")
-        kind = "passive" if type(policy) is PassiveBodyPolicyV1 else "effect"
+        kind = {PassiveBodyPolicyV1: "passive", SettledBodyEffectPolicyV1: "effect", CharacterLaborPolicyV1: "labor"}[type(policy)]
         encoded = canonical_serialize(plain_v1(policy))
         start, end = ((policy.from_role_cursor, policy.to_role_cursor) if kind == "passive" else (None, None))
         expected = (kind, policy.profile_id, start, end, encoded, digest,
@@ -152,12 +240,15 @@ class InstalledD02ProductionReadersV1:
         pin = tuple(item for item in read.frame.installed_policy_refs if item.policy_ref == ref and item.revision == revision)
         if len(pin) != 1 or pin[0].policy_digest != digest:
             raise MissingProductionOriginalV1("installed_d02_policy_version:" + ref)
-        raw["namespace"] = NamespaceId(**raw["namespace"])
+        namespace_wire = raw["namespace"]
+        raw["namespace"] = NamespaceId(**namespace_wire)
         if kind == "passive":
             raw["rates"] = BodyPassiveRates(**raw["rates"])
             policy = PassiveBodyPolicyV1(**raw)
         elif kind == "effect":
             policy = SettledBodyEffectPolicyV1(**raw)
+        elif kind == "labor":
+            policy = character_labor_policy_from_wire_v1(dict(raw, namespace=namespace_wire))
         else:
             raise ValueError("unrecognized D02 installed policy kind")
         if policy.namespace != read.frame.envelope.authority.namespace or policy.policy_ref != ref or policy.revision != revision:
@@ -165,7 +256,11 @@ class InstalledD02ProductionReadersV1:
         return policy, ProductionOriginalRefV1("d02." + kind + "_policy", ref, digest)
 
     def _current_body(self, db, read, profile_id=None):
-        states = read.complete_inventory(db, "d02.body_state.v1")
+        from .d02_character_labor_read_v1 import read_current_character_labor_resource_inventory_v1
+        def inventory(family):
+            scoped,values = read_current_character_labor_resource_inventory_v1(db,read,family)
+            return values if scoped else read.complete_inventory(db,family)
+        states = inventory("d02.body_state.v1")
         valid = tuple(atom for atom in states if atom.valid and (profile_id is None or atom.key.name == profile_id))
         if len(valid) != 1:
             raise MissingProductionOriginalV1("unique_current_body_profile_state")
@@ -181,7 +276,7 @@ class InstalledD02ProductionReadersV1:
         profile = BodyProfile(**raw)
         if profile.namespace != ns or profile.version != profile_atom.revision:
             raise ValueError("current body profile identity/version changed")
-        reservations = tuple(_reservation(atom.value) for atom in read.complete_inventory(db, "d02.reservation.v1") if atom.valid)
+        reservations = tuple(_reservation(atom.value) for atom in inventory("d02.reservation.v1") if atom.valid)
         if len({item.effect_id for item in reservations}) != len(reservations):
             raise ValueError("body reservation inventory repeats an effect")
         return profile, state, reservations

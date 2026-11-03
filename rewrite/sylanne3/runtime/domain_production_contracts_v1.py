@@ -361,6 +361,12 @@ class DomainOperationReceiptV1:
 
 def actual_frame_read_versions_v1(frame):
     """Pure stage readset; private Source frames add their actual header CAS facts."""
+    from .current_full_persona_writer_v1 import current_full_persona_writer_frame_read_versions_v1
+    full_writer=current_full_persona_writer_frame_read_versions_v1(frame)
+    if full_writer is not None:return full_writer
+    from .persona_growth_review_frame_v1 import growth_review_frame_read_versions_v1
+    growth=growth_review_frame_read_versions_v1(frame)
+    if growth is not None:return growth
     from .named_joint_binding_write_v1 import named_joint_host_frame_read_versions_v3
     named=named_joint_host_frame_read_versions_v3(frame)
     if named is not None:return named

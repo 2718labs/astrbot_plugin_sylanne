@@ -12,9 +12,10 @@ from datetime import datetime
 import math
 
 from ...authority_service.v2_contract import MutationReceiptV2, PlatformObservationV2
+from ...authority_service.observation_refinement_contract_v3 import (
+    PlatformObservationRefinementReceiptV3,observation_platform_observation_v3)
 from ...graph_types import AtomKey, GraphAtom, GraphVersion, GraphWrite, Owner, TypeSpec
 from ...memory_types import SourceRecord, access_key, source_key, validate_access
-from ...runtime.dispatch_candidate import dispatch_segment_payload_ref
 from ...runtime_contracts import NamespaceId, canonical_digest, schema_hash
 
 
@@ -347,6 +348,7 @@ def _outbound_segment(batch):
         validate_natural_verified_batch_value(batch.value)
         return batch.value["segment"], natural_dispatch_segment_payload_ref_v2(batch.key.token, batch.value["segment"]["position"])
     if batch.key.type_name == "d09.verified_segment_batch.v1":
+        from ...runtime.dispatch_candidate import dispatch_segment_payload_ref
         segments = batch.value.get("segments")
         if type(segments) is list and len(segments) == 1 and type(segments[0]) is dict:
             return segments[0], dispatch_segment_payload_ref(batch.key.token, 0)
@@ -356,15 +358,16 @@ def _outbound_segment(batch):
 def observe_outbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
                              outbox: GraphAtom, batch: GraphAtom,
                              source: GraphAtom, access: GraphAtom,
-                             observation_receipt: MutationReceiptV2, *,
+                             observation_receipt: MutationReceiptV2 | PlatformObservationRefinementReceiptV3, *,
                              previous: GraphAtom | None = None) -> TurnOutboundObservationCandidateV1:
     """Record accepted/unknown transport evidence, never a completed turn.
 
     W01 must independently read the Authority receipt and current outbox under
     its fence. A caller-supplied receipt is structurally checked but untrusted.
     """
-    pending = observation_receipt.pending if type(observation_receipt) is MutationReceiptV2 else None
-    observation = pending.platform_observation if pending is not None else None
+    if type(observation_receipt) not in (MutationReceiptV2,PlatformObservationRefinementReceiptV3):
+        raise ValueError('exact Authority observation receipt required')
+    observation=observation_platform_observation_v3(observation_receipt)
     source_record = SourceRecord.from_dict(source.value)
     segment, payload_ref = _outbound_segment(batch)
     _source_guard(namespace, slot.value.get("conversation_ref"), source, access)
@@ -378,7 +381,7 @@ def observe_outbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
             or segment.get("body") != source_record.text
             or source_record.source_kind != "authored"
             or type(observation) is not PlatformObservationV2
-            or pending.phase != "observed" or observation_receipt.durable_state != "committed"
+            or observation_receipt.durable_state != "committed"
             or observation.outcome not in {"accepted", "unknown"}
             or outbox.value.get("phase") != (
                 "ack" if observation.outcome == "accepted" else "unknown")
@@ -421,15 +424,16 @@ def observe_outbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
 def complete_outbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
                               outbox: GraphAtom, batch: GraphAtom,
                               source: GraphAtom, access: GraphAtom,
-                              delivery_receipt: MutationReceiptV2, *,
+                              delivery_receipt: MutationReceiptV2 | PlatformObservationRefinementReceiptV3, *,
                               tool_state: str = "not_applicable") -> TurnCompletionCandidateV1:
     """Complete only independently verified D11 recipient-delivery evidence.
 
     An accepted adapter ACK never passes this gate. W01 must obtain the
     receipt from current Authority state and recheck the same graph versions.
     """
-    pending = delivery_receipt.pending if type(delivery_receipt) is MutationReceiptV2 else None
-    observation = pending.platform_observation if pending is not None else None
+    if type(delivery_receipt) not in (MutationReceiptV2,PlatformObservationRefinementReceiptV3):
+        raise ValueError('exact Authority delivery receipt required')
+    observation=observation_platform_observation_v3(delivery_receipt)
     record = SourceRecord.from_dict(source.value)
     segment, payload_ref = _outbound_segment(batch)
     if (type(slot) is not GraphAtom or not slot.valid
@@ -443,7 +447,7 @@ def complete_outbound_turn_v1(namespace: NamespaceId, slot: GraphAtom,
             or outbox.value.get("payload_ref") != payload_ref
             or segment.get("body") != record.text or record.source_kind != "authored"
             or type(observation) is not PlatformObservationV2
-            or pending.phase != "observed" or delivery_receipt.durable_state != "committed"
+            or delivery_receipt.durable_state != "committed"
             or observation.outcome != "delivered"
             or outbox.value.get("effect_id") != observation.binding.origin.effect_id
             or outbox.value.get("operation_id") != observation.binding.origin.operation_id

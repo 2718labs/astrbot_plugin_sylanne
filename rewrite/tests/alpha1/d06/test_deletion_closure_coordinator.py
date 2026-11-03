@@ -247,8 +247,10 @@ def test_coordinator_candidate_includes_current_and_historical_d06_dependencies(
     assert "independent_deletion_intent" in result.missing_facets
     assert "request_authorization" in result.missing_facets
     assert not hasattr(result, "deletion_permit")
-    assert not any(spec.storage_role in {"cache", "projection"}
-                   for spec in D06DomainProvider.type_specs())
+    projection_specs = {spec.name for spec in D06DomainProvider.type_specs()
+                        if spec.storage_role in {"cache", "projection"}}
+    assert projection_specs == {"memory.episode_eligibility.v2",
+                                "memory.internal_life_content_eligibility.v1"}
 
     limited = read_deletion_closure_candidate_from_coordinator(
         coordinator, authority, lease,

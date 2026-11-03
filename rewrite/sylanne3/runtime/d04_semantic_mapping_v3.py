@@ -244,6 +244,26 @@ def stage_current_d04_drive_in_transaction_v3(
         for contribution in (d for d in mapping.contribution_doses if d.family_root == family):
             for i, mechanism in enumerate(MECHANISMS):
                 dose_policy.validate_share(mechanism, tuple(contribution.dose[i * 3:i * 3 + 3]), family_share)
+    from .d04_ordinary_readout_v3 import (require_bound_d04_role_readout_v3,
+        d04_role_manifest_wire_v3,d04_role_manifest_versions_v3)
+    if type(acceptance)is LifeNumericAppraisalAcceptanceV1:
+        from .d06_ordinary_readout_v3 import (require_bound_life_ordinary_readout_v3,
+            life_role_manifest_wire_v3,life_role_manifest_versions_v3)
+        prepared_role=require_bound_life_ordinary_readout_v3(db)
+        role_manifest=life_role_manifest_wire_v3(prepared_role.manifest)
+        if (purpose!='consolidation' or tuple(audience)!=prepared_role.manifest.audience
+                or role_manifest!=acceptance.role_support_manifest):
+            raise ValueError('Life mapping differs from its actual independent consolidation readout')
+        role_versions=life_role_manifest_versions_v3(role_manifest,namespace)
+    else:
+        prepared_role=require_bound_d04_role_readout_v3(db,namespace,frozen=frozen,
+            manifest=acceptance.role_support_manifest)
+        role_manifest=d04_role_manifest_wire_v3(prepared_role.manifest)
+        role_versions=d04_role_manifest_versions_v3(role_manifest,namespace)
+    from ..domains.d01 import ActiveRoleHeadControlV3
+    selected_readout=prepared_role.selected_readout if type(role)is ActiveRoleHeadControlV3 else None
+    if selected_readout is not None and selected_readout.control is not role:
+        raise ValueError('D04 mapping control differs from its actual selected readout')
     families = []
     # Only the adopted broker signal is used; no public parameter can set doses.
     aggregate = {}
@@ -269,15 +289,16 @@ def stage_current_d04_drive_in_transaction_v3(
             role=role, condition=condition, policy=mapping.policy,
             time_map=AffineTimeMapV1(clock.role_start, clock.role_end, clock.role_start, clock.role_end,
                                     mapping_ref=clock.mapping_id + ":" + str(clock.mapping_version)),
-            portions=tuple(portions), audience=audience, purpose=purpose)
+            portions=tuple(portions), audience=audience, purpose=purpose,selected_readout=selected_readout)
         families.append(candidate)
         for portion in candidate.portions:
             identity = (portion.checkpoint_ref, portion.source_ref)
             vector = aggregate.setdefault(identity, [0.0] * 24)
             for axis, rate in enumerate(portion.rate):
                 vector[axis] = math.fsum((vector[axis], rate))
+    role_keys={v.key for v in role_versions}-{v.key for v in source_versions}
     writes = []
-    versions = {v.key: v for v in (*role.read_versions, *source_versions,
+    versions = {v.key: v for v in (*role.read_versions, *source_versions, *role_versions,
         GraphVersion(AtomKey.from_token(appraisal_ref), acceptance.appraisal_revision))}
     for candidate in families:
         versions.update((v.key, v) for v in candidate.read_versions)
@@ -296,7 +317,7 @@ def stage_current_d04_drive_in_transaction_v3(
             raise ValueError("D04 drive requires actual absent CAS read")
         versions[write.key] = GraphVersion(write.key, 0)
         writes.append(write)
-    rows = graph_read_rows_v3(snapshot, tuple(versions.values()))
+    rows = graph_read_rows_v3(snapshot, tuple(v for v in versions.values() if v.key not in role_keys))
     require_current_read_rows_v3(db, rows, namespace)
     dose_kind = "d11.installed-d04-semantic-dose-policy.v3"
     dose_authority_body = {"schema": dose_kind, "namespace": asdict(namespace),
@@ -317,6 +338,7 @@ def stage_current_d04_drive_in_transaction_v3(
         "interpretation_level": interpretation_level,
         "mapping_candidate": asdict(mapping), "family_candidates": [asdict(f) for f in families],
         "read_rows": [asdict(row) for row in rows], "source_family_by_ref": family_by_ref,
+        "role_support_manifest":role_manifest,
         "unknown_fields": {f.facet_id: f.unknown_fields for f in suggestion.bundle.meaning_facets},
         "output_writes": [asdict(w) for w in writes]}
     wire = canonical_serialize(payload)

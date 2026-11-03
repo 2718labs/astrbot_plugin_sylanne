@@ -132,11 +132,11 @@ def life_outcome_fact_v1(prepared,terminal):
     return GraphWrite(outcome_key,plain_v1(outcome))
 
 
-def life_outcome_qualified_writes_v1(prepared,terminal,life_writes):
+def life_outcome_qualified_writes_v1(prepared,terminal,life_writes,*,adoption_inputs=None):
     fact=life_outcome_fact_v1(prepared,terminal);b=prepared.binding
     end=life_role_segment_key_v1(b,'end')
     end_fact=next(write for write in life_writes if write.key==end)
-    end_proof=life_fact_provenance_v1(prepared,terminal.claim,terminal,end_fact)
+    end_proof=life_fact_provenance_v1(prepared,terminal.claim,terminal,end_fact,adoption_inputs=adoption_inputs)
     end_proof_key=life_fact_auxiliary_key_v1(end,END_PROVENANCE_TYPE)
     proof=LifeOutcomeProvenanceV1(fact.key.token,1,canonical_digest(fact.value),prepared.plan.action_intent.ref,
         prepared.plan.action_intent.revision,prepared.plan.action_intent.digest,end_proof_key.token,1,

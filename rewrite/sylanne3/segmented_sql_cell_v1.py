@@ -71,6 +71,11 @@ CORE_REF_DDLS_V2={
     PRIMARY KEY(namespace,call_id,phase)) STRICT""",
 }
 
+from .authority_service.c09_platform_observation_fact_storage_v3 import (
+    TABLE as FACT_TABLE_V3,PHYSICAL_DDL as FACT_DDL_V3,BLOB_COLUMNS as FACT_BLOB_COLUMNS_V3,
+    fact_cell_owner_v3)
+FACT_REF_DDLS_V3={FACT_TABLE_V3:FACT_DDL_V3}
+
 GRAPH_REF_INDEXES_V3={
  'graph_d09_turn_slot_origin_v3':"CREATE INDEX graph_d09_turn_slot_origin_v3 ON graph_d09_turn_slot_origins_v3(bot,persona,origin_ref)",
 }
@@ -81,7 +86,7 @@ for table in ('segmented_storage_layout_v1','segmented_cells_v1','segmented_cell
         TRIGGERS[name]=f"CREATE TRIGGER {name} BEFORE {action} ON {table} BEGIN SELECT RAISE(ABORT,'segmented original is immutable'); END"
 LAYOUT_SCHEMA_DIGEST=canonical_digest({'schema':LAYOUT_SCHEMA,'tables':DDLS,'triggers':TRIGGERS,
     'graph_ref_tables':GRAPH_REF_DDLS_V3,'graph_ref_indexes':GRAPH_REF_INDEXES_V3,'core_ref_tables':CORE_REF_DDLS_V2,
-    'segment_bytes':MAX_SEGMENT_BYTES,'codecs':sorted(CODECS)})
+    'fact_ref_tables':FACT_REF_DDLS_V3,'segment_bytes':MAX_SEGMENT_BYTES,'codecs':sorted(CODECS)})
 
 
 @dataclass(frozen=True,slots=True)
@@ -206,7 +211,9 @@ class InstalledSegmentedTargetV1:
             'core':{'authority_d13_counter_originals_v1':'payload_json','authority_d13_provider_http_bindings_v1':'payload_json'}}
         role=self.pair.source_original.role
         codec_id='canonical-json.ascii.v1'
-        if table not in registered.get(role,{}) or registered[role][table]!=column:
+        fact=role=='core' and table==FACT_TABLE_V3 and column in FACT_BLOB_COLUMNS_V3
+        if fact:codec_id='canonical-json.utf8.v1'
+        if not fact and (table not in registered.get(role,{}) or registered[role][table]!=column):
             raise AuthorityUnavailable('segmented logical family/column requires its registered codec')
         from .runtime.c09_paged_sql_v2 import read_c09_table_shape_v2,legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2,_quote
         source=self.pair.source
@@ -250,17 +257,26 @@ class InstalledSegmentedTargetV1:
                     event=q.read_one(source,'SELECT 1 FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?',actual[2:])
                     if event!=(1,):raise AuthorityUnavailable('actual graph history lacks its original event foreign key')
                 erasure_owner_ref=key.token
+            elif fact:
+                actual=q.read_descriptor(source,table,('namespace','fact_operation_id','mutation_id','subject','request_digest','state'),
+                    'fact_operation_id=?',primary_key,(8192,256,256,8192,71,16))
+                if (shape.primary_key_columns!=('fact_operation_id',) or actual is None
+                        or actual[0]!=self.session.scope.authority_namespace or actual[1]!=primary_key[0]
+                        or actual[2]!=actual[1] or actual[5] not in ('pending','committed')):
+                    raise AuthorityUnavailable('actual observation Fact PK/namespace/state differs')
+                erasure_owner_ref=fact_cell_owner_v3(actual[0],actual[1])
             else:
                 if primary_key[0]!=self.session.scope.authority_namespace:
                     raise AuthorityUnavailable('segmented logical source crosses actual Core authority namespace')
                 if type(primary_key[1]) is not str or not primary_key[1]:
                     raise AuthorityUnavailable('actual Core original operation or call identity required')
                 if table=='authority_d13_counter_originals_v1':
-                    if primary_key[2] not in ('draft','header','evidence'):
+                    if primary_key[2] not in ('draft','header','evidence','pressure_mapping_v1'):
                         raise AuthorityUnavailable('unknown D13 counter original phase')
                     family='d13-counter-source' if primary_key[2]=='draft' else 'd13-counter-history'
                 else:
-                    if primary_key[2] not in ('expected','observed_before_send'):
+                    from .authority_service.d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+                    if primary_key[2] not in {'expected','observed_before_send'} | D13_ACCOUNTING_PHASES_V3:
                         raise AuthorityUnavailable('unknown D13 provider HTTP original phase')
                     family='d13-provider-http-history'
                 erasure_owner_ref=canonical_serialize((family,primary_key[0],primary_key[1]))
@@ -268,7 +284,7 @@ class InstalledSegmentedTargetV1:
                 raise AuthorityUnavailable('actual derived erasure owner exceeds registered descriptor bound')
             _,total,kind=read_legacy_sql_cell_fragment_v2(source,table=table,column=column,where=where,
                 parameters=primary_key,start=0,length=0,meter=q.meter)
-        if kind!='text' or codec_id=='opaque-bytes.v1':
+        if kind!=('blob' if fact else 'text') or codec_id=='opaque-bytes.v1':
             raise AuthorityUnavailable('registered source family has canonical JSON text, not opaque bytes')
         locator={'role':role,'family':table,'primary_key':primary_key,'column':column,'source_schema_digest':shape.schema_digest}
         locator_json=canonical_serialize(locator)
@@ -378,7 +394,8 @@ def graph_ref_columns_v3(source_columns):
 
 def core_ref_columns_v2(source_columns):
     """Registered Core payload reference mapping preserves the original digest."""
-    return tuple('payload_cell_id' if name=='payload_json' else name for name in source_columns)
+    from .authority_service.c09_platform_observation_fact_storage_v3 import fact_columns_v3
+    return fact_columns_v3(tuple('payload_cell_id' if name=='payload_json' else name for name in source_columns))
 
 
 class _CellCopyV1:
@@ -449,7 +466,7 @@ class _CellCopyV1:
                     or header[1]!=self.codec or header[2]!=self.owner):
                 raise AuthorityUnavailable('actual mapped Source header changed during independent copy')
             raw,total=source.scope.read_cell_fragment_v3(binding['cell_id'],start=start,length=length,meter=q.meter)
-            return raw,total,'text'
+            return raw,total,('blob' if self.shape.table==FACT_TABLE_V3 else 'text')
         from .runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2,_quote
         where=' AND '.join(_quote(name)+' COLLATE BINARY = ?' for name in self.shape.primary_key_columns)
         with legacy_cell_read_transaction_v2(self.target.pair.source):
@@ -478,7 +495,7 @@ class _CellCopyV1:
         if q.meter.remaining_bytes<amount*3+8192:
             return {'phase':'write','cell_id':self.cell_id,'bytes':self.offset,'needs_next_quantum':True}
         chunk,total,kind=self._read_source_fragment(q,self.offset,amount)
-        if total!=self.total or kind!='text':raise AuthorityUnavailable('actual frozen cell source changed')
+        if total!=self.total or kind!=('blob' if self.shape.table==FACT_TABLE_V3 else 'text'):raise AuthorityUnavailable('actual frozen cell source changed')
         next_hash=self.hash.copy();next_hash.update(chunk)
         next_parser=self.parser.copy();next_parser.feed(chunk,lambda event:None)
         chunk_sha=sha256(chunk).hexdigest()
@@ -556,7 +573,7 @@ class _CellCopyV1:
             if segment is None:return {'phase':'verify','bytes':self.verify_offset,'needs_next_quantum':True}
             offset,chunk,chunk_sha=segment
             original,total,kind=self._read_source_fragment(q,self.verify_offset,len(chunk))
-            if total!=self.total or kind!='text' or original!=chunk:
+            if total!=self.total or kind!=('blob' if self.shape.table==FACT_TABLE_V3 else 'text') or original!=chunk:
                 raise AuthorityUnavailable('independent stored segment differs from actual frozen source')
             actual_hash=self.verify_hash.copy();actual_hash.update(chunk)
             parser=self.verify_parser.copy();parser.feed(chunk,lambda event:None)

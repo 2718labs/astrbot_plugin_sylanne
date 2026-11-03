@@ -10,6 +10,8 @@ from ..runtime_contracts import NamespaceId, VersionedRef, canonical_digest, can
 from .d13_paid_coordinator_v1 import D13PaidStandbyPreparationV1
 
 TABLE = 'graph_d11_derived_cache_payloads_v1'
+MAX_RETAINED_PAYLOAD_BYTES_V1 = 8 * 1024 * 1024
+MAX_RETAINED_BLOCKS_V1 = 256
 
 @dataclass(frozen=True, slots=True)
 class DerivedPayloadStageV1:
@@ -78,6 +80,19 @@ def _require_metadata_head(db, metadata):
         raise ValueError('derived payload requires its exact currently adopted Graph metadata')
 
 
+def derived_payload_capacity_available_v1(db, namespace, additional_bytes):
+    """Count actual retained bodies, including expired bodies not yet reclaimed.
+
+    Only BLOB lengths are read. The fixed extra row detects an already oversized
+    historical cache without scanning or loading its unbounded body inventory.
+    """
+    _transaction(db)
+    rows = db.execute(f'SELECT length(payload_bytes) FROM {TABLE} '
+        'WHERE bot=? AND persona=? ORDER BY block_ref LIMIT 257', namespace.as_tuple).fetchall()
+    return (len(rows) < MAX_RETAINED_BLOCKS_V1
+        and sum(row[0] for row in rows) + additional_bytes <= MAX_RETAINED_PAYLOAD_BYTES_V1)
+
+
 def insert_derived_payload_v1(db, stage):
     _transaction(db)
     if type(stage) is not DerivedPayloadStageV1 or type(stage.metadata) is not DerivedBlockMetadataV2:
@@ -97,6 +112,8 @@ def insert_derived_payload_v1(db, stage):
         if prior != (metadata.payload_digest, payload):
             raise ValueError('derived block identity was reused for different body bytes')
         return False
+    if not derived_payload_capacity_available_v1(db, metadata.namespace, len(payload)):
+        raise ValueError('D13 retained derived cache capacity exhausted')
     db.execute(f'INSERT INTO {TABLE} VALUES(?,?,?,?,?)',
         (*metadata.namespace.as_tuple, metadata.block_ref, metadata.payload_digest, payload))
     return True
@@ -113,6 +130,10 @@ def read_derived_payload_v1(db, metadata, *, now_utc):
         if work.namespace!=metadata.namespace:raise ValueError('current derived payload crossed Authority namespace')
         from .installed_d13_natural_frame_v6 import require_authority_derived_blocks_reader_v6
         return require_authority_derived_blocks_reader_v6(work).require_body_v6(metadata)
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db) is not None:
+        from .d13_cache_use_admission_v2 import require_d13_graph_payload_pin_v2
+        require_d13_graph_payload_pin_v2(db,metadata)
     row = db.execute(f'SELECT payload_digest,payload_bytes FROM {TABLE} WHERE bot=? AND persona=? AND block_ref=?',
         (*metadata.namespace.as_tuple, metadata.block_ref)).fetchone()
     if (row is None or row[0]!=metadata.payload_digest or len(row[1])!=metadata.payload_length_bytes

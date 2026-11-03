@@ -37,6 +37,7 @@ from .v2_fence_service import AuthorityV2FenceService
 from .v2_fence_store import AuthorityV2FenceStore
 from .v2_owner_session import AuthorityV2OwnerSessionStore
 from .v2_owner_contract import OwnerClaimTicketV1
+from ..diagnostic_channel_v1 import StderrDiagnosticSinkV1, install_diagnostic_sink_v1
 from ..host.owner_deployment import compose_owner_deployment
 from ..host.owner_identity_sqlite import AuthorityOwnerPairingSource
 from ..runtime.installed_v2_graph_dispatch_verifier import (
@@ -272,6 +273,7 @@ class AuthorityDaemon:
         self.deletion = deletion
         self.execution = MappingProxyType(dict(execution))
         self.owner_pairings = pairings
+        self._d13_controlled_sdk_consumers_v3=None
         self._creation_verifier = PinnedInstalledCreationTicketVerifier(
             config.graph_db, core)
         self._maintenance_lock = threading.RLock()
@@ -381,6 +383,11 @@ class AuthorityDaemon:
         return matches.pop()
 
     async def start(self) -> asyncio.AbstractServer:
+        # The Authority service is installed without AstrBot, so its formal
+        # diagnostic destination is this process's stderr, which the OS service
+        # supervisor captures (journald/systemd). Keep a sink the embedding
+        # process already wired instead of overriding it.
+        install_diagnostic_sink_v1(StderrDiagnosticSinkV1(), replace=False)
         with self._maintenance_lock:
             if self._closed or self._starting or self._listener is not None:
                 raise AuthorityUnavailable("Authority daemon is not stopped")
@@ -408,6 +415,9 @@ class AuthorityDaemon:
                 self._starting = False
 
     async def aclose(self) -> None:
+        if self._d13_controlled_sdk_consumers_v3 is not None:
+            from ..runtime.d13_consumer_manifest_v3 import require_actual_controlled_sdk_consumers_stopped_v3
+            require_actual_controlled_sdk_consumers_stopped_v3(self._d13_controlled_sdk_consumers_v3,daemon=self)
         with self._maintenance_lock:
             if self._closed:
                 return
@@ -426,6 +436,8 @@ class AuthorityDaemon:
             if self.c09_maintenance is not None:
                 self.c09_maintenance.graph.close()
             self.core.close()
+            from .d13_original_owner_v3 import detach_closed_actual_d13_core_birth_v4
+            detach_closed_actual_d13_core_birth_v4(self)
             for journal in self.execution.values():
                 journal.close()
             self.deletion.close()
@@ -434,6 +446,28 @@ class AuthorityDaemon:
                     _release_instance_lock(self._lock_handle)
                 finally:
                     self._lock_handle = None
+
+
+def _compose_d13_cache_use_control_services_v2(config, core, services, natural, utc_clock):
+    from .d13_cache_use_control_v2 import InstalledD13CacheUseControlServiceV2
+    from ..runtime.d13_consumer_manifest_v3 import defer_fresh_d13_control_composition_v3
+    if defer_fresh_d13_control_composition_v3(config,core):
+        core._d13_cache_use_controls_v2=MappingProxyType({})
+        return
+    assets = config.d13_cache_use_assets_v2 or {}
+    enabled = {}
+    for namespace, item in natural.items():
+        bundle = item.installation_bundle
+        if bundle is not None and bundle.d13_cache_use_control_v2 is not None and bundle.d13_cache_use_control_v2.enabled:
+            enabled[namespace] = item
+    if set(assets) != set(enabled):
+        raise AuthorityUnavailable("enabled D13 cache policies and protected assets differ")
+    controls = {}
+    for namespace, item in enabled.items():
+        assets[namespace].require_installation_v2(item.installation_bundle)
+        controls[namespace] = InstalledD13CacheUseControlServiceV2(fences=services[namespace],
+            bundle=item.installation_bundle, budget_issuer=item.d11_issuer, clock=utc_clock)
+    core._d13_cache_use_controls_v2 = MappingProxyType(controls)
 
 
 def _compose_installed_fence_components_v3(config, paths, core, deletion, execution):
@@ -495,6 +529,7 @@ def _compose_installed_fence_components_v3(config, paths, core, deletion, execut
             v2_dispatch_verifier=dispatch_verifiers.get(namespace))
         for namespace, journal in execution.items()
     }
+    _compose_d13_cache_use_control_services_v2(config, core, services, natural, installed_utc_clock)
     return fences, services, natural, installed_clock_reading, installed_utc_clock, dispatch_verifiers, namespace_map
 
 
@@ -534,8 +569,9 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
                 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+                from ..host.model_workflows_v10 import AdminModelWorkflowsV10
                 from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-                actual_v7=(type(workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and workflows.natural_generation is not None
+                actual_v7=(type(workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and workflows.natural_generation is not None
                     and workflows.natural_generation.template_version==V7_TEMPLATE)
                 history_factory=(build_authority_d13_natural_frame_verifier_v7 if actual_v7 else
                     build_authority_d13_natural_frame_verifier_v6 if actual_v6 else build_authority_d13_natural_frame_verifier_v1)
@@ -577,6 +613,9 @@ def _compose_installed_authority_server_v1(config, paths, core, deletion, execut
                                       for namespace in natural},
         clock_provider=installed_clock_reading if natural else None,
         owner_sessions=sessions, create_owner_schema=False)
+    from .d13_cache_use_control_v2 import install_d13_cache_use_rpc_service_v2
+    for namespace, service in core._d13_cache_use_controls_v2.items():
+        install_d13_cache_use_rpc_service_v2(server, namespace, service)
     for namespace, model_service in models.items():
         history = model_service._graph_verifier._natural_history
         if history is not None:
@@ -924,6 +963,17 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
             if offline_bundle is not None:
                 _install_current_life_model_readers_v1(server,namespace=namespace,installation=offline_installation,
                     storage_owner=storage_owner,location=location)
+            if offline_bundle is not None and offline_bundle.model_workflows.appraisal is not None:
+                from .d04_ordinary_source_v3 import InstalledD04AuthoritySourceReaderV3
+                from .current_authority_graph_read_v3 import install_authority_graph_read_controller_v3
+                d04_model=server._v2_model_egress.get(namespace)
+                d04_result=server._d04_appraisal_reads_v3.get(namespace)
+                if d04_model is None or d04_result is None:
+                    raise AuthorityUnavailable('D04 Source lacks actual installed model/result services')
+                d04_reader=InstalledD04AuthoritySourceReaderV3(owner_storage=storage_owner,bundle=offline_bundle,
+                    issuer=offline_installation.d11_issuer,model_service=d04_model,result_service=d04_result)
+                d04_model._graph_verifier.install_d04_source_reader_v3(d04_reader)
+                install_authority_graph_read_controller_v3(d04_result,service=d04_result,source_location=location)
             if offline_bundle is not None and offline_bundle.habit_runtime_policy is not None:
                 from ..host.habit_runtime_policy_v1 import HabitRuntimePolicyV1
                 from .d10_habit_ledger_v1 import habit_signing_key_v1
@@ -998,7 +1048,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
                 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-                if type(offline_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+                from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+                if type(offline_bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}:
                     from .d13_installed_counter_factory_v1 import install_d13_core_counter_v1
                     from ..runtime.d13_counter_cpu_quote_policy_v1 import D13CounterCpuQuotePolicyAuthorityV1
                     from ..domains.d02.body_quote_original import D02BodyQuoteAuthority
@@ -1070,7 +1121,8 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
                     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
                     from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+                    from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+                    if type(offline_bundle.model_workflows) in (AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
                         from .contact_model_result_service_v2 import InstalledContactModelResultServiceV2 as InstalledContactModelResultServiceV1
                         install_contact_reader = server.install_contact_model_result_reader_v2
                     else:
@@ -1145,6 +1197,27 @@ def _compose_business_daemon_v3(config, lock_handle, composition):
                         if "d10.life.artifact_draft.v1" in offline_bundle.installation_policy.root_grant.allowed_work_kinds else None))
                 server._d11_life_services_v1[namespace] = life
                 core.install_execution_redaction_d11_life_service_v1(namespace, life)
+            if offline_bundle is not None:
+                from ..runtime.d13_cache_use_admission_v2 import _bundle_use_enabled_v2
+                from ..runtime.d13_consumer_manifest_v3 import (
+                    _DORMANT, installed_d13_consumer_cohort_digest_v3)
+                accounting_request = _DORMANT.get()
+                if accounting_request is not None:
+                    accounting_request.require_v3(config)
+                    if accounting_request.composition is not composition:
+                        raise AuthorityUnavailable('accounting producer changed its actual fresh composition')
+                if (_bundle_use_enabled_v2(offline_bundle)
+                        and (accounting_request is not None
+                            or offline_bundle.d13_cache_use_control_v2.consumer_cohort_digest
+                                == installed_d13_consumer_cohort_digest_v3())):
+                    from ..runtime.d13_technical_policy import InstalledD13CacheUseAssetsV2
+                    from .v2_model_egress_service import install_d13_accounting_metadata_producer_v3
+                    accounting_assets = (config.d13_cache_use_assets_v2 or {}).get(namespace)
+                    if type(accounting_assets) is not InstalledD13CacheUseAssetsV2:
+                        raise AuthorityUnavailable('new accounting cohort lacks its actual protected D13 assets')
+                    accounting_assets.require_installation_v2(offline_bundle)
+                    install_d13_accounting_metadata_producer_v3(
+                        server._v2_model_egress[namespace], server=server, bundle=offline_bundle)
             composition.require_current()
         return daemon
     except BaseException:
@@ -1181,6 +1254,10 @@ class _ResolvedStorageCompositionV3:
         self.config,self.control,self.context=config,control,context
         self.selected,self.maintenance_basis=selected,maintenance_basis
         self.peer_gate=None
+        self.initial=None
+        self.initial_maintenance=None
+        if context is not None and context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4'and context.stage=='READY':
+            self.initial=control._initial_segmented_storage_v4
 
     def require_current(self):
         if self.control is None:
@@ -1192,6 +1269,8 @@ class _ResolvedStorageCompositionV3:
                 self.context.require_current("business" if self.context.stage in {"READY","RELEASED"} else "maintenance")
 
     def store_kwargs(self):
+        if self.initial_maintenance is not None:return dict(initial_maintenance=self.initial_maintenance,storage_context=self.context)
+        if self.initial is not None:return dict(initial_storage=self.initial,storage_context=self.context)
         if self.maintenance_basis is not None:
             return dict(maintenance_basis=self.maintenance_basis,storage_context=self.context)
         if self.selected is not None:
@@ -1211,7 +1290,7 @@ class _ResolvedStorageCompositionV3:
                     raise
         else:
             graph=ProductionGraphStore(self.config.graph_db,registry,**self.store_kwargs())
-            if self.selected is not None:
+            if self.selected is not None or self.initial is not None:
                 try:install_runtime_storage_schema_v3(graph._db,handle=graph._runtime_storage_v3)
                 except BaseException:
                     graph.close()
@@ -1229,6 +1308,10 @@ def _selected_config_v3(config, context):
             or any(item.installation_id!=installed.installation_id for item in config.installations_v2.values())):
         raise AuthorityUnavailable("selected composition differs from actual installed cohort")
     namespace=namespaces[0]
+    if context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4':
+        if any(str(Path(path).resolve())!=members[role]['resolved_path']for role,path in (('core',config.authority_db),('deletion',config.deletion_db),('graph',config.graph_db),('execution',config.execution_journals[namespace].path))):
+            raise AuthorityUnavailable('initial signed storage cannot substitute fixed installed role paths')
+        return config
     return replace(config,authority_db=Path(members["core"]["resolved_path"]),
         deletion_db=Path(members["deletion"]["resolved_path"]),graph_db=Path(members["graph"]["resolved_path"]),
         execution_journals={namespace:ExecutionJournalInstallation(Path(members["execution"]["resolved_path"]),
@@ -1322,7 +1405,11 @@ def _compose_cold_maintenance_services_v3(composition):
 
 
 class _AuthorityBootstrapPlanV3:
-    def __init__(self,config,lease):
+    def __init__(self,config,lease,fresh_installation=None):
+        self.fresh_installation=fresh_installation
+        if fresh_installation is not None:
+            from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+            _require_fresh_d13_request_v3(fresh_installation,config=config)
         self.config,self.lease=config,lease
         self.control=None
         self.phase="identity"
@@ -1333,6 +1420,7 @@ class _AuthorityBootstrapPlanV3:
         self.factual=None
         self.counter_builders=[]
         self.counter_index=0
+        self.current_core_qualification=None
         self.failure=None
 
     def _progress(self):
@@ -1347,7 +1435,11 @@ class _AuthorityBootstrapPlanV3:
                 self.factual=AuthorityFactualDaemonV2(config,self.lease,reader)
                 self.phase="factual_ready"
                 return self.factual
-            _,self.control=_resolve_current_c09_config(self.config,self.lease)
+            installed=self.config.c09_storage_v1
+            if (self.fresh_installation is not None and installed is not None and not Path(installed.control_path).exists()):
+                from .c09_initial_segmented_genesis_v4 import prepare_actual_initial_segmented_storage_v4
+                self.control=prepare_actual_initial_segmented_storage_v4(config=self.config,lease=self.lease,fresh_request=self.fresh_installation)
+            else:_,self.control=_resolve_current_c09_config(self.config,self.lease)
             self.phase="control" if self.control is not None else "business_compose"
             if self.control is None:
                 self.composition=_ResolvedStorageCompositionV3(_COMPOSITION_V3,self.config,None,None,None,None)
@@ -1357,7 +1449,12 @@ class _AuthorityBootstrapPlanV3:
             if self.metadata["status"]=="complete":self.phase="selected"
             return self._progress()
         if self.phase=="selected":
-            if self.metadata["manifest_schema"]=="sylanne3.c09.storage_manifest.v3":
+            if self.metadata['manifest_schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4':
+                from .c09_initial_segmented_genesis_v4 import read_initial_segmented_context_v4
+                with _bootstrap_control_quantum_v3(self.control)as meter:
+                    self.context=read_initial_segmented_context_v4(self.control,meter=meter)
+                self.phase='physical_composition'
+            elif self.metadata["manifest_schema"]=="sylanne3.c09.storage_manifest.v3":
                 from .c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
                 selected=self.control.advance_selected_history_read_v3()
                 if type(selected) is not VerifiedSelectedHistoryReadV3:return selected
@@ -1393,17 +1490,19 @@ class _AuthorityBootstrapPlanV3:
             config=_selected_config_v3(self.config,self.context)
             self.composition=_ResolvedStorageCompositionV3(_COMPOSITION_V3,config,self.control,self.context,
                 self.selected,maintenance_basis)
+            if self.fresh_installation is not None:
+                self.fresh_installation.bind_selected_composition_v3(self.composition)
             self.phase="peer_registry"
             return self._progress()
         if self.phase=="peer_registry":
             from .c09_storage_maintenance_v1 import InstalledC09WriterGateV1
             factory=self.composition.config.c09_maintenance_factory
             result=factory.advance_peer_registry_preparation_v3(control=self.control,
-                config=self.composition.config,context=self.context)
+                config=self.composition.config,context=self.context,fresh_installation=self.fresh_installation)
             if type(result) is not InstalledC09WriterGateV1:return result
             self.composition.peer_gate=factory.take_prepared_peer_registry_gate_v3(
-                control=self.control,config=self.composition.config)
-            self.phase="business_qualification" if self.context.stage in {"READY","RELEASED"} else "maintenance_compose"
+                control=self.control,config=self.composition.config,fresh_installation=self.fresh_installation)
+            self.phase="business_qualification" if self.context.stage in {"READY","RELEASED"} else ("initial_maintenance_gate"if self.context.manifest['schema']=='sylanne3.c09.initial-segmented-storage-manifest.v4'else"maintenance_compose")
             return self._progress()
         if self.phase=="business_qualification":
             if self.selected is None and (self.context.stage!="READY" or self.context.storage_generation!=0):
@@ -1414,6 +1513,27 @@ class _AuthorityBootstrapPlanV3:
                 if type(proof) is not SelectedAppliedReadV3:return proof
             with _bootstrap_control_quantum_v3(self.control):self.context.require_current("business")
             self.phase="business_compose"
+            return self._progress()
+        if self.phase=='initial_maintenance_gate':
+            from .c09_writer_peer_originals_v3 import VerifiedPeerRetirementCoverageV3
+            from .c09_initial_segmented_genesis_v4 import issue_initial_maintenance_composition_v4
+            gate=self.composition.peer_gate;operation=self.metadata['active_operation_id']
+            with _bootstrap_control_quantum_v3(self.control)as meter:
+                gate.require_pending_start_bootstrap_scope_v3(meter=meter)
+                with self.control._db()as db:
+                    current=self.control._c09_control_chain_proof_v2.require_current(db,meter)
+                if (not operation or(current['stage'],current['active_operation_id'],current['pointer_version'],current['current_manifest_digest'])!=
+                        (self.context.stage,operation,0,self.context.manifest_digest)):
+                    raise AuthorityUnavailable('initial maintenance cold Gate predecessor changed before actual role open')
+                if self.context.stage=='INTENT':
+                    coverage=gate.advance_peer_retirement_coverage_v3(operation_id=operation)
+                    if type(coverage)is not VerifiedPeerRetirementCoverageV3:return coverage
+                elif self.context.stage=='PREPARED':
+                    gate.restore_prepared_peer_retirement_v3(operation_id=operation,context=self.context)
+                else:raise AuthorityUnavailable('initial metadata composition only supports actual INTENT/PREPARED')
+                self.composition.initial_maintenance=issue_initial_maintenance_composition_v4(self.control,composition=self.composition,
+                    gate=gate,root_census=gate._pending_start_bootstrap_hold_v3,meter=meter)
+            self.phase='maintenance_compose'
             return self._progress()
         if self.phase=="maintenance_compose":
             self.services=_compose_cold_maintenance_services_v3(self.composition)
@@ -1466,12 +1586,59 @@ class _AuthorityBootstrapPlanV3:
             self.phase="identity"
             return self._progress()
         if self.phase=="business_compose":
-            self.business=_compose_business_daemon_v3(self.composition.config,self.lease,self.composition)
-            if self.selected is not None:
-                from .d13_provider_http_admission_v1 import RuntimeCounterCallIndexBuilderV3
-                self.counter_builders=[RuntimeCounterCallIndexBuilderV3(counter)
-                    for counter in self.business.server._d13_core_counters_v1.values()]
-            self.phase="counter_bootstrap"
+            if self.fresh_installation is None:
+                self.business=_compose_business_daemon_v3(self.composition.config,self.lease,self.composition)
+            else:
+                from ..runtime.d13_consumer_manifest_v3 import (
+                    bind_fresh_d13_dormant_composition_v3,complete_fresh_d13_composition_v3,
+                    _PreparedFreshD13InstallationV3)
+                with bind_fresh_d13_dormant_composition_v3(self.fresh_installation):
+                    self.business=_compose_business_daemon_v3(self.composition.config,self.lease,self.composition)
+                if self.fresh_installation.consumer_mode=='controlled_sdk':
+                    from ..runtime.d13_consumer_manifest_v3 import issue_fresh_d13_dormant_composition_v3
+                    self.fresh_installation.daemon=self.business
+                    self.fresh_installation.dormant=issue_fresh_d13_dormant_composition_v3(self.fresh_installation,self.business)
+                    self.phase='fresh_sdk_dormant'
+                    return self._progress()
+                result=complete_fresh_d13_composition_v3(self.fresh_installation,self.business)
+                if type(result)is _PreparedFreshD13InstallationV3:
+                    self.phase='fresh_prepared_unpublished'
+                    return result
+                self.config.c09_maintenance_factory.finish_fresh_d13_peer_registry_v3(self.fresh_installation)
+                self.fresh_installation.close_v3()
+            if self.fresh_installation is None:
+                from ..runtime.d13_consumer_manifest_v3 import requires_current_core_birth_v4
+                if requires_current_core_birth_v4(self.business.config):
+                    self.phase='current_core_birth'
+                    return self._progress()
+            return self._begin_counter_bootstrap_v3()
+        if self.phase=='current_core_birth':
+            from ..runtime.d13_consumer_manifest_v3 import begin_actual_current_core_birth_v4
+            self.current_core_qualification=begin_actual_current_core_birth_v4(self.business)
+            self.phase='current_core_receiver_cleanup'
+            return self._progress()
+        if self.phase=='current_core_receiver_cleanup':
+            from .d13_original_owner_v3 import advance_actual_d13_current_core_receiver_cleanup_v4
+            result=advance_actual_d13_current_core_receiver_cleanup_v4(self.business,qualification=self.current_core_qualification)
+            if result['status']=='hold':
+                raise AuthorityUnavailable('current Core receiver cleanup first failure: '+str(result['first_failure']))
+            if result['status']!='complete':return result
+            self.business.config.c09_maintenance_factory.finish_current_core_birth_v4(
+                control=self.control,qualification=self.current_core_qualification)
+            self.current_core_qualification=None
+            return self._begin_counter_bootstrap_v3()
+        if self.phase=='fresh_sdk_dormant':
+            request=self.fresh_installation
+            if request.sdk_consumers is None:
+                raise AuthorityUnavailable('actual SDK dormant worker must be captured before fresh installation can advance')
+            from ..runtime.d13_consumer_manifest_v3 import complete_fresh_d13_composition_v3,_PreparedFreshD13InstallationV3
+            result=complete_fresh_d13_composition_v3(request,self.business)
+            if type(result)is _PreparedFreshD13InstallationV3:
+                self.phase='fresh_prepared_unpublished'
+                return result
+            self.config.c09_maintenance_factory.finish_fresh_d13_peer_registry_v3(request)
+            request.close_v3()
+            self.phase='counter_bootstrap'
             return self._progress()
         if self.phase=="counter_bootstrap":
             if self.counter_index<len(self.counter_builders):
@@ -1482,6 +1649,14 @@ class _AuthorityBootstrapPlanV3:
             self.phase="ready"
             return self.business
         raise AuthorityUnavailable("actual bootstrap phase differs")
+
+    def _begin_counter_bootstrap_v3(self):
+        if self.selected is not None:
+            from .d13_provider_http_admission_v1 import RuntimeCounterCallIndexBuilderV3
+            self.counter_builders=[RuntimeCounterCallIndexBuilderV3(counter)
+                for counter in self.business.server._d13_core_counters_v1.values()]
+        self.phase='counter_bootstrap'
+        return self._progress()
 
     def _close_maintenance(self):
         from ..runtime_storage_v3 import finish_runtime_storage_operation_v3
@@ -1496,6 +1671,12 @@ class _AuthorityBootstrapPlanV3:
         self.actor=self.maintenance=self.services=None
 
     def close(self):
+        if self.fresh_installation is not None:
+            sdk=self.fresh_installation.sdk_consumers
+            if sdk is not None and sdk.phase!='closed':
+                raise AuthorityUnavailable("SDK fresh close still owns actual retained consumers; drain remains pending")
+            self.config.c09_maintenance_factory.finish_fresh_d13_peer_registry_v3(self.fresh_installation)
+            self.fresh_installation.close_v3()
         if self.control is not None and self.config.c09_maintenance_factory is not None:
             self.config.c09_maintenance_factory.close_peer_registry_preparation_v3(self.control)
         self._close_maintenance()
@@ -1510,9 +1691,10 @@ class _AuthorityBootstrapPlanV3:
 
 class AuthorityBootstrapDaemonV3:
     """Installer-owned lifecycle; one bounded queue and one actual bootstrap thread."""
-    def __init__(self,config,lease):
+    def __init__(self,config,lease,fresh_installation=None):
         self.config=config
-        self._plan=_AuthorityBootstrapPlanV3(config,lease)
+        self._fresh_prepared=None
+        self._plan=_AuthorityBootstrapPlanV3(config,lease,fresh_installation)
         self._queue=Queue(maxsize=1)
         self._thread=None
         self._ready_lock=asyncio.Lock()
@@ -1531,11 +1713,34 @@ class AuthorityBootstrapDaemonV3:
         while True:
             command,future=self._queue.get()
             try:
+                if command=='host_graph_storage_binding_v4':
+                    from ..host.c09_storage_admission_v1 import issue_fresh_controlled_sdk_host_graph_binding_v4
+                    request=self._plan.fresh_installation
+                    if request is None or request.dormant is None:
+                        raise AuthorityUnavailable('actual fresh SDK dormant Host binding command required')
+                    future.set_result(issue_fresh_controlled_sdk_host_graph_binding_v4(request.dormant))
+                    continue
+                if command=='close_sdk_prepared':
+                    from ..host.c09_controlled_sdk_bootstrap_v3 import close_controlled_sdk_fresh_preparation_v3
+                    original=asyncio.run(close_controlled_sdk_fresh_preparation_v3(self._plan))
+                    self._closed=True
+                    future.set_result(original)
+                    return
                 if command=="close":
                     self._plan.close()
                     future.set_result(None)
                     return
                 result=self._plan.advance()
+                from ..runtime.d13_consumer_manifest_v3 import _PreparedFreshD13InstallationV3
+                if type(result)is _PreparedFreshD13InstallationV3:
+                    self._fresh_prepared=result
+                    if self._plan.fresh_installation.consumer_mode=='production_root':
+                        self._plan.close()
+                        self._closed=True
+                        future.set_result(result)
+                        return
+                    future.set_result(result)
+                    continue
                 if type(result) is AuthorityDaemon:
                     self._daemon=result
                 elif type(result) is AuthorityFactualDaemonV2:
@@ -1546,17 +1751,22 @@ class AuthorityBootstrapDaemonV3:
                 self._failure=exc
                 self._plan.failure=exc
                 try:self._plan.close()
-                finally:future.set_exception(exc)
+                except BaseException as cleanup_error:
+                    future.set_exception(BaseExceptionGroup('SDK bootstrap failure and retained cleanup',[exc,cleanup_error]))
+                    # Keep the original owning thread alive for its exact close command after actual worker drain.
+                    continue
+                future.set_exception(exc)
                 return
 
     async def _harvest_pending(self):
         future=self._pending
         if future is None:return None
-        result=await asyncio.shield(asyncio.wrap_future(future))
-        if self._pending is future:
-            self._pending=None
-            self._pending_command=None
-        return result
+        try:
+            return await asyncio.shield(asyncio.wrap_future(future))
+        finally:
+            if self._pending is future and future.done():
+                self._pending=None
+                self._pending_command=None
 
     async def _request(self,command):
         if self._pending is not None:
@@ -1564,7 +1774,7 @@ class AuthorityBootstrapDaemonV3:
             result=await self._harvest_pending()
             if pending_command==command:return result
             if self._daemon is not None or self._factual is not None:return None
-        if self._failure is not None:raise self._failure
+        if self._failure is not None and command!="close":raise self._failure
         if self._thread is None:
             self._thread=threading.Thread(target=self._run,
                 name="authority-bootstrap-"+str(self.config.instance_lock),daemon=True)
@@ -1575,7 +1785,43 @@ class AuthorityBootstrapDaemonV3:
         self._queue.put_nowait((command,future))
         return await self._harvest_pending()
 
+    async def await_fresh_dormant_composition_v3(self):
+        request=self._plan.fresh_installation
+        if request is None or request.consumer_mode!='controlled_sdk':
+            raise AuthorityUnavailable('actual explicit SDK fresh bootstrap required')
+        async with self._ready_lock:
+            while request.dormant is None:
+                await self._request('advance')
+            return request.dormant
+
+    async def read_fresh_sdk_host_graph_binding_v4(self):
+        async with self._ready_lock:
+            return await self._request('host_graph_storage_binding_v4')
+
+    async def close_fresh_sdk_preparation_v3(self):
+        request=self._plan.fresh_installation
+        if request is None or request.consumer_mode!='controlled_sdk' or self._fresh_prepared is None:
+            raise AuthorityUnavailable('actual unpublished SDK preparation required')
+        consumer=request.sdk_consumers
+        result=await consumer.close_v3()
+        if result['status']!='complete':return result
+        await request.dormant.close_metadata_listener_v3()
+        closed=await self._request('close_sdk_prepared')
+        self._closed=True
+        return dict(status='complete',consumer_closure=result['closure'],closed_services=closed)
+
+    async def await_fresh_prepared_v3(self):
+        request=self._plan.fresh_installation
+        if request is None or request.mode!='prepare':
+            raise AuthorityUnavailable('explicit fresh prepare bootstrap required')
+        async with self._ready_lock:
+            while self._fresh_prepared is None:
+                await self._request('advance')
+            return self._fresh_prepared
+
     async def await_business_ready_v3(self):
+        if self._plan.fresh_installation is not None and self._plan.fresh_installation.mode=="prepare":
+            raise AuthorityUnavailable("fresh D13 preparation is unpublished; business admission HOLD")
         if self.config.c09_storage_v2 is not None:
             raise AuthorityUnavailable("C09 V2 remains factual-only; ordinary business admission HOLD")
         async with self._ready_lock:
@@ -1620,7 +1866,10 @@ class AuthorityBootstrapDaemonV3:
                 await self._factual.aclose()
             elif self._thread is None:
                 self._plan.close()
-            elif self._failure is None:
+            else:
+                request=self._plan.fresh_installation
+                if request is not None and request.dormant is not None:
+                    await request.dormant.close_metadata_listener_v3()
                 await self._request("close")
 
 
@@ -1632,4 +1881,11 @@ def open_authority_daemon(config: AuthorityDeploymentConfig) -> AuthorityBootstr
     return AuthorityBootstrapDaemonV3(config,lease)
 
 
-__all__=("AuthorityDaemon","AuthorityBootstrapDaemonV3","open_authority_daemon")
+
+def open_fresh_d13_authority_installation_v3(config,*,fresh_request):
+    from ..runtime.d13_consumer_manifest_v3 import _require_fresh_d13_request_v3
+    _require_fresh_d13_request_v3(fresh_request,config=config)
+    lease=_instance_lock(_installed_file(config.instance_lock,'instance lock'))
+    return AuthorityBootstrapDaemonV3(config,lease,fresh_request)
+
+__all__=("AuthorityDaemon","AuthorityBootstrapDaemonV3","open_authority_daemon","open_fresh_d13_authority_installation_v3")

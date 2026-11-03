@@ -132,10 +132,22 @@ class _BoundedCursorV2:
             self.connection._natural_preflight_v3(size)
         if self.cursor is None:
             self.cursor = self.connection.db.execute(self.statement, self.parameters)
+        if self.connection._life_numeric_source_v1 is not None:
+            from ..runtime.c09_life_numeric_originals_v1 import preflight_numeric_frozen_native_v1
+            preflight_numeric_frozen_native_v1(self.connection,size)
+        if self.connection._character_labor_source_v1 is not None:
+            from .c09_character_labor_execution_v1 import preflight_character_labor_native_v1
+            preflight_character_labor_native_v1(self.connection,size)
         row = self.cursor.fetchone()
         if row is None or _bytes(row) != size:
             raise AuthorityUnavailable('frozen row differs from its measured storage classes/lengths')
         self.connection.meter.charge_read(size)
+        if self.connection._life_numeric_source_v1 is not None:
+            from ..runtime.c09_life_numeric_originals_v1 import retain_numeric_frozen_native_v1
+            retain_numeric_frozen_native_v1(self.connection,tuple(row),size)
+        if self.connection._character_labor_source_v1 is not None:
+            from .c09_character_labor_execution_v1 import retain_character_labor_native_v1
+            retain_character_labor_native_v1(self.connection,tuple(row),size)
         return tuple(row)
 
     def fetchmany(self, size=1):
@@ -170,11 +182,13 @@ class _BoundedReadConnectionV2:
     Metadata is selected before payloads. SQL comes only from installed readers;
     no request accepts a statement, table name or expression from a caller.
     """
-    __slots__ = ('db', 'meter', '_natural_preflight_v3')
+    __slots__ = ('db', 'meter', '_natural_preflight_v3', '_life_numeric_source_v1','_character_labor_source_v1')
 
     def __init__(self, db, meter):
         self.db, self.meter = db, meter
         self._natural_preflight_v3 = None
+        self._life_numeric_source_v1 = None
+        self._character_labor_source_v1 = None
 
     @property
     def in_transaction(self): return self.db.in_transaction
@@ -201,6 +215,12 @@ class _BoundedReadConnectionV2:
             return _FiniteCursorV2(rows, cursor.description)
         if not sql.upper().startswith('SELECT '):
             raise AuthorityUnavailable('recovery original reader cannot mutate source storage')
+        if self._life_numeric_source_v1 is not None:
+            from ..runtime.c09_life_numeric_originals_v1 import read_numeric_frozen_logical_point_v1
+            logical=read_numeric_frozen_logical_point_v1(self,sql,parameters)
+            if logical is not None:
+                rows,description=logical
+                return _FiniteCursorV2(rows,description)
         probe = self.db.execute('SELECT * FROM (' + sql + ') LIMIT 0', parameters)
         description = probe.description
         names = tuple('c' + str(index) for index in range(len(description)))
@@ -527,7 +547,7 @@ class _OneExecutionOriginalsV2:
     scanner and complete-family tuple producer are never called on all rows.
     """
     def __init__(self, token, producer, execution_id, kind, rows, core, graph, reader):
-        if token is not _TOKEN or not 1 <= len(rows) <= 3:
+        if token is not _TOKEN or not 1 <= len(rows) <= (4 if kind == 'dispatch' else 3):
             raise AuthorityUnavailable('one actual indexed execution required')
         self.producer, self.execution_id, self.kind, self.rows = producer, execution_id, kind, rows
         self.namespace_id = producer.maintenance.namespace_id
@@ -605,12 +625,27 @@ class _OneExecutionOriginalsV2:
                     JournalHead(reader.journal_id, rows[1][0], rows[1][6]))
                 proofs[binding.operation_id] = (proof, service)
         elif self.kind == 'dispatch':
-            from .v2_contract import decode_bytes
-            pending = decode_bytes(rows[-1][4])
-            if pending.permit.effect_id != self.execution_id:
-                raise AuthorityUnavailable('indexed dispatch crossed the actual effect')
-            phases[self.execution_id] = pending
-            by_mutation[pending.mutation_id] = rows[-1]
+            from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_ENTRY_PREFIX, decode_fact_row_v3
+            if rows[-1][4].startswith(FACT_ENTRY_PREFIX):
+                fact = decode_fact_row_v3(reader, rows[-1])
+                if len(rows) != 4:
+                    raise AuthorityUnavailable('observation refinement is not the exact fourth dispatch record')
+                from .v2_contract import PendingMutationV2, decode_bytes
+                previous = decode_bytes(rows[-2][4])
+                if (type(previous) is not PendingMutationV2 or previous.phase != 'observed'
+                        or previous.permit.effect_id != self.execution_id
+                        or fact.original_claimed_receipt != previous.claimed_receipt
+                        or fact.predecessor_mutation_id != previous.mutation_id):
+                    raise AuthorityUnavailable('observation fact does not follow its actual V2 dispatch receipt')
+                phases[self.execution_id] = previous
+                by_mutation[previous.mutation_id] = rows[-2]
+            else:
+                from .v2_contract import decode_bytes
+                pending = decode_bytes(rows[-1][4])
+                if pending.permit.effect_id != self.execution_id:
+                    raise AuthorityUnavailable('indexed dispatch crossed the actual effect')
+                phases[self.execution_id] = pending
+                by_mutation[pending.mutation_id] = rows[-1]
         result = source, claims, terminals, proofs, phases, by_mutation, core
         self._cache['base'] = result
         return result
@@ -646,6 +681,16 @@ def _journal_identity(reader, row):
     if row[4].startswith(b'{"binding":'):
         binding, claim, terminal = reader._decode_internal_row(row)
         return binding.execution_id, binding.operation_id, 'internal', 'claim' if terminal is None else 'terminal', canonical_digest(binding), canonical_digest(claim), binding
+    from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_ENTRY_PREFIX, decode_fact_row_v3
+    if row[4].startswith(FACT_ENTRY_PREFIX):
+        fact = decode_fact_row_v3(reader, row)
+        permit = fact.original_claimed_receipt.pending.permit
+        if (permit.namespace != reader.namespace or permit.effect_id is None
+                or fact.fact_write_permit.operation_id != fact.mutation_id):
+            raise AuthorityUnavailable('observation fact lost its actual dispatch identity')
+        binding = canonical_digest((permit.authority_id, permit.namespace, permit.operation_id,
+                                    permit.effect_id, permit.command_digest, permit.generation))
+        return permit.effect_id, permit.operation_id, 'dispatch', 'observed', binding, canonical_digest(permit), fact
     from .v2_contract import PendingMutationV2, decode_bytes, canonical_bytes
     pending = decode_bytes(row[4])
     if (type(pending) is not PendingMutationV2 or pending.phase not in ('prepared', 'claimed', 'observed')
@@ -815,7 +860,7 @@ class C09PagedRecoveryFactsProducerV2:
         indexed = _BoundedReadConnectionV2(self.pair.candidate, meter).execute(
             'SELECT seq,row_commitment FROM c09_recovery_journal_index_v2 WHERE scope_digest=? AND execution_id=? ORDER BY seq',
             (self.scope.scope_digest, execution)).fetchall()
-        if not 1 <= len(indexed) <= (3 if kind == 'dispatch' else 2):
+        if not 1 <= len(indexed) <= (4 if kind == 'dispatch' else 2):
             raise AuthorityUnavailable('one execution source has an invalid claim/terminal inventory')
         rows = []
         for seq, commitment in indexed:
@@ -916,7 +961,14 @@ class C09PagedRecoveryFactsProducerV2:
             natural_proof = active.issue(core=core,graph=graph,meter=meter,budget=budget)
         elif self._natural_model_active_v3 is not None:
             raise AuthorityUnavailable('active natural model lost its actual natural work kind')
-        if natural_proof is None:
+        if kind is not None and kind[0]=='d06.encode_internal_life_numeric':
+            from ..runtime.c09_life_numeric_originals_v1 import numeric_model_facts_source_v1
+            with numeric_model_facts_source_v1(self,core,graph,meter,budget):
+                original = read_frozen_model_budget_original_v2(core_db=core, business=graph,
+                    namespace_id=self.maintenance.namespace_id, seal=self.source,
+                    resource_issuer=self.original_port.resource_issuer, call_id=call,
+                    budget_job_issuer=self.original_port.budget_job_issuer,_provider_scope_sink=self)
+        elif natural_proof is None:
             original = read_frozen_model_budget_original_v2(core_db=core, business=graph,
                 namespace_id=self.maintenance.namespace_id, seal=self.source,
                 resource_issuer=self.original_port.resource_issuer, call_id=call,
@@ -1666,6 +1718,7 @@ class InstalledC09AuthorityRoleBasisV2:
         from ..host.model_workflows_v7 import AdminModelWorkflowsV7
         from ..host.model_workflows_v8 import AdminModelWorkflowsV8
         from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+        from ..host.model_workflows_v10 import AdminModelWorkflowsV10
         self.require_current();maintenance=self.session._control.maintenance
         config=getattr(maintenance,'_installed_deployment_config_v2',None)
         if type(config) is not AuthorityDeploymentConfig:
@@ -1674,7 +1727,7 @@ class InstalledC09AuthorityRoleBasisV2:
         if type(model) is not InstalledNaturalModelAuthorityV2:
             raise AuthorityUnavailable('actual C09 natural authority namespace installation absent')
         bundle=model.installation_bundle
-        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        if (type(bundle) is not AdminInstallationBundle or type(model.workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                 or bundle.model_workflows is not model.workflows
                 or model.d11_issuer is not getattr(maintenance,'_installed_d11_budget_job_issuer_v2',None)
                 or model.d11_issuer.resource_issuer is not getattr(maintenance,'_installed_d02_resource_issuer_v2',None)):

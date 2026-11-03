@@ -17,6 +17,15 @@ SOURCE_ROOT = Path(__file__).resolve().parents[4]
 ASSET = "resources/catalogue/d03-neutral-context-scheme.json"
 
 
+@pytest.fixture(autouse=True)
+def _verified_synthetic_package(monkeypatch):
+    """Package qualification has its own coverage; pin the verified seam here."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "sylanne3.host.context_scheme_asset.verify_installed_backend_runtime_v1",
+        lambda *args, **kwargs: SimpleNamespace(verified=True, build_mode="formal-alpha1"))
+
+
 def _encoded(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
 
@@ -117,7 +126,11 @@ def test_rejects_non_neutral_role_even_when_manifest_is_rebound(tmp_path: Path) 
         load_verified_context_scheme(root, _write_manifest(root, manifest))
 
 
-def test_dev_probe_cannot_activate_context_scheme(tmp_path: Path) -> None:
+def test_dev_probe_cannot_activate_context_scheme(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "sylanne3.host.context_scheme_asset.verify_installed_backend_runtime_v1",
+        lambda *args, **kwargs: SimpleNamespace(verified=False))
     root, manifest = _package(tmp_path)
     manifest["build_mode"] = "dev-probe"
     with pytest.raises(ValueError, match="formal-alpha1"):

@@ -324,8 +324,47 @@ class GraphWorkbenchIssuer:
             return _unavailable("source_correction_context_unavailable")
         raise error
 
+    def read_onboarding_choices(self, *, session, scope, purpose, audience):
+        """Read finite verified selectors on the existing Graph worker, never the Host loop."""
+        from ..installation_policy import AdminInstallationPolicy
+        if (purpose != "workbench_user_action" or audience != "owner"
+                or not session.allows(scope, "workbench.read", purpose, audience)):
+            return _unavailable("onboarding_read_capability_denied")
+        grant = self._resolve(session, scope, purpose, audience)
+        if grant is None or "workbench.read" not in grant.capabilities:
+            return _unavailable("onboarding_current_owner_unavailable")
+        namespace = grant.authority.namespace
+        if scope != "/".join(namespace.as_tuple):
+            return _unavailable("installed_onboarding_scope_unavailable")
+        creation = {"choices": [], "reason_code": "creation_capability_denied"}
+        if (session.allows(scope, "workbench.create", purpose, audience)
+                and "workbench.create" in grant.capabilities):
+            policy = self._correction_installation_policy
+            reader = getattr(self._onboarding, "read_current_creation_choices", None)
+            if type(policy) is not AdminInstallationPolicy or policy.namespace != namespace:
+                creation = {"choices": [], "reason_code": "installed_creation_resources_unavailable"}
+            elif not callable(reader):
+                creation = {"choices": [], "reason_code": "creation_selector_reader_unavailable"}
+            else:
+                try:
+                    creation = reader(session=session, scope=scope, purpose=purpose, audience=audience,
+                                      budget_ref=policy.root_lease.lease_id)
+                except PermissionError:
+                    raise
+                except (OSError, ValueError, RuntimeError, LookupError):
+                    # The canonical metadata/Source reader may HOLD. No raw Graph fallback.
+                    creation = {"choices": [], "reason_code": "creation_resources_currently_unavailable"}
+        binding = (session.allows(scope, "workbench.bind_scene", purpose, audience)
+                   and "workbench.bind_scene" in grant.capabilities
+                   and self._onboarding is not None
+                   and callable(getattr(self._coordinator, "commit_scene_binding_v2", None)))
+        return {"status": "ready", "projection": {
+            "schema": "d12.onboarding-choices.v1",
+            "namespace": {"bot": namespace.bot_id, "persona": namespace.persona_id},
+            "creation": creation, "binding_route_available": binding}}
+
     def read_configuration_draft(self, *, session: AuthenticatedSession, scope: str,
-                                 purpose: str, audience: str) -> Mapping[str, Any]:
+                                 purpose: str, audience: str):
         if (not session.allows(scope, "workbench.read", purpose, audience)
                 or not session.allows(scope, "workbench.create", purpose, audience)):
             return _unavailable("authority_unavailable")
@@ -335,38 +374,63 @@ class GraphWorkbenchIssuer:
         read = getattr(self._scheme_port, "read_current_configuration_draft_v1", None)
         if not callable(read):
             return _unavailable("creator_configuration_unavailable")
+        from ..graph_worker import GraphStorageWorkV3
+        from ..runtime.d12_creator_draft_read_v3 import consume_current_creator_draft_read_v3
+        def project(prepared):
+            consume_current_creator_draft_read_v3(prepared,graph=self._coordinator,
+                work=returned,consumer='configuration_view')
+            frame=prepared.frame_v3()
+            from ..runtime.d12_creator_configuration_v1 import supported_configuration_fields_v1
+            projection={
+                "schema":"d12.creator-configuration.v1",
+                "draft_ref":frame.draft_ref,"exists":frame.draft_revision>0,
+                "draft_revision":frame.draft_revision,
+                "draft_digest":canonical_digest(frame.draft)if frame.draft_revision else None,
+                "fields":frame.draft.fields,"field_sources":frame.draft.field_sources,
+                "active_head_ref":frame.active_head_ref if frame.active_head_revision else None,
+                "active_head_revision":frame.active_head_revision,
+                "graph_revision":frame.graph_revision,"access_epoch":frame.access_epoch,
+                "delete_epoch":frame.delete_epoch,
+                "access_generation":grant.authority.activation_generation,
+                "supported_fields":supported_configuration_fields_v1(),
+            }
+            from ..installation_policy import AdminInstallationPolicy
+            policy = self._correction_installation_policy
+            projection["budget_ref"]=(policy.root_lease.lease_id
+                if type(policy)is AdminInstallationPolicy and policy.namespace==grant.authority.namespace else None)
+            fields=set(projection["fields"])
+            head_available=projection["active_head_revision"]>0
+            def allowed(capability,method):
+                return(capability in grant.capabilities
+                    and session.allows(scope,capability,purpose,audience)
+                    and callable(getattr(self._scheme_port,method,None)))
+            projection["action_permissions"]={
+                "save":allowed("workbench.create","save_current_creator_draft_for_operation_v1"),
+                "compile":allowed("workbench.compile","compile_current_scheme_for_operation_v1"),
+                "preview":head_available and fields<={"d07.attention_policy","d09.expression_policy"}
+                    and allowed("workbench.experiment","preview_current_scheme_for_operation_v1"),
+                "activate":head_available and fields=={"d09.expression_policy"}
+                    and allowed("workbench.activate","adopt_current_scheme_for_operation_v1"),
+            }
+            from .creator_configuration_v1 import creator_field_templates_v1
+            projection["field_templates"]=creator_field_templates_v1(grant.authority.namespace)
+            return {"status":"ready","projection":projection}
         try:
-            projection = read(grant.authority, grant.lease)
-        except StaleRead:
-            return {"status": "stale", "problem": {"code": "draft_current_basis_changed"}}
-        except PermissionError:
-            raise
-        except (D12SchemeHold, ValueError, RuntimeError, LookupError):
+            returned=read(grant.authority,grant.lease)
+        except (StaleRead,PermissionError,D12SchemeHold,ValueError,RuntimeError,LookupError)as error:
+            return self._configuration_draft_error_v3(error)
+        if type(returned)is not GraphStorageWorkV3:
             return _unavailable("creator_configuration_unavailable")
-        if type(projection) is not dict or projection.get("schema") != "d12.creator-configuration.v1":
+        return returned.map_terminal_v3('issuer',project,self._configuration_draft_error_v3)
+
+    @staticmethod
+    def _configuration_draft_error_v3(error):
+        if isinstance(error,StaleRead):
+            return {"status":"stale","problem":{"code":"draft_current_basis_changed"}}
+        if isinstance(error,PermissionError):raise error
+        if isinstance(error,(D12SchemeHold,ValueError,RuntimeError,LookupError)):
             return _unavailable("creator_configuration_unavailable")
-        from ..installation_policy import AdminInstallationPolicy
-        policy = self._correction_installation_policy
-        projection = {**projection, "budget_ref": (
-            policy.root_lease.lease_id if type(policy) is AdminInstallationPolicy
-            and policy.namespace == grant.authority.namespace else None)}
-        fields = set(projection["fields"])
-        head_available = projection["active_head_revision"] > 0
-        def allowed(capability, method):
-            return (capability in grant.capabilities
-                    and session.allows(scope, capability, purpose, audience)
-                    and callable(getattr(self._scheme_port, method, None)))
-        projection["action_permissions"] = {
-            "save": allowed("workbench.create", "save_current_creator_draft_for_operation_v1"),
-            "compile": allowed("workbench.compile", "compile_current_scheme_for_operation_v1"),
-            "preview": head_available and fields <= {"d07.attention_policy", "d09.expression_policy"}
-                and allowed("workbench.experiment", "preview_current_scheme_for_operation_v1"),
-            "activate": head_available and fields == {"d09.expression_policy"}
-                and allowed("workbench.activate", "adopt_current_scheme_for_operation_v1"),
-        }
-        from .creator_configuration_v1 import creator_field_templates_v1
-        projection["field_templates"] = creator_field_templates_v1(grant.authority.namespace)
-        return {"status": "ready", "projection": projection}
+        raise error
 
     def save_creator_draft(self, *, session: AuthenticatedSession, scope: str,
                           purpose: str, audience: str, operation_id: str,
@@ -455,6 +519,8 @@ class GraphWorkbenchIssuer:
             self, grant: CoordinatorGrant, *, scope: str, view_type: str,
             purpose: str, audience: str, cursor: str | None = None,
             page_size: int = 100) -> Mapping[str, Any]:
+        if view_type == 'd06.memory_sources.v1':
+            return _unavailable('legacy_source_view_retired')
         views = self._views(grant)
         if views is None:
             return _unavailable("domain_registry_unavailable")
@@ -596,45 +662,31 @@ class GraphWorkbenchIssuer:
         if grant is None:
             return _unavailable("authority_unavailable")
         return self._open_workspace_with_grant(
-            grant, scope=scope, purpose=purpose, audience=audience)
+            grant, scope=scope, purpose=purpose, audience=audience,
+            source_session_authorized=session.allows(scope, 'workbench.read', 'context', 'owner'))
 
     def _open_workspace_with_grant(
             self, grant: CoordinatorGrant, *, scope: str, purpose: str,
-            audience: str) -> Mapping[str, Any]:
+            audience: str, source_session_authorized: bool = False) -> Mapping[str, Any]:
         views = self._views(grant)
         if views is None:
             return _unavailable("domain_registry_unavailable")
-        entries = []
-        checks = []
+        # Catalogue checks installed READ profiles and current Owner metadata only.
+        # It never opens view content to infer availability or non-emptiness.
+        entries, checks = [], []
+        owner = self._coordinator._GraphCoordinator__owner_leases.get(grant.lease)
+        source_authorized = (source_session_authorized and owner is not None
+            and owner.namespace == grant.authority.namespace and owner.scope == scope
+            and 'workbench.read' in owner.capabilities and 'context' in owner.purposes
+            and 'owner' in owner.audiences)
         for name in sorted(views):
-            # The catalogue must use the same fenced graph and field projection
-            # path as a view read. A one-row query cannot establish that a v2
-            # view can complete its private, multi-page projection.
-            read = self._read_projection_with_grant(
-                grant, scope=scope, view_type=name, purpose=purpose,
-                audience=audience)
-            entry = {"view_type": name,
-                     "status": "available" if read.get("status") == "ready" else "unavailable"}
-            if entry["status"] == "available" and "snapshot_epoch" in read["projection"]:
-                entry["snapshot_epoch"] = read["projection"]["snapshot_epoch"]
-            entries.append(entry)
-            # Diagnostic metadata comes from the same fenced read as the
-            # catalogue. Never expose field values, hidden atom counts, or a
-            # cursor in the workspace overview.
-            check = {"view_type": name, "read_status": read.get("status", "unavailable")}
-            if read.get("status") == "ready":
-                projection = read.get("projection")
-                coverage = projection.get("coverage") if isinstance(projection, Mapping) else None
-                if isinstance(coverage, Mapping):
-                    check["coverage"] = "partial" if coverage.get("truncated") is True else "complete"
-                    check["snapshot_epoch"] = projection.get("snapshot_epoch")
-                else:
-                    check["coverage"] = "not_disclosed"
-            else:
-                problem = read.get("problem")
-                if isinstance(problem, Mapping) and isinstance(problem.get("code"), str):
-                    check["problem_code"] = problem["code"]
-            checks.append(check)
+            installed = (name == 'd06.memory_sources.v1'
+                and callable(getattr(self._coordinator, 'read_current_source_page_v1', None))
+                and callable(getattr(self._coordinator, 'read_current_source_detail_v1', None)))
+            status = ('readable_not_loaded' if source_authorized else 'unavailable') if installed else 'unsupported'
+            reason = ('source_read_not_loaded' if source_authorized else 'source_read_unavailable') if installed else 'legacy_view_requires_source_work'
+            entries.append({'view_type': name, 'status': status, 'reason_code': reason})
+            checks.append({'view_type': name, 'read_status': status, 'reason_code': reason})
         return {"status": "ready", "projection": {
             "namespace": {"bot": grant.authority.namespace.bot_id,
                           "persona": grant.authority.namespace.persona_id},
@@ -653,6 +705,7 @@ class GraphWorkbenchIssuer:
         """
         scheme = self._scheme_port
         routes = {
+            "read_onboarding_choices": callable(getattr(self._onboarding, "read_current_creation_choices", None)),
             "create_character": self._onboarding is not None and callable(
                 getattr(self._coordinator, "commit_role_initialization_v2", None)),
             "bind_scene": self._onboarding is not None and callable(
@@ -687,15 +740,20 @@ class GraphWorkbenchIssuer:
         }
         from .d04_initialization_v3 import ACTIONS
         routes.update({action: callable(getattr(self._coordinator, spec[0], None)) for action, spec in ACTIONS.items()})
+        routes['prepare_current_commitment_communication_v1'] = callable(getattr(self._coordinator, 'prepare_current_commitment_communication_v1', None))
         from .domain_operations_v1 import ACTIONS as DOMAIN_ACTIONS
         routes.update({action: callable(getattr(self._coordinator, "run_current_domain_operation_v1", None))
             for action in DOMAIN_ACTIONS})
         routes.update({action: callable(getattr(self._coordinator, action, None))
             for action in ("pause_project_v1", "resume_project_v1", "read_project_control_context_v1", "read_project_control_context_v2",
                 "read_owner_project_artifact_options_v1", "read_owner_project_artifact_v1")})
+        routes.update({action: callable(getattr(self._coordinator, action, None)) for action in
+            ('read_current_source_page_v1', 'read_current_source_detail_v1')})
         routes["read_current_self_view_v4"] = callable(getattr(self._coordinator, "read_current_self_view_v4", None))
         from ..runtime.beta1_owner_state_read_v3 import prepare_owner_state_read_v3
         routes['read_beta1_owner_state_v1'] = callable(prepare_owner_state_read_v3)
+        routes['read_character_labor_rebuild_options_v1']=callable(getattr(self._coordinator,'character_labor_rebuild_options_v1',None))
+        routes['domain_rebuild_character_labor_body']=callable(getattr(self._coordinator,'character_labor_rebuild_selection_v1',None))
         routes["d02_fixed_work_policy"] = callable(getattr(self._coordinator, "adopt_current_fixed_body_work_policy_v1", None))
         routes["d07_cognition_budget"] = callable(getattr(self._coordinator, "allocate_current_d07_cognition_budget_v1", None))
         routes["d03_context_catalogue"] = callable(getattr(self._coordinator, "adopt_current_context_catalogue_v1", None))
@@ -703,7 +761,8 @@ class GraphWorkbenchIssuer:
             "c04_cpu_policy": "adopt_current_c04_cpu_policy_v3", "c04_prepare": "prepare_owner_c04_trigger_v3",
             "c04_advance": "advance_current_c04_product_v3"}.items()})
         routes.update({action:self._package_maintenance_port is not None for action in
-            ("read_package_maintenance","accept_package_switch","read_package_operation")})
+            ("read_package_maintenance","accept_package_switch","read_package_operation",
+                "accept_source_inspection_migration_v1","read_source_inspection_migration_v1")})
 
         return tuple({"action": action, "status": (
                          "partial_route_installed" if action in {"run_experiment", "diagnose_and_export_support"}
@@ -717,6 +776,10 @@ class GraphWorkbenchIssuer:
         if action in {"pause_project_v1", "resume_project_v1"}:
             return self.execute_project_control_v1(session=session, action=action, scope=scope,
                 purpose=purpose, audience=audience, operation_id=operation_id, input_data=input_data)
+        if action == 'prepare_current_commitment_communication_v1':
+            from .commitment_communication_v1 import execute_commitment_communication_v1
+            return execute_commitment_communication_v1(self, session=session, scope=scope, purpose=purpose,
+                audience=audience, operation_id=operation_id, input_data=input_data)
         if action == "d03_context_catalogue":
             from .context_catalogue_v1 import execute_context_catalogue_v1
             return execute_context_catalogue_v1(self, session=session, scope=scope, purpose=purpose,
@@ -838,6 +901,9 @@ class GraphWorkbenchIssuer:
 
     def _backend_route_installed(self, action: str) -> bool:
         port = self._maintenance_port if action == "install_or_upgrade" else self._backend_operation_port
+        from ..host.workbench_lifecycle_port_v1 import WorkbenchLifecyclePortV1
+        if type(port) is WorkbenchLifecyclePortV1:
+            return port.backend_route_installed_v1(action)
         return (callable(getattr(port, _BACKEND_ROUTES[action][0], None))
                 and callable(getattr(port, "read_current_backend_operation_original_v1", None)))
 
@@ -1340,6 +1406,30 @@ class GraphWorkbenchIssuer:
         commit = getattr(self._coordinator, "commit_source_correction_v1", None)
         if not callable(commit):
             return _unavailable("source_correction_commit_unavailable")
+        def receipt_result(result):
+            if (type(result) is not SourceCorrectionCommitReceiptV1
+                    or result.namespace != request.namespace
+                    or result.operation_id != request.operation_id
+                    or result.request_digest != request.request_digest
+                    or result.source_refs != request.source_refs
+                    or result.invalidated_target_refs != request.target_refs
+                    or result.access_epoch != request.access_epoch
+                    or result.deletion_epoch != request.deletion_epoch):
+                return _unavailable("source_correction_receipt_invalid")
+            return {"status": "ready", "receipt": {
+                "schema": result.schema, "phase": result.phase,
+                "operation_id": result.operation_id,
+                "request_digest": result.request_digest,
+                "correction_source_ref": result.correction_source_ref,
+                "source_refs": list(result.source_refs),
+                "invalidated_target_refs": list(result.invalidated_target_refs),
+                "reevaluation_outbox_ref": result.reevaluation_outbox_ref,
+                "audit_event_ref": result.audit_event_ref,
+                "graph_revision": result.graph_revision,
+                "access_epoch": result.access_epoch,
+                "deletion_epoch": result.deletion_epoch,
+            }}
+
         try:
             result = commit(
                 request=request, actor_id=session.actor_id,
@@ -1349,6 +1439,7 @@ class GraphWorkbenchIssuer:
                 admin_policy=self._correction_admin_policy,
                 owner_session_token=session.owner_session_token,
                 owner_session_request=login,
+                _receipt_mapper=receipt_result,
             )
         except PermissionError:
             raise
@@ -1358,28 +1449,10 @@ class GraphWorkbenchIssuer:
             return {"status": "unavailable", "problem": {
                 "code": "source_correction_outcome_unknown", "retryable": False,
             }}
-        if (type(result) is not SourceCorrectionCommitReceiptV1
-                or result.namespace != request.namespace
-                or result.operation_id != request.operation_id
-                or result.request_digest != request.request_digest
-                or result.source_refs != request.source_refs
-                or result.invalidated_target_refs != request.target_refs
-                or result.access_epoch != request.access_epoch
-                or result.deletion_epoch != request.deletion_epoch):
-            return _unavailable("source_correction_receipt_invalid")
-        return {"status": "ready", "receipt": {
-            "schema": result.schema, "phase": result.phase,
-            "operation_id": result.operation_id,
-            "request_digest": result.request_digest,
-            "correction_source_ref": result.correction_source_ref,
-            "source_refs": list(result.source_refs),
-            "invalidated_target_refs": list(result.invalidated_target_refs),
-            "reevaluation_outbox_ref": result.reevaluation_outbox_ref,
-            "audit_event_ref": result.audit_event_ref,
-            "graph_revision": result.graph_revision,
-            "access_epoch": result.access_epoch,
-            "deletion_epoch": result.deletion_epoch,
-        }}
+        from ..graph_worker import GraphStorageWorkV3
+        if type(result)is GraphStorageWorkV3:
+            return result
+        return receipt_result(result)
 
     def revoke_source_access(self, *, session: AuthenticatedSession, scope: str,
                              purpose: str, audience: str, operation_id: str,
@@ -1525,6 +1598,7 @@ class GraphWorkbenchIssuer:
             return _unavailable("scene_binding_receipt_invalid")
         return {"status": "ready", "receipt": {
             "operation_id": operation_id, "phase": "scene_bound",
+            "namespace": {"bot": result.namespace.bot_id, "persona": result.namespace.persona_id},
             "scene_ref": result.scene_ref, "binding_id": result.binding_id,
             "binding_revision": 1,
             "role_head_id": result.role_head_id,
@@ -1598,6 +1672,7 @@ class GraphWorkbenchIssuer:
             return _unavailable("role_initialization_receipt_invalid")
         return {"status": "ready", "receipt": {
             "operation_id": operation_id, "phase": "role_initialized",
+            "namespace": {"bot": result.namespace.bot_id, "persona": result.namespace.persona_id},
             "role_ref": f"persona:{result.namespace.persona_id}",
             "plan_id": result.plan_id, "head_id": result.head_id,
             "owner_grant_id": result.owner_grant_id,

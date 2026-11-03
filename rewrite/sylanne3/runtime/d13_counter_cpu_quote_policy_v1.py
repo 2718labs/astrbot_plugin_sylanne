@@ -198,6 +198,53 @@ class D13CounterCpuQuotePolicyAuthorityV1:
                 or "d13.counter.cpu.prepare" not in owner.capabilities
                 or not now < envelope.deadline_utc <= policy.valid_until_utc):
             raise IssuerAuthorityDenied("D13 counter policy, Owner or envelope identity differs")
+        return self._request_current_counter_budget_v1(db,namespace=namespace,envelope=envelope,
+            owner=owner,d11_issuer=d11_issuer,policy=policy)
+
+    def request_current_counter_quote_v1(self,db,*,namespace,policy_id,policy_version,
+            envelope,owner,d11_issuer,algorithm_ref,now_utc,issued,resource_inputs):
+        """Current Self acts under an independently observed Owner and real counter Source Work."""
+        from ..graph_coordinator import OwnerLeaseBindingV1
+        from .d13_counter_cpu_graph_v1 import require_d13_counter_self_scope_v1
+        from .d13_counter_prepare_resource_inputs_v1 import (
+            D13CounterPrepareResourceReadV1,require_actual_d13_counter_resource_reader_v1)
+        _transaction(db)
+        if(type(resource_inputs)is not D13CounterPrepareResourceReadV1
+                or type(namespace)is not NamespaceId or type(envelope)is not CommandEnvelope
+                or type(owner)is not OwnerLeaseBindingV1 or not isinstance(d11_issuer,D11BudgetGrantIssuer)):
+            raise TypeError("actual typed current counter Source/Owner resource request required")
+        require_actual_d13_counter_resource_reader_v1(resource_inputs)
+        full=resource_inputs.full
+        actual_owner=require_d13_counter_self_scope_v1(issued,full.graph,full.authority,issued.operation_id)
+        resource_inputs.require_inputs_v1(db=db,instruction=issued.instruction,scope=full.fence.scope)
+        if(owner!=actual_owner or owner is not full.owner_binding
+                or envelope.authority is not issued.authority or issued.authority is not full.authority
+                or envelope.identity.operation_id!=issued.instruction.counter_operation_id
+                or envelope.parent_budget_lease_ref!=issued.instruction.parent_budget_lease_ref):
+            raise IssuerAuthorityDenied("counter quote changed its actual Root Self/Owner/Source issuance")
+        _identifier(algorithm_ref,"algorithm_ref")
+        if(type(now_utc)not in(int,float)or not math.isfinite(now_utc)
+                or envelope.version_guard.resource_lease_versions):
+            raise IssuerAuthorityDenied("counter current pre-quote time or resource guard differs")
+        now=float(now_utc)
+        policy=self.read_policy(db,namespace,policy_id,policy_version)
+        authority=envelope.authority;identity=envelope.identity
+        if((policy_id,policy_version)!=(issued.instruction.cpu_policy_id,issued.instruction.cpu_policy_version)
+                or policy.installation_id!=issued.instruction.install_id
+                or policy.algorithm_ref!=algorithm_ref or authority.namespace!=namespace
+                or identity.effect_id is None or identity.phase!="prepare_current_d13_counter_cpu_v1"
+                or authority.issuer_domain!="d13"or owner.namespace!=namespace
+                or owner.purpose!=authority.purpose or(owner.audience,)!=authority.audience
+                or "d13.counter.cpu.prepare"not in owner.capabilities
+                or authority.purpose not in owner.purposes or not set(authority.audience)<=owner.audiences
+                or not now<envelope.deadline_utc<=policy.valid_until_utc
+                or envelope.deadline_utc>min(issued.instruction.expires_at_utc,full.operation.deadline_utc)):
+            raise IssuerAuthorityDenied("counter current policy, Owner or original deadline differs")
+        return self._request_current_counter_budget_v1(db,namespace=namespace,envelope=envelope,
+            owner=owner,d11_issuer=d11_issuer,policy=policy)
+
+    def _request_current_counter_budget_v1(self,db,*,namespace,envelope,owner,d11_issuer,policy):
+        identity=envelope.identity
         grant = d11_issuer.current_budget_grant(db, envelope.parent_budget_lease_ref)
         lease = get_budget_lease(db, envelope.parent_budget_lease_ref)
         require_budget_family_admissible(db, lease.lease_id)

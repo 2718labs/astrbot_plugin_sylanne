@@ -49,8 +49,14 @@ def _window(now=100_000):
 
 def _planned():
     window = _window()
+    from sylanne3.domains.d13.precompression import D13CurrentMainPressureV2
+    from sylanne3.runtime_contracts import canonical_digest
+    pressure = D13CurrentMainPressureV2(
+        canonical_digest(window), "b" * 64, "installation:main",
+        "provider:conversation", "model:conversation", "a" * 64, 800, "exact-tokenizer")
     plan = plan_precompression(
         window, 1000, background_capacity=True, outstanding_candidate=False,
+        pressure=pressure,
     )
     assert plan is not None
     installation = D13PrecompressionInstallationV1(

@@ -84,8 +84,11 @@ TARGET_MATRIX = {
     "macos": frozenset({"x86_64", "aarch64"}),
 }
 TARGET_ARCHITECTURES = frozenset().union(*TARGET_MATRIX.values())
+MAINTENANCE_CONSOLE_RESOURCE_ROOT = "resources/maintenance-console"
+MAINTENANCE_CONSOLE_ENTRY = "rewrite/sylanne3/maintenance_console.py"
 RESOURCE_ROOT_ALLOWLIST = (
     "resources/workbench",
+    MAINTENANCE_CONSOLE_RESOURCE_ROOT,
     "resources/catalogue",
     "resources/migrations",
 )
@@ -116,6 +119,11 @@ FORMAL_BACKEND_SOURCE = frozenset({
 WORKBENCH_PACKAGE_FILES = frozenset({
     "resources/workbench/index.html",
     "resources/workbench/workbench-manifest.json",
+})
+MAINTENANCE_CONSOLE_PACKAGE_FILES = frozenset({
+    "resources/maintenance-console/maintenance-console.html",
+    "resources/maintenance-console/assets/console.js",
+    "resources/maintenance-console/assets/maintenance-console.css",
 })
 NOTICE_FILE_ALLOWLIST = (
     "THIRD_PARTY_NOTICES",
@@ -706,6 +714,8 @@ def _allowed_package_member(path: str, native_path: str) -> bool:
         return False
     if path.startswith("resources/workbench/"):
         return path in WORKBENCH_PACKAGE_FILES
+    if path.startswith(MAINTENANCE_CONSOLE_RESOURCE_ROOT + "/"):
+        return path in MAINTENANCE_CONSOLE_PACKAGE_FILES
     if path.startswith("rewrite/sylanne3/"):
         return path.endswith(".py") and "__pycache__" not in PurePosixPath(path).parts
     return any(
@@ -744,7 +754,7 @@ def _read_allowlisted_payload(
 
     populated_resource_roots: set[str] = set()
     for relative_root in RESOURCE_ROOT_ALLOWLIST:
-        if relative_root == "resources/workbench" and not include_workbench:
+        if relative_root in {"resources/workbench", MAINTENANCE_CONSOLE_RESOURCE_ROOT} and not include_workbench:
             continue
         source_root = project_root / Path(relative_root)
         if not source_root.exists():
@@ -765,9 +775,16 @@ def _read_allowlisted_payload(
             # only the currently declared built page enters the package.
             if relative_root == "resources/workbench" and relative not in WORKBENCH_PACKAGE_FILES:
                 continue
+            if (relative_root == MAINTENANCE_CONSOLE_RESOURCE_ROOT
+                    and relative not in MAINTENANCE_CONSOLE_PACKAGE_FILES):
+                raise ValueError(f"unreviewed maintenance console release resource: {relative}")
             _validate_member_path(relative)
             payload[relative] = source.read_bytes()
             populated_resource_roots.add(relative_root)
+
+    console_members = set(payload) & MAINTENANCE_CONSOLE_PACKAGE_FILES
+    if (console_members or formal and include_workbench) and console_members != MAINTENANCE_CONSOLE_PACKAGE_FILES:
+        raise ValueError("maintenance console requires its exact three declared runtime assets")
 
     found_notices: list[str] = []
     found_sboms: list[str] = []
@@ -1206,11 +1223,10 @@ def build_package(
     """Build a deterministic ZIP and return its absolute path."""
 
     root = Path(project_root).resolve()
-    from sylanne3.host.alpha1_test_snapshot_v1 import MODE as TEST_MODE, SCHEMA as TEST_SCHEMA, qualify_test_snapshot_v1
-    from sylanne3.host.alpha1_test_snapshot_v1 import (
-        ALPHA2_MODE, ALPHA2_VERSION, ALPHA2_SCHEMA, ALPHA2_SPECIFICATION,
-        BETA1_MODE, BETA1_VERSION, BETA1_SCHEMA, qualify_beta1_candidate_v1, validate_beta1_candidate_manifest_v1,
-        qualify_alpha2_candidate_v1, validate_alpha2_candidate_manifest_v1, validate_test_snapshot_manifest_v1)
+    from sylanne3.host.package_qualification_v1 import MODE as TEST_MODE, SCHEMA as TEST_SCHEMA
+    from rewrite.tools.package_qualification_builder_v1 import qualify_test_snapshot_v1
+    from sylanne3.host.package_qualification_v1 import ALPHA2_MODE, ALPHA2_VERSION, ALPHA2_SCHEMA, ALPHA2_SPECIFICATION, BETA1_MODE, BETA1_VERSION, BETA1_SCHEMA, validate_beta1_candidate_manifest_v1, validate_alpha2_candidate_manifest_v1, validate_test_snapshot_manifest_v1
+    from rewrite.tools.package_qualification_builder_v1 import qualify_beta1_candidate_v1, qualify_alpha2_candidate_v1
     if sum((snapshot_alpha1_test, alpha2_candidate, beta1_candidate)) > 1:
         raise ValueError("alpha1, alpha2 and beta1 candidates have separate identities")
     snapshot_build = snapshot_alpha1_test or alpha2_candidate or beta1_candidate
@@ -1352,7 +1368,7 @@ def build_package(
         manifest["source"]["handoff_snapshot"] = handoff
     if snapshot_build:
         from sylanne3.runtime_contracts import canonical_digest
-        from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
+        from sylanne3.host.package_qualification_v1 import validate_test_snapshot_manifest_v1
         baseline = _strict_json_object(Path(source_handoff_manifest).read_bytes(), "handoff manifest")
         old = {row["path"]: row for row in baseline["files"]}
         actual = manifest["source_inventory"]["files"]
@@ -1511,18 +1527,28 @@ def verify_package(package: Path | str) -> None:
             if scope is not None and not (mode == "snapshot-alpha1-test" and scope == "alpha1-test") and not (mode == "alpha2-candidate" and scope == "alpha2-local") and not (mode == "beta1-candidate" and scope == "beta1-server-test") and (scope != "backend-only"
                                       or any(path.startswith("resources/workbench/") for path in listed)):
                 raise ValueError("ReleaseManifest candidate scope is invalid")
+            console_members = {member for member in listed
+                if member.startswith(MAINTENANCE_CONSOLE_RESOURCE_ROOT + "/")}
+            if scope == "backend-only" and console_members:
+                raise ValueError("backend-only archive cannot contain maintenance console UI assets")
+            if console_members and (console_members != MAINTENANCE_CONSOLE_PACKAGE_FILES
+                    or MAINTENANCE_CONSOLE_ENTRY not in listed):
+                raise ValueError("maintenance console archive assets/runtime entry differ")
+            if (scope != "backend-only" and MAINTENANCE_CONSOLE_ENTRY in listed
+                    and console_members != MAINTENANCE_CONSOLE_PACKAGE_FILES):
+                raise ValueError("maintenance console runtime entry lacks its three declared assets")
             if mode == "snapshot-alpha1-test":
-                from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
+                from sylanne3.host.package_qualification_v1 import validate_test_snapshot_manifest_v1
                 validate_test_snapshot_manifest_v1(manifest)
             elif mode == "alpha2-candidate":
                 if not set(ROOT_FILE_ALLOWLIST).issubset(listed):
                     raise ValueError("alpha2 candidate is missing required installation entries")
-                from sylanne3.host.alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+                from sylanne3.host.package_qualification_v1 import validate_alpha2_candidate_manifest_v1
                 validate_alpha2_candidate_manifest_v1(manifest)
             elif mode == "beta1-candidate":
                 if not set(ROOT_FILE_ALLOWLIST).issubset(listed):
                     raise ValueError("Beta1 candidate is missing required installation entries")
-                from sylanne3.host.alpha1_test_snapshot_v1 import validate_beta1_candidate_manifest_v1
+                from sylanne3.host.package_qualification_v1 import validate_beta1_candidate_manifest_v1
                 validate_beta1_candidate_manifest_v1(manifest)
             if ((mode == "backend-alpha1-candidate" and scope != "backend-only")
                     or (mode == "formal-alpha1" and scope not in {None, "backend-only"})
@@ -1605,6 +1631,9 @@ def verify_package(package: Path | str) -> None:
                     })
                 required_roots = (BACKEND_RESOURCE_ROOTS if scope == "backend-only"
                                   else set(RESOURCE_ROOT_ALLOWLIST))
+                # Historical packages predating this runtime entry retain their resource contract.
+                if MAINTENANCE_CONSOLE_ENTRY not in listed:
+                    required_roots = set(required_roots) - {MAINTENANCE_CONSOLE_RESOURCE_ROOT}
                 formal_resources_present = all(
                     any(path.startswith(root + "/") for path in listed)
                     for root in required_roots
@@ -1657,13 +1686,13 @@ def verify_package(package: Path | str) -> None:
                         expected_qualification = _backend_candidate_qualification(
                             resources, schema_version=versions[schema])
                         if mode == "snapshot-alpha1-test":
-                            from sylanne3.host.alpha1_test_snapshot_v1 import qualify_test_snapshot_v1
+                            from rewrite.tools.package_qualification_builder_v1 import qualify_test_snapshot_v1
                             expected_qualification = qualify_test_snapshot_v1(expected_qualification)
                         elif mode == "alpha2-candidate":
-                            from sylanne3.host.alpha1_test_snapshot_v1 import qualify_alpha2_candidate_v1
+                            from rewrite.tools.package_qualification_builder_v1 import qualify_alpha2_candidate_v1
                             expected_qualification = qualify_alpha2_candidate_v1(expected_qualification)
                         elif mode == "beta1-candidate":
-                            from sylanne3.host.alpha1_test_snapshot_v1 import qualify_beta1_candidate_v1
+                            from rewrite.tools.package_qualification_builder_v1 import qualify_beta1_candidate_v1
                             expected_qualification = qualify_beta1_candidate_v1(expected_qualification)
                         if manifest.get("backend_qualification") != expected_qualification:
                             raise ValueError("backend candidate qualification binding is invalid")

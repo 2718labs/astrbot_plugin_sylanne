@@ -43,6 +43,7 @@ class RelationshipDomainTests(unittest.TestCase):
 
         key = AtomKey(Owner("relation", "bot", "persona", "entity:alice"),
                       "d05.contribution", "contribution:1")
+        # New writes use the registered v2 wire (legacy v1 is read-only material).
         value = {
             "owner_persona_ref": "persona:sylanne",
             "canonical_event_or_family_ref": "event:arrival-1",
@@ -51,6 +52,9 @@ class RelationshipDomainTests(unittest.TestCase):
             "semantics": "external_observation",
             "contribution_revision": 1,
             "source_refs": ["source:1"],
+            "schema_version": 2, "kind": "external_interaction",
+            "recollection_activity_ref": None, "identity_status": "resolved",
+            "legacy_alias_keys": [],
         }
         registry.validate(key, value)
         with self.assertRaises(ValueError):
@@ -80,7 +84,9 @@ class RelationshipDomainTests(unittest.TestCase):
                 AtomKey(Owner("relation", "bot", "persona", "entity:alice"),
                         "d05.relationship_projection", "current"),
                 {"subject_entity_ref": "entity:alice", "dimension": "reliability:project",
-                 "status": "unknown"},
+                 "status": "unknown", "schema_version": 2,
+                 "source_qualification": "unknown", "estimate": "unknown",
+                 "influence_status": "not_evaluated"},
             ),
         )
         for graph_key, payload in cases:

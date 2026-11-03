@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
+import asyncio
 import json
 import time
 
@@ -127,7 +128,7 @@ def _restore_schedule_intent(raw, digest):
     return intent
 
 
-def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_ref):
+def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_ref, expected_pending=None, deterministic_decision=None):
     """Schedule a paid original or return a namespace-local original to recover."""
     store, _port, policy, resource, budget = _authorize(graph, authority, lease)
     # A prior queued/running original takes precedence over planning a new wire.
@@ -136,21 +137,40 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
         reader = d13_paid_current_reader_v3(store._db)
         if reader is None or reader.parent is None:
             raise ValueError("D13 schedule needs its actual full metadata and current Source Work")
+        if expected_pending is not None:
+            from .d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+            if (type(expected_pending) is not D13PrecompressionPriorityV1
+                    or expected_pending.status != "pending_paid_schedule"
+                    or expected_pending.namespace != authority.namespace
+                    or expected_pending.scene_ref != scene_ref
+                    or expected_pending.conversation_ref != authority.audience[0]):
+                raise ValueError("D13 pending recovery selector differs from actual installed scope")
+            fixed = reader.pending_schedule_head
+            if (reader.job_id is not None or fixed is None
+                    or fixed != (expected_pending.job_ref, expected_pending.original_digest)):
+                raise ValueError("D13 pending original changed; no replacement schedule")
         if reader.job_id is not None:
             return _read_original_locked(graph, authority.namespace, reader.job_id)
         handled, pending_input = d13_paid_original_point_v3(store._db,
             table="graph_d13_paid_schedule_inputs_v1", columns=("payload_json","payload_digest"),
             key_columns=("bot","persona","scene_ref"),key=(*authority.namespace.as_tuple,scene_ref))
     graph.local_module_admission.require_v1(("d13", "d11"), "d13:paid_schedule")
+    applicability = None
     intent = None if pending_input is None else _restore_schedule_intent(*pending_input)
+    if expected_pending is not None and (
+            intent is None or intent.plan.job_ref != expected_pending.job_ref
+            or intent.binding.original_operation_id != expected_pending.original_operation_id):
+        raise ValueError("D13 pending recovery lost its exact immutable input")
     if intent is not None:
         window = intent.frozen.window
         if (window.namespace != authority.namespace or window.conversation_ref != authority.audience[0]
                 or intent.frozen.installation != policy.selected_main):
             raise ValueError("D13 pending paid schedule installation changed")
     else:
+        from .d13_deterministic_applicability_v3 import require_current_d13_paid_fallback_v3
+        applicability = require_current_d13_paid_fallback_v3(reader, deterministic_decision)
         window = graph.read_current_d13_conversation_window_v1(
-            authority, lease, scene_ref=scene_ref, max_slots=policy.max_slots)
+            authority, lease, scene_ref=scene_ref, max_slots=reader.args.get("max_slots", policy.max_slots))
         if not window.turns or window.missing_ranges:
             return None
     with store._lock:
@@ -183,21 +203,30 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
                                      authority.namespace.as_tuple + (window.conversation_ref,
                                                                      window.trusted_utc)).fetchone()
             shared_pending = shared_pending or standby is not None
+            from .d11_derived_cache_payload_v1 import derived_payload_capacity_available_v1
+            cache_capacity = derived_payload_capacity_available_v1(db, authority.namespace, 1)
             db.execute("COMMIT")
         except BaseException:
             db.execute("ROLLBACK")
             raise
+    if not cache_capacity:
+        # Existing queued/running originals returned above still recover and
+        # settle; a full retained cache only prevents creating a new call.
+        return None
     deadline = min(window.trusted_utc + policy.deadline_after_seconds,
                    min(turn.trusted_utc for turn in window.turns) + 72 * 3600)
     if prepared_deadline is not None:
         deadline = min(deadline, prepared_deadline)
+    if deterministic_decision is not None:
+        deadline = min(deadline, deterministic_decision.original_deadline_utc)
     if intent is None:
         intent = prepare_paid_precompression_intent_v1(
             window, policy.selected_main, history_token_budget=policy.history_token_budget,
             background_capacity=True, outstanding_candidate=pending or shared_pending,
             attempted_input_digests=attempted | shared_attempted,
             parent_budget_lease_ref=policy.lease_id, resource_ref=policy.resource_ref,
-            ceiling=dict(policy.quote_ceiling), deadline_utc=deadline)
+            ceiling=dict(policy.quote_ceiling), deadline_utc=deadline,
+            _prepared_deterministic_v3=applicability)
     if intent is None:
         return None
     operation_id = intent.plan.job_ref
@@ -208,6 +237,8 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
             db = store._db
             db.execute("BEGIN IMMEDIATE")
             try:
+                _require_new_paid_original_absence_v1(db, authority.namespace, scene_ref,
+                    operation_id, None)
                 db.execute("INSERT INTO graph_d13_paid_schedule_inputs_v1 "
                            "(bot,persona,job_ref,scene_ref,payload_json,payload_digest) VALUES(?,?,?,?,?,?)",
                            authority.namespace.as_tuple + (operation_id, scene_ref,
@@ -221,6 +252,15 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
 
     def commit(db, metadata, epoch, now):
         nonlocal scheduled
+        if deterministic_decision is not None:
+            from .d13_deterministic_applicability_v3 import require_current_d13_paid_fallback_v3
+            require_current_d13_paid_fallback_v3(reader, deterministic_decision)
+            _require_new_paid_original_absence_v1(db, authority.namespace, scene_ref,
+                operation_id, canonical_digest(asdict(intent)))
+            busy, attempted = graph._d13_precompression_ledger_locked_v2(
+                authority.namespace, window.conversation_ref, now)
+            if busy or intent.plan.input_digest in attempted:
+                raise ValueError("D13 deterministic original appeared before new paid WRITE")
         if now >= datetime.fromisoformat(intent.job.deadline_utc.replace("Z", "+00:00")).timestamp():
             raise ValueError("D13 paid original schedule deadline elapsed")
         current = read_current_d13_frozen_window_for_authority_v1(db, window, now,
@@ -228,6 +268,8 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
         refreshed = freeze_d13_precompression_request_v1(current, intent.plan, policy.selected_main)
         if refreshed.turns != intent.frozen.turns:
             raise ValueError("D13 paid schedule source changed")
+        if not derived_payload_capacity_available_v1(db, authority.namespace, 1):
+            raise ValueError("D13 retained derived cache became full before new schedule")
         grant = budget.current_budget_grant(db, policy.lease_id)
         if (grant.grant_id, grant.version) != (policy.grant_id, policy.grant_version):
             raise ValueError("D13 paid installed grant changed")
@@ -263,6 +305,24 @@ def schedule_d13_paid_precompression_graph_v1(graph, authority, lease, *, scene_
     result = graph._d13_worker_write_v2(authority, operation_id, digest, commit, paid_owner_phase='schedule')
     return scheduled
 
+
+
+def _require_new_paid_original_absence_v1(db, namespace, scene_ref, job_ref, pending_digest):
+    """Exact fixed metadata recheck in the original pending/business WRITE view."""
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    if not db.in_transaction:
+        raise RuntimeError("D13 new paid competition check needs its actual WRITE transaction")
+    with runtime_storage_quantum_v3(db) as meter:
+        row = meter.read_fixed_row(db, "graph_d13_paid_schedule_inputs_v1", ("job_ref", "payload_digest"),
+            "bot=? AND persona=? AND scene_ref=? AND pending=1", (*namespace.as_tuple, scene_ref))
+        expected = None if pending_digest is None else (job_ref, pending_digest)
+        if row != expected:
+            raise ValueError("D13 competing or changed immutable pending schedule before new paid WRITE")
+        unresolved = meter.read_fixed_row(db, "graph_d13_precompression_attempts_v2", ("operation_id",),
+            "bot=? AND persona=? AND ((receipt_json IS NULL AND rejected_json IS NULL) OR finish_confirmed=0) ORDER BY operation_id",
+            namespace.as_tuple)
+        if unresolved is not None:
+            raise ValueError("D13 unresolved deterministic original blocks new paid WRITE")
 
 def prepare_d13_paid_call_graph_v1(graph, authority, lease, *, job_id, timeout_seconds, privacy_tier,
                                   lease_seconds=300):
@@ -471,31 +531,61 @@ class D13PaidRuntimeResultV1:
     job_id: str
     reason: str | None
 
+    @property
+    def original_resolved(self):
+        return self.status == "standby" or (
+            self.status == "terminal" and self.reason == "original_completed")
+
 
 def _d13_paid_runtime_status_v1(value):
     if value is None:
         return None
     if type(value) is D13PaidRecoveryV1:
-        return D13PaidRuntimeResultV1(value.next_action, value.job.job_id, None)
+        reason = None
+        if value.next_action == "terminal":
+            reason = ("original_completed" if value.job.phase == "completed" and value.job.result_ref
+                      else "original_terminal_" + value.job.phase)
+        return D13PaidRuntimeResultV1(value.next_action, value.job.job_id, reason)
     job = value["job"]
     reason = value["reason"]
     status = "standby" if reason is None and job["phase"] == "completed" and job["result_ref"] else job["phase"]
     return D13PaidRuntimeResultV1(status, value["job_id"], reason)
 
 
-async def run_installed_d13_paid_runtime_v1(runtime, envelope, ingress_operation_id, *, executor):
-    """Run one installed original through durable paid standby or exact recovery."""
-    from .first_ingress_v2 import scene_ref_for_conversation
-    from ..host.model_egress_executor import HostModelEgressExecutor, d13_paid_worker_read_request_v1
-    from ..runtime.first_ingress_v2 import ingress_ids
+async def run_installed_d13_paid_runtime_v1(runtime, envelope, ingress_operation_id, *, executor, priority=None, deterministic_decision=None):
+    """Fresh ingress entry; original-only selection never creates a provider call."""
+    from .first_ingress_v2 import scene_ref_for_conversation, ingress_ids
     from ..host.ingress import HostIngressEnvelope
+    if (type(envelope) is not HostIngressEnvelope
+            or ingress_ids(envelope.lineage.source_ref)[2] != ingress_operation_id):
+        return None
+    scene = scene_ref_for_conversation(envelope.namespace, envelope.platform_ref, envelope.conversation_ref)
+    return await _run_installed_d13_paid_scope_v1(runtime, namespace=envelope.namespace,
+        conversation_ref=envelope.conversation_ref, scene_ref=scene,
+        original_operation_id=ingress_operation_id, executor=executor, priority=priority, deterministic_decision=deterministic_decision)
+
+
+async def resume_installed_d13_paid_original_runtime_v1(runtime, selection, *, executor):
+    """Resume saved original identity; no fabricated envelope or new call is allowed."""
+    from .d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+    if (type(selection) is not D13PrecompressionPriorityV1
+            or selection.status not in {"existing_paid", "pending_paid_schedule"}
+            or not selection.job_ref or not selection.original_operation_id):
+        raise ValueError("D13 cold resume requires its exact saved original metadata selection")
+    return await _run_installed_d13_paid_scope_v1(runtime, namespace=selection.namespace,
+        conversation_ref=selection.conversation_ref, scene_ref=selection.scene_ref,
+        original_operation_id=selection.original_operation_id, executor=executor, priority=selection, deterministic_decision=None)
+
+
+async def _run_installed_d13_paid_scope_v1(runtime, *, namespace, conversation_ref, scene_ref,
+                                          original_operation_id, executor, priority, deterministic_decision):
+    from ..host.model_egress_executor import HostModelEgressExecutor, d13_paid_worker_read_request_v1
     bundle, policy, grant = runtime._v2_model_bundle, runtime._v2_policy, runtime._v2_installation_grant
     worker, bootstrap, port = runtime._worker, runtime._v2_bootstrap, runtime._v2_port
-    if (type(executor) is not HostModelEgressExecutor or type(envelope) is not HostIngressEnvelope or
-            bundle is None or type(bundle.d13_paid_precompression) is not AdminD13PaidPrecompressionPolicyV1 or
-            policy is None or grant is None or worker is None or bootstrap is None or port is None or
-            not runtime._v2_namespace_provisioned or envelope.namespace != policy.namespace or
-            ingress_ids(envelope.lineage.source_ref)[2] != ingress_operation_id):
+    if (type(executor) is not HostModelEgressExecutor
+            or bundle is None or type(bundle.d13_paid_precompression) is not AdminD13PaidPrecompressionPolicyV1
+            or policy is None or grant is None or worker is None or bootstrap is None or port is None
+            or not runtime._v2_namespace_provisioned or namespace != policy.namespace):
         return None
 
     async def graph_call(method, **kwargs):
@@ -505,14 +595,14 @@ async def run_installed_d13_paid_runtime_v1(runtime, envelope, ingress_operation
             lease, capability = graph.grant(
                 bootstrap, actor=grant.subject, issuer_domain="d11", namespace=policy.namespace,
                 domains=("d11", "d13"), activation_generation=anchor.activation_generation,
-                operation_id=ingress_operation_id)
+                operation_id=original_operation_id)
             from contextlib import ExitStack
             from ..graph_worker import GraphStorageWorkV3
             lifetime = ExitStack()
             lifetime.callback(graph.release_authority_lease, bootstrap, lease)
             try:
                 authority = AuthorityContext(grant.subject, "d11", capability, policy.namespace,
-                    ("persona",), "context", (envelope.conversation_ref,),
+                    ("persona",), "context", (conversation_ref,),
                     policy.root_grant.policy_ref, anchor.activation_generation)
                 result = getattr(graph, method)(authority, lease, **kwargs)
                 if type(result) is GraphStorageWorkV3:
@@ -524,83 +614,131 @@ async def run_installed_d13_paid_runtime_v1(runtime, envelope, ingress_operation
         result = await worker.call(invoke)
         if type(result) is OwnedGraphStorageResultV3:
             value, retention = result.take_value_v3()
-            source_lifetime.callback(retention.release)
+            from .d13_derived_cache_maintenance_v2 import _PendingD13PayloadV2
+            if type(value) is _PendingD13PayloadV2:
+                retention.release()
+            else:
+                source_lifetime.callback(retention.release)
             return value
         return result
 
     from contextlib import ExitStack
     with ExitStack() as source_lifetime:
-        from ..host.model_workflows_v6 import AdminModelWorkflowsV6
-        from ..host.model_workflows_v7 import AdminModelWorkflowsV7
-        from ..host.model_workflows_v8 import AdminModelWorkflowsV8
-        from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-        from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
-        from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
-        actual_v7=(type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} and bundle.model_workflows.natural_generation is not None
-            and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
-        if (actual_v7 or (type(bundle.model_workflows) is AdminModelWorkflowsV6
-                and bundle.model_workflows.natural_generation is not None
-                and bundle.model_workflows.natural_generation.template_version == V6_TEMPLATE)):
-            due = await graph_call('discover_due_d13_derived_cache_v6')
-            for token, revision in due:
-                await graph_call('retire_due_d13_derived_cache_v6',
-                    block_ref=AtomKey.from_token(token).name, expected_revision=revision)
-        scene = scene_ref_for_conversation(policy.namespace, envelope.platform_ref, envelope.conversation_ref)
-        saved = await graph_call("schedule_d13_paid_precompression_v1", scene_ref=scene)
-        if saved is None or saved.next_action == "terminal":
-            return _d13_paid_runtime_status_v1(saved)
-        job_id = saved.job.job_id
-        prepared = None
-        if saved.call_original is None:
-            model = bundle.model_workflows.reply
-            prepared = await graph_call("prepare_d13_paid_call_v1", job_id=job_id,
-                                        timeout_seconds=model.timeout_seconds, privacy_tier=model.privacy_tier,
-                                        lease_seconds=max(30, min(3600, int(model.timeout_seconds) + 120)))
-            if type(prepared) is D13PaidPreparedCallV1:
-                sent = await executor.execute_frozen_d13_once(
-                    original=prepared.original, call_original=prepared.call_original,
-                    frozen=prepared.frozen, envelope=prepared.envelope,
-                    draft=prepared.draft, expected_anchor=prepared.expected_anchor)
-                if sent is None:
-                    return _d13_paid_runtime_status_v1(await graph_call("recover_d13_paid_precompression_v1", job_id=job_id))
-                intent, terminal = sent.intent, sent.terminal
-                saved = await graph_call("recover_d13_paid_precompression_v1", job_id=job_id)
-            else:
-                saved = prepared
-        if saved.evidence is None:
-            if prepared is None or type(prepared) is not D13PaidPreparedCallV1:
-                # Original lookup reads Authority only. It never calls execute_once.
-                lookup = C02OriginalIntentLookupV1(
-                    saved.original.namespace, grant.authority_id, policy.authority_namespace,
-                    saved.original.binding.installation_id, job_id,
-                    saved.original.budget_operation_id, saved.original.binding.original_operation_id,
-                    saved.original.binding.call_id, saved.original.binding.binding_digest,
-                    saved.call_original.request_digest, "d13-adopt:" + saved.original.binding.binding_digest)
-                try:
-                    intent = await executor._authority.model_original_intent_lookup_v1(
-                        executor._bundle, executor._grant, lookup=lookup)
-                    terminal = await executor.recover_original_terminal(intent)
-                except Exception:
-                    return _d13_paid_runtime_status_v1(saved)
-            if terminal is None:
-                return _d13_paid_runtime_status_v1(saved)
-            first = d13_paid_worker_read_request_v1(saved.original, saved.call_original, intent)
-            request = await executor.select_original_worker_read_attempt(first)
-            if request is None:
-                return _d13_paid_runtime_status_v1(saved)
-            read = await executor.read_original_for_worker(read_request=request, intent=intent, terminal=terminal)
-            if read is None:
-                return _d13_paid_runtime_status_v1(saved)
-            saved = await graph_call("record_d13_paid_result_read_v1", job_id=job_id, intent=intent, read=read)
-        if saved.settlement is None:
-            saved = await graph_call("settle_d13_paid_precompression_v1", job_id=job_id)
         try:
-            selected_main = await executor._adapter.selected_d13_main_installation_v1()
-        except Exception:
-            selected_main = None
-        completed = await graph_call("complete_d13_paid_precompression_v1", job_id=job_id,
-                                     selected_main=selected_main)
-        return _d13_paid_runtime_status_v1(completed)
+            from ..host.model_workflows_v6 import AdminModelWorkflowsV6
+            from ..host.model_workflows_v7 import AdminModelWorkflowsV7
+            from ..host.model_workflows_v8 import AdminModelWorkflowsV8
+            from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+            from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+            from ..model_broker.natural_reply_history_v6 import TEMPLATE_VERSION as V6_TEMPLATE
+            from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION as V7_TEMPLATE
+            actual_v7=(type(bundle.model_workflows) in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10} and bundle.model_workflows.natural_generation is not None
+                and bundle.model_workflows.natural_generation.template_version==V7_TEMPLATE)
+            if priority is None and (actual_v7 or (type(bundle.model_workflows) is AdminModelWorkflowsV6
+                    and bundle.model_workflows.natural_generation is not None
+                    and bundle.model_workflows.natural_generation.template_version == V6_TEMPLATE)):
+                due = await graph_call('discover_due_d13_derived_cache_v6')
+                for token, revision in due:
+                    await graph_call('retire_due_d13_derived_cache_v6',
+                        block_ref=AtomKey.from_token(token).name, expected_revision=revision)
+            scene = scene_ref
+            if priority is None:
+                saved = await graph_call("schedule_d13_paid_precompression_v1", scene_ref=scene, deterministic_decision=deterministic_decision)
+            else:
+                from .d13_priority_metadata_v1 import D13PrecompressionPriorityV1
+                if (type(priority) is not D13PrecompressionPriorityV1
+                        or priority.namespace != policy.namespace or priority.scene_ref != scene
+                        or priority.conversation_ref != conversation_ref
+                        or priority.status not in {"existing_paid", "pending_paid_schedule"}
+                        or not priority.job_ref):
+                    raise ValueError("D13 original-only recovery selection differs")
+                if priority.status == "pending_paid_schedule":
+                    saved = await graph_call("schedule_d13_paid_precompression_v1", scene_ref=scene,
+                                             expected_pending=priority)
+                else:
+                    saved = await graph_call("recover_d13_paid_precompression_v1", job_id=priority.job_ref)
+                if (saved is not None and (saved.job.job_id != priority.job_ref
+                        or saved.original.binding.original_operation_id != priority.original_operation_id
+                        or (priority.status == "existing_paid"
+                            and saved.original.original_digest != priority.original_digest))):
+                    raise ValueError("D13 recovered original differs from selected identity")
+            if saved is None or saved.next_action == "terminal":
+                return _d13_paid_runtime_status_v1(saved)
+            job_id = saved.job.job_id
+            prepared = None
+            if saved.call_original is None and priority is not None:
+                # Original-only reconciliation cannot manufacture a provider attempt.
+                return _d13_paid_runtime_status_v1(saved)
+            if saved.call_original is None:
+                model = bundle.model_workflows.reply
+                prepared = await graph_call("prepare_d13_paid_call_v1", job_id=job_id,
+                                            timeout_seconds=model.timeout_seconds, privacy_tier=model.privacy_tier,
+                                            lease_seconds=max(30, min(3600, int(model.timeout_seconds) + 120)))
+                if type(prepared) is D13PaidPreparedCallV1:
+                    sent = await executor.execute_frozen_d13_once(
+                        original=prepared.original, call_original=prepared.call_original,
+                        frozen=prepared.frozen, envelope=prepared.envelope,
+                        draft=prepared.draft, expected_anchor=prepared.expected_anchor)
+                    if sent is None:
+                        return _d13_paid_runtime_status_v1(await graph_call("recover_d13_paid_precompression_v1", job_id=job_id))
+                    intent, terminal = sent.intent, sent.terminal
+                    saved = await graph_call("recover_d13_paid_precompression_v1", job_id=job_id)
+                else:
+                    saved = prepared
+            if saved.evidence is None:
+                if prepared is None or type(prepared) is not D13PaidPreparedCallV1:
+                    # Original lookup reads Authority only. It never calls execute_once.
+                    lookup = C02OriginalIntentLookupV1(
+                        saved.original.namespace, grant.authority_id, policy.authority_namespace,
+                        saved.original.binding.installation_id, job_id,
+                        saved.original.budget_operation_id, saved.original.binding.original_operation_id,
+                        saved.original.binding.call_id, saved.original.binding.binding_digest,
+                        saved.call_original.request_digest, "d13-adopt:" + saved.original.binding.binding_digest)
+                    try:
+                        intent = await executor._authority.model_original_intent_lookup_v1(
+                            executor._bundle, executor._grant, lookup=lookup)
+                        terminal = await executor.recover_original_terminal(intent)
+                    except Exception:
+                        return _d13_paid_runtime_status_v1(saved)
+                if terminal is None:
+                    return _d13_paid_runtime_status_v1(saved)
+                first = d13_paid_worker_read_request_v1(saved.original, saved.call_original, intent)
+                request = await executor.select_original_worker_read_attempt(first)
+                if request is None:
+                    return _d13_paid_runtime_status_v1(saved)
+                read = await executor.read_original_for_worker(read_request=request, intent=intent, terminal=terminal)
+                if read is None:
+                    return _d13_paid_runtime_status_v1(saved)
+                saved = await graph_call("record_d13_paid_result_read_v1", job_id=job_id, intent=intent, read=read)
+            if saved.settlement is None:
+                saved = await graph_call("settle_d13_paid_precompression_v1", job_id=job_id)
+            try:
+                selected_main = await executor._adapter.selected_d13_main_installation_v1()
+            except Exception:
+                selected_main = None
+            completed = await graph_call("complete_d13_paid_precompression_v1", job_id=job_id,
+                                         selected_main=selected_main)
+            from .d13_derived_cache_maintenance_v2 import _PendingD13PayloadV2, run_installed_d13_maintenance_v2
+            if type(completed) is _PendingD13PayloadV2:
+                pending = completed
+                saved = prepared = sent = read = intent = terminal = None
+                source_lifetime.close()
+                maintenance = await run_installed_d13_maintenance_v2(runtime, pending=pending)
+                runtime._d13_maintenance_last_status_v2 = runtime._background_status_v3(maintenance)
+                # Continue the already settled job once through a fresh Source
+                # READ; this branch cannot dispatch a provider or renew a job.
+                completed = await graph_call("complete_d13_paid_precompression_v1", job_id=job_id,
+                    selected_main=selected_main)
+                if type(completed) is _PendingD13PayloadV2:
+                    return {"status": "held", "reason": "derived_cache_capacity_still_in_use", "job_id": job_id}
+            return _d13_paid_runtime_status_v1(completed)
+        except asyncio.CancelledError:
+            # Retain the actual Source DTOs until the in-flight adapter has stopped.
+            await executor._adapter.abort_local_dispatches()
+            raise
+        finally:
+            saved = prepared = completed = sent = None
+            due = first = request = read = intent = terminal = selected_main = None
 
 __all__ = [name for name in globals() if name.endswith("_graph_v1") or
-           name in {"D13PaidPreparedCallV1", "run_installed_d13_paid_runtime_v1"}]
+           name in {"D13PaidPreparedCallV1", "run_installed_d13_paid_runtime_v1", "resume_installed_d13_paid_original_runtime_v1"}]

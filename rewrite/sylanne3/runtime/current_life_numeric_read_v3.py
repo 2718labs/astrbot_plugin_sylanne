@@ -625,6 +625,8 @@ def advance_current_life_numeric_read_v3(graph,work):
             return GraphStorageStepV3("progress")
         token=_READING.set(r)
         try:
+            from .d06_ordinary_readout_v3 import prepare_current_life_ordinary_readout_v3
+            prepare_current_life_ordinary_readout_v3(r)
             with bind_prepared_method_learning_read_v3(r.inventory,graph,r.db),r.store._lock:
                 r.db.execute("BEGIN")
                 try:

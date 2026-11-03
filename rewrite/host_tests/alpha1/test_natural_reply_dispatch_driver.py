@@ -119,15 +119,19 @@ def test_committed_natural_original_is_read_then_holds_without_specific_claim():
     graph = _Graph()
     result = asyncio.run(_run(graph))
     assert result.status == "hold" and "final graph claim" in result.reason
-    assert result.original is not None
-    assert result.original.payload.payload.decode() == BODY
+    assert result.original_summary is not None
+    from dataclasses import asdict
+    assert result.original_summary.payload_digest == segment_payload_digest(BODY, (), ())
+    assert result.original_summary.request_digest == canonical_digest(graph.original[1])
+    assert not hasattr(result.original_summary, "payload")
+    assert BODY not in json.dumps(asdict(result), ensure_ascii=False)
     assert graph.calls == ["original", "text"]
 
 
 def test_missing_paid_receipt_holds_before_p2():
     graph = _Graph(paid_digest="")
     result = asyncio.run(_run(graph))
-    assert result.status == "hold" and result.original is None
+    assert result.status == "hold" and result.original_summary is None
     assert graph.calls == ["original", "text"]
 
 
@@ -213,5 +217,5 @@ def test_absent_effect_recovery_is_read_only_and_does_not_create_a_fresh_send():
     continuation.dispatch = dispatch
     result = asyncio.run(_run(graph, continuation))
     assert result.status == "hold" and "recovery read only" in result.reason
-    assert result.original is not None
+    assert result.original_summary is not None
     assert not calls

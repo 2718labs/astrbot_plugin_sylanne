@@ -75,6 +75,12 @@ def test_activation_is_registered_and_qualified_only_with_current_owner_and_plan
     assert result.head_id == "chosen@1"
     assert result.graph_epoch == 3
     assert tuple(ref.revision for ref in result.read_versions) == (1, 1, 1)
+    control = domain.resolve_active_role_control_v3(
+        _snapshot(include_plan=False), namespace=NAMESPACE, current_guard=_guard())
+    assert control.head_id == result.head_id and control.graph_epoch == result.graph_epoch
+    assert control.plan_key == domain.plan_write(_plan()).key
+    assert tuple(ref.revision for ref in control.read_versions) == (1, 1)
+    assert not hasattr(control, "plan") and not hasattr(control, "blocks")
 
 
 @pytest.mark.parametrize("include_plan, include_activation", [(False, True), (True, False)])
@@ -186,3 +192,45 @@ def test_growth_candidate_uses_current_head_and_graph_source_consumption():
             )), namespace=NAMESPACE, current_guard=_guard(), proposal=growth,
             source_ids=("observed:one", "observed:two"),
         )
+
+
+@pytest.mark.parametrize("refusal", ["owner", "initial_head"])
+def test_actual_scene_control_refusal_precedes_complete_plan_read(monkeypatch, refusal):
+    """Actual Graph method, with explicit control-reader doubles and real SQL.
+
+    This tests ordering only; it creates no Source/Owner/installation proof.
+    """
+    import importlib
+    import sqlite3
+    from types import SimpleNamespace
+    from sylanne3.contracts import canonical_json
+    from sylanne3.graph_coordinator import GraphCoordinator, UnavailableGuard
+    from sylanne3.graph_store import GraphStore
+    module = importlib.import_module("sylanne3.graph_coordinator")
+    snapshot = _snapshot()
+    plan_key = PersonaDomain.plan_write(_plan()).key
+    reads = []
+    def read_head(_db, token):
+        reads.append(token)
+        if token == plan_key.token:
+            raise AssertionError("complete claim read preceded rejected controls")
+        atom = next(atom for atom in snapshot.atoms if atom.key.token == token)
+        return atom.revision, canonical_json(atom.value), int(atom.valid)
+    db = sqlite3.connect(":memory:")
+    try:
+        db.execute("CREATE TABLE graph_role_init_receipts_v1(bot TEXT,persona TEXT,receipt_json TEXT)")
+        db.execute("INSERT INTO graph_role_init_receipts_v1 VALUES(?,?,?)", (*NAMESPACE.as_tuple,
+            canonical_json({"head_id": "unrelated@1", "owner_grant_id": "grant",
+                "owner_authorization_head": _guard().authorization_head})))
+        graph = object.__new__(GraphCoordinator)
+        graph._GraphCoordinator__store = SimpleNamespace(_db=db)
+        graph._GraphCoordinator__graph_capability = object()
+        monkeypatch.setattr(module, "read_graph_head_v3", read_head)
+        monkeypatch.setattr(GraphStore, "graph_epoch", lambda *_args, **_kwargs: snapshot.epochs[0])
+        guard = _guard(installation_id="other") if refusal == "owner" else _guard()
+        with pytest.raises(UnavailableGuard, match=("Owner guard" if refusal == "owner" else "initialization receipt")):
+            graph._scene_binding_state_locked(NAMESPACE, guard)
+        assert plan_key.token not in reads
+        assert set(reads) == {atom.key.token for atom in snapshot.atoms if atom.key != plan_key}
+    finally:
+        db.close()

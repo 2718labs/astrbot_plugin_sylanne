@@ -65,9 +65,11 @@ def life_accounting_original_ref_v1(binding):
 def record_life_accounting_prepared_after_cas_v1(db, *, issuer, prepared):
     if prepared.requirements_json is None:
         raise ValueError("accounting original must follow the genuine final preparation CAS")
+    from .d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+    kind='character_labor_prepared_v1' if type(prepared)is D11CharacterLaborLifePreparedV1 else 'prepared'
     actual = db.execute("SELECT producing_operation_id,payload_json,payload_digest FROM " + TABLE +
-        " WHERE bot=? AND persona=? AND kind='prepared' AND original_ref=?",
-        (*prepared.binding.namespace.as_tuple, prepared.binding.prepared_original_ref)).fetchone()
+        " WHERE bot=? AND persona=? AND kind=? AND original_ref=?",
+        (*prepared.binding.namespace.as_tuple,kind,prepared.binding.prepared_original_ref)).fetchone()
     if actual != (prepared.prepare_operation_id, canonical_serialize(plain_v1(prepared)), prepared.digest):
         raise ValueError("accounting preparation projection must come from the actual same-SQL signed prepared row")
     value = D11LifeAccountingPreparedV1(prepared.binding, life_accounting_original_ref_v1(prepared.binding),

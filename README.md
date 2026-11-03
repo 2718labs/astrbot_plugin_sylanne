@@ -62,9 +62,9 @@ AstrBot 插件配置保留本机运行许可、Authority 配置档、主 LLM、�
 
 Docker 给 AstrBot 服务增加端口映射 `2718:2718`；与现有服务的端口并列。浏览器打开 `http://宿主机地址:2718/`。`0.0.0.0` 是监听地址，不能作为用户访问地址。修改容器内部端口后同步修改映射。
 
-TLS 复用 AstrBot `dashboard.ssl` 的 `enable`、`cert_file`、`key_file` 与现有 SSL 环境设置。未配置 TLS 时可打开前端和监听状态，登录、配置 API、Owner 和业务操作拒绝 HTTP。已配置 HTTPS 时使用 `https://匹配证书的域名:2718/`；后台登录复用真实 AstrBot 登录与 HttpOnly Cookie。填写已启用的二次验证码；凭据不会写入浏览器存储。
+TLS 复用 AstrBot `dashboard.ssl` 的 `enable`、`cert_file`、`key_file` 与现有 SSL 环境设置。未配置 TLS 时按已明确批准的完整 HTTP 模式运行，使用 `http://宿主机地址:2718/`；已配置 HTTPS 时使用 `https://匹配证书的域名:2718/`。两种协议均保留真实 Dashboard 会话、Owner 签名、精确 Origin 和 CSRF 核验，HTTP 链路未加密。后台登录使用 HttpOnly Cookie，填写已启用的二次验证码；凭据不会写入浏览器存储。
 
-Owner 登录和管理仍要求已安装 profile 中精确的 `workbench_origin`。端口变化会改变来源；管理员需要通过正式安装协议登记新 HTTPS 来源。监听服务不会改写 Origin、迁移旧授权或放宽生产 Host 身份边界。缺少证书、端口占用、Dashboard 未就绪会明确显示当前原因，不自动换端口或关闭 TLS 检查。
+Owner 登录和管理仍要求已安装 profile 中精确的 `workbench_origin`。端口变化会改变来源；管理员需要通过正式安装协议登记匹配实际 HTTP 或 HTTPS 协议的新来源。监听服务不会改写 Origin、迁移旧授权或放宽生产 Host 身份边界。缺少证书、端口占用、Dashboard 未就绪会明确显示当前原因，不自动换端口或关闭 TLS 检查。
 
 模块开关保存后在下次重载冻结。本机开关只限制各模块接收新工作；开启不安装 optional workflow、不产生 grant、不解除领域 HOLD。已有终态、结算、原件读取、安全撤销和恢复保持可用。D11/D12 关闭后仍可进入配置、登录与恢复入口。旧 queued job 的首次模型或 sender 调用仍要满足模块许可及原有全部当前性与预算检查。
 

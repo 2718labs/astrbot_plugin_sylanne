@@ -1437,36 +1437,22 @@ def begin_personal_eligibility_recovery_read_v1(graph, runtime, *, selector, req
                     graph=graph,fence=fence,issued=issued,entry=entry)
             roots=tuple(v.key.token for v in read_versions if v.key.type_name=="memory.source")
             if source_ref not in roots:raise ValueError("saved eligibility is not bound to its actual selected Source")
-            from .source_correction_read_v3 import PersonalEligibilityRecoverySourcesV1
-            source_gate=PersonalEligibilityRecoverySourcesV1(store._db,roots=roots,namespace=ns,
-                storage_lease=operation,read_scope=fence.scope,graph_stamp=graph._v2_graph_stamp(ns),
-                purpose=issued.purpose,audiences=issued.audiences)
-            while not source_gate.complete:
-                graph._validate_read_fence_v3(fence)
-                with store._lock:
-                    store._db.execute("BEGIN")
-                    try:entry.require_for_v3(graph,issued,operation)
-                    finally:store._db.rollback()
-                    source_gate.advance()
-                graph._validate_read_fence_v3(fence)
-            with store._lock:
-                original=_personal_recovery_original_v1(store._db,operation,ns,selector.operation_id,locator,
-                    read_versions,graph=graph,fence=fence,issued=issued,entry=entry,source_gate=source_gate)
-            if original["payload"]["request"]!=plain_v1(request) or locator[2]!=canonical_digest(request):
-                raise ValueError("qualified saved preparation differs from its exact current typed request")
-            wave=decode_typed_production_value_v1(original["payload"]["provenance"]["personal_eligibility_inputs"],PreparedPersonalEligibilityWaveV1)
-            if wave.original_deadline_utc!=saved_deadline or wave.parent_budget_lease_ref!=parent_budget:
-                raise ValueError("qualified saved wave changed its actual metadata deadline/budget")
-            operation.retain(_personal_input_heap_v1((wave,original,request))*3+4096)
             reader=PreparedPersonalEligibilityRecoveryReadV1(READ_ISSUER,graph,operation,fence,
                 runtime=runtime,authority=authority,owner_binding=owner,owner_guard=issued.current_owner.guard,
-                issued=issued,selector=selector,request=request,initial_now_utc=now,saved_wave=wave,
-                saved_original=original,saved_receipt=None)
+                issued=issued,selector=selector,request=request,initial_now_utc=now,
+                original_locator=locator,original_metadata=metadata,read_versions=read_versions)
+            from .source_correction_read_v3 import PersonalEligibilityRecoverySourcesV1
+            source_gate=PersonalEligibilityRecoverySourcesV1(store._db,roots=roots,namespace=ns,
+                storage_lease=operation,read_scope=fence.scope,graph_stamp=reader.graph_stamp,
+                purpose=issued.purpose,audiences=issued.audiences,expected_versions=read_versions)
+            source_gate.inspection_owner=reader
             reader.owner_read_entry=entry;reader.read_issuance_lifetime=lifetime;reader.source_gate=source_gate
-            reader.initial_clock=clock;reader.initial_monotonic_deadline=time.monotonic()+wave.original_deadline_utc-now
+            reader.initial_clock=clock
+            reader.initial_monotonic_deadline=time.monotonic()+saved_deadline-now
         work=create_graph_storage_work_v3(graph,kind="current_method_learning_read_v3",operation_id=read_attempt_id,
             selection_digest=operation.selection_digest,deadline_utc=operation.deadline_utc,state=reader,operation=operation)
         attach_current_method_learning_work_v3(reader,work)
+        work.phase='eligibility_recovery_sources'
         return work
     except BaseException:
         try:

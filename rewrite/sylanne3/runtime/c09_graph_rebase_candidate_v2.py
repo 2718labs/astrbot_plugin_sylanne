@@ -137,7 +137,7 @@ def _install_graph_proof_schema(candidate):
 
 
 class InstalledGraphRebaseBuildV2:
-    __slots__=('_issuer', 'session', 'pair', 'scope', 'prior_reader', 'prior_view', 'barrier_view', 'hash_file', 'hash_identity', 'hash_value', 'hash_offset', 'candidate_done', 'source_disposition_view', 'historical_verification', 'source_row_capture_v3', 'segmented_target_v3', 'segmented_writer_v3', 'segmented_seal_v3', 'target_prior_checked_v3', 'marker_cause_capture_v3', 'mapped_source_scope_v3', 'mapped_source_shapes_v3', 'source_container_reader_v3', 'source_container_proof_v3', 'pre_graph_core_source_v3', 'pre_graph_owner_links_v3', 'pre_graph_history_reader_v3', 'owner_output_publisher_v3', 'owner_family_mode_v3', 'owner_family_reader_v3', 'owner_family_proof_v3', 'contact_plan_birth_reader_v3', 'contact_plan_birth_after_v3', 'contact_plan_birth_complete_v3', 'contact_plan_birth_proofs_v3', 'contact_plan_target_v3', 'contact_plan_birth_capture_v3', 'contact_prefix_source_v3', 'contact_prefix_publisher_v3', 'contact_prospective_reader_v1', 'contact_prospective_after_v1', 'contact_prospective_table_v1', 'contact_prospective_complete_v1', 'contact_prospective_proofs_v1', 'world_producer_capture_v1', 'b3_managed_metadata_proof_v1')
+    __slots__=('_issuer', 'session', 'pair', 'scope', 'prior_reader', 'prior_view', 'barrier_view', 'hash_file', 'hash_identity', 'hash_value', 'hash_offset', 'candidate_done', 'source_disposition_view', 'historical_verification', 'source_row_capture_v3', 'segmented_target_v3', 'segmented_writer_v3', 'segmented_seal_v3', 'target_prior_checked_v3', 'marker_cause_capture_v3', 'mapped_source_scope_v3', 'mapped_source_shapes_v3', 'source_container_reader_v3', 'source_container_proof_v3', 'pre_graph_core_source_v3', 'pre_graph_owner_links_v3', 'pre_graph_history_reader_v3', 'owner_output_publisher_v3', 'owner_family_mode_v3', 'owner_family_reader_v3', 'owner_family_proof_v3', 'contact_plan_birth_reader_v3', 'contact_plan_birth_after_v3', 'contact_plan_birth_complete_v3', 'contact_plan_birth_proofs_v3', 'contact_plan_target_v3', 'contact_plan_birth_capture_v3', 'contact_prefix_source_v3', 'contact_prefix_publisher_v3', 'contact_prospective_reader_v1', 'contact_prospective_after_v1', 'contact_prospective_table_v1', 'contact_prospective_complete_v1', 'contact_prospective_proofs_v1', 'world_producer_capture_v1', 'b3_managed_metadata_proof_v1', 'platform_lineage_reader_v3', 'platform_lineage_pending_v3', 'labor_metadata_reader_v1', 'labor_rebuild_binding_reader_v1', 'labor_rebuild_binding_pending_v1')
     def __init__(self,token,session,pair):
         if token is not _BUILD:raise TypeError('installed Graph builder is not caller constructible')
         self._issuer=token;self.session=session;self.pair=pair;self.scope=session.scope
@@ -147,7 +147,7 @@ class InstalledGraphRebaseBuildV2:
         self.contact_plan_birth_complete_v3=False;self.contact_plan_birth_proofs_v3={};self.contact_plan_target_v3=None
         self.contact_prospective_reader_v1=None;self.contact_prospective_after_v1=None;self.contact_prospective_table_v1=0
         self.contact_prospective_complete_v1=False;self.contact_prospective_proofs_v1={}
-        self.b3_managed_metadata_proof_v1=None
+        self.b3_managed_metadata_proof_v1=None;self.platform_lineage_reader_v3=None;self.platform_lineage_pending_v3=None;self.labor_metadata_reader_v1=None;self.labor_rebuild_binding_reader_v1=None;self.labor_rebuild_binding_pending_v1=None
         self.contact_prefix_source_v3=self.contact_prefix_publisher_v3=None
         self.owner_family_mode_v3=self.owner_family_reader_v3=self.owner_family_proof_v3=None
         self.mapped_source_scope_v3=None;self.mapped_source_shapes_v3={}
@@ -196,7 +196,7 @@ def begin_current_graph_rebase_candidate_v2(session):
     return build
 
 
-def advance_current_graph_rebase_candidate_v2(build):
+def _advance_current_graph_rebase_candidate_quantum_v3(build):
     """Advance the real registered build, preserving strict unknown-codec HOLD."""
     if type(build) is not InstalledGraphRebaseBuildV2:raise TypeError('actual installed Graph build required')
     build.require_current();phase,progress=build.read_progress();started=monotonic_ns()
@@ -546,7 +546,8 @@ def _index_actual_graph_original_row_v2(build,stream,shape,key,row,budget,meter)
     # validated and traversed by the closure and target codecs.
     from .domain_production_erasure_v1 import DERIVED_STORE_TABLES_V6
     from .contact_plan_adoption_v3 import TABLE as PLAN3
-    if shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,PLAN3,CONTACT_EFFECT_ORIGINAL}:
+    from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS
+    if shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,PLAN3,CONTACT_EFFECT_ORIGINAL,INSPECTION_OPS,INSPECTION_MEMBERS}:
         decoded=read_c09_domain_row_v2(shape.table,shape.columns,row,
             authority_namespace=build.scope.authority_namespace,issuer=build.session.get_c09_domain_original_issuer_v2())
         index=C09DomainOriginalIndexV2(candidate=build.pair.candidate,source=build.pair.source,
@@ -959,7 +960,7 @@ def _verify_cold_source_row_v2(progress,shape,key,row,meter,*,verify_semantics=T
     _source_row_codec_v2(progress,shape,row)
     if verify_semantics:
         from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
-        if not prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter):return None
+        if not _prepare_graph_source_metadata_v3(progress.cold_build,shape,key,row,meter):return None
     if shape.table=='graph_world_revision_index_v1':
         from .d03_world_history_v1 import decode_world_revision_index_row_v1
         from .c09_world_producer_metadata_v1 import prepare_cold_world_producer_v1
@@ -996,10 +997,21 @@ def _verify_cold_source_row_v2(progress,shape,key,row,meter,*,verify_semantics=T
 
 def advance_current_graph_rebase_cold_v2(progress):
     if type(progress) is not GraphRebaseColdProgressV2:raise TypeError('actual cold progress required')
+    progress.cold_build.platform_lineage_pending_v3=None
+    progress.cold_build.labor_rebuild_binding_pending_v1=None
     progress.prospective_source_capture_v3=None;progress.prospective_world_producer_capture_v1=None
     progress.prospective_marker_cause_capture_v3=None
     progress.prospective_domain_cell_v3=None
+    if progress.cold_build.labor_metadata_reader_v1 is not None:progress.cold_build.labor_metadata_reader_v1.pending=None
     result=_advance_current_graph_rebase_cold_quantum_v2(progress)
+    from ..authority_service.c09_character_labor_adoption_metadata_v1 import confirm_character_labor_metadata_quantum_v1
+    confirm_character_labor_metadata_quantum_v1(progress.cold_build)
+    if progress.cold_build.labor_rebuild_binding_pending_v1 is not None:
+        progress.cold_build.labor_rebuild_binding_reader_v1=progress.cold_build.labor_rebuild_binding_pending_v1
+        progress.cold_build.labor_rebuild_binding_pending_v1=None
+    if progress.cold_build.platform_lineage_pending_v3 is not None:
+        progress.cold_build.platform_lineage_reader_v3=progress.cold_build.platform_lineage_pending_v3
+        progress.cold_build.platform_lineage_pending_v3=None
     if progress.prospective_world_producer_capture_v1 is not None:
         capture=progress.prospective_world_producer_capture_v1
         capture.quantum_completed=True
@@ -1837,6 +1849,21 @@ def _actual_domain_index_v2(build,shape,budget,meter):
 
 
 def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
+    from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS
+    if shape.table in {INSPECTION_OPS,INSPECTION_MEMBERS}:
+        from .source_inspection_migration_v1 import validate_source_inspection_migration_row_v1, DDL as GRAPH_MIGRATION_DDL
+        from ..runtime_contracts import NamespaceId,namespace_ref
+        ns=NamespaceId(row[0],row[1]); own=namespace_ref(ns)
+        if own!=build.scope.authority_namespace:return
+        actual=meter.read_fixed_row(build.pair.source,"sqlite_master",("sql",),"type=? AND name=?",("table",shape.table))
+        if actual!=(GRAPH_MIGRATION_DDL[shape.table],):raise C09PagedCaptureHold("Source inspection migration Graph DDL differs")
+        parsed=validate_source_inspection_migration_row_v1(shape.table,shape.columns,row,authority_namespace=own)
+        if shape.table==INSPECTION_MEMBERS:
+            from ..authority_service.c09_platform_observation_lineage_v3 import require_independent_inspection_member_v3
+            require_independent_inspection_member_v3(build,parsed,meter=meter)
+        # OPS/Core authorization is verified by the later actual final Core pair.
+        # This phase certifies only the frozen Graph original and independent members.
+        return
     if shape.table=="graph_owner_goal_cancellation_projections_v1":
         from .owner_goal_projection_v1 import validate_goal_projection_row_v1
         observed,receipt=validate_goal_projection_row_v1(shape.columns,row,issuer=build.session.get_c09_domain_original_issuer_v2())
@@ -1853,6 +1880,15 @@ def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
     from .c09_contact_originals_v2 import TABLE as CONTACT2
     from ..runtime_contracts import NamespaceId
     values=dict(zip(shape.columns,row,strict=True));ns=NamespaceId(values['bot'],values['persona'])
+    if shape.table=='graph_d04_originals_v3':
+        from .c09_d04_originals_v3 import verify_c09_life_mapping_manifest_history_v4
+        verify_c09_life_mapping_manifest_history_v4(build,original,meter=meter)
+    if shape.table=='graph_d11_life_originals_v1':
+        from .c09_life_numeric_originals_v1 import NUMERIC_KINDS,verify_numeric_life_graph_history_v1
+        if original.kind in NUMERIC_KINDS:
+            verify_numeric_life_graph_history_v1(build,original,
+                producing_operation_id=values['producing_operation_id'],meter=meter)
+            return
     index=_actual_domain_index_v2(build,shape,budget,meter)
     def read(kind,ref):
         saved=index.get(ns,kind,ref);return None if saved is None else saved[1]
@@ -1863,6 +1899,34 @@ def _verify_graph_domain_joins_v2(build,shape,row,original,budget,meter):
         from .c09_contact_effect_accounting_v1 import verify_financial_original_join_v1
         verify_financial_original_join_v1(original, read_original=read)
     elif shape.table=='graph_d11_life_originals_v1':
+        from .c09_character_labor_originals_v1 import LABOR_KINDS,decode_character_labor_original_v1,verify_character_labor_original_join_v1
+        if original.kind in LABOR_KINDS:
+            value=decode_character_labor_original_v1(original.kind,original.payload)
+            verify_character_labor_original_join_v1(ns=ns,kind=original.kind,ref=original.original_ref,
+                op=values["producing_operation_id"],value=value,raw=original.payload,
+                digest=original.original_commitment,read_original=index.life_point_original)
+            from ..authority_service.c09_character_labor_history_v1 import (
+                require_character_labor_body_history_v1,require_character_labor_plan_history_v1,
+                require_character_labor_membership_history_v1)
+            if original.kind=="character_labor_adoption_metadata_v1":
+                from ..authority_service.c09_character_labor_adoption_metadata_v1 import require_character_labor_adoption_metadata_source_v1
+                require_character_labor_adoption_metadata_source_v1(build,value)
+            elif original.kind=="character_labor_rebuild_selection_binding_v1":
+                from ..authority_service.c09_character_labor_rebuild_binding_v1 import require_character_labor_rebuild_binding_graph_v1
+                require_character_labor_rebuild_binding_graph_v1(build,value,meter=meter)
+            elif original.kind=="body_policy_checkpoint_v1":
+                from ..authority_service.c09_character_labor_adoption_metadata_v1 import require_body_policy_checkpoint_history_v1
+                require_body_policy_checkpoint_history_v1(build,value,meter=meter)
+            elif original.kind=="character_labor_body_preparation_v1":
+                require_character_labor_body_history_v1(build,value,meter=meter)
+            elif original.kind=="character_labor_plan_v1":
+                require_character_labor_plan_history_v1(build,value,
+                    producing_operation_id=values["producing_operation_id"],meter=meter)
+            elif original.kind=="character_labor_accounting_basis_v1" and index.life_point_original((
+                    ns,"character_labor_prepared_metadata_v1",
+                    "character-labor-prepared-metadata:"+value.execution_id)) is not None:
+                require_character_labor_membership_history_v1(build,value,meter=meter)
+            return
         d07_read=None
         if original.kind=='artifact_phase_assessment' and original.payload['request']['observer_original_refs']:
             d07_shape=read_c09_table_shape_v2(build.pair.source,D07,meter=meter)
@@ -2036,6 +2100,9 @@ def _actual_streamed_source_origin_v3(build,shape,key,metadata,capture,meter):
 def _advance_source_nested_match_v3(build,shape,key,metadata,closure,progress,budget,meter):
     """One actual closure pattern at a time, decoded text across byte boundaries."""
     from .c09_graph_row_codec_v2 import C09MemorySourceRowCaptureV3
+    from ..authority_service.c09_platform_observation_lineage_v3 import prepare_dispatch_source_lineage_v3
+    if not prepare_dispatch_source_lineage_v3(build,shape,key,meter):
+        return False,False,build.source_row_capture_v3,None
     kind=progress.get('pattern_kind','atom');after=progress.get('pattern_after')
     pattern=next(closure.iter_members(kind,after,1),None)
     ref=None if pattern is None else pattern[0]
@@ -2109,6 +2176,15 @@ def _expand_streamed_source_closure_v3(build,shape,key,small,origin,closure,hit,
         decoded=capture.value.parser.value;atom=AtomKey.from_token(key[0])
         if atom.type_name=='memory.access':return
         if type(decoded) is dict and decoded.get('schema')=='sylanne3.graph.erased_value.v1':return
+        if atom.type_name=='d11.dispatch_claim.v1':
+            from ..authority_service.c09_platform_observation_lineage_v3 import require_dispatch_source_roots_v3
+            from ..runtime.dispatch_graph_claim import DispatchGraphClaimValueV1
+            from ..runtime_contracts import NamespaceId
+            claim=DispatchGraphClaimValueV1(**decoded)
+            roots=require_dispatch_source_roots_v3(build,NamespaceId.from_key(atom),claim,current_c09_sql_meter_v2())
+            if claim.effect_id!=atom.name:raise C09PagedCaptureHold('actual claim key differs from its effect')
+            if any(closure.contains_atom(ref)or closure.contains_source_id(AtomKey.from_token(ref).owner.subject)for ref in roots):
+                closure.add_domain_link('platform_observation_effect_v3',claim.effect_id,**origin)
         for dependent,dependency in iter_c09_typed_graph_edges_v2(build.pair.source,atom,decoded):
             closure.add_edge(dependent,dependency,**origin)
             if closure.contains_atom(dependency):closure.add_atom(dependent,**origin)
@@ -2186,7 +2262,7 @@ def _advance_graph_closure_v2(build,progress):
                     if size*9>meter.remaining_bytes:raise C09PagedCaptureHold('actual closure row needs its registered streaming semantic codec')
                     row=tuple(meter.read_row(source,shape,key));_validate_graph_source_row_v2(build.session,shape,row)
                     from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
-                    if not prepare_b3_managed_source_row_v1(build,shape,key,row,meter):
+                    if not _prepare_graph_source_metadata_v3(build,shape,key,row,meter):
                         progress['table']=table
                         with capture_transaction_v2(candidate):_save_graph_progress_v2(build,'closure',progress,meter)
                         return _graph_step_report_v2(build,'closure',meter,started)
@@ -2213,6 +2289,8 @@ def _expand_graph_closure_row_v2(build,shape,key,row,closure,hit,origin,budget,m
     from .c09_d07_execution_v1 import TABLE as D07
     from .c09_contact_originals_v1 import TABLE as CONTACT
     from .c09_contact_originals_v2 import TABLE as CONTACT2
+    from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS
+    from .d13_outbound_observation_v1 import TABLE as D13_OUTBOUND
     from .c09_b3_managed_metadata_v1 import expand_b3_managed_metadata_closure_v1
     if expand_b3_managed_metadata_closure_v1(build,shape,key,row,closure,hit,origin):return
     values=dict(zip(shape.columns,row,strict=True));namespace=tuple(json.loads(build.scope.graph_namespace))
@@ -2227,6 +2305,15 @@ def _expand_graph_closure_row_v2(build,shape,key,row,closure,hit,origin,budget,m
         if atom.type_name=='memory.access':return
         decoded=json.loads(values['value'])
         if type(decoded) is dict and decoded.get('schema')=='sylanne3.graph.erased_value.v1':return
+        if atom.type_name=='d11.dispatch_claim.v1':
+            from ..authority_service.c09_platform_observation_lineage_v3 import require_dispatch_source_roots_v3
+            from ..runtime.dispatch_graph_claim import DispatchGraphClaimValueV1
+            claim=DispatchGraphClaimValueV1(**decoded)
+            roots=require_dispatch_source_roots_v3(build,NamespaceId(*namespace),claim,meter)
+            if claim.effect_id!=atom.name:raise C09PagedCaptureHold('actual claim key differs from its effect')
+            if any(closure.contains_atom(ref)
+                    or closure.contains_source_id(AtomKey.from_token(ref).owner.subject) for ref in roots):
+                closure.add_domain_link('platform_observation_effect_v3',claim.effect_id,**origin)
         for dependent,dependency in iter_c09_typed_graph_edges_v2(build.pair.source,atom,decoded):
             closure.add_edge(dependent,dependency,**origin)
             if closure.contains_atom(dependency):closure.add_atom(dependent,**origin)
@@ -2242,7 +2329,7 @@ def _expand_graph_closure_row_v2(build,shape,key,row,closure,hit,origin,budget,m
         if dependent.type_name!='memory.access' and closure.contains_atom(dependency.token):closure.add_atom(dependent.token,**origin)
     elif shape.table=='graph_events' and hit:
         if (values.get('bot'),values.get('persona'))==namespace:closure.add_member('operation',values['event_id'],**origin)
-    elif shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
+    elif shape.table in (set(TABLE_COLUMNS)-set(DERIVED_STORE_TABLES_V6)) or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL,INSPECTION_OPS,INSPECTION_MEMBERS,D13_OUTBOUND}:
         original=read_c09_domain_row_v2(shape.table,shape.columns,row,authority_namespace=build.scope.authority_namespace,
             issuer=build.session.get_c09_domain_original_issuer_v2())
         classify_c09_domain_row_v2(original,shape.columns,row,closure=closure,nested_hit=hit,origin=origin,
@@ -2258,6 +2345,8 @@ def _classify_graph_target_row_v2(build,shape,key,row,closure,nested_hit,origin,
     from .c09_d07_execution_v1 import TABLE as D07
     from .c09_contact_originals_v1 import TABLE as CONTACT
     from .c09_contact_originals_v2 import TABLE as CONTACT2
+    from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS
+    from .d13_outbound_observation_v1 import TABLE as D13_OUTBOUND
     from ..graph_types import AtomKey
     if shape.table=='graph_world_revision_index_v1':
         _authenticated_world_revision_index_v1(build,shape,row,meter)
@@ -2311,13 +2400,13 @@ def _classify_graph_target_row_v2(build,shape,key,row,closure,nested_hit,origin,
     elif shape.table in DERIVED_STORE_TABLES_V6:
         disposition=classify_c09_derived_store_row_v2(build.pair.source,shape.table,shape.columns,row,closure=closure,
             authority_namespace=build.scope.authority_namespace,require_erased_fact=lambda *args,**kw:_require_previous_derived_fact_v2(build,*args,**kw),meter=meter)
-    elif shape.table in TABLE_COLUMNS or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
+    elif shape.table in TABLE_COLUMNS or shape.table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL,INSPECTION_OPS,INSPECTION_MEMBERS,D13_OUTBOUND}:
         original=read_c09_domain_row_v2(shape.table,shape.columns,row,authority_namespace=build.scope.authority_namespace,
             issuer=build.session.get_c09_domain_original_issuer_v2())
         disposition=classify_c09_domain_row_v2(original,shape.columns,row,closure=closure,nested_hit=nested_hit,origin=origin,
             verify_original_joins=lambda actual:_verify_graph_domain_joins_v2(build,shape,row,actual,budget,meter))
     elif shape.table=='graph_domain_production_originals_v1':
-        disposition=classify_c09_shared_original_row_v2(build.pair.source,row,registry=build.session._control.maintenance.graph._registry,
+        disposition=classify_c09_shared_original_row_v2(build.pair.source,row,registry=build.session._control.maintenance.graph._registry,build=build,
             closure=closure,nested_hit=nested_hit)
     elif shape.table=='graph_domain_production_outbox_v1':
         def causal(ns,op):
@@ -2329,7 +2418,14 @@ def _classify_graph_target_row_v2(build,shape,key,row,closure,nested_hit,origin,
                 'scope_digest=? AND table_name=? AND key_digest=?',(build.scope.scope_digest,'graph_domain_production_originals_v1',canonical_digest(('graph_domain_production_originals_v1',tuple(actual[:3])))))
             if proof is None:raise C09PagedCaptureHold('shared outbox causal original not yet classified in actual target order')
             return proof[0]
-        disposition=classify_c09_shared_outbox_row_v2(build.pair.source,row,closure=closure,read_causal_disposition=causal)
+        from .c09_native_outbox_v1 import _C09NativeOutboxReadV1
+        native=_C09NativeOutboxReadV1(build,meter)
+        try:
+            disposition=classify_c09_shared_outbox_row_v2(build.pair.source,row,closure=closure,
+                read_causal_disposition=causal,read_native_causal=native.causal,
+                read_native_command=native.command,read_native_job=native.job)
+        finally:
+            native.close()
     elif shape.table in {'graph_atoms','graph_history'}:
         atom=AtomKey.from_token(values['token'])
         if closure.contains_atom(atom.token) and atom.type_name!='memory.access':
@@ -2854,7 +2950,7 @@ def _advance_graph_target_v2(build,progress):
                             if sum(n or 0 for _,n in metadata)*9>meter.remaining_bytes:raise C09PagedCaptureHold('target pattern row needs registered streaming semantic codec')
                             row=tuple(meter.read_row(source,shape,key))
                             from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
-                            if not prepare_b3_managed_source_row_v1(build,shape,key,row,meter):
+                            if not _prepare_graph_source_metadata_v3(build,shape,key,row,meter):
                                 progress['historical_waiting']=False
                             elif _prepare_historical_row_stream_v2(build,shape,row,meter):
                                 progress['historical_waiting']=True
@@ -3271,6 +3367,8 @@ def _read_frozen_source_row_metadata_v3(build,shape,key,meter):
 
 
 def _advance_cold_source_row_capture_v3(progress,shape,key,metadata,budget):
+    from ..authority_service.c09_platform_observation_lineage_v3 import prepare_dispatch_source_lineage_v3
+    if not prepare_dispatch_source_lineage_v3(progress.cold_build,shape,key,current_c09_sql_meter_v2()):return None
     from .c09_graph_row_codec_v2 import C09MemorySourceRowCaptureV3
     build=progress.cold_build;capture=build.source_row_capture_v3
     if (capture is None or capture.shape!=shape or capture.key!=key or capture.metadata!=metadata
@@ -3421,11 +3519,12 @@ def _advance_source_semantic_stage_v2(progress,budget,meter,started):
                     break
                 row=tuple(meter.read_row(source,shape,key));_validate_graph_source_row_v2(progress.session,shape,row)
                 from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
-                if not prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter):break
+                if not _prepare_graph_source_metadata_v3(progress.cold_build,shape,key,row,meter):break
                 _require_source_owner_mapping_metadata_v3(progress.cold_build,shape,key,row,meter)
                 _require_owner_source_metadata_row_for_graph_v3(progress.cold_build,shape,key,row,meter)
                 _require_paid_owner_graph_source_row_v3(progress.cold_build,shape,row,meter)
-                if table in TABLE_COLUMNS or table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL}:
+                from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS
+                if table in TABLE_COLUMNS or table in {D04,D07,CONTACT,CONTACT2,CONTACT_EFFECT_ORIGINAL,INSPECTION_OPS,INSPECTION_MEMBERS}:
                     original=read_c09_domain_row_v2(table,shape.columns,row,
                         authority_namespace=progress.session.scope.authority_namespace,
                         issuer=progress.session.get_c09_domain_original_issuer_v2())
@@ -3666,7 +3765,7 @@ def _advance_independent_graph_closure_v2(progress,budget,meter,started):
                                 raise C09PagedCaptureHold('independent closure Source row requires its registered streaming codec')
                             row=tuple(meter.read_row(source,shape,key))
                             from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
-                            qualified=prepare_b3_managed_source_row_v1(progress.cold_build,shape,key,row,meter)
+                            qualified=_prepare_graph_source_metadata_v3(progress.cold_build,shape,key,row,meter)
                             hit,done=(_graph_nested_advance_v2(closure,_graph_row_nested_value_v2(shape,row),state,budget,meter)
                                 if qualified else(False,False))
                             if done:
@@ -4134,3 +4233,31 @@ def _world_deletion_knowledge_sequence_v1(build,namespace,meter):
         raise C09PagedCaptureHold('World deletion watermark has no actual namespace sequence original')
     _actual_source_row_origin_v2(build,shape,key,tuple(row),meter)
     return row[2]
+
+
+def advance_current_graph_rebase_candidate_v2(build):
+    if type(build) is not InstalledGraphRebaseBuildV2:raise TypeError('actual installed Graph build required')
+    build.platform_lineage_pending_v3=None
+    build.labor_rebuild_binding_pending_v1=None
+    if build.labor_metadata_reader_v1 is not None:build.labor_metadata_reader_v1.pending=None
+    result=_advance_current_graph_rebase_candidate_quantum_v3(build)
+    from ..authority_service.c09_character_labor_adoption_metadata_v1 import confirm_character_labor_metadata_quantum_v1
+    confirm_character_labor_metadata_quantum_v1(build)
+    if build.labor_rebuild_binding_pending_v1 is not None:
+        build.labor_rebuild_binding_reader_v1=build.labor_rebuild_binding_pending_v1
+        build.labor_rebuild_binding_pending_v1=None
+    if build.platform_lineage_pending_v3 is not None:
+        build.platform_lineage_reader_v3=build.platform_lineage_pending_v3
+        build.platform_lineage_pending_v3=None
+    return result
+
+
+def _prepare_graph_source_metadata_v3(build,shape,key,row,meter):
+    from .c09_b3_managed_metadata_v1 import prepare_b3_managed_source_row_v1
+    from ..authority_service.c09_platform_observation_lineage_v3 import prepare_dispatch_source_lineage_v3
+    from ..authority_service.c09_character_labor_adoption_metadata_v1 import prepare_character_labor_adoption_metadata_source_v1
+    from ..authority_service.c09_character_labor_rebuild_binding_v1 import prepare_character_labor_rebuild_binding_source_v1
+    return (prepare_b3_managed_source_row_v1(build,shape,key,row,meter)
+        and prepare_dispatch_source_lineage_v3(build,shape,key,meter)
+        and prepare_character_labor_adoption_metadata_source_v1(build,shape,key,row,meter)
+        and prepare_character_labor_rebuild_binding_source_v1(build,shape,key,row,meter))

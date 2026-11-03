@@ -15,10 +15,10 @@ import sqlite3
 import threading
 from typing import Callable
 
-from ..model_broker.natural_reply_history_v3 import parse_natural_reply_output_current_v1 as parse_natural_reply_output_v2
 from ..runtime.jobs import get_job
 from ..runtime.model_cost_settlement import (
-    OriginalModelCostCommitV1, original_model_cost_operation_id_v1,
+    OriginalModelCostCommitV1, OriginalModelCostFactV1,
+    original_model_cost_operation_id_v1, reported_model_usage_original_v1,
 )
 from ..runtime.natural_reply_job_v2 import (
     NaturalReplyJobHold, read_original_call_binding, read_original_preparation,
@@ -45,7 +45,7 @@ class PinnedNaturalGenerationOriginalPaidVerifierV2:
 
     def read(self, request: NaturalGenerationOutputReadRequestV2,
              intent: ModelEgressIntentV1,
-             receipt: ModelTerminalReceiptV2):
+             receipt: ModelTerminalReceiptV2, *, include_reported_usage: bool = False):
         if (type(request) is not NaturalGenerationOutputReadRequestV2
                 or type(intent) is not ModelEgressIntentV1
                 or type(receipt) is not ModelTerminalReceiptV2):
@@ -118,6 +118,9 @@ class PinnedNaturalGenerationOriginalPaidVerifierV2:
                     if canonical_serialize(data) != row[2]:
                         return None
                     cost = OriginalModelCostCommitV1(**data["original_model_cost"])
+                    budget = db.execute("SELECT receipt_json FROM runtime_budget_operations "
+                        "WHERE bot_id=? AND persona_id=? AND operation_id=? AND phase='settle'",
+                        request.namespace.as_tuple + (seal.reservation_operation_id,)).fetchone()
                     intent_digest = canonical_digest(asdict(intent))
                     receipt_digest = canonical_digest(asdict(receipt))
                     if (data.get("original_intent_digest") != intent_digest
@@ -136,13 +139,8 @@ class PinnedNaturalGenerationOriginalPaidVerifierV2:
                                 "SELECT 1 FROM graph_atoms WHERE token=? AND valid=1",
                                 (cost.cost_ref,),
                             ).fetchone() is None
-                            or db.execute(
-                                "SELECT 1 FROM runtime_budget_operations WHERE "
-                                "bot_id=? AND persona_id=? AND operation_id=? "
-                                "AND phase='settle'",
-                                request.namespace.as_tuple +
-                                (seal.reservation_operation_id,),
-                            ).fetchone() is None
+                            or budget is None
+                            or canonical_digest(json.loads(budget[0])) != cost.budget_receipt_digest
                             or db.execute(
                                 "SELECT state FROM runtime_budget_reservations "
                                 "WHERE lease_id=? AND operation_id=?",
@@ -150,7 +148,9 @@ class PinnedNaturalGenerationOriginalPaidVerifierV2:
                                  seal.reservation_operation_id),
                             ).fetchone() != ("settled",)):
                         return None
-                    return saved, binding, seal_digest, intent_digest, receipt_digest
+                    original = (saved, binding, seal_digest, intent_digest, receipt_digest)
+                    return (original + (cost.budget_receipt_digest,
+                        data.get("model_reported_usage_v1")) if include_reported_usage else original)
                 finally:
                     db.execute("ROLLBACK")
         except (NaturalReplyJobHold, sqlite3.Error, KeyError, TypeError,
@@ -186,8 +186,9 @@ class AuthorityV2NaturalGenerationOutputService:
         self._holder, self._clock = holder, trusted_now_utc
         self._delivery_lock = threading.RLock()
         self._inflight_deliveries: dict[str, FencePermitV2 | None] = {}
+        self._d13_generation_parse_v3 = {}
 
-    def _terminal_locked(self, db, request, anchor, *, content: bool):
+    def _terminal_locked(self, db, request, anchor, *, content: bool, include_fact: bool = False):
         record = self._store._read(db, request.call_id)
         if (record is None or record.state != "observed" or record.content_erased
                 or (record.intent.authority_id, record.intent.namespace,
@@ -229,15 +230,16 @@ class AuthorityV2NaturalGenerationOutputService:
                        intent, original_permit, "completed",
                        record.observation_digest)):
             raise AuthorityUnavailable("original natural admission differs")
+        fact = (OriginalModelCostFactV1(intent, record, admission, receipt),) if include_fact else ()
         if not content:
-            return intent, receipt, None
+            return (intent, receipt, None) + fact
         observation = self._store._read_observation_locked(db, intent)
         if (observation.status != "completed"
                 or observation.digest != receipt.observation_digest):
             raise AuthorityUnavailable("original natural observation differs")
-        return intent, receipt, observation
+        return (intent, receipt, observation) + fact
 
-    def _read_original(self, request, anchor, *, content: bool):
+    def _read_original(self, request, anchor, *, content: bool, include_fact: bool = False):
         fences = self._fences
         with fences._frozen() as (db, deletion_head, execution_head, history):
             current = fences._current_locked(
@@ -245,7 +247,7 @@ class AuthorityV2NaturalGenerationOutputService:
                 generation=anchor.activation_generation)
             if current != anchor:
                 raise AuthorityUnavailable("natural result read anchor changed")
-            return self._terminal_locked(db, request, anchor, content=content)
+            return self._terminal_locked(db, request, anchor, content=content, include_fact=include_fact)
 
     def prepare(self, *, credential: object,
                 request: NaturalGenerationOutputReadRequestV2,
@@ -284,8 +286,8 @@ class AuthorityV2NaturalGenerationOutputService:
             credential=credential, subject=self._read_subject)
         if anchor.authority_id != request.authority_id:
             raise AuthorityUnavailable("natural result Authority identity differs")
-        intent, receipt, _ = self._read_original(request, anchor, content=False)
-        original = self._graph.read(request, intent, receipt)
+        intent, receipt, _, fact = self._read_original(request, anchor, content=False, include_fact=True)
+        original = self._graph.read(request, intent, receipt, include_reported_usage=True)
         if original is None:
             raise AuthorityUnavailable("natural original paid graph unavailable")
         permit = fences.begin_fence(
@@ -295,29 +297,38 @@ class AuthorityV2NaturalGenerationOutputService:
             expected_anchor=anchor)
         fences.validate_fence(
             credential=credential, subject=self._read_subject, permit=permit)
-        second_intent, second_receipt, observation = self._read_original(
-            request, anchor, content=True)
-        after = self._graph.read(request, second_intent, second_receipt)
+        second_intent, second_receipt, observation, second_fact = self._read_original(
+            request, anchor, content=True, include_fact=True)
+        after = self._graph.read(request, second_intent, second_receipt, include_reported_usage=True)
         if (second_intent != intent or second_receipt != receipt
-                or after != original):
+                or second_fact != fact or after != original):
             raise AuthorityUnavailable("natural original changed during read")
-        result = observation.result
-        if (type(result) is not dict or set(result) != {"text"}
-                or type(result["text"]) is not str):
-            raise AuthorityUnavailable("natural provider result shape differs")
-        parsed = parse_natural_reply_output_v2(result["text"], original[0].frozen)
-        output = NaturalGenerationOriginalOutputV2(
-            request=request, original_seal_digest=original[2],
-            typed_model_request_digest=original[1].typed_request_digest,
-            original_intent_digest=original[3],
-            terminal_receipt_digest=original[4],
-            observation_digest=observation.digest,
-            output_digest=parsed.output_digest, status=parsed.status)
-        fences.validate_fence(
-            credential=credential, subject=self._read_subject, permit=permit)
-        if self._graph.read(request, intent, receipt) != original:
-            raise AuthorityUnavailable("natural original changed after copy")
-        return NaturalGenerationOutputDeliveryV2(output, permit)
+        # Legacy receipts remain historical and are never backfilled. A new
+        # transcription must match this independently read Authority terminal.
+        if original[6] is not None and original[6] != reported_model_usage_original_v1(
+                second_fact, budget_receipt_digest=original[5]):
+            raise AuthorityUnavailable("natural reported usage differs from the original observation")
+        with self._delivery_lock:
+            self._d13_generation_parse_v3[request.read_attempt_id] = (
+                request, original, observation, intent, receipt, permit, None)
+        try:
+            from .d13_original_owner_v3 import (
+                parse_actual_d13_natural_generation_output_v3, record_actual_d13_natural_generation_parse_v3)
+            parsed = parse_actual_d13_natural_generation_output_v3(self, credential=credential, request=request)
+            output = NaturalGenerationOriginalOutputV2(
+                request=request, original_seal_digest=original[2],
+                typed_model_request_digest=original[1].typed_request_digest,
+                original_intent_digest=original[3], terminal_receipt_digest=original[4],
+                observation_digest=observation.digest, output_digest=parsed.output_digest, status=parsed.status)
+            fences.validate_fence(
+                credential=credential, subject=self._read_subject, permit=permit)
+            if self._graph.read(request, intent, receipt, include_reported_usage=True) != original:
+                raise AuthorityUnavailable("natural original changed after copy")
+            record_actual_d13_natural_generation_parse_v3(self, credential=credential, request=request)
+            return NaturalGenerationOutputDeliveryV2(output, permit)
+        finally:
+            with self._delivery_lock:
+                self._d13_generation_parse_v3.pop(request.read_attempt_id, None)
 
     def finish_delivery(self, *, credential: object,
                         delivery: NaturalGenerationOutputDeliveryV2) -> None:

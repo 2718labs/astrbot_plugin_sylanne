@@ -1,6 +1,7 @@
 """Root Source material prepared by the originating ordinary FULL Work."""
 from copy import copy
 import hmac
+import math
 from hashlib import sha256
 from types import MappingProxyType
 from weakref import WeakKeyDictionary,WeakSet
@@ -42,8 +43,8 @@ class _SourceTextJSONStreamV3(C09MemorySourceJSONStreamV3):
 
 def _require_prefinal(prefinal,entry,meter=None):
     from .current_graph_full_read_v3 import _PrefinalSourceInventoryV3,_CurrentSourceEntryLocatorV3
-    if (type(prefinal) is not _PrefinalSourceInventoryV3 or type(entry) is not _CurrentSourceEntryLocatorV3
-            or entry is not prefinal.actual_entry):
+    if (type(prefinal) is not _PrefinalSourceInventoryV3 or entry is not prefinal.actual_entry
+            or entry is not None and type(entry) is not _CurrentSourceEntryLocatorV3):
         raise AuthorityUnavailable('actual originating prefinal Source inventory/entry locator required')
     prefinal.require_current(meter=meter)
     return prefinal
@@ -107,9 +108,9 @@ def _read_entry(prefinal,entry,meter,originals):
     receipt=CommitReceipt('committed',op,row[0],row[1],row[2],row[3],reads,writes,
         (NamespaceEpoch(*ns.as_tuple,originals.event_epoch),),tuple(detail['ledger_refs']),tuple(detail['outbox_refs']))
     source_reader=lambda key:prefinal.source_metadata(db,ns,prefinal.query,key,require_grant=False,meter=meter)
-    attention=_qualify_focus_attention_values_v3(prefinal.projection,ns,now=None,source_reader=source_reader)
+    attention=_qualify_focus_attention_values_v3(prefinal.require_body_projection_v3(),ns,now=None,source_reader=source_reader)
     if attention is None:raise AuthorityUnavailable('Source material current D07 focus/ticket is unavailable')
-    inputs=read_current_reply_model_inputs_v1(db,originals.issuer,ns,receipt,ref,prefinal.projection,attention,
+    inputs=read_current_reply_model_inputs_v1(db,originals.issuer,ns,receipt,ref,prefinal.require_body_projection_v3(),attention,
         _prefinal_source_inventory=prefinal,_prepared_c02_originals=originals)
     return ref,inputs
 
@@ -139,7 +140,7 @@ def _family_from_nodes(reader):
         visited.add(ref)
         key=AtomKey.from_token(ref);witness=reader.witnesses[ref]
         access=access_key(*ns.as_tuple,key.owner.subject)
-        versions.extend((GraphVersion(key,witness.revision),GraphVersion(access,reader.prefinal.projection.get(access).revision),
+        versions.extend((GraphVersion(key,witness.revision),GraphVersion(access,reader.prefinal.require_body_projection_v3().get(access).revision),
             GraphVersion(source_correction_head_key(ns,key.owner.subject),0)))
         pending.extend(source_key(*ns.as_tuple,parent).token for parent in reader.metadata_records[ref].parent_source_ids)
     return QualifiedPreparedAttentionReadV3(reader.inputs.attention,
@@ -224,7 +225,9 @@ class CurrentGraphSourceMaterialReadV3:
     def __init__(self,token,prefinal,entry):
         if token is not _ISSUER:raise AuthorityUnavailable('actual Source material factory required')
         self.prefinal,self.entry=prefinal,entry
-        self.phase='entry_setup';self.inputs=self.source_ref=self.witness=self.family=None
+        self.phase='entry_setup'if entry is not None else'entry_metadata';self.inputs=self.source_ref=self.witness=self.family=None
+        self.rights_seal=None;self.rights_done=set();self.groups=();self.entry_roots=self.attention_roots=()
+        self.route=self.target=self.conversation_ref=self.focus_key=self.ticket_key=None;self.ingress_metadata_original=None
         self.entry_specs=();self.entry_column_position=0;self.entry_column=None;self.entry_columns={}
         self.entry_business=self.entry_archive=self.entry_event_epoch=self.entry_issuer=self.quote_id=self.quote_signature=None
         self.quote_hmac=None;self.c02_originals=None
@@ -246,6 +249,7 @@ class CurrentGraphSourceMaterialReadV3:
         result.entry_columns=dict(self.entry_columns)
         if self.quote_hmac is not None:result.quote_hmac=self.quote_hmac.copy()
         result.pending=list(self.pending);result.versions=list(self.versions);result.attention_refs=set(self.attention_refs)
+        result.rights_done=set(self.rights_done)
         result.witnesses=dict(self.witnesses);result.metadata_records=dict(self.metadata_records);result.records=dict(self.records)
         if self.cell is not None:
             result.cell=copy(self.cell);result.cell.hash=self.cell.hash.copy()
@@ -255,6 +259,26 @@ class CurrentGraphSourceMaterialReadV3:
         result._advance(meter)
         _require_prefinal(self.prefinal,self.entry,meter);result._reserve()
         return result
+    def freeze_groups_v3(self,groups):
+        if self.phase!='metadata_ready' or groups!=self.prefinal.reader.owner_groups:
+            raise AuthorityUnavailable('actual frozen metadata Source groups required')
+        self.groups=groups;self.pending=[]
+        for purpose,audiences,roots in groups:
+            if len(roots)>32:raise AuthorityUnavailable('actual Source group exceeds its original root bound')
+            self.pending.extend((ref,purpose,audience,False)for ref in roots for audience in audiences)
+        self.pending.extend((ref,'expression',self.conversation_ref,True)for ref in self.attention_roots)
+        self.phase='await_owner'
+    def admit_owner_v3(self):
+        self.prefinal.reader.owner_entry.require_for_v3(self.prefinal.reader)
+        if self.phase!='await_owner':raise AuthorityUnavailable('actual Owner intersection must precede SourceALL')
+        self.phase='rights'
+    def require_rights_seal_v3(self):
+        if self.rights_seal is None:raise AuthorityUnavailable('all Source groups have not reached metadata rights EOF')
+        return self.rights_seal.require_v3()
+    def begin_body_entry_v3(self):
+        self.require_rights_seal_v3()
+        if self.phase!='rights_sealed':raise AuthorityUnavailable('actual SourceALL seal must precede native input validation')
+        self.prefinal.require_body_projection_v3();self.phase='body_entry'
     def _advance(self,meter):
         db=self.prefinal.db;ns=self.prefinal.namespace
         if self.phase=='entry_setup':
@@ -303,47 +327,58 @@ class CurrentGraphSourceMaterialReadV3:
             if finished:
                 self.entry_columns[name]=self.entry_column;self.entry_column=None;self.entry_column_position+=1
             return
-        if self.phase=='entry':
+        if self.phase=='entry':self.phase='entry_metadata';return
+        if self.phase=='entry_metadata':
             from .c09_paged_sql_v2 import legacy_cell_read_transaction_v2
-            with legacy_cell_read_transaction_v2(db):
-                self.source_ref,self.inputs=_read_entry(self.prefinal,self.entry,meter,self.c02_originals)
-            self.producer_members=self.prefinal.reader.prepared_producer_members
-            roots=()
-            if self.producer_members is not None:
-                from .natural_producer_qualification_v1 import require_prepared_host_natural_producers_v3
-                proof=require_prepared_host_natural_producers_v3(self.producer_members,prefinal=self.prefinal,scope=self.prefinal.scope)
-                roots=proof.require_for(self.prefinal,self.entry)
-            self.roots=tuple(dict.fromkeys((self.source_ref,*roots)))
-            self.pending=[(ref,False)for ref in self.roots]+[(ref,True)for ref in self.inputs.attention.ticket.source_refs]
-            self.phase='rights';return
+            with legacy_cell_read_transaction_v2(db):_read_entry_metadata_v3(self,meter)
+            return
+        if self.phase in ('metadata_ready','await_owner','rights_sealed'):
+            raise AuthorityUnavailable('Source phase requires its actual metadata/Owner/Body continuation')
         if self.phase=='rights':
-            if not self.pending:self.family=_family_from_nodes(self);self.phase='cell';return
-            ref,attention_required=self.pending.pop()
-            if ref in self.witnesses:
-                if attention_required and ref not in self.attention_refs:
-                    record=self.metadata_records[ref]
-                    if record.assertion_status not in {'confirmed','reported'}:
-                        raise AuthorityUnavailable('D07 ticket Source assertion status differs')
-                    self.attention_refs.add(ref)
-                    self.pending.extend((source_key(*ns.as_tuple,parent).token,True)for parent in record.parent_source_ids)
-                return
-            if len(self.witnesses)>=256:raise AuthorityUnavailable('Source material ancestry exceeds its original bound')
+            self.prefinal.reader.owner_entry.require_for_v3(self.prefinal.reader)
+            if not self.pending:
+                # Cycle validation uses only the complete metadata ancestry.
+                active=set();done=set()
+                def visit(ref):
+                    if ref in active:raise AuthorityUnavailable('Source material ancestry contains a cycle')
+                    if ref in done:return
+                    active.add(ref)
+                    for parent in self.metadata_records[ref].parent_source_ids:visit(source_key(*ns.as_tuple,parent).token)
+                    active.remove(ref);done.add(ref)
+                for ref in self.witnesses:visit(ref)
+                self.rights_seal=_MetadataSourceAllRightsSealV3(_ISSUER,self)
+                self.prefinal.reader.source_rights_seal=self.rights_seal;self.phase='rights_sealed';return
+            ref,purpose,audience,attention_required=self.pending.pop();identity=(ref,purpose,audience,attention_required)
+            if identity in self.rights_done:return
+            if ref not in self.witnesses and len(self.witnesses)>=256:
+                raise AuthorityUnavailable('Source material ancestry exceeds its original bound')
             from ..domains.d06 import source_correction_head_key
             from ..domains.d07.qualified_attention_read import _qualify_source_node_values_v3,_qualify_source_rights_values_v3
             key=AtomKey.from_token(ref)
             witness=self.prefinal.source_metadata(db,ns,self.prefinal.query,key,require_grant=False,meter=meter)
             access=access_key(*ns.as_tuple,key.owner.subject);head=source_correction_head_key(ns,key.owner.subject)
             correction=self.prefinal.correction_head(db,ns,self.prefinal.query,head,meter=meter)
-            atom=self.prefinal.projection.get(access)
+            atom=self.prefinal.control_metadata_v3(access,meter=meter)
             qualifier=_qualify_source_node_values_v3 if attention_required else _qualify_source_rights_values_v3
-            record=qualifier(ns,ref,witness,atom,correction,
-                audience=self.inputs.conversation_ref,purpose='expression',metadata_only=True)
-            if record is None:raise AuthorityUnavailable('Source material ancestry/access/correction/purpose/audience differs')
-            self.witnesses[ref]=witness;self.metadata_records[ref]=record
+            record=qualifier(ns,ref,witness,atom,correction,audience=audience,purpose=purpose,metadata_only=True)
+            if record is None:raise AuthorityUnavailable('SourceALL ancestry/access/correction/purpose/audience differs')
+            self.witnesses[ref]=witness;self.metadata_records[ref]=record;self.rights_done.add(identity)
             if attention_required:self.attention_refs.add(ref)
             self.versions.extend((GraphVersion(key,witness.revision),GraphVersion(access,atom.revision),GraphVersion(head,0)))
-            self.pending.extend((source_key(*ns.as_tuple,parent).token,attention_required)for parent in record.parent_source_ids)
+            self.pending.extend((source_key(*ns.as_tuple,parent).token,purpose,audience,attention_required)for parent in record.parent_source_ids)
             return
+        if self.phase=='body_entry':
+            self.require_rights_seal_v3()
+            if self.entry is None:self.complete=True;self.phase='complete';return
+            from .c09_paged_sql_v2 import legacy_cell_read_transaction_v2
+            with legacy_cell_read_transaction_v2(db):ref,self.inputs=_read_entry(self.prefinal,self.entry,meter,self.c02_originals)
+            if ref!=self.source_ref or tuple(self.inputs.attention.ticket.source_refs)!=self.attention_roots:
+                raise AuthorityUnavailable('full native entry differs from its metadata SourceALL selector')
+            self.producer_members=self.prefinal.reader.prepared_producer_members
+            if self.producer_members is not None:
+                roots=self.producer_members.require_for(self.prefinal,self.entry)
+                if not set(roots)<=set(self.roots):raise AuthorityUnavailable('native producer roots were not SourceALL qualified')
+            self.family=_family_from_nodes(self);self.phase='cell';return
         if self.phase=='cell':
             if self.root_position==len(self.roots):self.phase='seal';return
             ref=self.roots[self.root_position];self.witness=self.witnesses[ref]
@@ -365,7 +400,13 @@ class CurrentGraphSourceMaterialReadV3:
             if(parsed.byte_count!=self.cell.header[3]or parsed.sha256!=digest or digest!=self.witness.payload_sha256
                     or metadata!=dict(self.witness.metadata)):
                 raise AuthorityUnavailable('Source material full codec/SHA/EOF or original metadata differs')
-            self.records[self.roots[self.root_position]]=SourceRecord.from_dict(dict(self.parser._source_metadata,text=self.parser.text))
+            record=SourceRecord.from_dict(dict(self.parser._source_metadata,text=self.parser.text))
+            original=self.prefinal.reader.source_inspections[self.witness.source_key.token]
+            original.require_v3(self.prefinal.reader,meter)
+            from ..runtime_contracts import canonical_digest
+            if canonical_digest(record.to_dict())!=original.semantic_digest:
+                raise AuthorityUnavailable('qualified Source material semantic digest differs from its inspection original')
+            self.records[self.roots[self.root_position]]=record
             self.fragment=b'';self.offset=0;self.parser=self.cell=None;self.root_position+=1;self.phase='cell';return
         if self.phase=='seal':
             if self.producer_members is not None:self.producer_members.require_for(self.prefinal,self.entry)
@@ -387,3 +428,130 @@ def require_prepared_current_source_material_v3(material,*,prefinal_inventory,ac
     prefinal_inventory._actual()
     material.c02_originals.require_for_v3(prefinal_inventory,actual_entry)
     return material
+
+
+_RIGHTS_SEALS_V3=WeakKeyDictionary()
+
+
+class _MetadataSourceAllRightsSealV3:
+    def __init__(self,issuer,reader):
+        owner=reader.prefinal.reader
+        if issuer is not _ISSUER or reader.pending or reader.phase!='rights' or owner.owner_entry is None:
+            raise AuthorityUnavailable('all actual Source groups must complete before the rights seal')
+        owner.metadata_selection.require_for_v3(owner);owner.owner_entry.require_for_v3(owner)
+        self.prefinal,self.work,self.operation=reader.prefinal,owner.work,owner.operation
+        self.selection,self.entry,self.groups=owner.metadata_selection,owner.owner_entry,owner.owner_groups
+        self.rights=tuple(sorted(reader.rights_done));self.versions=tuple(reader.versions)
+        self.heads=tuple(sorted((ref,reader.prefinal.heads[ref])for ref in reader.witnesses))
+        self.controls=tuple(sorted((v.key.token,reader.prefinal.heads.get(v.key.token))for v in self.versions if v.key.type_name!='memory.source'))
+        _RIGHTS_SEALS_V3[self]=self._identity_v3()
+    def _identity_v3(self):return(self.prefinal,self.work,self.operation,self.selection,self.entry,self.groups,self.rights,self.versions,self.heads,self.controls)
+    def require_v3(self):
+        owner=self.work.state
+        if (_RIGHTS_SEALS_V3.get(self)!=self._identity_v3()or self.operation.closed or owner.prefinal is not self.prefinal
+                or owner.work is not self.work or owner.operation is not self.operation or owner.owner_entry is not self.entry
+                or owner.owner_groups!=self.groups):raise AuthorityUnavailable('actual same-Work SourceALL rights seal changed')
+        self.prefinal._actual();self.selection.require_for_v3(owner);self.entry.require_for_v3(owner)
+        if any(self.prefinal.heads.get(ref)!=head for ref,head in (*self.heads,*self.controls)):
+            raise AuthorityUnavailable('SourceALL control heads differ from their full metadata EOF')
+        return self
+    def release_v3(self):_RIGHTS_SEALS_V3.pop(self,None)
+
+
+def require_natural_reply_context_metadata_v3(reader,*,now):
+    """Fixed natural-prepare D03 request metadata; never a Body qualification."""
+    from .current_graph_full_read_v3 import NATURAL_ROUTE_FULL_READ_V3
+    from .current_commitment_input_source_v3 import _policy_decision_v3
+    from ..graph_types import Owner
+    from ..runtime_contracts import canonical_digest
+    pre=reader.prefinal;owner=pre.reader
+    if (type(reader)is not CurrentGraphSourceMaterialReadV3 or reader not in _READERS
+            or owner.source_material is not reader or owner.contract is not NATURAL_ROUTE_FULL_READ_V3
+            or owner.work.state is not owner or owner.work.operation is not owner.operation
+            or owner.fence.scope is not reader.prefinal.scope or reader.phase!='metadata_ready'
+            or reader.entry is None or reader.ingress_metadata_original is None
+            or reader.ingress_metadata_original[:2]!=(reader.source_ref,reader.entry.c02_operation_id)):
+        raise AuthorityUnavailable('natural reply predicate requires its actual current prepare Work/fence/C02 metadata')
+    reader.c02_originals.require_for_v3(pre,reader.entry);pre.require_current()
+    focus=pre.metadata_value_v3(reader.focus_key);ticket=pre.metadata_value_v3(reader.ticket_key)
+    account_key=AtomKey(Owner('persona',*pre.namespace.as_tuple),'d03.account_binding',
+        'account:v1:'+canonical_digest({'namespace':pre.namespace.as_tuple,'platform_ref':reader.route[0],'sender_ref':reader.route[2]}))
+    account=pre.metadata_value_v3(account_key)
+    if (focus is None or focus['persona_id']!=pre.namespace.persona_id
+            or focus['primary_ticket_ref']!=reader.ticket_key.token
+            or ticket is None or ticket['ticket_id']!=reader.ticket_key.name
+            or ticket['causal_root']!=reader.source_ref or tuple(ticket['source_refs'])!=(reader.source_ref,)
+            or ticket['category']!='interaction' or ticket['eligible']is not True
+            or ticket['resources_available']is not True or ticket['cancel_refs']
+            or type(ticket['valid_until'])not in(int,float)or not math.isfinite(ticket['valid_until'])or ticket['valid_until']<=now
+            or account is None or not _policy_decision_v3('d03.account_binding',account,
+                subject='persona:'+pre.namespace.persona_id,target=reader.target,route=reader.route,now=now)
+            or account['valid_until']is not None and account['valid_until']<=now):
+        raise AuthorityUnavailable('natural reply fixed account/Focus/Ticket metadata is not the actual live C02 prepare recipe')
+    source=pre.sources.get(reader.source_ref)
+    if source is None or not source.valid or source.revision<1:
+        raise AuthorityUnavailable('natural reply predicate has no actual current Source metadata version')
+    originals=tuple(pre.metadata[key.token]for key in (account_key,reader.focus_key,reader.ticket_key))
+    if any(not original.valid for original in originals):
+        raise AuthorityUnavailable('natural reply predicate references an invalid account/Focus/Ticket head')
+    for original in originals:original.require_v3(owner)
+    bases=tuple((original.key.token,original.revision,original.cell_id,original.header,original.digest)for original in originals)
+    bases+=((source.source_key.token,source.revision,source.cell_id,source.header,source.payload_sha256),)
+    expiry=min(ticket['valid_until'],account['valid_until'])if account['valid_until']is not None else ticket['valid_until']
+    request=('persona:'+pre.namespace.persona_id,account['entity_id'],None,reader.route[4],'expression','reply',now,True)
+    return request,bases,expiry
+
+
+def _read_entry_metadata_v3(reader,meter):
+    from ..graph_types import Owner
+    from ..runtime_contracts import canonical_digest
+    from .first_ingress_v2 import scene_ref_for_conversation
+    pre=reader.prefinal;ns=pre.namespace
+    if reader.entry is None:
+        actual=pre.reader.artifact_metadata
+        if actual is None or not actual.complete:raise AuthorityUnavailable('actual Artifact metadata EOF required')
+        reader.source_ref=actual.receipt.source_ref;source_id=AtomKey.from_token(reader.source_ref).owner.subject
+    else:
+        reader.c02_originals.require_for_v3(pre,reader.entry)
+        evidence=reader.c02_originals.value_v3('evidence');source_id=evidence['source_ref']
+        reader.source_ref=source_key(*ns.as_tuple,source_id).token
+        if reader.entry.source_ref is not None and reader.source_ref!=reader.entry.source_ref:
+            raise AuthorityUnavailable('actual C02 Source locator differs from metadata original')
+    row=meter.read_fixed_row(pre.db,'graph_first_ingress_identity_v1',
+        ('source_ref','platform_ref','conversation_ref','sender_ref','message_id','visibility','operation_id'),
+        'bot=? AND persona=? AND source_ref=? ORDER BY operation_id',(*ns.as_tuple,source_id))
+    if row is None and reader.entry is None:
+        # Receipt Source is produced from the actual inbound C02 selector.
+        row=meter.read_fixed_row(pre.db,'graph_first_ingress_identity_v1',
+            ('source_ref','platform_ref','conversation_ref','sender_ref','message_id','visibility','operation_id'),
+            'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,actual.receipt.selector.task.c02_operation_id))
+        if row is not None:source_id=row[0]
+    if row is None or row[0]!=source_id or row[5]!='private':
+        raise AuthorityUnavailable('Source entry lacks its exact original private route metadata')
+    second=meter.read_fixed_row(pre.db,'graph_first_ingress_identity_v1',('operation_id',),
+        'bot=? AND persona=? AND source_ref=? AND operation_id>? ORDER BY operation_id',(*ns.as_tuple,source_id,row[6]))
+    if second is not None:raise AuthorityUnavailable('Source entry has more than one actual ingress identity')
+    operation=reader.entry.c02_operation_id if reader.entry is not None else actual.receipt.selector.task.c02_operation_id
+    if row[6]!=operation:
+        raise AuthorityUnavailable('original ingress metadata belongs to another actual C02 operation')
+    business=reader.entry_business if reader.entry is not None else meter.read_fixed_row(pre.db,'graph_bundle_operations',
+        ('digest','activity_id','effect_id','commit_seq'),'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,operation))
+    if business is None:raise AuthorityUnavailable('original ingress metadata lacks its actual committed C02 bundle')
+    reader.ingress_metadata_original=(source_key(*ns.as_tuple,source_id).token,operation,tuple(row),business)
+    platform,conversation,sender,message=row[1:5]
+    reader.conversation_ref=conversation
+    reader.route=(platform,conversation,sender,message,scene_ref_for_conversation(ns,platform,conversation))
+    reader.target='entity:account-v1:'+canonical_digest({'namespace':ns.as_tuple,'platform_ref':platform,'sender_ref':sender})
+    reader.entry_roots=(reader.source_ref,);reader.attention_roots=()
+    if reader.entry is not None:
+        focus=AtomKey(Owner('persona',*ns.as_tuple),'d07.focus.v1',ns.persona_id)
+        value=pre.metadata_value_v3(focus,meter=meter)
+        if value is None or not pre.metadata[focus.token].valid:raise AuthorityUnavailable('current focus metadata is absent')
+        ticket=AtomKey.from_token(value['primary_ticket_ref'])
+        if (ticket.owner.bot,ticket.owner.persona)!=ns.as_tuple or ticket.type_name!='d07.attention_ticket.v1':
+            raise AuthorityUnavailable('focus metadata points outside its actual attention family')
+        attention=pre.metadata_value_v3(ticket,meter=meter)
+        if attention is None or not pre.metadata[ticket.token].valid:raise AuthorityUnavailable('current attention metadata is absent')
+        reader.focus_key,reader.ticket_key=focus,ticket
+        reader.attention_roots=tuple(attention['source_refs'])
+    reader.phase='metadata_ready'

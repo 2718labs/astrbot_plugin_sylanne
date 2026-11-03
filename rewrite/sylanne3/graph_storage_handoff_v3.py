@@ -58,6 +58,8 @@ def transfer_graph_storage_lifetime_v3(value,parent):
     if not is_graph_storage_handoff_v3(value):return False
     if value.parent is not parent or value.lifetime is not None:
         raise RuntimeError('request lifetime handoff was already transferred')
+    from .runtime.ordinary_continuity_child_handoff_v1 import install_ordinary_continuity_child_lifetime_v1
+    if install_ordinary_continuity_child_lifetime_v1(value,parent):return True
     value.lifetime,parent._request_lifetime=parent._request_lifetime,None
     return True
 
@@ -104,7 +106,12 @@ def advance_graph_storage_handoff_v3(worker,call,coordinator,value):
             or call.work is not handoff.parent or not handoff.parent.terminal
             or call.is_callback or monotonic()>=handoff.start_before):
         error=RuntimeError('Graph handoff changed its parent/ticket/original deadline')
-        if type(value)is OwnedGraphStorageResultV3:_close_secondary_v3(error,value.release_v3)
+        from .runtime.ordinary_continuity_child_handoff_v1 import retain_invalid_ordinary_continuity_parent_v1
+        claimed=retain_invalid_ordinary_continuity_parent_v1(handoff,coordinator,call,value,error)
+        if not claimed:
+            from .runtime.d13_counter_prepare_owner_v1 import retain_invalid_d13_counter_owner_parent_v1
+            claimed=retain_invalid_d13_counter_owner_parent_v1(handoff,coordinator,call,value,error)
+        if type(value)is OwnedGraphStorageResultV3 and not claimed:_close_secondary_v3(error,value.release_v3)
         if handoff.lifetime is not None:_close_secondary_v3(error,handoff.lifetime.close)
         raise error
     if type(value)is OwnedGraphStorageResultV3:_,holder=value.take_value_v3()
@@ -120,11 +127,21 @@ def advance_graph_storage_handoff_v3(worker,call,coordinator,value):
                 raise RuntimeError('Graph child changed its actual ticket or original business deadline')
             child.operation.retain(len(handoff.command)*2+65536)
             if handoff.lifetime is not None:
-                if child._request_lifetime is None:child.adopt_request_lifetime_v3(handoff.lifetime)
-                else:child._request_lifetime.callback(handoff.lifetime.close)
+                if handoff.mappers or call.final_mappers:
+                    call.final_lifetimes.append(handoff.lifetime)
+                elif child._request_lifetime is None:
+                    child.adopt_request_lifetime_v3(handoff.lifetime)
+                else:
+                    child._request_lifetime.callback(handoff.lifetime.close)
                 handoff.lifetime=None
             if holder is not None:
-                retired,holder=holder,None;retired.release()
+                from .runtime.ordinary_continuity_child_handoff_v1 import retain_ordinary_continuity_parent_holder_v1
+                from .runtime.d13_counter_prepare_owner_v1 import retain_d13_counter_owner_parent_holder_v1
+                if (retain_ordinary_continuity_parent_holder_v1(handoff,holder,child=child)
+                        or retain_d13_counter_owner_parent_holder_v1(handoff,holder,child=child)):
+                    holder=None
+                else:
+                    retired,holder=holder,None;retired.release()
             child._accept(coordinator,call.ticket)
             call.final_mappers=handoff.mappers+call.final_mappers
             call.work=child;worker._queue.put_nowait(call)
@@ -136,7 +153,11 @@ def advance_graph_storage_handoff_v3(worker,call,coordinator,value):
         if is_graph_storage_handoff_v3(child):raise RuntimeError('child factory must construct its actual Work or terminal result')
         immediate=_retain_immediate_result_v3(handoff.parent,child,call.handoff_deadline)
         if handoff.lifetime is not None:
-            lifetime,handoff.lifetime=handoff.lifetime,None;lifetime.close()
+            lifetime,handoff.lifetime=handoff.lifetime,None
+            if handoff.mappers or call.final_mappers:
+                call.final_lifetimes.append(lifetime)
+            else:
+                lifetime.close()
         if holder is not None:
             retired,holder=holder,None;retired.release()
         call.final_mappers=handoff.mappers+call.final_mappers
@@ -144,6 +165,14 @@ def advance_graph_storage_handoff_v3(worker,call,coordinator,value):
         worker._queue.put_nowait(call)
         return True,None
     except BaseException as error:
+        if holder is not None:
+            from .runtime.ordinary_continuity_child_handoff_v1 import retain_ordinary_continuity_parent_holder_v1
+            try:
+                from .runtime.d13_counter_prepare_owner_v1 import retain_d13_counter_owner_parent_holder_v1
+                if (retain_ordinary_continuity_parent_holder_v1(handoff,holder,error=error)
+                        or retain_d13_counter_owner_parent_holder_v1(handoff,holder,error=error)):holder=None
+            except BaseException as secondary:
+                error.add_note('ordinary parent ownership cleanup also failed: '+type(secondary).__name__)
         if immediate is not None:_close_secondary_v3(error,immediate.release_v3)
         if type(child)is OwnedGraphStorageResultV3:_close_secondary_v3(error,child.release_v3)
         if type(child)is GraphStorageWorkV3 and not child.terminal:

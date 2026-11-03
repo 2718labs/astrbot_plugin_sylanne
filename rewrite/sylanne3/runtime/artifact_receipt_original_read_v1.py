@@ -110,6 +110,9 @@ def artifact_receipt_sql_v1(db,sql,parameters=()):
 
 @contextmanager
 def _bind_v1(task):
+    from .artifact_outbound_receipt_adoption_read_v3 import _ArtifactRecordedFactTaskV3
+    if type(task)not in(ArtifactReceiptOriginalReadTaskV1,_ArtifactRecordedFactTaskV3):
+        raise AuthorityUnavailable('exact issued Artifact original or recorded-fact task required')
     task.require_actual_v1()
     token=_ACTIVE.set(task)
     try:yield
@@ -181,7 +184,20 @@ class _ReceiptPointV1:
                     if name not in jsons or current[position]is None:continue
                     if self.table in {"graph_atoms","graph_history"}:
                         token=dict(zip(keys,pk))["token"]
-                        if AtomKey.from_token(token).type_name=="memory.source":
+                        key=AtomKey.from_token(token)
+                        from .current_graph_full_read_v3 import _OrdinaryFullReadV3
+                        if type(task.owner)is _OrdinaryFullReadV3:
+                            owner=task.owner;owner.source_rights_seal.require_v3()
+                            if not owner.body_eof:raise AuthorityUnavailable('receipt graph Body precedes selected Body EOF')
+                            if self.table=='graph_atoms'and key.type_name!='memory.source'and token not in owner.metadata_selection.keys and token not in owner.body_keys:
+                                raise AuthorityUnavailable('receipt graph Body was not selected by its actual metadata scope')
+                            if self.table=='graph_history'and key.type_name!='memory.source':
+                                owner.artifact_metadata.require_history_body_v3(owner,token,dict(zip(keys,pk))['revision'],integrity_row)
+                            else:
+                                head=owner.prefinal.heads.get(token)
+                                if head is None or integrity_row.get('revision')!=head[0]:
+                                    raise AuthorityUnavailable('receipt graph Body is outside its selected current metadata head')
+                        if key.type_name=="memory.source":
                             if not task.source_roots_qualified:
                                 raise AuthorityUnavailable("receipt Source body requires actual metadata rights first")
                             if token not in task.source_family:
@@ -195,6 +211,9 @@ class _ReceiptPointV1:
             row,position,column=self.columns[self.index]
             if not column.advance(meter):return
             value=column.require_v3(task.owner)
+            from .artifact_outbound_receipt_adoption_read_v3 import _ArtifactRecordedFactTaskV3
+            if type(task)is _ArtifactRecordedFactTaskV3:
+                task.require_source_column_v3(column,value,meter)
             encoded=canonical_serialize(value)
             task.owner.operation.retain(len(encoded.encode("utf-8"))+1024)
             self.output[row][position]=encoded;self.index+=1;return
@@ -259,7 +278,11 @@ class ArtifactReceiptOriginalReadTaskV1:
             from .current_graph_full_read_v3 import require_bound_graph_full_read_proof_v3,CURRENT_DISPATCH_FAMILY_V3
             active=require_bound_graph_full_read_proof_v3(self.graph,self.db,owner.namespace,
                 required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3}))
-            if getattr(active,"base",None)is not owner.result:
+            base=getattr(active,"base",None)
+            from .current_graph_full_read_v3 import PreparedCurrentGraphFullReadV3,ARTIFACT_RECEIPT_FULL_READ_V1
+            if (type(base)is not PreparedCurrentGraphFullReadV3 or base.work.state is not owner
+                    or base.operation is not owner.operation or base.prefinal is not owner.prefinal
+                    or base.contract is not ARTIFACT_RECEIPT_FULL_READ_V1):
                 raise AuthorityUnavailable("receipt pre-read cannot accept an unrelated graph delta")
     def advance_v1(self,meter):
         self.require_actual_v1();owner=self.owner
@@ -569,3 +592,29 @@ def _receipt_life_index_profile_v1(task,query,key):
             raise AuthorityUnavailable("receipt preparation census crossed its actual original task")
         return "c4_phase_prepared",("selector","task","c02_operation_id"),("producing_operation_id",),None
     return "c4_prepared",("call_id",),("original_ref",),2
+
+
+
+def read_artifact_receipt_reply_account_metadata_census_v3(db,namespace,query,*,platform_ref,sender_ref,now_utc):
+    task=_ACTIVE.get()
+    if task is None:return None
+    from .current_graph_full_read_v3 import _OrdinaryFullReadV3,require_current_full_reply_account_metadata_census_v3
+    if type(task)is not ArtifactReceiptOriginalReadTaskV1 or type(task.owner)is not _OrdinaryFullReadV3:return None
+    task.require_actual_v1()
+    return require_current_full_reply_account_metadata_census_v3(task.owner,db,namespace,query,
+        platform_ref=platform_ref,sender_ref=sender_ref,now_utc=now_utc)
+
+
+
+def release_artifact_receipt_original_task_v3(task):
+    if type(task)is not ArtifactReceiptOriginalReadTaskV1 or _TASKS.pop(task,None)is None:return
+    from .dispatch_initial_source_read_v3 import _COLUMNS,_COLUMN_COPY_BYTES_V3
+    if task.seal is not None:_SEALS.pop(task.seal,None)
+    points=tuple(task.points.values())+(()if task.pending is None else(task.pending,))
+    for point in points:
+        for _,_,column in point.columns:
+            _COLUMNS.pop(column,None);_COLUMN_COPY_BYTES_V3.pop(column,None)
+            column._frozen_value=column.value=column.cell=column.parser=None
+            column.nodes={};column.scalar=bytearray();column.fragment=b''
+        point.columns.clear();point.rows=point.output=point.metadata=()
+    task.points.clear();task.pending=task.receipt=task.seal=None

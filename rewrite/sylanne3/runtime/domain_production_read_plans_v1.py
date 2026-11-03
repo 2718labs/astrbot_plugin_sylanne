@@ -46,7 +46,26 @@ _POLICY_TABLES = (
 )
 
 
-def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None, d06_recall_policy=None, d07_execution_service=None, ingress_c03_readers=None, self_c04_readers=None, ingress_task_scope_readers=None, personal_candidate_readers=None, artifact_phase_readers=None, installed_readers=None):
+def _read_plan_current_domain_operation_without_growth_review_v1(db, *, namespace, activity_id, domain, operation_kind, request, operation_id=None, now_utc=None, audiences=None, life_d04_before_capture_policy=None, d06_recall_policy=None, d07_execution_service=None, ingress_c03_readers=None, self_c04_readers=None, ingress_task_scope_readers=None, personal_candidate_readers=None, artifact_phase_readers=None, installed_readers=None):
+    from .d06_retention_v1 import OPERATIONS as RETENTION_OPERATIONS,read_plan_memory_retention_v1
+    if operation_kind in RETENTION_OPERATIONS:
+        if domain!='d06' or type(request) is not RETENTION_OPERATIONS[operation_kind]:
+            raise ValueError('retention read plan changed its exact installed domain/request')
+        return read_plan_memory_retention_v1(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request,operation_id=operation_id,
+            issuer=_issuer(installed_readers))
+    from .d01_ordinary_cumulative_growth_v1 import OPERATION_KINDS as ORDINARY_CUMULATIVE_OPERATIONS_V1
+    if operation_kind in ORDINARY_CUMULATIVE_OPERATIONS_V1:
+        if domain!='d01':raise ValueError('ordinary cumulative growth requires its actual D01 issuer')
+        from .d01_ordinary_cumulative_growth_v1 import read_plan_ordinary_cumulative_growth_v1
+        return read_plan_ordinary_cumulative_growth_v1(db,namespace=namespace,request=request,
+            issuer=_issuer(installed_readers))
+    from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1
+    if operation_kind in SINGLE_EVENT_OPERATION_KINDS_V1:
+        if domain != "d01":raise ValueError("single-event operation requires its actual D01 issuer")
+        from .d01_single_event_growth_v1 import read_plan_single_event_growth_v1
+        return read_plan_single_event_growth_v1(db,namespace=namespace,operation_kind=operation_kind,
+            request=request,activity_id=activity_id,issuer=_issuer(installed_readers))
     from .conditioned_self_operations_v1 import OPERATIONS as CONDITIONED_OPERATIONS
     if operation_kind in CONDITIONED_OPERATIONS:
         from .current_conditioned_self_read_v3 import read_plan_current_conditioned_self_v1
@@ -389,6 +408,14 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .d08_source_note_action_v1 import read_plan_source_note_action_v1
         return read_plan_source_note_action_v1(db, namespace=namespace, activity_id=activity_id,
             operation_id=operation_id, request=request, now_utc=now_utc, audiences=audiences)
+    if operation_kind=='rebuild_character_labor_body':
+        from .d02_character_labor_rebuild_v1 import read_plan_rebuild_character_labor_body_v1
+        return read_plan_rebuild_character_labor_body_v1(db,namespace=namespace,activity_id=activity_id,
+            operation_kind=operation_kind,request=request,operation_id=operation_id)
+    if operation_kind=='prepare_character_labor_body':
+        from .d11_character_work_segment_v1 import read_plan_character_labor_body_v1
+        return read_plan_character_labor_body_v1(db,namespace=namespace,activity_id=activity_id,
+            operation_id=operation_id,request=request,now_utc=now_utc,installed_readers=installed_readers)
     if operation_kind in {"prepare_source_note_body", "prepare_artifact_draft_body"}:
         from .d02_life_body_preparation_v1 import read_plan_source_note_body_v1
         return read_plan_source_note_body_v1(db, namespace=namespace, activity_id=activity_id,
@@ -465,12 +492,19 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         from .d06_association_formation_v1 import read_plan_current_d06_association_v1
         return read_plan_current_d06_association_v1(db, namespace=namespace, activity_id=activity_id,
             operation_kind=operation_kind, request=request)
+    if operation_kind=='register_single_event_review_attention_v1':
+        from .d07_single_event_review_v1 import read_plan_register_single_event_review_attention_v1
+        return read_plan_register_single_event_review_attention_v1(db,namespace=namespace,
+            request=request,installed_readers=installed_readers)
     if domain == "d07":
         from .d07_production_operations_v1 import read_plan_current_d07_operation_v1
         return read_plan_current_d07_operation_v1(db, namespace=namespace, activity_id=activity_id,
             operation_kind=operation_kind, request=request,installed_readers=installed_readers)
     if domain not in _READ_PLANNERS:
         raise ValueError("domain has no registered current production operations")
+    if domain=='d05'and operation_kind in {'adopt_relationship_contribution','reevaluate_relationship'}:
+        from .current_relationship_source_read_v3 import read_plan_relationship_source_v3
+        return read_plan_relationship_source_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
     plan = _READ_PLANNERS[domain](db, namespace=namespace, activity_id=activity_id,
                                 operation_kind=operation_kind, request=request)
     # A typed inventory supplies current negative-query coverage. Its relevant
@@ -498,6 +532,28 @@ def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain,
         pending_kind="growth" if operation_kind=="adopt_growth" else operation_kind
         keys += (waiting_domain_job_key_v1(namespace, operation_id, domain, pending_kind, activity_id),)
     return production_read_plan_v1(plan.fixed_type_ids, keys, roots, plan.required_original_refs)
+
+
+def read_plan_current_domain_operation_v1(db, *, namespace, activity_id, domain, operation_kind, request, **kwargs):
+    if operation_kind in {"acknowledge_commitment_terms","settle_current_commitment_fulfillment"}:
+        from .current_commitment_fulfillment_source_v3 import terms_source_read_plan_v3
+        return terms_source_read_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
+    if operation_kind == "cancel_action":
+        from .d08_action_cancellation_v1 import action_cancellation_read_plan_v1
+        if domain != "d08":raise ValueError("cancellation plan belongs only to D08")
+        return action_cancellation_read_plan_v1(db,namespace=namespace,activity_id=activity_id,request=request)
+    from .persona_growth_review_contract_v1 import REVIEW_OPERATIONS_V1, target_domain_v1
+    from .persona_growth_review_v1 import read_plan_growth_review_v1, augment_growth_review_plan_v1
+    if operation_kind in REVIEW_OPERATIONS_V1:
+        if target_domain_v1(AtomKey.from_token(request.target_ref)) != domain:
+            raise ValueError("growth review target differs from its registered domain")
+        return read_plan_growth_review_v1(db, namespace=namespace, request=request)
+    plan = _read_plan_current_domain_operation_without_growth_review_v1(db, namespace=namespace,
+        activity_id=activity_id, domain=domain, operation_kind=operation_kind, request=request, **kwargs)
+    from .persona_growth_birth_v1 import augment_persona_birth_plan_v1
+    plan = augment_persona_birth_plan_v1(db, namespace=namespace, operation_kind=operation_kind, plan=plan)
+    return augment_growth_review_plan_v1(db, namespace=namespace, operation_kind=operation_kind,
+        request=request, plan=plan)
 
 
 def waiting_domain_job_key_v1(namespace, operation_id, domain, kind, activity_id):
@@ -565,17 +621,18 @@ def _signed_policy(db, namespace, ref, issuer):
     if table_exists_v1(db,D01_TABLE):
         row=db.execute("SELECT kind,producing_operation_id,payload_json,payload_digest,signature FROM "+D01_TABLE+
             " WHERE bot=? AND persona=? AND original_ref=?",(*namespace.as_tuple,ref)).fetchone()
-        if row and row[0] in {"identity_plasticity_policy_v3","identity_trial_observation_policy_v3"}:
+        if row and row[0] in {"identity_plasticity_policy_v3","identity_trial_observation_policy_v3","single_event_growth_policy_v1"}:
             issuer._signer.verify(D01_SIGN_KIND,row[2],row[4])
             from .domain_production_erasure_v1 import decode_typed_production_value_v1
             raw=json.loads(row[2]);policy=decode_typed_production_value_v1(raw,_ORIGINAL_TYPES[row[0]])
             actual=db.execute("SELECT commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
                 (*namespace.as_tuple,row[1])).fetchone()
+            terms=policy.terms if row[0]=="single_event_growth_policy_v1" else policy
             if (canonical_serialize(raw)!=row[2] or canonical_digest(raw)!=row[3]
-                    or policy.namespace!=namespace or policy.policy_ref!=ref or actual is None or actual[0]<1):
+                    or terms.namespace!=namespace or terms.policy_ref!=ref or actual is None or actual[0]<1):
                 raise ValueError("D01 signed Owner policy original or producing commit changed")
             found.append((ProductionOriginalRefV1("d01."+row[0],ref,row[3]),
-                ProductionPolicyRefV1(ref,policy.revision,row[3])))
+                ProductionPolicyRefV1(ref,terms.revision,row[3])))
     for table, sign_kind, domain in _POLICY_TABLES:
         if not table_exists_v1(db, table):
             continue
@@ -621,10 +678,16 @@ def read_committed_recollection_original_v1(db, namespace, ref):
             or key.name != value["recollection_id"]):
         raise ValueError("recollection original has no exact adopted activity history")
     operation = history[5]
-    committed = db.execute("SELECT digest,activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations "
-        "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation)).fetchone()
-    event = db.execute("SELECT reads,revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
-        history[2:]).fetchone()
+    from .current_relationship_source_read_v3 import relationship_point_v3
+    prepared,committed=relationship_point_v3(db,'graph_bundle_operations',('digest','activity_id','effect_id','commit_seq','receipt_json'),
+        ('bot','persona','operation_id'),(*namespace.as_tuple,operation))
+    if not prepared:
+        committed = db.execute("SELECT digest,activity_id,effect_id,commit_seq,receipt_json FROM graph_bundle_operations "
+            "WHERE bot=? AND persona=? AND operation_id=?", (*namespace.as_tuple, operation)).fetchone()
+    prepared,event=relationship_point_v3(db,'graph_events',('reads','revisions'),('bot','persona','session','event_id'),history[2:])
+    if not prepared:
+        event = db.execute("SELECT reads,revisions FROM graph_events WHERE bot=? AND persona=? AND session=? AND event_id=?",
+            history[2:]).fetchone()
     if committed is None or event is None:
         raise MissingProductionOriginalV1("actual_committed_recollection_receipt:" + ref)
     receipt = json.loads(committed[4])
@@ -807,6 +870,19 @@ def _outbound_original(db, namespace, ref):
 
 
 def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_readers, authenticated_external_originals=()):
+    from .current_commitment_fulfillment_source_v3 import read_bound_commitment_terms_originals_v3
+    handled,refs=read_bound_commitment_terms_originals_v3(db,namespace=namespace,plan=plan)
+    if handled:return refs
+    from .d08_action_cancellation_v1 import read_bound_action_cancellation_originals_v1
+    handled,refs=read_bound_action_cancellation_originals_v1(db,namespace=namespace,plan=plan)
+    if handled:return refs
+    from .current_relationship_source_read_v3 import read_bound_relationship_originals_v3
+    handled,refs=read_bound_relationship_originals_v3(db,namespace=namespace,plan=plan,installed_readers=installed_readers)
+    if handled:return refs
+    from .current_commitment_lifecycle_source_v3 import read_bound_commitment_lifecycle_originals_v3
+    handled, refs = read_bound_commitment_lifecycle_originals_v3(db, namespace=namespace, plan=plan)
+    if handled:
+        return refs
     from .current_d07_simulation_source_read_v3 import read_bound_current_d07_simulation_original_refs_v3
     handled,refs=read_bound_current_d07_simulation_original_refs_v3(db,namespace=namespace,plan=plan,installed_readers=installed_readers,external=authenticated_external_originals)
     if handled:return refs
@@ -824,6 +900,11 @@ def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_reade
         raise ValueError("independent production original references repeat")
     result = []
     for ref in plan.required_original_refs:
+        from .single_event_review_target_v1 import read_bound_single_event_review_target_original_ref_v1
+        handled,original=read_bound_single_event_review_target_original_ref_v1(db,namespace,ref)
+        if handled:
+            result.append(original)
+            continue
         original = _signed_input(db, namespace, ref, issuer)
         policy = _signed_policy(db, namespace, ref, issuer)
         if policy:
@@ -903,6 +984,9 @@ def read_current_domain_original_refs_v1(db, *, namespace, plan, installed_reade
 
 
 def read_current_domain_policy_refs_v1(db, *, namespace, plan, installed_readers):
+    from .current_relationship_source_read_v3 import read_bound_relationship_policies_v3
+    handled,refs=read_bound_relationship_policies_v3(db,namespace=namespace,plan=plan)
+    if handled:return refs
     issuer = _issuer(installed_readers)
     refs = []
     for ref in plan.required_original_refs:
@@ -941,6 +1025,12 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("command identity must be derived in the current W01 transaction")
     activity, effect, purpose = requested_activity_id, None, "context"
+    from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1
+    if operation_kind in SINGLE_EVENT_OPERATION_KINDS_V1:
+        return CurrentDomainCommandIdentityV1(activity,None,"consolidation",requested_audience_ref)
+    from .persona_growth_review_contract_v1 import REVIEW_OPERATIONS_V1
+    if operation_kind in REVIEW_OPERATIONS_V1:
+        return CurrentDomainCommandIdentityV1(activity, None, "consolidation", requested_audience_ref)
     from ..domains.d03.world_history_v1 import WORLD_OPERATIONS
     if operation_kind in WORLD_OPERATIONS:
         purpose=("consolidation" if operation_kind in {"adopt_world_assertion_v1","relearn_world_assertion_v1"} else
@@ -1120,14 +1210,23 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
         if requested_activity_id != activity:
             raise ValueError("contact command activity differs from its stable actual cause")
         purpose = "expression"
-    elif operation_kind in {"prepare_contact", "input:create_goal", "input:create_contact_opportunity"}:
+    elif operation_kind in {"prepare_contact", "input:create_goal", "input:create_aspiration", "input:create_commitment", "input:create_commitment_with_fulfillment_terms", "input:register_commitment_terms_communication", "input:register_commitment_communication", "input:create_contact_opportunity"}:
         purpose = "expression"
+    elif operation_kind == "cancel_action":
+        from .d08_action_cancellation_v1 import action_cancellation_command_identity_v1
+        activity,effect,purpose=action_cancellation_command_identity_v1(db,namespace=namespace,request=request)
     elif operation_kind in {"recheck_action", "settle_observed_action"}:
-        action = raw_head_value_v1(db, namespace, AtomKey.from_token(request.action_intent_ref))
-        if action:
-            from ..domains.d08.execution import _decode_intent
-            intent = _decode_intent(action)
-            activity, effect, purpose = intent.identity.activity_id, intent.identity.effect_id, intent.purpose
+        from .current_commitment_lifecycle_source_v3 import read_bound_commitment_lifecycle_identity_v3
+        handled, identity = read_bound_commitment_lifecycle_identity_v3(db, namespace=namespace,
+            operation_kind=operation_kind, request=request)
+        if handled:
+            activity, effect, purpose = identity
+        else:
+            action = raw_head_value_v1(db, namespace, AtomKey.from_token(request.action_intent_ref))
+            if action:
+                from ..domains.d08.execution import _decode_intent
+                intent = _decode_intent(action)
+                activity, effect, purpose = intent.identity.activity_id, intent.identity.effect_id, intent.purpose
     elif operation_kind == "apply_body_effect":
         from .c04_internal_work_original_v1 import read_c04_internal_work_prepared_v1
         prepared = read_c04_internal_work_prepared_v1(db, namespace, request.settlement_operation_ref) if table_exists_v1(db, "graph_c04_internal_work_prepared_v1") else None
@@ -1147,17 +1246,20 @@ def read_current_domain_command_identity_v1(db, *, namespace, operation_kind, re
                     from ..domains.d08.execution import _decode_intent
                     intent = _decode_intent(action)
                     activity, effect, purpose = intent.identity.activity_id, intent.identity.effect_id, intent.purpose
-    elif operation_kind in {"input:register_life_plan_v2", "input:register_life_outcome_v2", "prepare_life"}:
-        from .d11_life_contract_v1 import RegisteredLifePlanV2, life_from_wire_v1
-        from .d11_life_product_adapter_v1 import raw_life_original_v1
-        if operation_kind == "input:register_life_plan_v2":
+    elif operation_kind in {"input:register_life_plan_v2", "input:register_life_outcome_v2", "prepare_life",
+            "input:register_character_labor_life_plan_v1"}:
+        from .d11_life_contract_v1 import RegisteredLifePlanV2, RegisteredCharacterLaborLifePlanV1, life_from_wire_v1
+        from .d11_life_product_adapter_v1 import raw_registered_life_plan_v1
+        if operation_kind in {"input:register_life_plan_v2","input:register_character_labor_life_plan_v1"}:
             plan = request.plan
         else:
             ref = request.plan_original_ref if operation_kind == "prepare_life" else request.outcome.plan_original_ref
-            raw = raw_life_original_v1(db, namespace, "plan", ref)
-            if raw is None:
+            original=raw_registered_life_plan_v1(db,namespace,ref)
+            if original is None:
                 raise MissingProductionOriginalV1("actual_registered_life_plan_v2")
-            plan = life_from_wire_v1(raw, RegisteredLifePlanV2)
+            kind,raw=original
+            plan=life_from_wire_v1(raw,RegisteredCharacterLaborLifePlanV1
+                if kind=='character_labor_plan_v1'else RegisteredLifePlanV2)
             if installed_readers is not None:
                 from .d11_life_preparation_v1 import read_registered_life_plan_v2
                 plan = read_registered_life_plan_v2(db, namespace=namespace,

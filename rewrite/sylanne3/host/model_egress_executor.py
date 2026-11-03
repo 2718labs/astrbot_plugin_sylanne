@@ -12,6 +12,7 @@ from .model_workflows_v6 import AdminModelWorkflowsV6, is_installed_growth_cogni
 from .model_workflows_v7 import AdminModelWorkflowsV7, is_installed_growth_cognition_slot_v3, is_installed_relationship_cognition_slot_v3
 from .model_workflows_v8 import AdminModelWorkflowsV8, is_installed_growth_cognition_slot_v4, is_installed_relationship_cognition_slot_v4, is_installed_general_growth_cognition_slot_v1
 from .model_workflows_v9 import AdminModelWorkflowsV9,is_installed_artifact_observation_cognition_slot_v1
+from .model_workflows_v10 import AdminModelWorkflowsV10,is_installed_ordinary_continuity_cognition_slot_v1
 from ..runtime.d11_artifact_draft_model_v1 import is_installed_artifact_draft_slot_v1
 from .authority_profile import is_installed_artifact_draft_phase_slot_v2
 
@@ -247,12 +248,14 @@ class HostModelEgressExecutor:
                               or model is workflows.appraisal
                               or model is workflows.d07_cognition
                               or is_installed_general_growth_cognition_slot_v1(bundle, model)
+                              or any(is_installed_ordinary_continuity_cognition_slot_v1(bundle,model,phase)
+                                  for phase in("ordinary_screen","deep_review"))
                               or is_installed_artifact_observation_cognition_slot_v1(bundle,model)
                               or (is_installed_relationship_cognition_slot_v2(bundle, model) or (is_installed_relationship_cognition_slot_v3(bundle, model) or is_installed_relationship_cognition_slot_v4(bundle, model)))
                               or (is_installed_growth_cognition_slot_v2(bundle, model) or (is_installed_growth_cognition_slot_v3(bundle, model) or is_installed_growth_cognition_slot_v4(bundle, model)))
                               or is_installed_artifact_draft_slot_v1(bundle,model)
                               or is_installed_artifact_draft_phase_slot_v2(bundle,model)
-                              or (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+                              or (type(workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
                                   and (model is workflows.life_content
                                        or model is workflows.life_numeric))))
         if not installed:
@@ -1068,7 +1071,8 @@ class HostModelEgressExecutor:
                 if not installed_d13_paid_context_request_v1(self._bundle, model, request):
                     return None
                 quote_ceiling = self._bundle.d13_paid_precompression.quote_ceiling
-            if (model is workflows.d07_cognition or is_installed_artifact_observation_cognition_slot_v1(self._bundle,model) or is_installed_general_growth_cognition_slot_v1(self._bundle,model) or (is_installed_relationship_cognition_slot_v2(self._bundle, model) or (is_installed_relationship_cognition_slot_v3(self._bundle, model) or is_installed_relationship_cognition_slot_v4(self._bundle, model)))
+            if (any(is_installed_ordinary_continuity_cognition_slot_v1(self._bundle,model,phase)
+                    for phase in("ordinary_screen","deep_review")) or model is workflows.d07_cognition or is_installed_artifact_observation_cognition_slot_v1(self._bundle,model) or is_installed_general_growth_cognition_slot_v1(self._bundle,model) or (is_installed_relationship_cognition_slot_v2(self._bundle, model) or (is_installed_relationship_cognition_slot_v3(self._bundle, model) or is_installed_relationship_cognition_slot_v4(self._bundle, model)))
                     or (is_installed_growth_cognition_slot_v2(self._bundle, model) or (is_installed_growth_cognition_slot_v3(self._bundle, model) or is_installed_growth_cognition_slot_v4(self._bundle, model)))):
                 from ..runtime.d07_execution_v1 import D07PreparedExecutionV1, D07IngressRecallPreparedV1, D07RelationshipPreparedV2, D07ReflectionPreparedV3
                 from ..runtime.d07_method_growth_semantic_v2 import D07MethodGrowthPreparedV2
@@ -1078,7 +1082,15 @@ class HostModelEgressExecutor:
                 )
                 from ..runtime.d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,thaw_current_general_growth_prepared_request_v1
                 from ..runtime.artifact_phase_observation_execution_v1 import D07ArtifactObservationPreparedV3
-                if type(d07_original)is D07ArtifactObservationPreparedV3:
+                from ..runtime.d07_ordinary_continuity_cognition_v1 import (
+                    D07OrdinaryContinuityPreparedV1,thaw_current_ordinary_continuity_prepared_request_v1)
+                if type(d07_original)is D07OrdinaryContinuityPreparedV1:
+                    from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_template_v1
+                    if(not is_installed_ordinary_continuity_cognition_slot_v1(self._bundle,model,d07_original.phase)
+                            or model.template_version!=ordinary_continuity_template_v1(d07_original.phase)[0]):
+                        return None
+                    frozen=thaw_current_ordinary_continuity_prepared_request_v1(d07_original)
+                elif type(d07_original)is D07ArtifactObservationPreparedV3:
                     if (not is_installed_artifact_observation_cognition_slot_v1(self._bundle,model)
                             or model.template_version!=TEMPLATE_VERSION):
                         return None
@@ -1112,6 +1124,12 @@ class HostModelEgressExecutor:
                             or model.template_version!=GENERAL_TEMPLATE_VERSION):
                         return None
                     frozen=thaw_current_general_growth_prepared_request_v1(d07_original)
+                elif d07_original.schema=="d07.single-event-review-prepared.v1":
+                    from ..runtime.d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+                    if(type(d07_original)is not D07SingleEventReviewPreparedV1
+                            or model is not workflows.d07_cognition or model.template_version!=TEMPLATE_VERSION):
+                        return None
+                    frozen=thaw_d07_cognition_request_v1(json.loads(d07_original.frozen_json))
                 elif type(d07_original) is D07PreparedExecutionV1:
                     if model is not workflows.d07_cognition or model.template_version != TEMPLATE_VERSION:
                         return None

@@ -154,8 +154,16 @@ def prepare_d04_series_chunk_v1(graph, bootstrap, bundle, root, *, predecessor=N
     value = run_installed_d04_stage_v3(graph, bootstrap, bundle,
         c02_operation_id=root.payload["c02_operation_id"], source_ref=root.payload["source_ref"],
         operation_id="d04-series-stage:" + operation, stage="numeric_prepare",
-        request_digest=canonical_digest((root.digest, start)), commit=prepare, semantic=True)
-    return from_wire(value["binding"], D04SeriesChunkBindingV1)
+        request_digest=canonical_digest((root.digest, start)), commit=prepare, semantic=True,
+        original_deadline_utc=__import__("datetime").datetime.fromisoformat(root.prepared.binding.deadline_utc.replace("Z", "+00:00")).timestamp())
+    def prepared(result):
+        return from_wire(result["binding"], D04SeriesChunkBindingV1)
+    from ..graph_worker import GraphStorageWorkV3
+    if type(value) is GraphStorageWorkV3:
+        def failed(error):
+            raise error
+        return value.map_terminal_v3("issuer", prepared, failed)
+    return prepared(value)
 
 
 @dataclass(frozen=True, slots=True)

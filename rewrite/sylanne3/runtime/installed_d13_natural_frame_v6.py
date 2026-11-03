@@ -83,7 +83,9 @@ def read_current_derived_blocks_v6(db,*,collection,question,paid_verifier):
         raise ValueError('v6 blocks require the actual current collection and new installed paid verifier')
     window=collection.window
     first,last=collection.pages[-1].first_sequence,window.order_watermark
-    rows=db.execute("SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
+    from .graph_d13_cache_use_collection_v2 import read_bound_graph_d13_candidate_rows_v2
+    handled,rows=read_bound_graph_d13_candidate_rows_v2(db,collection)
+    if not handled:rows=db.execute("SELECT token,revision,value FROM graph_atoms WHERE bot=? AND persona=? "
         "AND type_name=? AND owner_kind='persona' AND valid=1 "
         "AND json_extract(value,'$.status') IN ('standby','active') "
         "AND json_extract(value,'$.turn_expiries[0].sequence')>=? "

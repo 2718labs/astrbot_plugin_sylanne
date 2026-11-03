@@ -14,7 +14,6 @@ from ..runtime_contracts import NamespaceId, canonical_digest, canonical_seriali
 from ..runtime_storage_v3 import runtime_storage_quantum_v3
 from .dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
-from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
 from .source_correction_read_v3 import _heap
 from .foreground_command_contract_v3 import foreground_command_source_spec_v3, foreground_command_evidence_locators_v3
 _KEY = object()
@@ -63,6 +62,7 @@ class _ForegroundCommandStateV3:
         self.catalogue = None
         self.catalogue_merged = False
         self.preparation = None
+        self.c03_search = None
         self.phase = 'owner'
         self.plan = None
         self.columns = WeakSet()
@@ -203,51 +203,26 @@ class _CommandSourceLeafV3:
     header: tuple
 
 class _CommandSourceColumnV3:
-
+    """Only the actual Borrowed Work's independent inspection metadata EOF."""
     def __init__(self, work, key):
-        self.work, self.key = (work, key)
-        self.phase = 'head'
-        self.cell = self.parser = None
-        self.fragment = b''
-        self.offset = 0
-        self.complete = False
+        self.work,self.key=work,key
+        self.inspection=None
+        self.complete=False
 
-    def advance(self, meter):
-        from ..runtime_storage_v3 import begin_runtime_cell_read_v3
-        work = self.work
+    def advance(self,meter):
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
+        work=self.work
         work.require_current(meter=meter)
-        if self.phase == 'head':
-            row = meter.read_fixed_row(work.db, 'graph_atoms', ('revision', 'valid', 'value_cell_id'), 'bot=? AND persona=? AND token=?', (*work.namespace.as_tuple, self.key.token))
-            if row is None or row[0] < 1 or row[1] != 1 or (row[2] is None):
-                raise AuthorityUnavailable('Foreground command Source current metadata is absent')
-            self.head = row
-            self.cell = begin_runtime_cell_read_v3(work.db, row[2], erasure_owner_ref=self.key.token)
-            if self.cell.header[0] not in ('canonical-json.ascii.v1', 'canonical-json.utf8.v1'):
-                raise AuthorityUnavailable('Foreground command Source has an unregistered physical codec')
-            self.parser = C09MemorySourceJSONStreamV3(ensure_ascii=self.cell.header[0] == 'canonical-json.ascii.v1')
-            self.phase = 'body'
+        if self.inspection is None:
+            self.inspection=InspectionMetadataReadV3(work.reader,self.key)
             return False
-        if self.offset < len(self.fragment):
-            end = min(self.offset + 1024, len(self.fragment))
-            _reserve(work, (work.original_metadata, self.parser._source_metadata), 65536)
-            self.parser.feed(self.fragment[self.offset:end], lambda event: None)
-            self.offset = end
-            return False
-        fragment = self.cell.read_fragment(meter=meter)
-        if fragment is not None:
-            self.fragment, self.offset = (fragment, 0)
-            return False
-        parsed = self.parser.finish()
-        digest = self.cell.finish(meter=meter)
-        if (parsed.sha256, parsed.byte_count) != (digest, self.cell.header[3]):
-            raise AuthorityUnavailable('Foreground command Source metadata did not reach actual canonical EOF')
-        metadata = MappingProxyType({name: tuple(value) if type(value) is list else value for name, value in self.parser._source_metadata.items()})
-        if metadata['source_id'] != self.key.owner.subject:
-            raise AuthorityUnavailable('Foreground command Source metadata key differs')
-        self.leaf = _CommandSourceLeafV3(self.key, self.head[0], True, metadata, self.head[2], digest, tuple(self.cell.header))
-        self.complete = True
-        self.fragment = b''
-        self.parser = self.cell = None
+        self.inspection.advance(meter)
+        if not self.inspection.complete:return False
+        original=self.inspection.result.require_v3(work.reader,meter)
+        work.reader.source_inspections[self.key.token]=original
+        self.leaf=_CommandSourceLeafV3(self.key,original.revision,original.valid,original.metadata,
+            original.cell_id,original.payload_sha256,original.header)
+        self.complete=True
         return True
 
 class _CommandBudgetMetadataV3:
@@ -970,18 +945,18 @@ class ForegroundCommandSourceCapabilityV3:
         r = s.reader
         return (s, s.identity, s.work, s.owner_entry, s.metadata, s.rights, s.original_budget, tuple(sorted(s.rights.versions.items(), key=lambda row: row[0].token)), tuple(sorted(((ref,frozenset(purposes))for ref,purposes in s.original_root_purposes.items()),key=lambda row:row[0])), s.catalogue, s.catalogue_merged, s.preparation, s.deadline_utc)
 
-def require_v3(self):
-    s = self.state
-    s.require_v3()
-    r = s.reader
-    if s.capability is not self or _CAPABILITIES.get(self) != self._identity_v3() or s.phase != 'qualified':
-        raise AuthorityUnavailable('Foreground Source capability changed actual Work/Owner/EOF/ALL binding')
-    with r.store._lock, runtime_storage_quantum_v3(r.db) as meter:
-        r.require_current(meter=meter)
-        s.owner_entry.require_for_v3(r)
-        if _clock_upper_v3(s) >= s.deadline_utc:
-            raise AuthorityUnavailable('Foreground original Source deadline elapsed')
-    return self
+    def require_v3(self):
+        s = self.state
+        s.require_v3()
+        r = s.reader
+        if s.capability is not self or _CAPABILITIES.get(self) != self._identity_v3() or s.phase != 'qualified':
+            raise AuthorityUnavailable('Foreground Source capability changed actual Work/Owner/EOF/ALL binding')
+        with r.store._lock, runtime_storage_quantum_v3(r.db) as meter:
+            r.require_current(meter=meter)
+            s.owner_entry.require_for_v3(r)
+            if _clock_upper_v3(s) >= s.deadline_utc:
+                raise AuthorityUnavailable('Foreground original Source deadline elapsed')
+        return self
 
 def advance_foreground_command_source_v3(reader):
     if reader not in _STATES:
@@ -989,6 +964,10 @@ def advance_foreground_command_source_v3(reader):
     s = _state_v3(reader)
     if reader.db.in_transaction:
         raise AuthorityUnavailable('Foreground Source advancement must precede SQL Body transaction')
+    if s.c03_search is not None:
+        from .source_inspection_metadata_read_v3 import resolve_pending_inspection_metadata_core_v3
+        if resolve_pending_inspection_metadata_core_v3(reader.work):
+            return True
     if s.phase == 'qualified':
         s.capability.require_v3()
         return False
@@ -1037,6 +1016,14 @@ def advance_foreground_command_source_v3(reader):
             s.metadata.advance(meter)
             if s.metadata.complete:
                 if type(s.preparation)is _CommandConcernMetadataV3:s.preparation.finalize_v3()
+                if reader.operation_kind == 'select_ingress_recall_seed_v1':
+                    from .d06_c03_search_source_v3 import begin_foreground_c03_search_source_v3
+                    s.c03_search = begin_foreground_c03_search_source_v3(s)
+                    s.phase = 'c03_search'
+                else:
+                    s.phase = 'owner_rights'
+        elif s.phase == 'c03_search':
+            if s.c03_search.advance(meter):
                 s.phase = 'owner_rights'
         elif s.phase == 'owner_rights':
             owner = s.owner_entry.require_for_v3(reader)
@@ -1263,6 +1250,9 @@ def compose_foreground_command_frame_fields_v3(prepared, snapshot, pages):
         return (snapshot, tuple(pages), None)
     versions = {v.key: v.revision for v in snapshot.versions}
     metadata_versions = (*s.locator_versions, *(GraphVersion(k, v) for k, v in s.rights.versions.items()), *(GraphVersion(AtomKey.from_token(ref), head[0]) for ref, head in s.metadata.heads.items()))
+    if s.c03_search is not None:
+        from .d06_c03_search_source_v3 import c03_search_versions_for_frame_v3
+        metadata_versions = (*metadata_versions, *c03_search_versions_for_frame_v3(s.reader))
     for v in metadata_versions:
         if v.key in versions and versions[v.key] != v.revision:
             raise AuthorityUnavailable('Foreground Body and metadata CAS versions differ')
@@ -1289,6 +1279,13 @@ def release_foreground_command_source_v3(reader):
     s = _STATES.pop(reader, None)
     if s is None:
         return
+    from .c04_body_resource_inputs_v3 import release_self_c04_body_resource_inputs_v3
+    release_self_c04_body_resource_inputs_v3(reader)
+    if s.c03_search is not None:
+        s.c03_search.release_v3()
+        s.c03_search = None
+    from .source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+    release_inspection_metadata_owner_v3(reader)
     _CAPABILITIES.pop(s.capability, None)
     _C1_BINDINGS.pop(reader, None)
     _OUTPUTS.pop(reader, None)
@@ -1472,7 +1469,11 @@ class _CommandIngressMetadataV3:
     def advance(self,meter):
         s=self.state;s.require_current_v3(meter);s.owner_entry.require_for_v3(s.reader)
         if self.complete:return True
-        if self.index>=len(self.tasks):self._finish();return True
+        if self.index>=len(self.tasks):
+            if s.reader.operation_kind=='prepare_ingress_c04_v1':
+                from .c04_body_resource_inputs_v3 import advance_self_c04_body_resource_metadata_v3
+                if not advance_self_c04_body_resource_metadata_v3(s.reader,meter):return False
+            self._finish();return True
         role,task=self.tasks[self.index]
         if not task.advance(meter):return False
         self._publish(role,task);self._validate(role,task);self.index+=1;s.reader.operation.refresh_retained_state_v3(self);return False
@@ -1592,25 +1593,39 @@ class _CommandIngressMetadataV3:
         self.c04=p;self._versions(tuple(GraphVersion(AtomKey.from_token(ref),revision)for ref,revision in p.read_versions))
         self.tasks.append(('c04_quote',_CommandIngressRowV3(self,'quote','runtime_resource_quotes','quote',(binding.resource_quote_ref,binding.resource_quote_version))))
 
-def _finish(self):
-    s=self.state;m=s.metadata
-    for ref in self.roots:
-        key=AtomKey.from_token(ref)
-        if key.type_name!='memory.source'or NamespaceId.from_key(key)!=s.namespace:
-            raise AuthorityUnavailable('Foreground ingress declares noncanonical Source roots')
-        m.roots.add(ref)
-    for (ref,revision),version in self.keys.items():
-        if ref not in m.exact:m.exact.add(ref);m.pending.append(ref)
-        if revision and(ref,revision)not in m.history_heads:m.catalogue_history_pending.append((ref,revision))
-    for identity,entry in self.records.items():
-        s.typed_metadata[identity]=entry
-        if identity[0]=='graph_domain_production_originals_v1':
-            if entry is not None:m.producers.add(identity[2])
-    if self.prepared is not None:m.job_ids.add(self.prepared['job_id'])
-    if self.c04 is not None:
-        from .c04_prepare_service_v3 import c04_prepare_job_id_v3
-        m.job_ids.add(c04_prepare_job_id_v3(s.namespace,self.c04.binding.operation_id))
-    self.complete=True
+    def _finish(self):
+        s=self.state;m=s.metadata
+        if s.reader.operation_kind=='prepare_ingress_c04_v1':
+            from .c04_body_resource_inputs_v3 import require_self_c04_body_resource_metadata_v3
+            resources=require_self_c04_body_resource_metadata_v3(s.reader)
+            self.roots.update(resources.roots)
+            for ref,head in resources.heads.items():
+                actual=(0,0,None)if head is None else head
+                if ref in m.heads and m.heads[ref]!=actual:
+                    raise AuthorityUnavailable('C04 resource metadata differs from current foreground HEAD')
+                m.heads[ref]=actual
+            for key,version in resources.versions.items():
+                if key.type_name=='memory.source':
+                    old=s.expected_source_versions_v3.setdefault(key,version.revision)
+                    if old!=version.revision:
+                        raise AuthorityUnavailable('C04 resource and ingress parents disagree on Source version')
+        for ref in self.roots:
+            key=AtomKey.from_token(ref)
+            if key.type_name!='memory.source'or NamespaceId.from_key(key)!=s.namespace:
+                raise AuthorityUnavailable('Foreground ingress declares noncanonical Source roots')
+            m.roots.add(ref)
+        for (ref,revision),version in self.keys.items():
+            if ref not in m.exact:m.exact.add(ref);m.pending.append(ref)
+            if revision and(ref,revision)not in m.history_heads:m.catalogue_history_pending.append((ref,revision))
+        for identity,entry in self.records.items():
+            s.typed_metadata[identity]=entry
+            if identity[0]=='graph_domain_production_originals_v1':
+                if entry is not None:m.producers.add(identity[2])
+        if self.prepared is not None:m.job_ids.add(self.prepared['job_id'])
+        if self.c04 is not None:
+            from .c04_prepare_service_v3 import c04_prepare_job_id_v3
+            m.job_ids.add(c04_prepare_job_id_v3(s.namespace,self.c04.binding.operation_id))
+        self.complete=True
     def close_v3(self):
         for _,task in self.tasks:task.close_v3()
         self.state.reader.operation.unregister_retained_state_v3(self)

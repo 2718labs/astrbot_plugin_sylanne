@@ -45,6 +45,27 @@ def execute_body_policy_v1(issuer, *, session, scope, purpose, audience, operati
         return _unavailable('body_policy_namespace_or_capability_unavailable')
     result = issuer._coordinator.adopt_current_fixed_body_work_policy_v1(grant.authority, grant.lease,
         operation_id=operation_id, policy=policy)
+    from ..graph_worker import GraphStorageWorkV3
+    if type(result) is GraphStorageWorkV3:
+        require_body_policy_command_work_v3(issuer,result,operation_id=operation_id,policy=policy)
+        return result
+    return body_policy_result_v1(operation_id,input_data,result)
+
+
+def require_body_policy_command_work_v3(issuer,work,*,operation_id,policy):
+    from ..runtime.d02_fixed_policy_read_v3 import WORK_KIND, _Reader
+    if (work.coordinator is not issuer._coordinator or work.kind != WORK_KIND
+            or work.operation_id != operation_id or type(work.state) is not _Reader):
+        raise ValueError('D02 continuation differs from its actual Owner policy command')
+    state=work.state.actual()
+    if (state.work is not work or state.operation_id != operation_id or state.policy != policy
+            or state.request_digest != canonical_digest(('d02.fixed-work-policy-adoption.v1',
+                state.namespace,operation_id,policy))):
+        raise ValueError('D02 continuation changed its exact administrator input')
+    return state
+
+
+def body_policy_result_v1(operation_id,input_data,result):
     if type(result) is not dict or result.get('operation_id') != operation_id:
         raise ValueError('fixed body policy did not return its durable original')
     return {'status':'ready','receipt':{'schema':'d12.body-policy-receipt.v1','operation_id':operation_id,

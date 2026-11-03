@@ -103,6 +103,8 @@ def read_current_d04_appraisal_graph_v3(db, intent, issuer, now, *, allow_unseal
     sealed = read_d04_original_v3(db, namespace, "appraisal_call", job.job_id)
     if original is None:
         raise ValueError("D04 appraisal prepared original absent")
+    from .d04_ordinary_source_v3 import require_authority_d04_ordinary_readout_v3
+    require_authority_d04_ordinary_readout_v3(db,intent,original)
     request = read_original_d04_request_v3(db, original)
     if (original is None or (sealed is None and not allow_unsealed_prepare)
             or (sealed is not None and sealed[0] != intent_wire(intent))

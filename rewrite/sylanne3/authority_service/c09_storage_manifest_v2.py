@@ -36,6 +36,10 @@ def _require_paged_root_values_v2(value):
 
 
 def manifest_signature_domain(value):
+    if value["schema"]=="sylanne3.c09.initial-segmented-storage-manifest.v4":
+        from .c09_initial_segmented_genesis_v4 import require_initial_segmented_manifest_v4,MANIFEST_SIGNATURE_DOMAIN_V4
+        require_initial_segmented_manifest_v4(value)
+        return MANIFEST_SIGNATURE_DOMAIN_V4
     if value["schema"]=="sylanne3.c09.storage_manifest.v3":
         from .c09_storage_manifest_v3 import require_manifest_provenance_shape_v3,SIGNATURE_DOMAIN_V3
         require_manifest_provenance_shape_v3(value)

@@ -17,10 +17,6 @@ from sylanne3.authority_service.internal_work_contract import (
     InternalWorkBindingV1, InternalWorkTerminalProofV1,
     claim_internal_work_v1, terminal_internal_work_v1,
 )
-from sylanne3.domains.d02.body_quote_original import BodyQuoteUnavailable
-from sylanne3.domains.d02.measured_settlement import (
-    build_measured_fixed_component_settlement,
-)
 from sylanne3.graph_types import AtomKey, Owner
 from sylanne3.runtime.issuers import (
     D02ResourceIssuer, IssuerAuthorityDenied, ResourceOutcome, ResourceQuote,
@@ -215,5 +211,3 @@ def test_unknown_authority_terminal_cannot_become_a_resource_outcome():
     )
     with pytest.raises(ValueError, match="completed internal work"):
         candidate_outcome_from_terminal(failed_proof, quote, envelope)
-    with pytest.raises(BodyQuoteUnavailable, match="completion receipt"):
-        build_measured_fixed_component_settlement()

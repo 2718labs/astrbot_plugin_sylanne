@@ -15,6 +15,7 @@ from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+from ..host.model_workflows_v10 import AdminModelWorkflowsV10
 from dataclasses import dataclass
 from datetime import datetime
 import json
@@ -108,19 +109,19 @@ class InstalledNaturalModelAuthorityV2:
     """Administrator-installed model signing authority and exact mTLS reader."""
 
     d11_issuer: D11BudgetJobIssuer
-    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9
+    workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | AdminModelWorkflowsV10
     observer_peer: tuple[str, str]
     installation_bundle: object | None = None
 
     def __post_init__(self) -> None:
         if (type(self.d11_issuer) is not D11BudgetJobIssuer
-                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+                or type(self.workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
                 or self.workflows.natural_generation is None
                 or self.workflows.natural_review is None
                 or type(self.observer_peer) is not tuple
                 or len(self.observer_peer) != 2):
             raise AuthorityUnavailable("installed natural model authority is incomplete")
-        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9):
+        if type(self.workflows) in (AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10):
             from ..host.authority_profile import AdminInstallationBundle
             if (type(self.installation_bundle) is not AdminInstallationBundle
                     or self.installation_bundle.model_workflows is not self.workflows):
@@ -219,6 +220,36 @@ class AuthorityDeploymentConfig:
     c09_maintenance_factory: Callable | None = None
     c09_storage_v2: InstalledC09AuthorityV2 | None = None
     d13_counter_assets_v1: Mapping[str, object] | None = None
+    d13_cache_use_assets_v2: Mapping[str, object] | None = None
+
+    def require_d13_fresh_installation_scope_v3(self,*,consumer_mode='production_root'):
+        from .c09_installed_factory_v1 import InstalledC09MaintenanceFactoryV1
+        from .c09_writer_peer_activation_v3 import InstalledPeerRegistryCensusV3
+        assets=self.d13_cache_use_assets_v2 or {}
+        if (len(assets)!=1 or self.c09_storage_v1 is None or self.c09_storage_v2 is not None
+                or type(self.c09_maintenance_factory)is not InstalledC09MaintenanceFactoryV1):
+            raise AuthorityUnavailable('fresh D13 requires one actual selected installation cohort')
+        if consumer_mode=='production_root':
+            if type(self.c09_maintenance_factory._peer_registry_census_v3)is not InstalledPeerRegistryCensusV3:
+                raise AuthorityUnavailable('production fresh D13 requires its real Root prehost census')
+        elif consumer_mode=='controlled_sdk':
+            from ..host.c09_controlled_sdk_bootstrap_v3 import require_controlled_sdk_registry_assets_v3
+            assets_v3=self.c09_maintenance_factory._controlled_sdk_registry_assets_v3
+            if assets_v3 is None or assets_v3[1]is None:
+                raise AuthorityUnavailable('SDK fresh D13 requires its actual descriptor and closed Authority originals')
+            from .c09_initial_segmented_genesis_v4 import VerifiedControlledSDKInitialStorageContractV4
+            if type(assets_v3[1])is VerifiedControlledSDKInitialStorageContractV4:
+                assets_v3[1].require_current(config=self)
+            else:
+                require_controlled_sdk_registry_assets_v3(root_descriptor=assets_v3[0],closed_services=assets_v3[1],
+                    inventory=self.c09_maintenance_factory.inventory,peer=self.c09_maintenance_factory.peer)
+        else:raise AuthorityUnavailable('unregistered D13 fresh consumer mode')
+        namespace=next(iter(assets))
+        installed=(self.natural_model_authorities_v2 or {}).get(namespace)
+        if installed is None or installed.installation_bundle is None:
+            raise AuthorityUnavailable('fresh D13 requires actual protected single bundle/namespace')
+        assets[namespace].require_installation_v2(installed.installation_bundle)
+        return installed
 
     def __post_init__(self) -> None:
         for name in ("authority_db", "deletion_db", "graph_db", "instance_lock"):
@@ -342,6 +373,20 @@ class AuthorityDeploymentConfig:
                             for (peer, profile, graph_ns), mapped in self.namespace_bindings_v2.items())):
                     raise AuthorityUnavailable("installed D13 counter assets cross namespace, installation or package")
             object.__setattr__(self, "d13_counter_assets_v1", MappingProxyType(dict(counter_assets)))
+        use_assets = self.d13_cache_use_assets_v2
+        if use_assets is not None:
+            from ..runtime.d13_technical_policy import InstalledD13CacheUseAssetsV2
+            if not isinstance(use_assets, Mapping) or not use_assets:
+                raise AuthorityUnavailable("installed D13 use assets require exact namespace coverage")
+            for namespace, item in use_assets.items():
+                if (namespace not in namespaces or type(item) is not InstalledD13CacheUseAssetsV2
+                        or item.authority_namespace != namespace
+                        or not any(mapped == namespace and graph_ns == item.namespace
+                            and self.installations_v2[(peer, profile)].installation_id == item.installation_id
+                            and self.installations_v2[(peer, profile)].manifest_digest == item.package_manifest_sha256
+                            for (peer, profile, graph_ns), mapped in self.namespace_bindings_v2.items())):
+                    raise AuthorityUnavailable("installed D13 use assets cross namespace, installation or package")
+            object.__setattr__(self, "d13_cache_use_assets_v2", MappingProxyType(dict(use_assets)))
         if self.c09_storage_v2 is not None:
             if (type(self.c09_storage_v2) is not InstalledC09AuthorityV2
                     or self.c09_storage_v1 is not None
@@ -407,7 +452,7 @@ def load_installed_asset_config_v1(
         "bind_host", "bind_port", "tls", "execution_journals",
         "installations_v2", "namespace_bindings_v2", "reverse_handoff",
     }
-    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1", "c09_storage_v2", "d13_counter_assets_v1"}
+    optional_c04_fields = {"c04_installations_v2", "c04_installations_v3", "c09_storage_v1", "c09_storage_v2", "d13_counter_assets_v1", "d13_cache_use_assets_v2"}
     if (type(value) is not dict or not fields <= set(value) or
             not set(value).issubset(fields | optional_c04_fields)):
         raise AuthorityUnavailable("installed asset manifest fields differ")
@@ -517,6 +562,19 @@ def load_installed_asset_config_v1(
             if type(namespace) is not str or namespace in counter_assets:
                 raise AuthorityUnavailable("installed D13 counter namespace repeats")
             counter_assets[namespace] = InstalledD13CounterAssetsV2(**{**row, "namespace": NamespaceId(**graph_ns)})
+    use_assets = None
+    if "d13_cache_use_assets_v2" in manifest:
+        from dataclasses import fields as dataclass_fields
+        from ..runtime.d13_technical_policy import InstalledD13CacheUseAssetsV2
+        use_assets = {}
+        required = {field.name for field in dataclass_fields(InstalledD13CacheUseAssetsV2)}
+        for raw in records("d13_cache_use_assets_v2"):
+            row = _record(raw, required, "D13 cache use assets")
+            namespace = row["authority_namespace"]
+            graph_ns = _record(row["namespace"], {"bot_id", "persona_id"}, "D13 Graph namespace")
+            if type(namespace) is not str or namespace in use_assets:
+                raise AuthorityUnavailable("installed D13 cache use namespace repeats")
+            use_assets[namespace] = InstalledD13CacheUseAssetsV2(**{**row, "namespace": NamespaceId(**graph_ns)})
     c09 = None
     c09_v2 = None
     if "c09_storage_v1" in manifest and "c09_storage_v2" in manifest:
@@ -545,7 +603,7 @@ def load_installed_asset_config_v1(
         local_administrator_credential, c04_installations_v2=c04,
         c04_installations_v3=c04_v3, c09_storage_v1=c09,
         c09_maintenance_factory=c09_maintenance_factory, c09_storage_v2=c09_v2,
-        d13_counter_assets_v1=counter_assets)
+        d13_counter_assets_v1=counter_assets, d13_cache_use_assets_v2=use_assets)
 
 
 __all__ = ("ASSET_MANIFEST_SCHEMA", "AuthorityCoreVerifiers",

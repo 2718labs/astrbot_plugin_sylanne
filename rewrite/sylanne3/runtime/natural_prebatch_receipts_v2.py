@@ -150,12 +150,18 @@ def issue_natural_pregrant_social_receipts_v2(
         if (validators[action_key.type_name](action_atom.value) != intent
                 or validators[schema_key.type_name](schema_atom.value) != schema_record):
             raise ValueError("staged D08 action differs")
-        projection = read_current_dispatch_projection(db, namespace, snapshot, query)
         request = RoleBindingRequest(
             f"persona:{namespace.persona_id}", intent.target_ref, None,
             material.scene_id, intent.action_kind, intent.purpose, now_utc, True)
+        from .dispatch_current_projection import read_current_dispatch_policy_route_v3
+        policy_route=read_current_dispatch_policy_route_v3(db,namespace,query,
+            source_ref=material.source_ref.ref,c02_operation_id=material.c02_operation_id,
+            platform_ref=route_binding.platform_ref,conversation_ref=route_binding.conversation_ref,
+            sender_ref=route_binding.sender_ref,scene_ref=material.scene_id)
+        projection = read_current_dispatch_projection(db, namespace, snapshot, query,
+            policy_request=request,policy_route=policy_route)
         role_read, boundary_read = derive_current_domain_reads(
-            db, projection, request, context)
+            db, projection, request, context,policy_route=policy_route)
         specs = {(item.check_kind, item.provider_id): item
                  for item in intent.required_checks}
         if len(specs) != len(intent.required_checks):

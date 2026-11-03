@@ -239,7 +239,22 @@ def require_artifact_completion_receipt_history_v1(db, *, namespace, original):
     access=original['payload']['provenance']['receipt_access'];validate_access(access)
     sk=AtomKey.from_token(value.source_ref);ak=access_key(*namespace.as_tuple,source.source_id)
     expected=(GraphVersion(sk,1),GraphVersion(ak,1))
-    if (set(original['receipt'].write_versions)!=set(expected) or len(original['receipt'].write_versions)!=2
+    from ..domains.d06.inspection_metadata_v1 import inspection_key_v1,validate_inspection_metadata_v1
+    inspection=GraphVersion(inspection_key_v1(sk,1),1)
+    writes=tuple(original['receipt'].write_versions)
+    if inspection in writes:
+        projection=_artifact_receipt_sql_v1(db,
+            'SELECT event_id,value,valid FROM graph_history WHERE event_bot=? AND event_persona=? AND token=? AND revision=?',
+            (*namespace.as_tuple,inspection.key.token,1)).fetchone()
+        if projection is None or (projection[0],projection[2])!=(value.producer_operation_id,1):
+            raise ValueError('receipt Source inspection lost its actual same-producer history')
+        metadata=background_json_loads_v3(projection[1]);validate_inspection_metadata_v1(metadata,source=True)
+        if (metadata['target_ref']!=sk.token or metadata['target_revision']!=1
+                or metadata['producer_operation_id']!=value.producer_operation_id
+                or metadata['target_semantic_digest']!=value.source_digest):
+            raise ValueError('receipt Source inspection differs from its actual derived Source original')
+        expected=(*expected,inspection)
+    if (set(writes)!=set(expected) or len(writes)!=len(expected)
             or source.text!=value.text or source.provenance_root!=value.receipt_id
             or source.source_kind!='internal' or source.assertion_status!='confirmed'
             or source.parent_source_ids!=tuple(head.key.owner.subject for head,_ in value.parent_source_heads)
@@ -247,7 +262,7 @@ def require_artifact_completion_receipt_history_v1(db, *, namespace, original):
         raise ValueError('receipt producer changed actual Source/Access/parents/exact CAS writes')
     for head,digest in value.parent_source_heads:
         if head not in original['read_versions']: raise ValueError('receipt omitted an actual parent Source CAS read')
-    for version,digest in zip(expected,(value.source_digest,value.source_access_digest)):
+    for version,digest in zip(expected[:2],(value.source_digest,value.source_access_digest)):
         row=_artifact_receipt_sql_v1(db,'SELECT event_id,value,valid FROM graph_history WHERE event_bot=? AND event_persona=? AND token=? AND revision=?',
             (*namespace.as_tuple,version.key.token,version.revision)).fetchone()
         if row is None or row[0]!=value.producer_operation_id or row[2]!=1 or background_json_digest_v3(row[1],background_json_loads_v3(row[1]))!=digest:

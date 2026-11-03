@@ -58,6 +58,11 @@ class CurrentOnboardingResolver:
             purpose=purpose, audience=audience, operation_id=operation_id,
             request_digest=request_digest)
 
+    def read_current_creation_choices(self, **kwargs):
+        if self._d01 is None:
+            return {"choices": [], "reason_code": "role_initialization_policy_unavailable"}
+        return self._d01.read_current_creation_choices(**kwargs)
+
     def resolve_create_character(
         self,
         *,

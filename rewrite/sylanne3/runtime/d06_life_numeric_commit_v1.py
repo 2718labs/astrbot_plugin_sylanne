@@ -374,7 +374,8 @@ def commit_life_numeric_joint_stage_v1(runtime, db, *, stage, operation, frame, 
             or stage.bundle is not graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle):
         raise ValueError('Life joint requires its actual registered current Owner transaction')
     # The private producer rechecks its SQL-issued stage and commits the single
-    # job CAS before freezing the numerical input. A second W01 CAS would stale it.
+    # job CAS only after its genuine Source input freezes. Its actual receipt
+    # then rebinds that input; a second W01 CAS would correctly stale it.
     ready, receipt = prepare_life_numeric_joint_in_transaction_v1(db, stage=stage)
     prepared = ready.prepared
     return {'status': 'numeric_prepared', 'operation_id': frame.envelope.identity.operation_id,

@@ -6,17 +6,42 @@ from .contracts import (Scope, Atom, AtomVersion, Snapshot, CommitReceipt,
                         EventConflict, StaleRead, canonical_json, json_object, nonempty)
 
 class Store:
-    def __init__(self, path, *, selected_storage=None, storage_context=None, storage_role="graph", maintenance_basis=None):
+    def __init__(self, path, *, selected_storage=None, storage_context=None, storage_role="graph", maintenance_basis=None, initial_storage=None, initial_maintenance=None, host_storage_binding=None):
         self._lock = threading.RLock()
         self._closed = False
-        self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        if host_storage_binding is not None:
+            from pathlib import Path
+            from .host.c09_storage_admission_v1 import VerifiedHostGraphStorageBindingV4
+            if type(host_storage_binding)is not VerifiedHostGraphStorageBindingV4 or storage_role!='graph':
+                raise ValueError('actual independent Host Graph storage binding required')
+            host_storage_binding._require_custody_v4()
+            if Path(path).resolve(strict=True)!=Path(host_storage_binding.member('graph')['resolved_path']).resolve(strict=True):
+                raise ValueError('Host Graph constructor path differs from its actual admission')
+            self._db=sqlite3.connect(Path(path).resolve(strict=True).as_uri()+'?mode=rw',uri=True,check_same_thread=False,isolation_level=None)
+        else:self._db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
         self._db.execute('PRAGMA busy_timeout=5000')
         self._db.execute('PRAGMA journal_mode=WAL')
         self._db.execute('PRAGMA synchronous=FULL')
         self._runtime_storage_v3 = None
         from .runtime_storage_v3 import install_selected_runtime_storage_v3, runtime_storage_v3
-        if selected_storage is not None and maintenance_basis is not None:
-            raise ValueError("one exact selected runtime composition required")
+        if sum(value is not None for value in (selected_storage,maintenance_basis,initial_storage,initial_maintenance,host_storage_binding))>1:
+            raise ValueError("one exact runtime storage origin required")
+        if host_storage_binding is not None:
+            from .runtime_storage_v3 import install_host_graph_runtime_storage_v4
+            try:self._runtime_storage_v3=install_host_graph_runtime_storage_v4(self._db,binding=host_storage_binding)
+            except BaseException:
+                self._db.close();self._closed=True;host_storage_binding.close_v4();raise
+            return
+        if initial_maintenance is not None:
+            from .runtime_storage_v3 import install_initial_maintenance_runtime_storage_v4
+            self._runtime_storage_v3=install_initial_maintenance_runtime_storage_v4(
+                self._db,role=storage_role,composition=initial_maintenance,context=storage_context)
+            return
+        if initial_storage is not None:
+            from .runtime_storage_v3 import install_initial_runtime_storage_v4
+            self._runtime_storage_v3=install_initial_runtime_storage_v4(
+                self._db,role=storage_role,initial=initial_storage,context=storage_context)
+            return
         if maintenance_basis is not None:
             from .runtime_storage_v3 import install_selected_maintenance_storage_v3
             self._runtime_storage_v3 = install_selected_maintenance_storage_v3(

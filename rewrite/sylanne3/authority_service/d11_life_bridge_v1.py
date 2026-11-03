@@ -247,6 +247,18 @@ def _owner_observation(service,binding,permit,before):
         return prepare_owner_location_for_life_bridge_v3(service,binding=binding,permit=permit,before=before)
 
 def _observe_bridge(service, binding, permit):
+    if type(binding) is D11LifeExecutionBindingV1:
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
+        with own_d11_life_execution_invocation_v1(service, binding,
+                phase="adoption_metadata", permit=permit):
+            try:
+                return _observe_bridge_in_call_v1(service, binding, permit)
+            finally:
+                service._finish_character_labor_source_v1()
+    return _observe_bridge_in_call_v1(service, binding, permit)
+
+
+def _observe_bridge_in_call_v1(service, binding, permit):
     with service._frozen() as (db, deletion, execution, _):
         after, holder = service._current(db, deletion, execution)
         before, source, terminal = _originals_locked(service, db, binding, execution)
@@ -255,7 +267,10 @@ def _observe_bridge(service, binding, permit):
         service.bridge.fences.validate_fence_locked(db, permit, subject=service._subject, current_anchor=after)
     prepared = service._prepared(binding, for_execution=False, permit=permit)
     service._prepared_anchor(prepared, before)
-    if prepared.digest != terminal.payload.prepared_digest:
+    from ..runtime.d11_character_work_segment_v1 import CharacterLaborPreparedMetadataV1
+    prepared_digest = (prepared.prepared_digest if type(prepared) is CharacterLaborPreparedMetadataV1
+        else prepared.digest)
+    if prepared_digest != terminal.payload.prepared_digest:
         raise AuthorityUnavailable("life terminal preparation commitment changed")
     owner, actor_id = _owner_observation(service, binding, permit, before)
     current_self=_draft_current_self(service,binding,permit,before,owner) if type(binding) is D11DraftExecutionBindingV1 else None
@@ -269,7 +284,7 @@ def _observe_bridge(service, binding, permit):
     if current_self is not None:
         values=dict(binding=binding,terminal=terminal,owner_authority=owner,current_self=current_self,
             activity_scope_ref=binding.activity_scope_ref,activity_scope_digest=binding.activity_scope_digest,
-            prepared_digest=prepared.digest,before_requirements_json=prepared.requirements_json,
+            prepared_digest=prepared_digest,before_requirements_json=prepared.requirements_json,
             before_graph_revision=prepared.graph_revision,before_graph_epoch=prepared.graph_epoch,
             before_anchor=before,after_anchor=after,permit=permit)
         raw=dict(values,schema="d11.draft-self-adoption-bridge.v2")
@@ -279,7 +294,7 @@ def _observe_bridge(service, binding, permit):
         raw["before_anchor"]=asdict(before);raw["after_anchor"]=asdict(after)
         return D11DraftSelfAdoptionBridgeV2(**values,qualification_digest=canonical_digest(raw))
     return _make_bridge(binding=binding, terminal=terminal, owner_authority=owner, owner_actor_id=actor_id,
-        prepared_digest=prepared.digest, before_requirements_json=prepared.requirements_json,
+        prepared_digest=prepared_digest, before_requirements_json=prepared.requirements_json,
         before_graph_revision=prepared.graph_revision, before_graph_epoch=prepared.graph_epoch,
         before_anchor=before, after_anchor=after, permit=permit)
 
@@ -291,8 +306,14 @@ def operate_life_adoption_bridge_v1(service, binding, action, gate=None, outcome
         if type(service) is not AuthorityD11LifeServiceV1 or action not in {"begin", "validate", "finish", "status"}:
             raise AuthorityUnavailable("actual installed life bridge and closed operation required")
         if action in {"finish", "status"}:
-            from .d11_life_historical_accounting_v1 import _scope
-            _scope(service, binding)
+            from .d11_life_execution_owner_v1 import (
+                require_own_life_adoption_bridge_identity_v1,
+                require_own_life_adoption_bridge_scope_v1,
+            )
+            if action == "finish":
+                require_own_life_adoption_bridge_identity_v1(service,binding,gate)
+            else:
+                require_own_life_adoption_bridge_scope_v1(service,binding,gate)
         else:
             service._binding(binding)
         service.bridge.core._require(service.credential, "current", service.bridge.namespace)
@@ -301,10 +322,19 @@ def operate_life_adoption_bridge_v1(service, binding, action, gate=None, outcome
                 or gate.binding != binding or gate.permit.operation_id != operation_id):
             raise AuthorityUnavailable("life exact original bridge required")
         if action in {"finish", "status"}:
-            with service.bridge.core._tx() as db:
+            with service._frozen() as (db,deletion,execution,_):
+                _,holder = service._current(db,deletion,execution)
+                head = service.owner_tickets.current_migration_head_in_tx(
+                    db,authority_namespace=service.bridge.namespace)
                 row = service.bridge.fences._row(db, operation_id)
-                if row is None or service.bridge.fences._permit(row) != gate.permit:
-                    raise AuthorityUnavailable("life actual bridge gate differs")
+                if (row is None or service.bridge.fences._permit(row) != gate.permit
+                        or row[6] not in {"active","finished"} or row[10] is not None
+                        or gate.permit.holder != holder
+                        or head is None or head.state != "active"
+                        or head.guard.namespace != service.namespace
+                        or head.guard.installation_id != service.installation_id
+                        or head.guard.pending_revoke_operation_id is not None):
+                    raise AuthorityUnavailable("life actual bridge gate/current Owner differs")
                 if action == "status":
                     if row[6] not in {"active", "finished"}:
                         raise AuthorityUnavailable("life gate has an unsupported state")
@@ -316,6 +346,7 @@ def operate_life_adoption_bridge_v1(service, binding, action, gate=None, outcome
                     if row[8:10] != finish:
                         raise AuthorityUnavailable("life finished bridge replay changed outcome")
                     return True
+            require_own_life_adoption_bridge_scope_v1(service,binding,gate)
             _verify_graph_finish(service, gate, outcome)
             with service._frozen() as (db, deletion, execution, _):
                 current = service.fences._current_locked(db, deletion, execution, require_clear=False)
@@ -351,6 +382,10 @@ def operate_life_adoption_bridge_v1(service, binding, action, gate=None, outcome
 
 
 def _verify_graph_finish(service, gate, outcome):
+    if outcome == "committed":
+        from .character_labor_source_read_v1 import verify_character_labor_graph_finish_metadata_v1
+        if verify_character_labor_graph_finish_metadata_v1(service,gate):
+            return
     from ..runtime.d11_life_adoption_v1 import verify_life_adoption_commit_v1
     db = sqlite3.connect(service.graph_path.as_uri() + "?mode=ro", uri=True, isolation_level=None)
     try:

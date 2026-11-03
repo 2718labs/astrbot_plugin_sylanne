@@ -36,6 +36,38 @@ from sylanne3.runtime_contracts import (
     canonical_digest,
 )
 
+@pytest.fixture(autouse=True)
+def _default_pressure_fixture(monkeypatch):
+    """Current planning requires the exact main-input pressure original; these
+    tests exercise planning decisions, so inject a deterministic typed pressure
+    unless the case supplies its own."""
+    import sys
+    import sylanne3.domains.d13.precompression as pc
+    from sylanne3.runtime_contracts import canonical_digest
+    module = sys.modules[__name__]
+
+    def _pressure(window, history_token_budget):
+        return pc.D13CurrentMainPressureV2(
+            canonical_digest(window), "b" * 64, "install", "provider", "model",
+            "a" * 64, max(history_token_budget * 3 // 2, 1), "exact-tokenizer")
+
+    original_plan = module.plan_precompression
+
+    def with_pressure(window, history_token_budget, *, pressure=None, **kwargs):
+        return original_plan(window, history_token_budget,
+                             pressure=pressure or _pressure(window, history_token_budget), **kwargs)
+
+    monkeypatch.setattr(module, "plan_precompression", with_pressure)
+    if hasattr(module, "prepare_precompression_intent_v1"):
+        original_intent = module.prepare_precompression_intent_v1
+
+        def with_intent(window, history_token_budget, *, pressure=None, **kwargs):
+            return original_intent(window, history_token_budget,
+                                   pressure=pressure or _pressure(window, history_token_budget), **kwargs)
+
+        monkeypatch.setattr(module, "prepare_precompression_intent_v1", with_intent)
+
+
 
 def ref(name, version=1):
     return VersionedRef(name, version)

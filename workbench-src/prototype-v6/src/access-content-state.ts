@@ -14,7 +14,7 @@ export function ownerLabel(state: BackendState) { return state.owner === 'unlock
 export function visibleProjection(state: BackendState, entryId: string): CharacterProjection | null {
   const view = ARCHIVE_META[entryId]?.view, projection = state.view.data
   if (state.auth !== 'authenticated' || state.mode !== 'same-origin' || !view || state.viewType !== view || !['ready', 'empty'].includes(state.view.status) || projection?.view_type !== view) return null
-  if (`${projection.namespace.bot}/${projection.namespace.persona}` !== state.scope || state.workspace.status !== 'ready' || !state.workspace.data?.views.some(v => v.view_type === view && v.status === 'available')) return null
+  if (`${projection.namespace.bot}/${projection.namespace.persona}` !== state.scope || state.workspace.status !== 'ready' || !state.workspace.data?.views.some(v => v.view_type === view && v.status === 'readable_not_loaded')) return null
   return projection
 }
 export function challengeExpired(expiresAt: string | undefined, now = Date.now()) { return !!expiresAt && (!Number.isFinite(Date.parse(expiresAt)) || Date.parse(expiresAt) <= now) }

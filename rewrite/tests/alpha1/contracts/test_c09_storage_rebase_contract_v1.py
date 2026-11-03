@@ -96,7 +96,7 @@ def test_recovery_unknown_requires_footprint_and_terminal_commitment():
         "bot/persona", "activity", "effect", external_query_ref="platform-query",
         conflict_keys=("conflict",))
     fact = SanitizedUnknownFactV4(
-        "execution", 2, "platform-query", 1, 5, footprint)
+        "execution", 2, "platform-query", 0, (), footprint)
     assert recovery(executions=(execution,), unknown=(fact,)).unknown_facts == (fact,)
     internal = replace(fact, platform_query_ref=None, footprint=RecoveryConstraintFootprint(
         "bot/persona", "activity", "effect", conflict_keys=("conflict",)))
@@ -114,10 +114,10 @@ def test_d02_cost_and_graph_read_state_are_explicit():
     fact = SanitizedD02FactV4(
         "quote", "component", "outcome", "settlement",
         digest("quote"), digest("completed"), digest("outcome"),
-        digest("settlement"), 12)
+        digest("settlement"), (12.0).hex())
     assert recovery(d02=(fact,)).d02_facts == (fact,)
-    with pytest.raises(ValueError, match="fixed_cost"):
-        replace(fact, fixed_cost=None)
+    with pytest.raises(ValueError, match="fixed cost"):
+        replace(fact, fixed_cost_hex=None)
     budget = SanitizedD11FactV4(
         "settlement", "parent-budget", "idempotency", 20, 12, 12, 0, 0)
     assert budget.actual_cost == 12

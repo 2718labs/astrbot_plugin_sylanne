@@ -48,8 +48,9 @@ def model_workflows_v8_from_payload(raw):
 def is_installed_general_growth_cognition_slot_v1(bundle, workflow):
     from .authority_profile import AdminInstallationBundle
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
     return (type(bundle) is AdminInstallationBundle
-            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
             and type(workflow) is AdminModelWorkflowV2
             and workflow is bundle.model_workflows.general_growth_cognition)
 
@@ -57,8 +58,9 @@ def is_installed_general_growth_cognition_slot_v1(bundle, workflow):
 def is_installed_growth_cognition_slot_v4(bundle, workflow):
     from .authority_profile import AdminInstallationBundle
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
     return (type(bundle) is AdminInstallationBundle
-            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
             and type(workflow) is AdminModelWorkflowV2
             and workflow is bundle.model_workflows.growth_cognition)
 
@@ -66,7 +68,8 @@ def is_installed_growth_cognition_slot_v4(bundle, workflow):
 def is_installed_relationship_cognition_slot_v4(bundle, workflow):
     from .authority_profile import AdminInstallationBundle
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
     return (type(bundle) is AdminInstallationBundle
-            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+            and type(bundle.model_workflows) in (AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10)
             and type(workflow) is AdminModelWorkflowV2
             and workflow is bundle.model_workflows.d07_relationship_cognition)

@@ -626,6 +626,29 @@ class AuthorityV2FenceStore:
             if row[10] is not None:
                 if row[6] != "active":
                     raise AuthorityUnavailable("finished fence retains pending mutation")
+                from .observation_refinement_contract_v3 import (
+                    PlatformObservationRefinementPendingV3,decode_bytes as decode_fact_bytes)
+                from .observation_refinement_v3 import (
+                    require_observation_refinement_schema_v3,fact_row_locked_v3,decode_fact_record_v3)
+                fact_kind=json.loads(row[10]).get('kind')
+                if fact_kind in ('platform_observation_refinement_pending_v3','platform_observation_refinement_cell_v3'):
+                    require_observation_refinement_schema_v3(db)
+                    from .c09_platform_observation_fact_storage_v3 import FENCE_MARKER,fact_fence_bytes_v3
+                    if fact_kind==FENCE_MARKER:
+                        marker=json.loads(row[10])
+                        saved_row=fact_row_locked_v3(db,operation_id)
+                        pending,result,updated=decode_fact_record_v3(saved_row)
+                        if row[10]!=fact_fence_bytes_v3(db,pending):
+                            raise AuthorityUnavailable('Fact pending marker differs from actual typed cell original')
+                    else:pending=decode_fact_bytes(row[10])
+                    from .observation_refinement_v3 import require_fact_unconsumed_v3
+                    require_fact_unconsumed_v3(db,namespace,operation_id)
+                    saved,result,updated=decode_fact_record_v3(fact_row_locked_v3(db,pending.mutation_id))
+                    if (type(pending) is not PlatformObservationRefinementPendingV3
+                            or pending.fact_write_permit!=permit or saved!=pending
+                            or result is not None or updated is not None):
+                        raise AuthorityUnavailable('observation fact pending owner/ledger differs')
+                    return permit,row[6],pending
                 try:
                     pending = decode_bytes(row[10])
                 except (TypeError, ValueError, UnicodeError) as exc:
@@ -643,6 +666,64 @@ class AuthorityV2FenceStore:
                             (operation_id,)).fetchone():
                 raise AuthorityUnavailable("pending mutation ledger lacks fence marker")
             return permit, row[6], pending
+
+    def record_observation_fact_pending_locked_v3(self,db,pending,*,subject,current_anchor):
+        from .observation_refinement_contract_v3 import (
+            PlatformObservationRefinementPendingV3,canonical_bytes as fact_bytes,expected_fact_digest_v3)
+        from .observation_refinement_v3 import TABLE,require_observation_refinement_schema_v3,require_fact_unconsumed_v3
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        if type(pending) is not PlatformObservationRefinementPendingV3 or expected_fact_digest_v3(pending)!=pending.expected_append_digest:
+            raise AuthorityUnavailable('exact observation fact pending/append commitment required')
+        require_observation_refinement_schema_v3(db)
+        permit=pending.fact_write_permit
+        require_fact_unconsumed_v3(db,permit.namespace,permit.operation_id)
+        self.validate_fence_locked(db,permit,subject=subject,current_anchor=current_anchor)
+        from .c09_platform_observation_fact_storage_v3 import (PHYSICAL_DDL,fact_storage_schema_v3,
+            insert_fact_pending_v3,fact_fence_bytes_v3)
+        if fact_storage_schema_v3(db)==PHYSICAL_DDL:
+            insert_fact_pending_v3(db,pending);encoded=fact_fence_bytes_v3(db,pending)
+        else:
+            encoded=fact_bytes(pending)
+            _capture_write_v2(db,"INSERT INTO "+TABLE+"(namespace,fact_operation_id,mutation_id,subject,request_digest,state,pending) VALUES(?,?,?,?,?,'pending',?)",
+                (permit.namespace,permit.operation_id,pending.mutation_id,subject,pending.request_digest,encoded))
+        changed=_capture_write_v2(db,"UPDATE authority_v2_fences SET pending=? WHERE operation_id=? AND state='active' AND pending IS NULL AND permit=?",
+            (encoded,permit.operation_id,canonical_bytes(permit))).rowcount
+        if changed!=1:raise AuthorityUnavailable('fact fence pending CAS failed')
+
+    def finish_observation_fact_locked_v3(self,db,receipt,*,subject):
+        from .observation_refinement_contract_v3 import (
+            PlatformObservationRefinementReceiptV3,canonical_bytes as fact_bytes,
+            canonical_digest as fact_digest)
+        from .observation_refinement_v3 import (
+            TABLE,require_observation_refinement_schema_v3,fact_row_locked_v3,decode_fact_record_v3,
+            require_fact_unconsumed_v3)
+        from ..runtime.c09_paged_sql_v2 import _capture_write_v2
+        if type(receipt) is not PlatformObservationRefinementReceiptV3:
+            raise AuthorityUnavailable('exact observation fact receipt required')
+        require_observation_refinement_schema_v3(db);self._require_no_migration(db)
+        p=receipt.pending;permit=p.fact_write_permit
+        require_fact_unconsumed_v3(db,permit.namespace,permit.operation_id)
+        row=self._row(db,permit.operation_id)
+        saved,result,prior=decode_fact_record_v3(fact_row_locked_v3(db,p.mutation_id))
+        from .c09_platform_observation_fact_storage_v3 import (PHYSICAL_DDL,fact_storage_schema_v3,
+            fact_fence_bytes_v3,commit_fact_cells_v3)
+        marker=fact_fence_bytes_v3(db,p)
+        if (saved!=p or result is not None or prior is not None or permit.subject!=subject
+                or row is None or row[6]!='active' or self._permit(row)!=permit
+                or row[10]!=marker):
+            raise AuthorityUnavailable('observation fact no longer owns active fact fence')
+        updated=replace(permit,revision=receipt.updated_revision,pinned_anchor=receipt.after_anchor)
+        changed=_capture_write_v2(db,"UPDATE authority_v2_fences SET revision=?,permit=?,pending=NULL WHERE operation_id=? AND state='active' AND pending=?",
+            (updated.revision,canonical_bytes(updated),permit.operation_id,marker)).rowcount
+        if fact_storage_schema_v3(db)==PHYSICAL_DDL:
+            recorded=commit_fact_cells_v3(db,receipt,updated)
+        else:
+            recorded=_capture_write_v2(db,"UPDATE "+TABLE+" SET state='committed',receipt=?,updated_fact_permit=? WHERE mutation_id=? AND state='pending' AND pending=?",
+                (fact_bytes(receipt),canonical_bytes(updated),p.mutation_id,fact_bytes(p))).rowcount
+        if (changed,recorded)!=(1,1):raise AuthorityUnavailable('observation fact commit CAS failed')
+        self.finish_fence_locked(db,updated,subject=subject,current_anchor=receipt.after_anchor,
+            request_id='finish:'+p.mutation_id,request_digest=fact_digest(receipt))
+        return updated
 
     def record_pending(self, pending: PendingMutationV2, *, subject: str,
                        current_anchor: RestoreAnchor,

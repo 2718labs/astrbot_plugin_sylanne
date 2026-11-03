@@ -130,6 +130,36 @@ class PersonaDomainTests(unittest.TestCase):
         self.assertEqual(result.rejected, ("flatter",))
         self.assertFalse(result.action_authorized)
 
+    def test_values_only_provenance_reaches_c09_and_d08_without_copying_claims(self):
+        from sylanne3.domains.d01.production_operations_v1 import plain_v1
+        from sylanne3.runtime.domain_production_contracts_v1 import ProductionOriginalRefV1
+        from sylanne3.runtime.domain_production_erasure_v1 import (
+            DomainProductionErasureHold, validate_domain_stage_provenance_v1)
+        from sylanne3.runtime.d08_personal_candidate_v1 import read_evaluation_value_rules_v1
+        from sylanne3.runtime_contracts import canonical_serialize
+        domain = PersonaDomain()
+        secret = "PRIVATE ORDINARY SUPPORT MUST NOT BE COPIED"
+        current = replace(plan(), blocks=(replace(plan().blocks[1], claim=secret),))
+        projection = domain.project_values_v1(current, context_tags=("private",))
+        result = domain.evaluate_values(projection,
+            {"kind_feedback": ("review",), "flatter": ("review",)})
+        provenance = plain_v1({"persona_values": projection, "evaluation": result,
+            "candidate_original": ProductionOriginalRefV1("d01.values_candidates", "candidates", "a" * 64),
+            "context_original": ProductionOriginalRefV1("d01.values_context", "context", "b" * 64)})
+        assert secret not in canonical_serialize(provenance)
+        assert "blocks" not in provenance["persona_values"] and "persona_view" not in provenance
+        assert validate_domain_stage_provenance_v1("d01", "evaluate_values", provenance) == ()
+        evaluated = {"payload": {"provenance": provenance}}
+        assert read_evaluation_value_rules_v1(evaluated) == tuple(plain_v1(rule) for rule in current.values)
+        assert result.preferred == ("kind_feedback",) and result.rejected == ("flatter",)
+        legacy = {**provenance, "persona_view": plain_v1(domain.project(current, context_tags=("private",)))}
+        del legacy["persona_values"]
+        assert validate_domain_stage_provenance_v1("d01", "evaluate_values", legacy) == ()
+        assert read_evaluation_value_rules_v1({"payload": {"provenance": legacy}}) == read_evaluation_value_rules_v1(evaluated)
+        malformed = {**provenance, "persona_values": {**provenance["persona_values"], "blocks": [{"claim": secret}]}}
+        with self.assertRaises(DomainProductionErasureHold):
+            validate_domain_stage_provenance_v1("d01", "evaluate_values", malformed)
+
     def test_core_growth_requires_two_independent_families_and_checked_counterevidence(self):
         domain = PersonaDomain()
         proposal = GrowthProposal(

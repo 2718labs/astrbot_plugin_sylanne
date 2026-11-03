@@ -106,7 +106,8 @@ class InstalledD07BehaviorPortV1:
     def _execution(self, ref, db, envelope):
         self._original(ref)
         execution = self.execution_reader.read_verified_terminal(ref)
-        if type(execution) is not D07ExecutionOriginalV1:
+        from ..runtime.d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityExecutionOriginalV1
+        if type(execution) not in {D07ExecutionOriginalV1,D07OrdinaryContinuityExecutionOriginalV1}:
             raise ValueError("D07 installed terminal reader returned no typed actual result")
         self.verify_execution(db, envelope, execution, execution.input_digest)
         return execution
@@ -135,9 +136,28 @@ class InstalledD07BehaviorPortV1:
             next(spec for spec in D07DomainProvider.type_specs() if spec.name == atom.key.type_name).validator(value)
             ticket = AttentionTicket(**{**{k: v for k, v in value.items() if k != "schema"},
                 "cancel_refs": tuple(value["cancel_refs"]), "source_refs": tuple(value["source_refs"])})
+            from ..runtime.d07_general_growth_attention_v1 import read_general_growth_ticket_original_v1
+            from ..runtime.d01_production_operations_v1 import CurrentDomainReadV1
+            original = read_general_growth_ticket_original_v1(db, read=CurrentDomainReadV1(self.frame),
+                ticket=ticket, issuer=self.execution_reader.d11_issuer)
+            if original is not None:
+                tickets.append(ticket); issuances.append(original.original_ref)
+                continue
+            from ..runtime.d07_ordinary_continuity_attention_v1 import read_ordinary_continuity_ticket_original_v1
+            ordinary=read_ordinary_continuity_ticket_original_v1(db,read=CurrentDomainReadV1(self.frame),
+                ticket=ticket,issuer=self.execution_reader.d11_issuer)
+            if ordinary is not None:
+                tickets.append(ticket);issuances.append(ordinary.original_ref)
+                continue
+            from ..runtime.d07_single_event_review_v1 import read_current_single_event_review_ticket_v1
+            review=read_current_single_event_review_ticket_v1(db,CurrentDomainReadV1(self.frame),ticket=ticket,
+                issuer=self.execution_reader.d11_issuer)
+            if review is not None:
+                if not ticket.eligible and not ticket.resources_available:continue
+                tickets.append(ticket);issuances.append(review.original_ref)
+                continue
             if ticket.ticket_id.startswith('attention:artifact-observation:'):
                 from ..runtime.artifact_phase_observation_v1 import read_artifact_observation_ticket_original_v1
-                from ..runtime.d01_production_operations_v1 import CurrentDomainReadV1
                 original=read_artifact_observation_ticket_original_v1(db,read=CurrentDomainReadV1(self.frame),
                     ticket=ticket,issuer=self.execution_reader.d11_issuer)
                 tickets.append(ticket);issuances.append(original.original_ref)
@@ -176,6 +196,8 @@ class InstalledD07BehaviorPortV1:
     def read_reflection(self, db, envelope, request) -> D07ReflectionInputsV1:
         snapshot = self._snapshot(db, envelope)
         execution = self._execution(request.cognitive_terminal_ref, db, envelope)
+        if type(execution)is not D07ExecutionOriginalV1:
+            raise ValueError("ordinary continuity execution cannot enter generic reflection")
         job = self._job(db, envelope)
         if job is None or job.result_ref != request.cognitive_terminal_ref:
             raise ValueError("reflection needs the original completed cognition job")

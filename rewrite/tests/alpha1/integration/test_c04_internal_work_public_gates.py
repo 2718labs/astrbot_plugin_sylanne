@@ -24,7 +24,7 @@ from sylanne3.runtime.c04_cpu_quote_policy import (
     C04InternalCpuQuotePolicyAuthorityV1, C04InternalCpuQuotePolicyV1,
 )
 from sylanne3.runtime_contracts import (
-    CommandEnvelope, OperationIdentity, RUNTIME_SCHEMA,
+    CommandEnvelope, OperationIdentity, QueryEpoch, RUNTIME_SCHEMA,
     SourceQualification, VersionGuard, canonical_digest,
 )
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime"))

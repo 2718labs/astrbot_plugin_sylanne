@@ -69,10 +69,10 @@ _DEFAULT_COMMAND = object()
 
 def _paired(server, request=REQUEST, peer=PEER):
     channel = b"channel-a"
-    handshake = server._dispatch_for_test("handshake", request, peer, channel)
+    handshake = server.dispatch("handshake", request, peer, channel)
 
     def call(command=_DEFAULT_COMMAND, *, method="ingress_clock_sample_v2", binding=None):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, request, peer, channel,
             handshake_binding=(handshake["channel_binding_sha256"]
                                if binding is None else binding),

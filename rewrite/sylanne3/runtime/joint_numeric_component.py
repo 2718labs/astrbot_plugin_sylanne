@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ..runtime_storage_v3 import read_graph_row_v3, read_graph_rows_v3
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import math
 import sqlite3
@@ -77,10 +77,27 @@ class JointNumericComponentCandidate:
     root_original_digest: str | None = None
 
 
+def joint_numeric_component_digest_v1(component):
+    """The existing canonical component binding, shared with exact own-job rebinding."""
+    binding = (component.namespace.as_tuple, component.catalogue_hash, component.query_epoch.revision,
+        component.graph_incarnation, component.graph_revision, component.access_epoch, component.delete_epoch,
+        component.role_start, component.role_end, component.checkpoint_refs,
+        tuple(edge.edge_id for edge in component.edges), component.read_values_digest,
+        component.root_original_digest)
+    if component.root_original_digest is not None:
+        binding += (tuple((block.checkpoint_ref, block.predecessor_receipt_digest)
+            for block in component.block_drives),)
+    return canonical_digest(binding)
+
+
 def _authored_predecessor_original(
     db: sqlite3.Connection, namespace: NamespaceId, checkpoint_ref: str,
     checkpoint_revision: int, checkpoint, state,
 ) -> tuple[str, str]:
+    from .d04_root_topology_read_v1 import read_bound_source_authored_predecessor_v1
+    handled,result=read_bound_source_authored_predecessor_v1(
+        db,namespace,checkpoint_ref,checkpoint_revision,checkpoint,state)
+    if handled:return result
     from .domain_background_read_v3 import read_bound_background_authored_predecessor_v3
     handled,result=read_bound_background_authored_predecessor_v3(db,namespace,checkpoint_ref,checkpoint_revision,checkpoint,state)
     if handled:return result
@@ -285,7 +302,25 @@ def read_joint_numeric_component(
                 or recovery is None or recovery[1] != expected_graph_revision
                 or incarnation != expected_graph_incarnation):
             raise JointNumericHold("joint graph or authority epoch changed")
-        rows = read_graph_rows_v3(db, ('token', 'revision', 'value', 'valid'), where='bot=? AND persona=? AND type_name IN (?,?,?)', parameters=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[:-1], history=False, order_by=('token',), limit=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[-1])
+        from .d04_source_work_v3 import read_bound_installed_d04_component_rows_v3
+        handled,rows=read_bound_installed_d04_component_rows_v3(db,namespace,
+            types=(checkpoint_type,EDGE_TYPE,DRIVE_TYPE),limit=max_rows+1)
+        if not handled:
+            if _life_source_bridge is not None:
+                from .life_numeric_source_bridge_v1 import (
+                    read_life_joint_bridge_rows_v1, require_live_life_joint_bridge_v1)
+                # Private issuance errors are the bridge's own verdict and must stay
+                # visible; only a live bridge whose inventory is outside the frame is
+                # converted into this component's HOLD.
+                require_live_life_joint_bridge_v1(db, _life_source_bridge)
+                try:
+                    rows = read_life_joint_bridge_rows_v1(db, _life_source_bridge,
+                        (checkpoint_type, EDGE_TYPE, DRIVE_TYPE), max_rows + 1)
+                except (TypeError, ValueError) as exc:
+                    raise JointNumericHold(
+                        "Life joint inventory is outside its qualified Source frame") from exc
+            else:
+                rows = read_graph_rows_v3(db, ('token', 'revision', 'value', 'valid'), where='bot=? AND persona=? AND type_name IN (?,?,?)', parameters=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[:-1], history=False, order_by=('token',), limit=(namespace.as_tuple + (checkpoint_type, EDGE_TYPE, DRIVE_TYPE, max_rows + 1))[-1])
         if len(rows) > max_rows:
             raise JointNumericHold("joint numeric enumeration exceeds complete page")
         numeric: dict[AtomKey, GraphAtom] = {}
@@ -353,7 +388,10 @@ def read_joint_numeric_component(
         root_original_digest = None
         atoms: dict[AtomKey, GraphAtom] = dict(numeric)
 
+        life_bridge_reader = None
+
         def load(ref: str) -> GraphAtom:
+            nonlocal life_bridge_reader
             try:
                 key = AtomKey.from_token(ref)
                 if NamespaceId.from_key(key) != namespace:
@@ -361,24 +399,39 @@ def read_joint_numeric_component(
             except (TypeError, ValueError) as exc:
                 raise JointNumericHold("joint dependency ref is invalid") from exc
             if key not in atoms:
-                row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(ref,), history=False)
-                if row is None:
-                    atoms[key] = GraphAtom(key, 0, {}, False)
-                else:
+                if _life_source_bridge is not None:
+                    from .life_numeric_source_bridge_v1 import life_joint_bridge_reader_v1
+                    if life_bridge_reader is None:
+                        life_bridge_reader = life_joint_bridge_reader_v1(db, _life_source_bridge)
                     try:
-                        value = json.loads(row[1])
-                        if canonical_json(value) != row[1]:
-                            raise ValueError("noncanonical")
+                        atoms[key] = life_bridge_reader.head(db, key)
                     except (TypeError, ValueError) as exc:
-                        raise JointNumericHold("joint dependency value is invalid") from exc
-                    atoms[key] = GraphAtom(key, row[0], value, bool(row[2]))
+                        raise JointNumericHold(
+                            "Life joint dependency is outside its qualified Source frame") from exc
+                else:
+                    from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
+                    handled,atom=read_bound_installed_d04_component_atom_v3(db,namespace,ref)
+                    if handled:
+                        atoms[key]=atom
+                    else:
+                        row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=?', parameters=(ref,), history=False)
+                        if row is None:
+                            atoms[key] = GraphAtom(key, 0, {}, False)
+                        else:
+                            try:
+                                value = json.loads(row[1])
+                                if canonical_json(value) != row[1]:
+                                    raise ValueError("noncanonical")
+                            except (TypeError, ValueError) as exc:
+                                raise JointNumericHold("joint dependency value is invalid") from exc
+                            atoms[key] = GraphAtom(key, row[0], value, bool(row[2]))
             return atoms[key]
 
         life_original = None
         life_selected = set()
         if _life_source_bridge is not None:
-            from .d06_life_numeric_joint_v1 import _require_life_joint_source_bridge_v1
-            life_current, life_frame = _require_life_joint_source_bridge_v1(db, _life_source_bridge)
+            from .life_numeric_source_bridge_v1 import require_live_life_joint_bridge_v1
+            life_current, life_frame = require_live_life_joint_bridge_v1(db, _life_source_bridge)
             life_original = life_current.original
             if (life_original.namespace != namespace or life_original.root_ref != root_ref
                     or (life_original.clock.role_start, life_original.clock.role_end) != (role_start, role_end)
@@ -592,19 +645,11 @@ def read_joint_numeric_component(
             (atom.key.token, atom.revision, canonical_digest(atom.value), atom.valid)
             for atom in atoms.values())))
         edge_values = tuple(edge for _, edge in component_edges)
-        binding = (namespace.as_tuple, registry.catalogue_hash, expected_query_epoch.revision,
-                   expected_graph_incarnation, expected_graph_revision,
-                   expected_access_epoch, expected_delete_epoch,
-                   role_start, role_end, tuple(sorted(component)),
-                   tuple(edge.edge_id for edge in edge_values), values_digest,
-                   root_original_digest)
-        if authored:
-            binding += (tuple((block.checkpoint_ref, block.predecessor_receipt_digest)
-                              for block in blocks),)
-        return JointNumericComponentCandidate(
+        candidate = JointNumericComponentCandidate(
             namespace, registry.catalogue_hash, expected_query_epoch, expected_graph_incarnation,
             expected_graph_revision, expected_access_epoch, expected_delete_epoch,
             role_start, role_end, tuple(sorted(component)), edge_values,
-            tuple(blocks), versions, values_digest, canonical_digest(binding),
+            tuple(blocks), versions, values_digest, "",
             root_original_digest=root_original_digest,
         )
+        return replace(candidate, candidate_digest=joint_numeric_component_digest_v1(candidate))

@@ -25,10 +25,10 @@ def actual_snapshot_package():
 
 def test_actual_snapshot_cold_load_and_full_provenance(actual_snapshot_package):
     from scripts.alpha1.verify_formal_cold_install import _cold_verify_package
-    from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
+    from sylanne3.host.package_qualification_v1 import validate_test_snapshot_manifest_v1
     path,pin,manifest=actual_snapshot_package
     if manifest['build_mode']=='alpha2-candidate':
-        from sylanne3.host.alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+        from sylanne3.host.package_qualification_v1 import validate_alpha2_candidate_manifest_v1
         evidence=validate_alpha2_candidate_manifest_v1(manifest)
         assert manifest['package_version']=='3.0.0-alpha2'
         assert evidence['specification']['task_count']==39
@@ -48,9 +48,9 @@ def test_actual_snapshot_cold_load_and_full_provenance(actual_snapshot_package):
 
 
 def test_actual_snapshot_cannot_claim_formal_or_omit_evidence(actual_snapshot_package):
-    from sylanne3.host.alpha1_test_snapshot_v1 import validate_test_snapshot_manifest_v1
+    from sylanne3.host.package_qualification_v1 import validate_test_snapshot_manifest_v1
     _,_,original=actual_snapshot_package
-    from sylanne3.host.alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1
+    from sylanne3.host.package_qualification_v1 import validate_alpha2_candidate_manifest_v1
     validator=validate_alpha2_candidate_manifest_v1 if original['build_mode']=='alpha2-candidate' else validate_test_snapshot_manifest_v1
     for mutate in (
         lambda value:value['test_snapshot'].__setitem__('public_release',True),
@@ -63,7 +63,7 @@ def test_actual_snapshot_cannot_claim_formal_or_omit_evidence(actual_snapshot_pa
 
 
 def test_actual_alpha2_rejects_legacy_identity_and_wrong_v3_resource(actual_snapshot_package):
-    from sylanne3.host.alpha1_test_snapshot_v1 import validate_alpha2_candidate_manifest_v1, validate_test_snapshot_manifest_v1
+    from sylanne3.host.package_qualification_v1 import validate_alpha2_candidate_manifest_v1, validate_test_snapshot_manifest_v1
     _,_,original=actual_snapshot_package
     if original['build_mode']!='alpha2-candidate':pytest.skip('requires the independently frozen alpha2 candidate')
     with pytest.raises(ValueError):validate_test_snapshot_manifest_v1(original)

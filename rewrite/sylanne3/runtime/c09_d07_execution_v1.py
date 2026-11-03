@@ -22,8 +22,11 @@ ACCOUNTING_COLUMNS = ("bot", "persona", "call_id", "intent_digest", "attempt_id"
 TIMING_TABLE = "authority_d07_model_timings_v1"
 TIMING_COLUMNS = ("call_id", "admission_id", "request_digest", "binding_digest", "started_at", "ended_at", "terminal_digest")
 BODY_KINDS = frozenset({"prepared", "prepare_commit", "request", "result", "execution", "adopted", "simulation_request", "semantic_question", "reflection_request","reflection_continuation","general_growth_attention_v1"})
-BODY_KINDS = BODY_KINDS | frozenset({'joint_external_semantic_basis_v1'})
-FACT_KINDS = KINDS - BODY_KINDS
+BODY_KINDS = BODY_KINDS | frozenset({
+    'joint_external_semantic_basis_v1','ordinary_continuity_attention_v1','ordinary_continuity_adoption_v1',
+    'single_event_review_attention_v1','single_event_review_adoption_v1','single_event_review_cardinality_rejected_v1'})
+FACT_KINDS = frozenset({'call','result_attempt','paid_cost','partial_cost','body_cost','simulation_budget',
+    'accounting_prepared','budget_allocation','budget_closed'})
 
 
 def _json(encoded):
@@ -110,6 +113,16 @@ def validate_d07_original_payload_v1(kind, raw):
             prepared=decode_typed_production_value_v1(raw,D07ReflectionPreparedV3)
             thaw_d07_cognition_request_v1(_json(prepared.frozen_json))
             authority_field="owner_authority_json"
+        elif raw.get("schema")=="d07.single-event-review-prepared.v1":
+            from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+            _fields(raw,(f.name for f in fields(D07SingleEventReviewPreparedV1)),"d07.single-event-review-prepared.v1")
+            prepared=decode_typed_production_value_v1(raw,D07SingleEventReviewPreparedV1)
+            authority_field="owner_authority_json"
+        elif raw.get("schema")=="d07.ordinary-continuity-prepared.v1":
+            from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+            _fields(raw,(f.name for f in fields(D07OrdinaryContinuityPreparedV1)),"d07.ordinary-continuity-prepared.v1")
+            prepared=decode_typed_production_value_v1(raw,D07OrdinaryContinuityPreparedV1)
+            authority_field="owner_authority_json"
         elif raw.get("schema")=="d07.general-growth-prepared.v1":
             from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
             _fields(raw,(f.name for f in fields(D07GeneralGrowthPreparedV1)),"d07.general-growth-prepared.v1")
@@ -155,7 +168,11 @@ def validate_d07_original_payload_v1(kind, raw):
         request = _request_from_wire(canonical_serialize(raw))
         from ..model_broker.general_growth_cognition_v1 import (TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST,
             general_growth_cognition_messages_v1)
-        messages=(general_growth_cognition_messages_v1(request)if request.prompt_template_digest==GENERAL_TEMPLATE_DIGEST
+        from ..model_broker.ordinary_continuity_cognition_v1 import (
+            ordinary_continuity_template_digest_v1,ordinary_continuity_cognition_messages_v1)
+        ordinary_digests={ordinary_continuity_template_digest_v1(p)for p in("ordinary_screen","deep_review")}
+        messages=(ordinary_continuity_cognition_messages_v1(request)if request.prompt_template_digest in ordinary_digests else
+            general_growth_cognition_messages_v1(request)if request.prompt_template_digest==GENERAL_TEMPLATE_DIGEST
             else d07_cognition_messages_v1(request))
         if request.identity.phase != "d07.cognition" or messages is None:
             raise ValueError("D07 body request is not the installed exact provider wire")
@@ -223,6 +240,26 @@ def validate_d07_original_payload_v1(kind, raw):
     elif kind == "reflection_continuation":
         from .d07_reflection_execution_v1 import D07ReflectionContinuationOriginalV3
         decode_typed_production_value_v1(raw,D07ReflectionContinuationOriginalV3)
+    elif kind=="ordinary_continuity_adoption_v1":
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityAdoptionOriginalV1
+        _fields(raw,(f.name for f in fields(D07OrdinaryContinuityAdoptionOriginalV1)),"d07.ordinary-continuity-adoption.v1")
+        decode_typed_production_value_v1(raw,D07OrdinaryContinuityAdoptionOriginalV1)
+    elif kind=="single_event_review_cardinality_rejected_v1":
+        from .d07_single_event_review_v1 import D07SingleEventReviewCardinalityRejectionOriginalV1
+        _fields(raw,(f.name for f in fields(D07SingleEventReviewCardinalityRejectionOriginalV1)),"d07.single-event-review-cardinality-rejected.v1")
+        decode_typed_production_value_v1(raw,D07SingleEventReviewCardinalityRejectionOriginalV1)
+    elif kind=="single_event_review_adoption_v1":
+        from .d07_single_event_review_v1 import D07SingleEventReviewAdoptionOriginalV1
+        _fields(raw,(f.name for f in fields(D07SingleEventReviewAdoptionOriginalV1)),"d07.single-event-review-adoption.v1")
+        decode_typed_production_value_v1(raw,D07SingleEventReviewAdoptionOriginalV1)
+    elif kind=="single_event_review_attention_v1":
+        from .d07_single_event_review_v1 import SingleEventReviewAttentionOriginalV1
+        _fields(raw,(f.name for f in fields(SingleEventReviewAttentionOriginalV1)),"d07.single-event-review-attention.v1")
+        decode_typed_production_value_v1(raw,SingleEventReviewAttentionOriginalV1)
+    elif kind=="ordinary_continuity_attention_v1":
+        from .d07_ordinary_continuity_attention_v1 import D07OrdinaryContinuityAttentionOriginalV1
+        _fields(raw,(f.name for f in fields(D07OrdinaryContinuityAttentionOriginalV1)),"d07.ordinary-continuity-attention.v1")
+        decode_typed_production_value_v1(raw,D07OrdinaryContinuityAttentionOriginalV1)
     elif kind=="general_growth_attention_v1":
         from .d07_general_growth_attention_v1 import D07GeneralGrowthAttentionOriginalV1
         _fields(raw,(f.name for f in fields(D07GeneralGrowthAttentionOriginalV1)),"d07.general-growth-attention.v1")
@@ -232,11 +269,13 @@ def validate_d07_original_payload_v1(kind, raw):
         from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2
         from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
         from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
-        question_type = (ArtifactPhaseObservationQuestionV1 if raw.get("schema")=="d07.artifact-phase-observation-question.v1" else
+        from .d07_ordinary_continuity_attention_v1 import D07OrdinaryContinuityQuestionV1
+        question_type = (D07OrdinaryContinuityQuestionV1 if raw.get("schema")=="d07.ordinary-continuity-question.v1" else
+            ArtifactPhaseObservationQuestionV1 if raw.get("schema")=="d07.artifact-phase-observation-question.v1" else
             D07GeneralGrowthQuestionV1 if raw.get("schema")=="d07.general-growth-semantic-question.v1" else
             D07MethodGrowthSemanticQuestionV2 if raw.get("schema") == "d07.method-growth-semantic-question.v2" else
             D07RelationshipSemanticQuestionV2 if raw.get("schema") == "d07.relationship-semantic-question.v2" else D07SemanticQuestionV1)
-        if question_type in (D07SemanticQuestionV1,D07GeneralGrowthQuestionV1,ArtifactPhaseObservationQuestionV1):
+        if question_type in (D07SemanticQuestionV1,D07GeneralGrowthQuestionV1,ArtifactPhaseObservationQuestionV1,D07OrdinaryContinuityQuestionV1):
             decode_typed_production_value_v1(raw, question_type)
         else:
             from .d07_execution_v1 import decode_native_named_d07_value_v2

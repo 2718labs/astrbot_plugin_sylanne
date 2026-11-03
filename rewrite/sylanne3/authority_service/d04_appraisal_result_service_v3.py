@@ -1,11 +1,9 @@
 """Current D04 content delivery from the original independent model journal."""
 from __future__ import annotations
 
-from contextlib import closing
 from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
-import sqlite3
 import threading
 
 from .contract import AuthorityUnavailable
@@ -40,6 +38,8 @@ class AuthorityD04AppraisalResultServiceV3(AuthorityV2NaturalGenerationOutputSer
         self._installation_id, self._read_subject, self._holder = installation_id, read_subject, holder
         self._clock = trusted_now_utc
         self._delivery_lock, self._inflight_deliveries = threading.RLock(), {}
+        self._d04_source_reader_v3 = None
+        self._artifact_draft_bundle = None
 
     def _scope(self, request):
         if (type(request) is not D04AppraisalResultReadRequestV3
@@ -47,23 +47,24 @@ class AuthorityD04AppraisalResultServiceV3(AuthorityV2NaturalGenerationOutputSer
                 or request.authority_namespace != self._fences.namespace):
             raise AuthorityUnavailable("D04 installed result request differs")
 
-    def _graph_read(self, request, intent):
-        now = self._clock()
-        if type(now) not in (int, float) or not math.isfinite(now):
-            raise AuthorityUnavailable("D04 trusted read time unavailable")
-        with closing(sqlite3.connect(self._path.as_uri() + "?mode=ro", uri=True)) as db:
-            db.execute("PRAGMA query_only=ON")
-            db.execute("BEGIN")
-            try:
-                original, job, frozen = read_current_d04_appraisal_graph_v3(db, intent, self._issuer, now, allow_accounted_result=True)
-                if ((request.namespace, request.job_id, request.original_operation_id, request.call_id,
-                     request.binding_digest, request.model_request_digest, request.acquire_operation_id) !=
-                    (original.namespace, original.job_id, original.operation_id, original.call_id,
-                     original.digest, intent.request_digest, intent.acquire_operation_id)):
-                    raise AuthorityUnavailable("D04 selector differs from actual original")
-                return original, job, frozen
-            finally:
-                db.rollback()
+    def _graph_read(self,request,intent,*,credential,permit):
+        from .current_authority_graph_read_v3 import (begin_authority_d04_result_graph_read_work_v3,
+            read_authority_graph_current_v3,finish_authority_graph_read_work_v3)
+        now=self._clock()
+        if type(now)not in(int,float)or not math.isfinite(now):
+            raise AuthorityUnavailable('D04 trusted read time unavailable')
+        work=begin_authority_d04_result_graph_read_work_v3(self,credential=credential,
+            subject=self._read_subject,permit=permit,intent=intent,now_utc=now)
+        def read(db):
+            original,job,frozen=read_current_d04_appraisal_graph_v3(db,intent,self._issuer,now,allow_accounted_result=True)
+            if ((request.namespace,request.job_id,request.original_operation_id,request.call_id,
+                    request.binding_digest,request.model_request_digest,request.acquire_operation_id)!=
+                    (original.namespace,original.job_id,original.operation_id,original.call_id,
+                     original.digest,intent.request_digest,intent.acquire_operation_id)):
+                raise AuthorityUnavailable('D04 result selector differs from actual current original')
+            return original,job,frozen
+        try:return read_authority_graph_current_v3(work,read)
+        finally:finish_authority_graph_read_work_v3(work)
 
     def prepare(self, *, credential, request, now_utc=None):
         self._scope(request)
@@ -84,8 +85,9 @@ class AuthorityD04AppraisalResultServiceV3(AuthorityV2NaturalGenerationOutputSer
             with self._delivery_lock:
                 self._inflight_deliveries[request.read_attempt_id] = permit
             fences.validate_fence(credential=credential, subject=self._read_subject, permit=permit)
+            before = self._graph_read(request,intent,credential=credential,permit=permit)
             current_intent, current_terminal, observation = self._read_original(request, anchor, content=True)
-            if current_intent != intent or current_terminal != terminal or self._graph_read(request, intent) != before:
+            if current_intent != intent or current_terminal != terminal or self._graph_read(request,intent,credential=credential,permit=permit) != before:
                 raise AuthorityUnavailable("D04 current source or original changed during copy")
             result = D04AppraisalResultReadV3(request, observation, terminal)
             result.require_original(intent, before[0])

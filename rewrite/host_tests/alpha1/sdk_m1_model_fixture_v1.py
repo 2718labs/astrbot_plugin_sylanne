@@ -37,13 +37,14 @@ class FiniteSdkM1ModelFixtureV1:
             "max_auxiliary_calls", "max_total_calls", "episodes"}
         crossday=config.get("schema")=="sylanne.sdk-real-elapsed-model-fixture.v1"
         if crossday:fields|={"ledger_path","phase_index"}
-        d13_v7 = config.get("schema") == "sylanne.sdk-d13-v7-256-model-fixture.v1"
+        self._v10 = config.get("schema") == "sylanne.sdk-v10-d13-v7-256-model-fixture.v1"
+        d13_v7 = self._v10 or config.get("schema") == "sylanne.sdk-d13-v7-256-model-fixture.v1"
         d13_256 = d13_v7 or config.get("schema") == "sylanne.sdk-d13-v6-256-model-fixture.v1"
         ordinary = crossday or d13_256 or config.get("schema") == "sylanne.sdk-ordinary-recall-model-fixture.v1"
         episode_count=3 if crossday else 256 if d13_256 else 2
         total_bound=18 if crossday else 1536 if d13_256 else 12
         if (type(config) is not dict or set(config) != fields
-                or config["schema"] not in {"sylanne.sdk-m1-model-fixture.v1", "sylanne.sdk-ordinary-recall-model-fixture.v1", "sylanne.sdk-d13-v6-256-model-fixture.v1","sylanne.sdk-d13-v7-256-model-fixture.v1","sylanne.sdk-real-elapsed-model-fixture.v1"}
+                or config["schema"] not in {"sylanne.sdk-m1-model-fixture.v1", "sylanne.sdk-ordinary-recall-model-fixture.v1", "sylanne.sdk-d13-v6-256-model-fixture.v1","sylanne.sdk-d13-v7-256-model-fixture.v1","sylanne.sdk-v10-d13-v7-256-model-fixture.v1","sylanne.sdk-real-elapsed-model-fixture.v1"}
                 or config["filename"] != "m1-draft.txt"
                 or (config["max_episode_calls"], config["max_auxiliary_calls"],
                     config["max_total_calls"]) != (6, 2, total_bound)
@@ -453,11 +454,13 @@ class ArtifactV3MockModelFixtureV1(FiniteSdkM1ModelFixtureV1):
         else:
             from artifact_phase_counter_fixture_v1 import mock_v3_input_tokens
         from sylanne3.host.model_workflows_v9 import AdminModelWorkflowsV9
+        from sylanne3.host.model_workflows_v10 import AdminModelWorkflowsV10
         if self.first_failure is not None:
             raise RuntimeError("first Mock failure retained; automatic replay prohibited")
         try:
-            if type(installed_bundle) is not AdminInstallationBundle or type(installed_bundle.model_workflows) is not AdminModelWorkflowsV9:
-                raise ValueError("Mock provider requires the real installed V9 bundle")
+            expected=AdminModelWorkflowsV10 if self._v10 else AdminModelWorkflowsV9
+            if type(installed_bundle) is not AdminInstallationBundle or type(installed_bundle.model_workflows) is not expected:
+                raise ValueError("Mock provider requires its exact actual installed workflow version")
             policy = installed_bundle.provider_billing_policy_v1
             public = self._key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex()
             if (policy is None or policy.evidence_kind != "fixture_simulated_charge"

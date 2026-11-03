@@ -13,6 +13,9 @@ from ..authority_service.v2_contract import (
     ExecutionBindingV2, FencePermitV2, MutationReceiptV2,
     PlatformObservationV2, canonical_digest as authority_digest,
 )
+from ..authority_service.observation_refinement_contract_v3 import (
+    PlatformObservationRefinementReceiptV3,
+)
 from ..authority_service.v2_execution_bridge import (
     CurrentEffectReadV2, HandoffStartV2, handoff_start_digest_v2,
 )
@@ -105,8 +108,8 @@ class InstalledCurrentDispatchHandoffPort:
 
     async def record_observation(
         self, start: HandoffStartV2, observation: PlatformObservationV2,
-    ) -> tuple[MutationReceiptV2, FencePermitV2]:
-        """Persist a report; an accepted ACK still does not prove delivery."""
+    ) -> tuple[MutationReceiptV2, FencePermitV2] | PlatformObservationRefinementReceiptV3:
+        """Persist an actual report; this adapter does not invent delivery evidence."""
         if (type(start) is not HandoffStartV2
                 or type(observation) is not PlatformObservationV2
                 or start.replay or observation.binding != self._claimed.pending.binding
@@ -117,6 +120,25 @@ class InstalledCurrentDispatchHandoffPort:
                 or observation.handoff_id != start.handoff_id
                 or observation.start_digest != handoff_start_digest_v2(start)):
             raise RuntimeError("V2 observation differs from the fresh handoff")
+        current=await asyncio.to_thread(self._port.read_current_effect,
+            namespace=self._policy.namespace,authority_namespace=start.namespace,effect_id=start.effect_id)
+        if (type(current) is not CurrentEffectReadV2
+                or (current.authority_id,current.namespace,current.effect_id,current.activation_generation)
+                   !=(start.permit.authority_id,start.namespace,start.effect_id,start.permit.generation)
+                or current.state not in ('unresolved','observed')):
+            raise RuntimeError('platform report lacks its actual current Authority effect')
+        if current.state=='observed' and observation.outcome=='delivered':
+            # Only Core's separately installed verifier can qualify this report.
+            # The current OneBot call_action installation reports accepted/unknown.
+            refined=await asyncio.to_thread(self._port.execution_refine_observation_v3,
+                namespace=self._policy.namespace,authority_namespace=start.namespace,
+                claimed_receipt=self._claimed,observation=observation)
+            if (type(refined) is not PlatformObservationRefinementReceiptV3
+                    or refined.durable_state!='committed'
+                    or refined.pending.original_claimed_receipt!=self._claimed
+                    or refined.pending.platform_observation!=observation):
+                raise RuntimeError('observation refinement Authority receipt differs')
+            return refined
         result = await asyncio.to_thread(
             self._port.execution_observe_v2,
             namespace=self._policy.namespace,

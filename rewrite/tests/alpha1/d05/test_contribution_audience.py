@@ -1,6 +1,7 @@
 from dataclasses import asdict
 
 from sylanne3.domains.d05 import RelationshipContribution
+from sylanne3.domains.d05.relationship import CONTRIBUTION_KINDS_V2
 from sylanne3.domains.d05.audience import qualify_contribution_for_audience
 from sylanne3.graph_types import AtomKey, GraphAtom, GraphSnapshot, NamespaceEpoch, Owner
 from sylanne3.memory_types import SourceRecord, access_key, source_key
@@ -26,14 +27,18 @@ def _source(source_id, audiences):
 
 
 def _contribution(sources):
+    # Stored contributions use the registered v2 wire; the v1 dataclass default
+    # is transient key-derivation material, not a serialized contribution.
     item = RelationshipContribution(
         "persona:persona", "event:one", "entity:friend", "closeness",
         "external_observation", 1, tuple(
             source_key(*NS.as_tuple, source_id).token for source_id in sources
-        ),
+        ), schema_version=2, kind=CONTRIBUTION_KINDS_V2["external_observation"],
+        identity_status="resolved",
     )
     atom = GraphAtom(AtomKey(RELATION, "d05.contribution", item.key), 1,
-                     asdict(item) | {"source_refs": list(item.source_refs)})
+                     asdict(item) | {"source_refs": list(item.source_refs),
+                                     "legacy_alias_keys": list(item.legacy_alias_keys)})
     return item, atom
 
 
@@ -102,3 +107,4 @@ def test_graph_revision_and_semantic_contribution_revision_are_separate():
     )
     assert result.status == "eligible"
     assert result.read_versions[0].revision == 3
+

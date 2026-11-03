@@ -65,15 +65,6 @@ class EncodingCallBinding:
         return json.loads(self.request_json)
 
 
-@dataclass(frozen=True)
-class EncodingRequestIssueV1:
-    """Legacy fixture output. It is never a production egress authorization."""
-
-    request: ModelCallRequest
-    provider_config_ref: str
-    provider_config_digest: str
-
-
 @dataclass(frozen=True, slots=True)
 class EncodingRequestIssueV2:
     """Pure request construction; graph, budget and egress admission stay external."""

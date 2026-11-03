@@ -91,11 +91,11 @@ def rpc(tmp_path):
 
 
 def paired(server, peer, channel):
-    handshake = server._dispatch_for_test("handshake", _REQUEST, peer, channel)
+    handshake = server.dispatch("handshake", _REQUEST, peer, channel)
     binding = handshake["channel_binding_sha256"]
 
     def call(method, command):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, _REQUEST, peer, channel,
             handshake_binding=binding, command=command,
         )

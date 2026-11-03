@@ -49,6 +49,14 @@ class D04GraphReadV3:
 
 
 @dataclass(frozen=True, slots=True)
+class D04SettledAppraisalLocatorV3:
+    """An already-settled job locator; current adoption still needs its own gate."""
+    job_id: str
+    original_digest: str
+    result_ref: str
+
+
+@dataclass(frozen=True, slots=True)
 class D04AppraisalOriginalV3:
     namespace: NamespaceId
     operation_id: str
@@ -67,11 +75,15 @@ class D04AppraisalOriginalV3:
     graph_epoch: int
     access_epoch: int
     delete_epoch: int
+    role_support_manifest: dict | None = None
     schema: str = "d04.paid_appraisal_original.v3"
 
     @property
     def digest(self):
-        return canonical_digest(asdict(self))
+        raw = asdict(self)
+        if self.role_support_manifest is None:
+            raw.pop("role_support_manifest")
+        return canonical_digest(raw)
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,11 +107,42 @@ class D04AppraisalAcceptanceV3:
     cost_original_digest: str
     suggestion_json: str
     read_rows: tuple[D04GraphReadV3, ...]
+    role_support_manifest: dict | None = None
     schema: str = "d04.appraisal_acceptance_original.v3"
 
     @property
     def digest(self):
-        return canonical_digest(asdict(self))
+        raw=asdict(self)
+        if self.role_support_manifest is None:raw.pop("role_support_manifest")
+        return canonical_digest(raw)
+
+
+@dataclass(frozen=True,slots=True)
+class D04AppraisalAccountingLocatorV3:
+    namespace: NamespaceId
+    operation_id: str
+    job_id: str
+    call_id: str
+    quote_id: str
+    quote_version: int
+    quote_digest: str
+    reservation_digest: str
+    digest: str
+
+
+def read_d04_appraisal_accounting_locator_v3(db,namespace,job_id):
+    """Read only scalar accounting metadata; never decode the frozen persona."""
+    names=('operation_id','job_id','call_id','quote_id','quote_version','quote_digest','reservation_digest')
+    expressions=','.join("json_extract(payload_json,'$."+name+"')"for name in names)
+    row=db.execute("SELECT json_extract(payload_json,'$.namespace.bot_id'),"
+        "json_extract(payload_json,'$.namespace.persona_id'),"+expressions+",payload_digest "
+        "FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND kind='appraisal' AND original_ref=?",
+        (*namespace.as_tuple,job_id)).fetchone()
+    if row is None:return None
+    if (row[:2]!=namespace.as_tuple or row[3]!=job_id or type(row[6])is not int or row[6]<1
+            or any(type(row[index])is not str or not row[index] for index in (2,3,4,5,7,8,9))):
+        raise ValueError('D04 accounting locator differs from its actual immutable original')
+    return D04AppraisalAccountingLocatorV3(namespace,*row[2:])
 
 
 def install_d04_appraisal_schema_v3(db: sqlite3.Connection) -> None:
@@ -223,7 +266,7 @@ def stage_current_d04_appraisal_in_transaction_v3(
     snapshot: GraphSnapshot, read_versions: tuple[GraphVersion, ...],
     job: PersistentJob, call_id: str, quote, resource_issuer,
     model_request_digest: str, audience: tuple[str, ...], purpose: str,
-    activation_generation: int, access_epoch: int, delete_epoch: int,
+    activation_generation: int, access_epoch: int, delete_epoch: int, ordinary_readout,
 ) -> D04AppraisalStageV3:
     """W01 passes its installed current issuer's rederived request, never wire from UI."""
     if (not db.in_transaction or type(frozen) is not FrozenAppraisalRequestV1
@@ -240,16 +283,25 @@ def stage_current_d04_appraisal_in_transaction_v3(
             or (quote.bot_id, quote.persona_id) != namespace.as_tuple
             or call_id == job.operation_id):
         raise ValueError("D04 quote/job/original identity differs")
+    from .d04_ordinary_readout_v3 import (require_bound_d04_role_readout_v3,d04_role_manifest_wire_v3,
+        d04_role_manifest_versions_v3,require_current_d04_role_manifest_heads_v3)
+    prepared_role = require_bound_d04_role_readout_v3(db,namespace,frozen=frozen)
+    if prepared_role is not ordinary_readout:
+        raise ValueError('D04 stage changed its actual current private ordinary readout')
+    role_manifest = d04_role_manifest_wire_v3(prepared_role.manifest)
+    role_versions = d04_role_manifest_versions_v3(role_manifest,namespace)
     source_versions, _families = qualify_appraisal_sources_v3(snapshot, frozen, audience=audience, purpose=purpose)
     mandatory = {AtomKey.from_token(ref.ref): ref.version for ref in (
         frozen.input.event_ref, frozen.input.role_ref,
         *(item.ref for item in frozen.input.interpretations))}
-    versions = {v.key: v for v in (*read_versions, *source_versions)}
+    versions = {v.key: v for v in (*read_versions, *source_versions, *role_versions)}
     for key, revision in mandatory.items():
         if key not in versions or versions[key].revision != revision:
             raise ValueError("D04 D01/D03/D07 current qualification absent")
-    rows = graph_read_rows_v3(snapshot, tuple(versions.values()))
+    role_keys = {v.key for v in role_versions}-{v.key for v in source_versions}
+    rows = graph_read_rows_v3(snapshot, tuple(v for v in versions.values() if v.key not in role_keys))
     require_current_read_rows_v3(db, rows, namespace)
+    require_current_d04_role_manifest_heads_v3(db,namespace,role_manifest)
     resource_issuer.issue_quote(db, quote)
     if resource_issuer.original_signed_quote(db, quote.quote_id, quote.version) != quote:
         raise ValueError("D04 signed appraisal quote differs")
@@ -261,7 +313,7 @@ def stage_current_d04_appraisal_in_transaction_v3(
     original = D04AppraisalOriginalV3(namespace, job.operation_id, job.job_id, call_id,
         canonical_serialize(asdict(frozen)), rows, audience, purpose, quote.quote_id,
         quote.version, canonical_digest(quote), reservation_digest, model_request_digest,
-        activation_generation, snapshot.epochs[0].revision, access_epoch, delete_epoch)
+        activation_generation, snapshot.epochs[0].revision, access_epoch, delete_epoch,role_manifest)
     record_d04_original_in_transaction_v3(db, namespace, "appraisal", job.job_id, asdict(original))
     return D04AppraisalStageV3(original, (job_graph_write(persisted),),
                                tuple(versions.values()))
@@ -277,6 +329,9 @@ def read_current_d04_appraisal_original_v3(db, namespace, job_id):
         "read_rows": tuple(D04GraphReadV3(**r) for r in raw["read_rows"])})
     if result.namespace != namespace or result.job_id != job_id or result.digest != row[1]:
         raise ValueError("D04 appraisal original identity differs")
+    if result.role_support_manifest is not None:
+        from .d04_ordinary_readout_v3 import validate_d04_role_manifest_wire_v3
+        validate_d04_role_manifest_wire_v3(result.role_support_manifest,namespace)
     return result
 
 
@@ -287,6 +342,8 @@ def seal_d04_appraisal_request_in_transaction_v3(db, original, request):
     if not db.in_transaction or type(request) is not ModelCallRequest:
         raise ValueError("actual acquired appraisal request required")
     frozen = thaw_appraisal_request_v1(json.loads(original.frozen_json))
+    from .d04_ordinary_readout_v3 import require_bound_d04_role_readout_v3
+    require_bound_d04_role_readout_v3(db,original.namespace,frozen=frozen,manifest=original.role_support_manifest)
     job = get_job(db, original.job_id)
     if (frozen.model_request_digest != original.model_request_digest
             or request.call_id != original.call_id or request.prompt_template_digest != TEMPLATE_DIGEST
@@ -422,7 +479,13 @@ def stage_current_d04_appraisal_adoption_in_transaction_v3(
     if (not db.in_transaction or frozen != current_frozen
             or canonical_serialize(asdict(frozen)) != original.frozen_json):
         raise ValueError("D04 adoption current installed input changed")
-    qualify_appraisal_sources_v3(snapshot, frozen, audience=original.audience, purpose=original.purpose)
+    from .d04_ordinary_readout_v3 import (require_bound_d04_role_readout_v3,d04_role_manifest_versions_v3,
+        require_current_d04_role_manifest_heads_v3)
+    require_bound_d04_role_readout_v3(db,original.namespace,frozen=frozen,manifest=original.role_support_manifest)
+    role_versions = d04_role_manifest_versions_v3(original.role_support_manifest,original.namespace)
+    role_keys = {v.key for v in role_versions}
+    event_versions,_ = qualify_appraisal_sources_v3(snapshot, frozen, audience=original.audience, purpose=original.purpose)
+    role_keys -= {v.key for v in event_versions}
     require_current_read_rows_v3(db, original.read_rows, original.namespace)
     cost = read_d04_original_v3(db, original.namespace, "appraisal_cost", original.job_id)
     if cost is None or cost[0]["paid"] is not True:
@@ -443,15 +506,17 @@ def stage_current_d04_appraisal_adoption_in_transaction_v3(
     if existing is None or existing.revision != 0 or existing.valid:
         raise ValueError("D04 appraisal CAS must include true absence")
     original_versions = tuple(GraphVersion(AtomKey.from_token(row.ref), row.revision) for row in original.read_rows)
-    versions = {v.key: v for v in (*current_read_versions, *original_versions, GraphVersion(key, 0))}
-    rows = graph_read_rows_v3(snapshot, tuple(versions.values()))
+    versions = {v.key: v for v in (*current_read_versions, *original_versions, *role_versions, GraphVersion(key, 0))}
+    rows = graph_read_rows_v3(snapshot, tuple(v for v in versions.values() if v.key not in role_keys))
+    require_current_d04_role_manifest_heads_v3(db,original.namespace,original.role_support_manifest)
     require_current_read_rows_v3(db, rows, original.namespace)
     write = GraphWrite(key, json.loads(canonical_serialize(asdict(appraisal))),
-        tuple(AtomKey.from_token(r.ref) for r in original.read_rows if r.revision > 0))
+        tuple(dict.fromkeys((*(AtomKey.from_token(r.ref) for r in original.read_rows if r.revision > 0),
+              *(v.key for v in role_versions if v.revision > 0)))))
     acceptance = D04AppraisalAcceptanceV3(original.namespace, original.operation_id,
         key.token, 1, canonical_serialize(asdict(appraisal)), original.digest,
         cost[0]["result_original_ref"], result[1], original.job_id, cost[1],
-        canonical_serialize(asdict(suggestion)), rows)
+        canonical_serialize(asdict(suggestion)), rows,original.role_support_manifest)
     return acceptance, (write,), tuple(versions.values())
 
 

@@ -14,6 +14,16 @@ from sylanne3.domains.d04 import AffectAxis, AffectScheme
 from sylanne3.host.affect_scheme_asset import load_verified_affect_scheme
 
 
+@pytest.fixture(autouse=True)
+def _verified_synthetic_package(monkeypatch):
+    """Package qualification is covered by its own tests; these cases exercise
+    the byte/JSON admission after verification, so pin the verified seam."""
+    from types import SimpleNamespace
+    monkeypatch.setattr(
+        "sylanne3.host.affect_scheme_asset.verify_installed_backend_runtime_v1",
+        lambda *args, **kwargs: SimpleNamespace(verified=True, build_mode="formal-alpha1"))
+
+
 def _encoded(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 

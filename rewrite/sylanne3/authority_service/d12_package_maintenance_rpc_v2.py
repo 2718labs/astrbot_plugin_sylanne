@@ -1,6 +1,5 @@
 """Fixed paired C11 acceptance/status routes; no OS mutation RPC exists here."""
 from .contract import AuthorityUnavailable,identifier
-from .d12_package_maintenance_authority_v2 import InstalledD12PackageMaintenanceAuthorityV2
 from .d12_package_maintenance_contract_v2 import package_intent_to_wire_v2
 from .v2_owner_session import OwnerSessionLoginRequestV1,from_wire as session_from_wire
 
@@ -8,6 +7,7 @@ METHOD='d12_package_maintenance_v2'
 
 
 def install_d12_package_maintenance_authority_v2(server,service):
+    from .d12_package_maintenance_authority_v2 import InstalledD12PackageMaintenanceAuthorityV2
     if type(service) is not InstalledD12PackageMaintenanceAuthorityV2 or service.core is not server._core:raise TypeError('actual package Authority service required')
     if not hasattr(server,'_d12_package_services_v2'):server._d12_package_services_v2={}
     if service.namespace in server._d12_package_services_v2:raise AuthorityUnavailable('package Authority already installed')
@@ -16,6 +16,7 @@ def install_d12_package_maintenance_authority_v2(server,service):
 
 def dispatch_d12_package_maintenance_v2(server,method,credential,profile_id,manifest_digest,command):
     if method!=METHOD:return None
+    from .d12_package_maintenance_authority_v2 import InstalledD12PackageMaintenanceAuthorityV2
     if type(command) is not dict:raise AuthorityUnavailable('package maintenance command differs')
     action=command.get('action');expected={'namespace','action'} if action=='profile' else {'namespace','action','operation_id'}
     if action in {'accept','status','profile'}:expected.update({'owner_actor_id','owner_session_token','owner_session_request'})

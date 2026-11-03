@@ -805,6 +805,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+    from ..host.model_workflows_v10 import AdminModelWorkflowsV10
     from ..domains.d03.self_perspective import self_mapping_key
     from ..graph_types import owner_grant_key
     from .budget import get_budget_lease, require_budget_family_admissible
@@ -815,7 +816,7 @@ def derive_current_foreground_responsibility_v1(db, *, namespace, request, insta
     from ..authority_service.current_foreground_activity_v1 import _source_family_current_sql_v1
     if (not db.in_transaction or type(request) is not CreateForegroundCycleRequestV2
             or type(installed_bundle) is not AdminInstallationBundle
-            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+            or type(installed_bundle.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10}
             or type(installed_bundle.foreground) is not AdminForegroundPolicyV1
             or installed_bundle.installation_policy.namespace != namespace or type(issuer) is not D11BudgetJobIssuer
             or type(owner_guard) is not ProductionOwnerGuardV1):
@@ -1572,7 +1573,7 @@ def read_original_reply_child_jobs_v1(db, *, namespace: NamespaceId, cycle: Pers
 
 def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
         reservation_digest, terminal_digest=None):
-    """Read the existing seven-field cost receipt and its financial CAS members."""
+    """Read the closed original cost receipt and its financial CAS members."""
     from .artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .model_cost_settlement import OriginalModelCostCommitV1, original_model_cost_operation_id_v1
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
@@ -1587,8 +1588,11 @@ def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
             raise MissingProductionOriginalV1("actual_reply_model_terminal_cost_commit")
         return False
     raw = background_json_loads_v3(row[2])
-    if (set(raw) != {"original_model_cost", "original_intent_digest", "terminal_receipt_digest",
-            "quote_id", "quote_version", "work_kind", "accounting_attempt_id"}
+    cost_fields = {"original_model_cost", "original_intent_digest", "terminal_receipt_digest",
+        "quote_id", "quote_version", "work_kind", "accounting_attempt_id"}
+    if job.work_kind == "natural_generation" and "model_reported_usage_v1" in raw:
+        cost_fields.add("model_reported_usage_v1")
+    if (set(raw) != cost_fields
             or raw["work_kind"] != job.work_kind or raw["quote_id"] != quote_id):
         raise ValueError("reply model terminal lost its exact existing financial receipt ABI")
     paid = decode_typed_production_value_v1(raw["original_model_cost"], OriginalModelCostCommitV1)
@@ -1616,6 +1620,26 @@ def _read_reply_model_cost_closed_v1(db, *, namespace, job, call_id, quote_id,
             or receipt.operation_id != cost.cost_operation_id or receipt.lease_id != job.budget_ref
             or receipt.status != cost.status):
         raise ValueError("reply model terminal lost its actual spent/unconfirmed accounting join")
+    if "model_reported_usage_v1" in raw:
+        from .model_cost_settlement import _REPORTED_USAGE_FIELDS_V1
+        usage = raw["model_reported_usage_v1"]
+        expected = {"schema": "sylanne.d11.reported-model-usage-original.v1",
+            "original_intent_digest": raw["original_intent_digest"], "call_id": call_id,
+            "terminal_receipt_digest": paid.terminal_receipt_digest,
+            "budget_receipt_digest": paid.budget_receipt_digest,
+            "budget_lease_id": job.budget_ref, "reservation_operation_id": cost.cost_operation_id,
+            "reservation_digest": reservation_digest, "token_semantics": "provider_reported_not_exact",
+            "cache_write_tokens": None, "total_billed_microusd": None, "cache_storage_microusd": None}
+        if (type(usage) is not dict or set(usage) != _REPORTED_USAGE_FIELDS_V1
+                or any(usage[name] != value for name, value in expected.items())):
+            raise ValueError("reply reported usage lost its exact original financial identity")
+        for dimension in ("input_tokens", "output_tokens"):
+            if cost.actual is not None and dimension in cost.actual and usage[dimension] != cost.actual[dimension]:
+                raise ValueError("reply reported token usage differs from the actual settled dimension")
+        if (cost.actual is not None and "model_tokens" in cost.actual
+                and (usage["input_tokens"] is None or usage["output_tokens"] is None
+                     or usage["input_tokens"] + usage["output_tokens"] != cost.actual["model_tokens"])):
+            raise ValueError("reply reported token usage differs from the settled token total")
     return True
 
 

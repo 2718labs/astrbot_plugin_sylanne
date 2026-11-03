@@ -14,7 +14,7 @@ from ..domains.d08.execution import (
 from ..domains.d08.production_operations_v1 import (
     AcknowledgeCurrentBilateralRequestV1, AdoptCurrentJointPlanRequestV1, CurrentBilateralInputsV1,
     CurrentJointPlanInputsV1, compile_acknowledge_current_bilateral_v1, compile_adopt_current_joint_plan_v1,
-    RecheckCurrentActionRequestV1, CurrentActionRecheckInputsV1, compile_recheck_current_action_v1,
+    RecheckCurrentActionRequestV1, CancelCurrentActionRequestV1, CurrentActionRecheckInputsV1, compile_recheck_current_action_v1,
     SettleCurrentObservedActionRequestV1, observed_action_outcome_key_v1,
     compile_settle_current_observed_action_v1,
     verify_d08_production_stage_v1,
@@ -99,10 +99,13 @@ class InstalledD08ProductionReadersV1:
         self.issuer = issuer
 
     def read_bilateral(self, db, frame, request):
-        read = CurrentDomainReadV1(frame)
+        from .current_commitment_lifecycle_source_v3 import commitment_lifecycle_read_v3
+        read = commitment_lifecycle_read_v3(db,frame)
         read.check(db)
         atom = read.head(db, request.commitment_ref, required=True)
         commitment = _decode("d08.commitment.v1", atom.value)
+        from .d08_commitment_fulfillment_v1 import reject_legacy_terms_ack_v1
+        reject_legacy_terms_ack_v1(db,frame=frame,commitment_key=atom.key)
         source = read.head(db, request.inbound_source_ref, required=True)
         read.source_family(db, (request.inbound_source_ref,))
         access = read.head(db, access_key(*frame.envelope.authority.namespace.as_tuple, source.key.owner.subject), required=True)
@@ -115,10 +118,13 @@ class InstalledD08ProductionReadersV1:
         observed, outbound = read.adopted_outbound_observation(db, request.outbound_receipt_ref)
         platform = observed.pending.platform_observation
         origin = getattr(platform.binding, "origin", platform.binding)
-        from .natural_dispatch_current_read_v2 import recover_natural_dispatch_candidate_in_transaction_v2
-        recovered = recover_natural_dispatch_candidate_in_transaction_v2(db, frame.envelope.authority.namespace, origin.operation_id)
+        from .d08_commitment_communication_v1 import recover_observed_commitment_dispatch_v1
+        recovered = recover_observed_commitment_dispatch_v1(db, frame.envelope.authority.namespace, origin.operation_id)
         if recovered is None:
             raise MissingProductionOriginalV1("original_outbound_commitment_communication_action")
+        if (origin.effect_id != recovered.evidence.effect_id
+                or origin.payload_digest.removeprefix("sha256:") != recovered.evidence.payload_digest):
+            raise ValueError("bilateral observation differs from its exact adopted communication segment/effect")
         action_heads = tuple((read.head(db, token, required=True), revision)
             for token, revision in recovered.write_versions
             if AtomKey.from_token(token).type_name == "d08.action_intent.v1")
@@ -295,10 +301,11 @@ def stage_settle_current_observed_action_in_transaction_v1(db, *, frame, request
     """Record the independently observed effect, without claiming a postcondition."""
     from datetime import datetime
     from ..domains.d08.execution import ActionOutcome
-    from .natural_dispatch_current_read_v2 import recover_natural_dispatch_candidate_in_transaction_v2
+    from .d08_commitment_communication_v1 import recover_observed_commitment_dispatch_v1
     if type(installed_readers) is not InstalledD08ProductionReadersV1 or type(request) is not SettleCurrentObservedActionRequestV1:
         raise TypeError("observed outcome needs its installed D08 reader and exact request")
-    read = CurrentDomainReadV1(frame)
+    from .current_commitment_lifecycle_source_v3 import commitment_lifecycle_read_v3
+    read = commitment_lifecycle_read_v3(db,frame)
     try:
         read.check(db)
         action = read.head(db, request.action_intent_ref, required=True)
@@ -307,7 +314,7 @@ def stage_settle_current_observed_action_in_transaction_v1(db, *, frame, request
         observed, original = read.adopted_outbound_observation(db, request.outbound_receipt_ref)
         platform = observed.pending.platform_observation
         origin = getattr(platform.binding, "origin", platform.binding)
-        recovered = recover_natural_dispatch_candidate_in_transaction_v2(db,
+        recovered = recover_observed_commitment_dispatch_v1(db,
             frame.envelope.authority.namespace, origin.operation_id)
         if (recovered is None or (action.key.token, action.revision) not in recovered.write_versions
                 or (origin.activity_id, origin.effect_id, origin.attempt_id, origin.operation_id) !=
@@ -315,6 +322,9 @@ def stage_settle_current_observed_action_in_transaction_v1(db, *, frame, request
                 or frame.envelope.identity.activity_id != intent.identity.activity_id
                 or frame.envelope.identity.effect_id != intent.identity.effect_id):
             raise ValueError("observed terminal does not belong to the exact adopted action attempt")
+        if (origin.effect_id != recovered.evidence.effect_id
+                or origin.payload_digest.removeprefix("sha256:") != recovered.evidence.payload_digest):
+            raise ValueError("observed communication differs from actual adopted segment payload/effect")
         cost = read.head(db, request.cost_settlement_ref, required=True)
         cost_original = read.original(request.cost_settlement_ref)
         if (cost_original.kind != "d11.cost_settlement"
@@ -340,8 +350,30 @@ def stage_settle_current_observed_action_in_transaction_v1(db, *, frame, request
                     or outcome.observed_at < prior.observed_at
                     or level not in progression.get(prior.result_level, set())):
                 raise ValueError("observed action outcome would regress or replace another settlement")
+        commitment_heads = ()
+        if intent.commitment_refs:
+            inventory = read.complete_inventory(db, "d08.commitment.v1")
+            selected = []
+            for ref in intent.commitment_refs:
+                matches = tuple(atom for atom in inventory if atom.valid
+                    and ref in {atom.key.token, atom.value["commitment_id"]})
+                if len(matches) != 1:
+                    raise MissingProductionOriginalV1("exact_current_observed_commitment:" + ref)
+                read.source_family(db, tuple(matches[0].value["source_refs"]))
+                from .d08_commitment_communication_v1 import CommitmentDispatchRecoveryV1
+                if type(recovered) is CommitmentDispatchRecoveryV1:
+                    use = recovered.evidence.promise_use
+                    if (matches[0].key != use.commitment.key
+                            or (request.outbound_receipt_ref not in matches[0].value["communicated_refs"]
+                                and matches[0].revision != use.commitment.revision)):
+                        raise ValueError("observed communication no longer names its exact approved commitment revision")
+                selected.append(matches[0])
+            if len({atom.key for atom in selected}) != len(selected):
+                raise ValueError("observed action repeats the same commitment")
+            commitment_heads = tuple(selected)
         return compile_settle_current_observed_action_v1(frame, request, intent=intent,
-            outcome_key=key, outcome=outcome, observation_original=original, cost_original=cost_original)
+            outcome_key=key, outcome=outcome, observation_original=original,
+            cost_original=cost_original, commitment_heads=commitment_heads)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d08", "settle_observed_action", request, missing)
 
@@ -453,22 +485,11 @@ def read_plan_current_d08_operation_v1(db, *, namespace, activity_id, operation_
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("D08 fixed read planning requires current W01 transaction")
     types = ["d03.entity_anchor", "d03.account_binding", "d05.boundary_rule"]
+    from .current_commitment_input_source_v3 import LIFECYCLE_OPERATIONS,commitment_input_read_plan_v3
+    if operation_kind in LIFECYCLE_OPERATIONS:
+        return commitment_input_read_plan_v3(db,namespace=namespace,activity_id=activity_id,operation_kind=operation_kind,request=request)
     keys, roots, originals = [owner_grant_key(*namespace.as_tuple)], [], []
-    if operation_kind == "settle_observed_action" and type(request) is SettleCurrentObservedActionRequestV1:
-        action_key = AtomKey.from_token(request.action_intent_ref)
-        keys.extend((action_key, AtomKey.from_token(request.cost_settlement_ref)))
-        originals.extend((request.action_intent_ref, request.cost_settlement_ref, request.outbound_receipt_ref))
-        action = raw_head_value_v1(db, namespace, action_key)
-        if action:
-            intent = _decode_intent(action)
-            roots.extend(intent.source_refs)
-            keys.append(observed_action_outcome_key_v1(action_key, intent))
-        types += ["d08.action_intent.v1", "d08.action_outcome.v1", "runtime.cost_settlement"]
-        if table_exists_v1(db, "graph_d13_outbound_observations_v1"):
-            roots.extend(row[0] for row in db.execute("SELECT source_ref FROM graph_d13_outbound_observations_v1 "
-                "WHERE bot=? AND persona=? AND (source_ref=? OR observation_digest=? OR final_operation_id=?) LIMIT 3",
-                (*namespace.as_tuple, request.outbound_receipt_ref, request.outbound_receipt_ref, request.outbound_receipt_ref)))
-    elif operation_kind == "recheck_action" and type(request) is RecheckCurrentActionRequestV1:
+    if operation_kind == "recheck_action" and type(request) is RecheckCurrentActionRequestV1:
         keys.append(AtomKey.from_token(request.action_intent_ref))
         types += ["d08.action_intent.v1", "d08.action_outcome.v1", "d08.action_schema.v1", "d08.action_cancellation.v1",
             "d08.commitment.v1", "d08.goal.v1", "d03.role_binding", "d05.relationship_projection", "runtime.cost_settlement"]
@@ -488,25 +509,6 @@ def read_plan_current_d08_operation_v1(db, *, namespace, activity_id, operation_
                     except (ValueError, TypeError):
                         continue
                     keys.append(key)
-    elif operation_kind == "acknowledge_bilateral" and type(request) is AcknowledgeCurrentBilateralRequestV1:
-        keys.extend(AtomKey.from_token(ref) for ref in (request.commitment_ref, request.inbound_source_ref, request.acceptance_interpretation_ref))
-        roots.append(request.inbound_source_ref)
-        originals.extend((request.acceptance_interpretation_ref, request.outbound_receipt_ref))
-        semantic = raw_head_value_v1(db, namespace, AtomKey.from_token(request.acceptance_interpretation_ref))
-        if semantic:
-            roots.extend(semantic["source_refs"])
-        if table_exists_v1(db, "graph_d13_outbound_observations_v1"):
-            rows = db.execute("SELECT final_operation_id,source_ref FROM graph_d13_outbound_observations_v1 "
-                "WHERE bot=? AND persona=? AND (source_ref=? OR observation_digest=? OR final_operation_id=?) LIMIT 3",
-                (*namespace.as_tuple, request.outbound_receipt_ref, request.outbound_receipt_ref, request.outbound_receipt_ref)).fetchall()
-            for operation, source in rows:
-                roots.append(source)
-                if table_exists_v1(db, "graph_bundle_operations"):
-                    row = db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?",
-                                     (*namespace.as_tuple, operation)).fetchone()
-                    if row:
-                        candidate = json.loads(row[0]).get("natural_dispatch_candidate", {})
-                        keys.extend(AtomKey.from_token(ref) for ref, _ in candidate.get("refs", ()))
     elif operation_kind == "adopt_joint_plan" and type(request) is AdoptCurrentJointPlanRequestV1:
         originals.extend((request.joint_plan_proposal_ref, *request.party_consent_original_refs))
         intent = raw_registered_input_v1(db, "graph_d08_joint_plan_intents_v1", namespace, request.joint_plan_proposal_ref)
@@ -534,3 +536,22 @@ def read_plan_current_d08_operation_v1(db, *, namespace, activity_id, operation_
     else:
         raise ValueError("unregistered exact D08 production request")
     return production_read_plan_v1(types, keys, roots, originals)
+
+
+def stage_cancel_current_action_in_transaction_v1(db, *, frame, request, installed_readers):
+    if type(installed_readers) is not InstalledD08ProductionReadersV1:
+        raise TypeError("action cancellation requires its installed D08 original reader")
+    from .d08_action_cancellation_v1 import stage_cancel_current_action_v1
+    return stage_cancel_current_action_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+
+
+def stage_acknowledge_current_commitment_terms_in_transaction_v1(db,*,frame,request,installed_readers):
+    from .d08_commitment_fulfillment_v1 import stage_acknowledge_current_commitment_terms_v1
+    try:return stage_acknowledge_current_commitment_terms_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+    except MissingProductionOriginalV1 as missing:return waiting_stage_v1(frame,"d08","acknowledge_commitment_terms",request,missing)
+
+
+def stage_settle_current_commitment_fulfillment_in_transaction_v1(db,*,frame,request,installed_readers):
+    from .d08_commitment_fulfillment_v1 import stage_settle_current_commitment_fulfillment_v1
+    try:return stage_settle_current_commitment_fulfillment_v1(db,frame=frame,request=request,installed_readers=installed_readers)
+    except MissingProductionOriginalV1 as missing:return waiting_stage_v1(frame,"d08","settle_current_commitment_fulfillment",request,missing)

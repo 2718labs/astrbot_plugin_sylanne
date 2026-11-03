@@ -295,3 +295,50 @@ class RuntimeContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GraphVersionReceiptIdentityTests(unittest.TestCase):
+    def test_large_exact_version_receipt_does_not_reencode_actual_versions(self):
+        from sylanne3.runtime_contracts import meter_canonical_outputs
+        from sylanne3.runtime.c09_paged_sql_v2 import C09BatchBudgetV2, C09SqlByteMeterV2
+        versions=tuple(GraphVersion(key(name="original:"+str(i).zfill(110)),1) for i in range(1300))
+        meter=C09SqlByteMeterV2(C09BatchBudgetV2(100,262144,25000000,250000000,8388608))
+        with meter_canonical_outputs(meter):
+            receipt=CommitReceipt('committed','operation:one','a'*64,'activity:one',None,1,
+                versions,(),(),(),())
+        self.assertEqual(receipt.read_versions,versions)
+        self.assertEqual(meter.encoded_bytes,0)
+
+    def test_exact_duplicate_version_is_still_rejected(self):
+        version=GraphVersion(key(),1)
+        with self.assertRaisesRegex(ValueError,'read_versions must be unique'):
+            CommitReceipt('committed','operation:one','a'*64,'activity:one',None,1,
+                (version,version),(),(),(),())
+
+    def test_extension_canonical_type_and_fields_remain_distinct(self):
+        @dataclasses.dataclass(frozen=True)
+        class ExtendedVersion(GraphVersion):
+            note: str='extension'
+        plain=GraphVersion(key(),1)
+        extra=ExtendedVersion(key(),1)
+        receipt=CommitReceipt('committed','operation:one','a'*64,'activity:one',None,1,
+            (plain,extra),(),(),(),())
+        self.assertEqual(receipt.read_versions,(plain,extra))
+        with self.assertRaisesRegex(ValueError,'read_versions must be unique'):
+            dataclasses.replace(receipt,read_versions=(extra,extra))
+
+
+class GraphVersionCanonicalAcceptanceTests(unittest.TestCase):
+    def test_public_python_only_strings_and_surrogate_alias_keep_original_canonical_rules(self):
+        class Text(str):
+            pass
+        version=GraphVersion(key(name=Text('original')),1)
+        with self.assertRaises(TypeError):
+            CommitReceipt('committed','operation:one','a'*64,'activity:one',None,1,
+                (version,),(),(),(),())
+        astral=GraphVersion(key(name=chr(0x1F600)),1)
+        surrogate_pair=GraphVersion(key(name=chr(0xD83D)+chr(0xDE00)),1)
+        self.assertEqual(canonical_serialize(astral),canonical_serialize(surrogate_pair))
+        with self.assertRaisesRegex(ValueError,'read_versions must be unique'):
+            CommitReceipt('committed','operation:one','a'*64,'activity:one',None,1,
+                (astral,surrogate_pair),(),(),(),())

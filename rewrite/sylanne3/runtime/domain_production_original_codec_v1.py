@@ -22,6 +22,17 @@ _PAYLOAD_FIELDS = {'schema','request','namespace','identity','authority','parent
     'policy_refs','read_versions','query_coverage','observed_originals','provenance','writes','coverage',
     'missing_inputs','continuation_ref'}
 _EVENTS = {
+ 'ordinary_continuity_basis_available_for_screen':'d01',
+ 'ordinary_continuity_deep_required':'d01',
+ 'ordinary_continuity_assessment_available':'d01',
+ 'ordinary_continuity_attention_available_for_service':'d07',
+ 'ordinary_continuity_cognition_adopted_v1':'d01',
+ 'single_event_growth_review_required_v1':'d01',
+ 'd01.single_event_review_case_registered_v1':'d07',
+ 'single_event_review_attention_available_for_service':'d07',
+ 'single_event_review_cognition_adopted_v1':'d01',
+ 'commitment_terms_accepted_requires_current_performance_qualification':'d08',
+ 'commitment_fulfilled_requires_current_plan_reevaluation':'d08',
  'conditioned_simulation_committed_v1':'d07',
  'conditioned_observed_outcome_committed_v1':'d07',
  'conditioned_calibration_resolution_committed_v1':'d01',
@@ -201,6 +212,12 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
                 or provenance['input_request_digest']!=canonical_digest(value['request'])):
             raise ValueError('domain input producer provenance differs')
         extra=()
+    elif domain == 'd07' and kind=='register_single_event_review_attention_v1':
+        from .d07_single_event_review_v1 import validate_single_event_review_registration_provenance_v1
+        extra=validate_single_event_review_registration_provenance_v1(value['provenance']) if value['coverage']=='complete' else ()
+    elif domain == 'd07' and kind=='register_ordinary_continuity_attention_v1':
+        from .d07_ordinary_continuity_attention_v1 import validate_ordinary_continuity_registration_provenance_v1
+        extra=validate_ordinary_continuity_registration_provenance_v1(value['provenance']) if value['coverage']=='complete' else ()
     elif domain == 'd07' and kind=='register_general_growth_attention_v1':
         from .d07_general_growth_attention_v1 import validate_general_growth_registration_provenance_v1
         extra=validate_general_growth_registration_provenance_v1(value['provenance']) if value['coverage']=='complete' else ()
@@ -224,10 +241,89 @@ def decode_domain_production_original_row_v1(row, namespace, *, registry):
         'operation_id':data['operation_id'],'domain':domain,'operation_kind':kind,'original_digest':data['original_digest']}
 
 
+
+def _ordinary_service_command_receipt_v1(db,namespace,data,value,item):
+    """Join the committed Serve invocation; this does not assert model completion."""
+    from .d07_execution_v1 import d07_execution_ids_v1
+    if(data['event_kind'] not in {'ordinary_continuity_attention_available_for_service','single_event_review_attention_available_for_service'}
+            or data['receiver_domain']!='d07'):
+        return None
+    op=item['operation_id']
+    row=db.execute('SELECT receipt_json FROM graph_owner_domain_attempts_v3 '
+        'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,op)).fetchone()
+    if row is None or row[0]is None:raise ValueError('ordinary service command lacks its actual Owner preparation receipt')
+    result=json.loads(row[0]);job=d07_execution_ids_v1(namespace,op,'concern')['job']
+    if(canonical_serialize(result)!=row[0] or result.get('schema')!='sylanne.domain-production-receipt.v1'
+            or result.get('domain')!='d07'or result.get('operation_kind')!='serve_concern'
+            or result.get('operation_id')!=op or result.get('original_ref')!='d07-prepared:'+op
+            or result.get('coverage')!='deferred' or result.get('continuation_ref')!=job
+            or result.get('missing_inputs')!=['actual_d07_original_execution']
+            or result.get('job_states')!=[[job,'queued']]):
+        raise ValueError('ordinary service handoff changed its exact native prepared/job result')
+    receipt=_receipt(result['receipt'])
+    if(receipt.status!='committed'or receipt.operation_id!=result.get('prepare_operation_id')
+            or receipt.activity_id!=result.get('activity_id') or canonical_digest(receipt)!=item['receipt_digest']
+            or result.get('receipt_digest')!=item['receipt_digest']):
+        raise ValueError('ordinary service handoff is not the actual preparation Graph receipt')
+    native=db.execute('SELECT payload_digest,signature FROM graph_d07_execution_originals_v1 '
+        'WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+        (*namespace.as_tuple,'prepare_commit',job)).fetchone()
+    prepared=db.execute('SELECT payload_digest,signature FROM graph_d07_execution_originals_v1 '
+        'WHERE bot=? AND persona=? AND kind=? AND original_ref=?',
+        (*namespace.as_tuple,'prepared',job)).fetchone()
+    actual=db.execute('SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations '
+        'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,receipt.operation_id)).fetchone()
+    if(native is None or prepared is None or native[0]!=result.get('original_digest')
+           
+            or actual!=(receipt.operation_digest,receipt.activity_id,receipt.effect_id,receipt.commit_seq)):
+        raise ValueError('ordinary service handoff lost its actual signed native originals/preparation bundle')
+    prior=result.get('followup_disposition')
+    if(type(prior)is not dict or prior.get('dedupe_key')!=data['dedupe_key']
+            or prior.get('causal_operation_id')!=data['causal_operation_id']
+            or prior.get('causal_original_digest')!=value['causal_original_digest']
+            or prior.get('trigger_original_digest')!=data['original_digest']
+            or prior.get('state')!='waiting'or prior.get('continuation_ref')!=job
+            or prior.get('completed_commands')!=[item]):
+        raise ValueError('ordinary service handoff lacks the actual atomic waiting disposition')
+    from .d11_types import runtime_job_key
+    job_key=runtime_job_key(*namespace.as_tuple,receipt.activity_id,job)
+    if not any(v.key==job_key and v.revision>0 for v in receipt.write_versions):
+        raise ValueError('ordinary service job is not an actual preparation receipt write')
+    # These are dependency locators. The C09 caller must authenticate the frozen
+    # native rows through the official typed reader and actual issuer.
+    dependencies=(
+        ('graph_d07_execution_originals_v1',(*namespace.as_tuple,'prepared',job),prepared[0]),
+        ('graph_d07_execution_originals_v1',(*namespace.as_tuple,'prepare_commit',job),native[0]))
+    if data['event_kind']=='single_event_review_attention_available_for_service' and data['state']=='completed':
+        from .d07_single_event_review_v1 import (single_event_review_adoption_original_ref_v1,
+            single_event_review_cardinality_rejection_ref_v1)
+        terminals=[]
+        for kind,ref in (('single_event_review_adoption_v1',single_event_review_adoption_original_ref_v1(namespace,job)),
+                ('single_event_review_cardinality_rejected_v1',single_event_review_cardinality_rejection_ref_v1(namespace,job))):
+            header=db.execute('SELECT payload_digest FROM graph_d07_execution_originals_v1 '
+                'WHERE bot=? AND persona=? AND kind=? AND original_ref=?',(*namespace.as_tuple,kind,ref)).fetchone()
+            if header is not None:terminals.append(('graph_d07_execution_originals_v1',(*namespace.as_tuple,kind,ref),header[0]))
+        if len(terminals)!=1:
+            raise ValueError('completed review service requires its unique actual signed adoption/rejection dependency')
+        dependencies=(*dependencies,*terminals)
+    return dependencies,job_key.token
+
+
 def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
     if len(row)!=len(OUTBOX_COLUMNS) or tuple(row[:2])!=namespace.as_tuple:
         raise ValueError('domain followup outbox row schema/namespace differs')
     data=dict(zip(OUTBOX_COLUMNS,row,strict=True))
+    native_causal=[];native_commands=[];native_jobs=[];native_preparations=[]
+    native_kind={'ordinary_continuity_attention_available_for_service':'ordinary_continuity_attention_v1',
+        'ordinary_continuity_cognition_adopted_v1':'ordinary_continuity_adoption_v1',
+        'single_event_review_attention_available_for_service':'single_event_review_attention_v1',
+        'single_event_review_cognition_adopted_v1':'single_event_review_adoption_v1'}.get(data['event_kind'])
+    if native_kind is not None:
+        native_causal.append(('graph_d07_execution_originals_v1',
+            (*namespace.as_tuple,native_kind,data['original_ref']),data['original_digest']))
+    if data['event_kind']=='d01.single_event_review_case_registered_v1':
+        native_causal.append(('graph_d01_production_inputs_v1',
+            (*namespace.as_tuple,data['original_ref']),data['original_digest']))
     if _EVENTS.get(data['event_kind']) != data['receiver_domain']:
         from .d07_behavior_stage_codec_v1 import decode_d07_followup_event_v1
         decode_d07_followup_event_v1(data['event_kind'], data['receiver_domain'])
@@ -247,25 +343,31 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
             from .foreground_cycle_v1 import validate_artifact_draft_wake_disposition_v1
             validate_artifact_draft_wake_disposition_v1(db, namespace=namespace, row_data=data, value=value)
             return {'content_bearing': False, 'causal_operation_id': data['causal_operation_id'],
-                'original_ref': data['original_ref'], 'original_digest': data['original_digest']}
+                'original_ref': data['original_ref'], 'original_digest':data['original_digest'],'native_causal_dependencies':(),
+                'native_command_dependencies':(),'native_job_graph_refs':(),'native_preparation_operations':()}
         if type(value) is dict and value.get('schema')=='d11.artifact-task-wait-consumed.v1':
             if canonical_serialize(value)!=data['receipt_json']:raise ValueError('task wait disposition bytes changed')
             from .artifact_task_wait_consumer_v1 import validate_task_wait_disposition_v1
             validate_task_wait_disposition_v1(db,namespace=namespace,row_data=data,value=value)
             return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
-                'original_ref':data['original_ref'],'original_digest':data['original_digest']}
+                'original_ref':data['original_ref'],'original_digest':data['original_digest'],'native_causal_dependencies':(),
+                'native_command_dependencies':(),'native_job_graph_refs':(),'native_preparation_operations':()}
         if type(value) is dict and value.get('schema') == 'd11.owner-source-note-submit-consumed.v1':
             if canonical_serialize(value) != data['receipt_json']:
                 raise ValueError('Owner task submit disposition bytes are noncanonical')
             from .owner_source_note_task_driver_v1 import validate_owner_task_submit_disposition_v1
             validate_owner_task_submit_disposition_v1(db,namespace=namespace,row_data=data,value=value)
             return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
-                'original_ref':data['original_ref'],'original_digest':data['original_digest']}
+                'original_ref':data['original_ref'],'original_digest':data['original_digest'],'native_causal_dependencies':(),
+                'native_command_dependencies':(),'native_job_graph_refs':(),'native_preparation_operations':()}
         expected={'schema','resolver_version','dedupe_key','causal_operation_id','causal_original_digest','trigger_original_digest',
             'manifest_digest','state','observed_epoch','completed_commands','missing_originals',
             'continuation_ref','consumer_operation_id'}
+        from .domain_production_followups_v1 import _NATIVE_ATTENTION_JOB_SCHEMA_V1
+        observed_job=type(value)is dict and value.get("schema")==_NATIVE_ATTENTION_JOB_SCHEMA_V1
+        if observed_job:expected=expected|{"job_preparation"}
         if (type(value) is not dict or set(value)!=expected or canonical_serialize(value)!=data['receipt_json']
-                or value['schema']!='sylanne.domain-followup-disposition.v1'
+                or value['schema']not in {'sylanne.domain-followup-disposition.v1',_NATIVE_ATTENTION_JOB_SCHEMA_V1}
                 or value['resolver_version']!='sylanne.domain-followup-resolver.v1'
                 or any(value[name]!=data[name] for name in ('dedupe_key','causal_operation_id','state','consumer_operation_id'))
                 or value['trigger_original_digest']!=data['original_digest']
@@ -280,6 +382,9 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
         causal=db.execute('SELECT original_digest FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND operation_id=?',
             (*namespace.as_tuple,data['causal_operation_id'])).fetchone()
         if causal!=(value['causal_original_digest'],):raise ValueError('followup causal adoption changed')
+        if observed_job:
+            dependencies,job_ref,preparation_op=_native_attention_observed_job_receipt_v1(db,namespace,data,value)
+            native_commands.extend(dependencies);native_jobs.append(job_ref);native_preparations.append(preparation_op)
         seen=set()
         for item in value['completed_commands']:
             if type(item) is not dict or set(item)!={'command_digest','operation_id','receipt_digest'}:
@@ -287,9 +392,13 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
             _digest(item['command_digest']);_digest(item['receipt_digest']);_text(item['operation_id'])
             if item['command_digest'] in seen:raise ValueError('domain followup command repeats')
             seen.add(item['command_digest'])
-            actual=db.execute('SELECT receipt_digest FROM graph_domain_production_originals_v1 '
-                'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,item['operation_id'])).fetchone()
-            if actual!=(item['receipt_digest'],):raise ValueError('domain followup lost its actual adopted receipt')
+            native=_ordinary_service_command_receipt_v1(db,namespace,data,value,item)
+            if native is not None:
+                native_commands.extend(native[0]);native_jobs.append(native[1])
+            else:
+                actual=db.execute('SELECT receipt_digest FROM graph_domain_production_originals_v1 '
+                    'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,item['operation_id'])).fetchone()
+                if actual!=(item['receipt_digest'],):raise ValueError('domain followup lost its actual adopted receipt')
         actual=db.execute('SELECT receipt_json FROM graph_owner_domain_attempts_v3 '
             'WHERE bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,data['consumer_operation_id'])).fetchone()
         if actual is None or actual[0] is None:raise ValueError('domain followup current disposition original missing')
@@ -297,4 +406,73 @@ def decode_domain_production_outbox_row_v1(row, namespace, *, db=None):
         if saved!=value and saved.get('followup_disposition')!=value:
             raise ValueError('domain followup differs from actual atomic Owner receipt')
     return {'content_bearing':False,'causal_operation_id':data['causal_operation_id'],
-        'original_ref':data['original_ref'],'original_digest':data['original_digest']}
+        'original_ref':data['original_ref'],'original_digest':data['original_digest'],
+        'native_causal_dependencies':tuple(native_causal),
+        'native_command_dependencies':tuple(native_commands),'native_job_graph_refs':tuple(native_jobs),
+        'native_preparation_operations':tuple(native_preparations)}
+
+def _native_attention_observed_job_receipt_v1(db,namespace,data,value):
+    from .domain_production_followups_v1 import (
+        _NATIVE_ATTENTION_SERVICE_EVENTS_V1,validate_native_attention_job_preparation_v1)
+    if data["event_kind"]not in _NATIVE_ATTENTION_SERVICE_EVENTS_V1 or data["receiver_domain"]!="d07":
+        raise ValueError("native observed-job disposition has another event")
+    p=validate_native_attention_job_preparation_v1(value["job_preparation"],namespace)
+    from .domain_production_followups_v1 import native_attention_job_observer_operation_v1
+    if (value["state"]not in {"waiting","completed"}
+            or value["consumer_operation_id"]!=native_attention_job_observer_operation_v1(
+                namespace,data["dedupe_key"],p,value["observed_epoch"])):
+        raise ValueError("observed job metadata is not its exact actual observer operation")
+    family="single_event_review"if data["event_kind"]=="single_event_review_attention_available_for_service"else"ordinary_continuity"
+    if (p["family"]!=family or value["completed_commands"]
+            or value["state"]=="waiting"and (value["continuation_ref"]!=p["job_id"]or value["missing_originals"]!=["actual_d07_original_execution"])
+            or value["state"]=="completed"and (value["continuation_ref"]is not None or value["missing_originals"])):
+        raise ValueError("native observed-job disposition changed its immutable family/cursor")
+    actual=db.execute("SELECT receipt_json FROM graph_owner_domain_attempts_v3 WHERE bot=? AND persona=? AND operation_id=?",
+        (*namespace.as_tuple,p["operation_id"])).fetchone()
+    if actual is None or actual[0]is None:raise ValueError("observed Owner preparation lacks its actual saved receipt")
+    result=json.loads(actual[0])
+    if (canonical_serialize(result)!=actual[0]or result.get("schema")!="sylanne.domain-production-receipt.v1"
+            or result.get("domain")!="d07"or result.get("operation_kind")!="serve_concern"
+            or result.get("operation_id")!=p["operation_id"]or result.get("activity_id")!=p["activity_id"]
+            or result.get("prepare_operation_id")!=p["prepare_operation_id"]
+            or result.get("original_ref")!="d07-prepared:"+p["operation_id"]
+            or result.get("original_digest")!=p["prepare_commit_original"]["original_digest"]
+            or result.get("receipt_digest")!=p["prepare_receipt_digest"]
+            or result.get("coverage")!="deferred"or result.get("continuation_ref")!=p["job_id"]
+            or result.get("missing_inputs")!=["actual_d07_original_execution"]
+            or result.get("job_states")!=[[p["job_id"],"queued"]]):
+        raise ValueError("observed Owner preparation is not the actual original job handoff")
+    receipt=_receipt(result["receipt"])
+    if (receipt.status!="committed"or receipt.operation_id!=p["prepare_operation_id"]
+            or canonical_digest(receipt)!=p["prepare_receipt_digest"]
+            or not any(v.key.token==p["job_ref"]and v.revision==p["job_revision"]for v in receipt.write_versions)):
+        raise ValueError("observed Owner job lacks its actual preparation receipt birth")
+    ledger=db.execute("SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations "
+        "WHERE bot=? AND persona=? AND operation_id=?",(*namespace.as_tuple,p["prepare_operation_id"])).fetchone()
+    if ledger!=(receipt.operation_digest,receipt.activity_id,receipt.effect_id,receipt.commit_seq):
+        raise ValueError("observed Owner prepare receipt differs from actual W01 ledger")
+    dependencies=[]
+    for name,kind in (("prepared_original","prepared"),("prepare_commit_original","prepare_commit")):
+        header=db.execute("SELECT payload_digest,signature FROM graph_d07_execution_originals_v1 "
+            "WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,kind,p["job_id"])).fetchone()
+        if header is None or header[0]!=p[name]["original_digest"]:
+            raise ValueError("observed Owner job changed its exact immutable native original")
+        dependencies.append(("graph_d07_execution_originals_v1",(*namespace.as_tuple,kind,p["job_id"]),header[0]))
+    if value["state"]=="completed":
+        if family=="single_event_review":
+            from .d07_single_event_review_v1 import (
+                single_event_review_adoption_original_ref_v1,single_event_review_cardinality_rejection_ref_v1)
+            variants=(("single_event_review_adoption_v1",single_event_review_adoption_original_ref_v1(namespace,p["job_id"])),
+                ("single_event_review_cardinality_rejected_v1",single_event_review_cardinality_rejection_ref_v1(namespace,p["job_id"])))
+        else:
+            from .d07_ordinary_continuity_cognition_v1 import ordinary_continuity_adoption_original_ref_v1
+            variants=(("ordinary_continuity_adoption_v1",ordinary_continuity_adoption_original_ref_v1(namespace,p["job_id"])),)
+        terminals=[]
+        for kind,ref in variants:
+            header=db.execute("SELECT payload_digest FROM graph_d07_execution_originals_v1 "
+                "WHERE bot=? AND persona=? AND kind=? AND original_ref=?",(*namespace.as_tuple,kind,ref)).fetchone()
+            if header is not None:terminals.append(("graph_d07_execution_originals_v1",(*namespace.as_tuple,kind,ref),header[0]))
+        if len(terminals)!=1:raise ValueError("observed job completion lacks its unique actual adopted/rejected native dependency")
+        dependencies.extend(terminals)
+    return tuple(dependencies),p["job_ref"],p["operation_id"]
+

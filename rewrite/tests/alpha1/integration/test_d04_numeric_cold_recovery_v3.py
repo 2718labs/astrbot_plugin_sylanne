@@ -232,55 +232,57 @@ async def test_actual_full_loo_cold_restore_and_atomic_adoption(tmp_path, instal
 
         def forbidden(*_args, **_kwargs):
             raise AssertionError("terminal retry/adoption attempted another native execution")
-        with pytest.MonkeyPatch.context() as patch:
-            patch.setattr(fixed_block_transcript, "run_fixed_block_math", forbidden)
-            patch.setattr(initial_box_trajectory, "_native_initial_radius", forbidden)
-            patch.setattr(d04_joint_product_math, "run_fixed_block_math", forbidden)
-            patch.setattr(d04_fixed_trajectory_v2, "run_fixed_block_math", forbidden)
-            patch.setattr(loader, "load_production_native", forbidden)
-            patch.setattr(trusted_joint_replay, "_replay_package_bound_joint_numeric", forbidden)
-            assert await worker.call(lambda current_graph: issue_current_numeric_math_ticket_v3(
-                current_graph, case["bootstrap"], bundle, queue, **arguments)) == executed
-            receipt = await asyncio.to_thread(graph.adopt_post_c02_joint_numeric_v3,
-                case["bootstrap"], bundle, operation_id=executed.prepared.binding.operation_id)
-            assert receipt["status"] == "joint_advance_committed"
-            assert receipt["output_original_digest"] == restored.output.original_digest
-            assert receipt["actual_cpu_ns"] == executed.terminal.measurement.actual_cpu_ns
-            assert await asyncio.to_thread(graph.adopt_post_c02_joint_numeric_v3,
-                case["bootstrap"], bundle, operation_id=executed.prepared.binding.operation_id) == receipt
-        with store._lock:
-            cost = read_d04_numeric_cost_original_v3(store._db, ns, executed.prepared.binding.operation_id)
-            assert cost is not None and cost.actual_cpu_ns == executed.terminal.measurement.actual_cpu_ns
-            assert get_job(store._db, executed.prepared.binding.job_id).phase == "completed"
-            for member in restored.output.members:
-                for ref in (member.checkpoint_ref, member.predecessor_state_ref):
-                    assert store._db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?", (ref,)).fetchone() == (2, 1)
-            assert store._db.execute("SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=? AND type_name=?",
-                (*ns.as_tuple, LEDGER_TYPE)).fetchone()[0] > 0
-            assert store._db.execute("SELECT COUNT(*) FROM graph_d04_originals_v3 "
-                "WHERE bot=? AND persona=? AND kind='numeric_cost' AND original_ref=?",
-                (*ns.as_tuple, executed.prepared.binding.operation_id)).fetchone() == (1,)
-        # A separate real encoding read freezes the newly adopted state at its
-        # actual current time. The C02 perspective only identifies the observer.
-        encoding = await worker.call(lambda current_graph: current_graph.commit_post_joint_c04_encoding_v3(
-            case["bootstrap"], bundle, **arguments, joint_operation_id=executed.prepared.binding.operation_id))
-        assert encoding["status"] == "encoding_baseline_committed"
-        assert await worker.call(lambda current_graph: current_graph.commit_post_joint_c04_encoding_v3(
-            case["bootstrap"], bundle, **arguments, joint_operation_id=executed.prepared.binding.operation_id)) == encoding
-        from sylanne3.runtime.c04_encoding_baseline_store_v3 import read_c04_encoding_baseline_v3
-        with store._lock:
-            store._db.execute("BEGIN")
-            try:
-                baseline = read_c04_encoding_baseline_v3(store._db, namespace=ns,
-                    encoding_operation_id=encoding["operation_id"], source_ref=case["source_ref"])
-                assert baseline.record_digest == encoding["record_digest"]
-                assert baseline.joint_operation_id == executed.prepared.binding.operation_id
-                assert baseline.encoding_receipt.write_versions == ()
-                assert baseline.original.as_known_at >= ticket.ready.preparation.current.component.role_end
-            finally:
-                store._db.rollback()
-        from c09_d04_original_inventory_acceptance_v3 import assert_actual_d04_original_erasure_inventory_v3
-        assert_actual_d04_original_erasure_inventory_v3(case, executed)
+        from sylanne3.graph_worker import retained_graph_calls_v3
+        with retained_graph_calls_v3(worker) as graph_call:
+            with pytest.MonkeyPatch.context() as patch:
+                patch.setattr(fixed_block_transcript, "run_fixed_block_math", forbidden)
+                patch.setattr(initial_box_trajectory, "_native_initial_radius", forbidden)
+                patch.setattr(d04_joint_product_math, "run_fixed_block_math", forbidden)
+                patch.setattr(d04_fixed_trajectory_v2, "run_fixed_block_math", forbidden)
+                patch.setattr(loader, "load_production_native", forbidden)
+                patch.setattr(trusted_joint_replay, "_replay_package_bound_joint_numeric", forbidden)
+                assert await worker.call(lambda current_graph: issue_current_numeric_math_ticket_v3(
+                    current_graph, case["bootstrap"], bundle, queue, **arguments)) == executed
+                receipt = await graph_call(lambda current_graph:current_graph.adopt_post_c02_joint_numeric_v3(
+                    case["bootstrap"],bundle,operation_id=executed.prepared.binding.operation_id),slot="numeric-adoption")
+                assert receipt["status"] == "joint_advance_committed"
+                assert receipt["output_original_digest"] == restored.output.original_digest
+                assert receipt["actual_cpu_ns"] == executed.terminal.measurement.actual_cpu_ns
+                assert await graph_call(lambda current_graph:current_graph.adopt_post_c02_joint_numeric_v3(
+                    case["bootstrap"],bundle,operation_id=executed.prepared.binding.operation_id),slot="numeric-adoption") == receipt
+            with store._lock:
+                cost = read_d04_numeric_cost_original_v3(store._db, ns, executed.prepared.binding.operation_id)
+                assert cost is not None and cost.actual_cpu_ns == executed.terminal.measurement.actual_cpu_ns
+                assert get_job(store._db, executed.prepared.binding.job_id).phase == "completed"
+                for member in restored.output.members:
+                    for ref in (member.checkpoint_ref, member.predecessor_state_ref):
+                        assert store._db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?", (ref,)).fetchone() == (2, 1)
+                assert store._db.execute("SELECT COUNT(*) FROM graph_atoms WHERE bot=? AND persona=? AND type_name=?",
+                    (*ns.as_tuple, LEDGER_TYPE)).fetchone()[0] > 0
+                assert store._db.execute("SELECT COUNT(*) FROM graph_d04_originals_v3 "
+                    "WHERE bot=? AND persona=? AND kind='numeric_cost' AND original_ref=?",
+                    (*ns.as_tuple, executed.prepared.binding.operation_id)).fetchone() == (1,)
+            # A separate real encoding read freezes the newly adopted state at its
+            # actual current time. The C02 perspective only identifies the observer.
+            encoding = await graph_call(lambda current_graph:current_graph.commit_post_joint_c04_encoding_v3(
+                case["bootstrap"],bundle,**arguments,joint_operation_id=executed.prepared.binding.operation_id),slot="encoding-baseline")
+            assert encoding["status"] == "encoding_baseline_committed"
+            assert await graph_call(lambda current_graph:current_graph.commit_post_joint_c04_encoding_v3(
+                case["bootstrap"],bundle,**arguments,joint_operation_id=executed.prepared.binding.operation_id),slot="encoding-baseline") == encoding
+            from sylanne3.runtime.c04_encoding_baseline_store_v3 import read_c04_encoding_baseline_v3
+            with store._lock:
+                store._db.execute("BEGIN")
+                try:
+                    baseline = read_c04_encoding_baseline_v3(store._db, namespace=ns,
+                        encoding_operation_id=encoding["operation_id"], source_ref=case["source_ref"])
+                    assert baseline.record_digest == encoding["record_digest"]
+                    assert baseline.joint_operation_id == executed.prepared.binding.operation_id
+                    assert baseline.encoding_receipt.write_versions == ()
+                    assert baseline.original.as_known_at >= ticket.ready.preparation.current.component.role_end
+                finally:
+                    store._db.rollback()
+            from c09_d04_original_inventory_acceptance_v3 import assert_actual_d04_original_erasure_inventory_v3
+            assert_actual_d04_original_erasure_inventory_v3(case, executed)
     try:
         await actual_drive_case(tmp_path, installed_d04_root, 0.5, after_drive=after_drive, role_clock_rate="1")
     finally:

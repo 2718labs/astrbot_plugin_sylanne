@@ -437,6 +437,9 @@ def require_habit_sources_v3(reader,roots):
 
 
 def require_habit_body_v3(reader,table,key):
+    from .persona_growth_review_metadata_v1 import require_growth_original_metadata_point_v1,require_growth_control_metadata_point_v1
+    for request in reader.points:
+        if request[0]==table and request[3]==tuple(key) and (require_growth_original_metadata_point_v1(reader,request) or require_growth_control_metadata_point_v1(reader,request)):return
     state=require_habit_source_work_v3(reader)
     from .current_beta1_source_read_v3 import require_beta1_source_control_point_v3
     if require_beta1_source_control_point_v3(reader,(table,('revision','value','valid'),('token','bot','persona'),tuple(key))):return
@@ -459,6 +462,8 @@ def require_habit_body_v3(reader,table,key):
 
 
 def require_habit_point_v3(reader,request):
+    from .persona_growth_review_metadata_v1 import require_growth_original_metadata_point_v1,require_growth_control_metadata_point_v1
+    if require_growth_original_metadata_point_v1(reader,request) or require_growth_control_metadata_point_v1(reader,request):return
     from .natural_producer_qualification_v1 import _HOST_ATTACHMENT_SHAPES_V3
     table,columns,key_columns,key=request
     from .habit_body_cpu_source_v3 import require_body_point_v3
@@ -497,8 +502,12 @@ def current_habit_source_read_plan_v3(db,*,namespace,activity_id,operation_kind,
     exact=set(state.body_keys)
     exact.add(owner_grant_key(*namespace.as_tuple))
     fixed=tuple(sorted(_CENSUS_TYPES))
-    return ProductionReadPlanV1(fixed,tuple(sorted(exact,key=lambda key:key.token)),
+    plan=ProductionReadPlanV1(fixed,tuple(sorted(exact,key=lambda key:key.token)),
         tuple(sorted(state.source_roots)),tuple(sorted(state.originals)))
+    from .persona_growth_birth_v1 import augment_persona_birth_plan_v1
+    from .persona_growth_review_v1 import augment_growth_review_plan_v1
+    plan=augment_persona_birth_plan_v1(db,namespace=namespace,operation_kind=operation_kind,plan=plan)
+    return augment_growth_review_plan_v1(db,namespace=namespace,operation_kind=operation_kind,request=request,plan=plan)
 
 
 def _clear_habit_frame_binding_v3(reader):
@@ -1191,8 +1200,11 @@ def prepare_habit_owner_entry_v3(reader):
     from ..authority_service.owner_location_read_v3 import (prepare_current_host_semantic_background_owner_read_entry_v3,
         prepare_current_host_method_owner_read_entry_v3)
     if reader.general_owner_entry is None:
-        reader.general_owner_entry=(prepare_current_host_method_owner_read_entry_v3(reader)if reader.session_proof is not None
-            else prepare_current_host_semantic_background_owner_read_entry_v3(reader))
+        if reader.session_proof is not None:
+            if reader.general_owner_task is None:reader.general_owner_task=prepare_current_host_method_owner_read_entry_v3(reader)
+            if not reader.general_owner_task.advance():return False
+            reader.general_owner_entry=reader.general_owner_task.take_result_v3();reader.general_owner_task=None
+        else:reader.general_owner_entry=prepare_current_host_semantic_background_owner_read_entry_v3(reader)
     entry=reader.general_owner_entry;entry.require_permission_v3(reader)
     with reader.store._lock:
         owner=entry.require_for_v3(reader)
@@ -1340,6 +1352,11 @@ def habit_selected_metadata_read_set_v3(prepared):
         if key in versions and versions[key]!=revision:
             raise AuthorityUnavailable('Habit metadata closure has conflicting same-key revisions')
         versions[key]=revision
+    from .persona_growth_review_metadata_v1 import growth_metadata_cas_versions_v1
+    for version in growth_metadata_cas_versions_v1(reader.db):
+        if version.key in versions and versions[version.key]!=version.revision:
+            raise AuthorityUnavailable('Habit metadata and persona control CAS disagree')
+        versions[version.key]=version.revision
     if len(versions)>1024:raise AuthorityUnavailable('Habit full metadata readset exceeds the original 1024-head bound')
     read_versions=tuple(GraphVersion(key,revision)for key,revision in sorted(versions.items(),key=lambda item:item[0].token))
     coverage=tuple(pages)
@@ -1771,6 +1788,9 @@ def _habit_dependency_v3(reader,needed):
     if kind=='habit_metadata':task=create_current_habit_metadata_task_v3(reader,actual)
     elif kind=='habit_parameters':task=create_current_habit_parameter_task_v3(reader,*actual)
     elif kind=='beta1_source_metadata':task=create_current_beta1_source_metadata_task_v3(reader,actual)
+    elif kind=='growth_review_metadata_v1':
+        from .persona_growth_review_metadata_v1 import start_growth_review_metadata_v1
+        task=start_growth_review_metadata_v1(reader,actual)
     elif kind=='point':
         require_habit_point_v3(reader,actual)
         task=reader.points.get(actual)

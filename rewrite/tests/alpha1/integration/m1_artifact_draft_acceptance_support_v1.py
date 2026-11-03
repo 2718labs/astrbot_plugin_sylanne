@@ -7,7 +7,7 @@ unknown. No Source, current grant, paid receipt, claim or terminal is seeded.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import asyncio
 from datetime import datetime, timezone
 from functools import partial
@@ -104,13 +104,16 @@ def load_m1_phase_fixture_installation_v2(setup_file):
     names = {"schema", "profile_id", "profile_root", "package_root", "data_dir", "authority_store",
         "server_certificate", "server_private_key", "administrator_certificate", "administrator_private_key",
         "billing_signing_key"}
-    current=setup["schema"]=="sylanne.artifact-phase-fixture-setup.v3"
+    current=setup["schema"] in {"sylanne.artifact-phase-fixture-setup.v3","sylanne.artifact-phase-fixture-setup.v4","sylanne.artifact-phase-fixture-setup.v5"}
+    d13_current=setup["schema"] in {"sylanne.artifact-phase-fixture-setup.v4","sylanne.artifact-phase-fixture-setup.v5"}
+    initial_segmented=setup["schema"]=="sylanne.artifact-phase-fixture-setup.v5"
     if current:names.update(("c04_component_key","c09_installation_assets","c09_sdk_peer_cohort"))
-    if type(setup) is not dict or set(setup)!=names or setup["schema"] not in {"sylanne.artifact-phase-fixture-setup.v2","sylanne.artifact-phase-fixture-setup.v3"}:
+    if d13_current:names.add("d13_installation_assets")
+    if type(setup) is not dict or set(setup)!=names or setup["schema"] not in {"sylanne.artifact-phase-fixture-setup.v2","sylanne.artifact-phase-fixture-setup.v3","sylanne.artifact-phase-fixture-setup.v4","sylanne.artifact-phase-fixture-setup.v5"}:
         raise ValueError("exact protected phase fixture setup descriptor required")
     profile._check_profile_id(setup["profile_id"])
     paths = {name: Path(setup[name]) for name in names - {"schema", "profile_id"}}
-    if any(not path.is_absolute() or path.resolve(strict=True) != path for path in paths.values()):
+    if any(not path.is_absolute() or path.resolve(strict=not(initial_segmented and name=="authority_store")) != path for name,path in paths.items()):
         raise ValueError("phase fixture setup requires actual canonical installation paths")
     assert paths["authority_store"].parent == paths["data_dir"]
     bundle=profile._load_installation_bundle_from_root(setup["profile_id"],paths["profile_root"],"Linux")
@@ -161,7 +164,8 @@ def load_m1_phase_fixture_installation_v2(setup_file):
         paths["data_dir"], paths["authority_store"], paths["server_certificate"], paths["server_private_key"],
         paths["administrator_certificate"], paths["administrator_private_key"], bundle, counter, key,
         paths["c04_component_key"] if current else None,paths["c09_installation_assets"] if current else None,
-        paths["c09_sdk_peer_cohort"] if current else None)
+        paths["c09_sdk_peer_cohort"] if current else None,
+        d13_installation_assets=paths["d13_installation_assets"] if d13_current else None,initial_segmented_genesis_v4=initial_segmented)
 
 
 M1_WORK_KINDS = ("d11.foreground_cycle.v1", WORK_KIND, FILE_WORK_KIND)
@@ -1166,10 +1170,10 @@ async def run_actual_m1_phase_protected_reply_v2(case):
     """Actual C5/C6 provider terminals and once-only accounting on the same graph."""
     from sylanne3.runtime.natural_reply_job_v2 import SavedNaturalPreparationV2, read_original_preparation
     from sylanne3.host.installed_natural_reply_driver import (
-        InstalledNaturalGenerationProgressV2, run_installed_post_c02_natural_generation_v2,
+        InstalledNaturalGenerationProgressV3, run_installed_post_c02_natural_generation_v2,
     )
     from sylanne3.host.installed_natural_review_driver import (
-        InstalledNaturalReviewProgressV2, run_installed_post_c02_natural_review_v2,
+        InstalledNaturalReviewProgressV3, run_installed_post_c02_natural_review_v2,
     )
     runtime, installation = await compose_actual_m1_phase_natural_runtime_v2(case)
     worker, bundle = case["phase_worker"], case["installed_bundle"]
@@ -1185,7 +1189,7 @@ async def run_actual_m1_phase_protected_reply_v2(case):
     before_calls = len(case["phase_provider_calls"])
     generated = await run_installed_post_c02_natural_generation_v2(runtime, installation,
         context=case["model_context"], trusted_umo=audience[0], saved=saved)
-    assert type(generated) is InstalledNaturalGenerationProgressV2
+    assert type(generated) is InstalledNaturalGenerationProgressV3
     assert generated.status == "review_content_hold", generated
     assert len(case["phase_provider_calls"]) == before_calls + 1
     with cold_originals_v1(case) as db:
@@ -1197,7 +1201,7 @@ async def run_actual_m1_phase_protected_reply_v2(case):
     reviewed = await run_installed_post_c02_natural_review_v2(runtime, installation,
         context=case["model_context"], trusted_umo=audience[0],
         generation_saved=current_generation, review_saved=review)
-    assert type(reviewed) is InstalledNaturalReviewProgressV2
+    assert type(reviewed) is InstalledNaturalReviewProgressV3
     assert reviewed.status == "paid_review_current_hold", reviewed
     assert len(case["phase_provider_calls"]) == before_calls + 2
     assert generated.output.terminal_receipt_digest and reviewed.output.terminal_receipt_digest
@@ -1528,15 +1532,19 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
         return hashlib.sha256(data).hexdigest()
 
     authority_store = business / "authority.db"
-    deny = lambda *args: False
-    core = AuthorityServiceCore(authority_store, authorizer=deny,
-        deletion_verifier=deny, execution_verifier=deny,
-        effect_verifier=deny, dispatch_verifier=deny, create=True)
-    try:
-        authority_id = core._db.execute(
-            "SELECT value FROM authority_meta WHERE key='authority_id'").fetchone()[0]
-    finally:
-        core.close()
+    if beta1_node_template is not None:
+        from uuid import uuid4
+        authority_id=str(uuid4())
+    else:
+        deny = lambda *args: False
+        core = AuthorityServiceCore(authority_store, authorizer=deny,
+            deletion_verifier=deny, execution_verifier=deny,
+            effect_verifier=deny, dispatch_verifier=deny, create=True)
+        try:
+            authority_id = core._db.execute(
+                "SELECT value FROM authority_meta WHERE key='authority_id'").fetchone()[0]
+        finally:
+            core.close()
     for path in business.iterdir():
         if path == host_data:
             assert path.is_dir() and not path.is_symlink()
@@ -1809,15 +1817,56 @@ def prepare_protected_phase_fixture_v2(*, installed_root, frozen_rewrite_root,
             canonical_digest((inventory.schema,inventory.authority_id,inventory.installation_id,inventory.namespace,resources)))
         peer_cert=x509.load_pem_x509_certificate((directory/"client-cert.pem").read_bytes())
         peer_digest=hashlib.sha256(peer_cert.public_bytes(serialization.Encoding.DER)).hexdigest()
+        control_directory=business
+        if beta1_node_template is not None:
+            control_directory=root/"c09-control"
+            control_directory.mkdir(mode=0o700);os.chown(control_directory,ordinary.pw_uid,ordinary.pw_gid)
         assets=dict(schema="sylanne3.c09.controlled-sdk-installation-assets.v3",authority_id=authority_id,
             installation_id=installation_id,control_store_id="controlled-sdk-control:"+uuid4().hex,
             key_id="controlled-sdk-key:"+uuid4().hex,namespace=authority_namespace,sdk_peer_descriptor=[peer_digest,"reply"],
             manifest_digest=manifest_digest,inventory_manifest_digest=inventory.manifest_digest,
-            control_path=str(business/"c09-control.db"),key_path=str(control_key),instance_lock=str(business/"c09-instance.lock"))
+            control_path=str(control_directory/"c09-control.db"),key_path=str(control_key),instance_lock=str(control_directory/"c09-instance.lock"))
         assets_path=sdk_assets_root/"installation-assets.json";protected(assets_path,canonical_serialize(assets).encode("utf8"),mode=0o640)
         cohort_path=sdk_assets_root/"peer-cohort.json"
         write_controlled_sdk_root_descriptor_from_assets_v3(cohort_path,installation_assets_path=assets_path)
         setup["c09_installation_assets"]=str(assets_path);setup["c09_sdk_peer_cohort"]=str(cohort_path)
+        if beta1_node_template is not None:
+            from dataclasses import asdict
+            from sylanne3.runtime.d13_technical_policy import InstalledD13CacheUseAssetsV2
+            from sylanne3.authority_service.d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
+            sections=_validate_beta1_profile_policy_sections_v3(payload,installed_policy)
+            use,maintenance=sections['d13_cache_use_control_v2'],sections['d13_derived_cache_maintenance_v2']
+            counter_assets=beta1_node_template.d13_counter_assets
+            if (type(counter_assets)is not InstalledD13CounterAssetsV2
+                    or counter_assets.package_root!=str(package)or counter_assets.package_manifest_sha256!=manifest_digest):
+                raise ValueError('actual Root Counter assets differ from the fixed new node package; HOLD_PREPARATION')
+            for source,pin in ((counter_assets.program_path,counter_assets.program_sha256),
+                    (counter_assets.program_manifest_path,counter_assets.program_manifest_sha256),
+                    (counter_assets.interpreter_path,counter_assets.interpreter_sha256),
+                    (counter_assets.metric_source_path,counter_assets.metric_source_sha256),
+                    (counter_assets.applicability_path,counter_assets.applicability_sha256)):
+                if hashlib.sha256(Path(source).read_bytes()).hexdigest()!=pin:
+                    raise ValueError('actual Root Counter source pin changed before fresh installation')
+            from sylanne3.authority_service.linux_installation_security_v1 import read_installed_bytes_v1
+            from sylanne3.authority_service.d13_counter_applicability_v2 import require_d13_counter_applicability_v2
+            from sylanne3.authority_service.d13_core_counter_contract_v1 import InstalledD13WirePolicyV7
+            wire=sections.get('d13_wire_policy')
+            if type(wire)is not InstalledD13WirePolicyV7:
+                raise ValueError('selected fresh SDK template requires the actual V7 Counter protocol; HOLD_PREPARATION')
+            signing_bytes=read_installed_bytes_v1(counter_assets.signing_key_path,limit=32,private=True)
+            signing=Ed25519PrivateKey.from_private_bytes(signing_bytes)
+            if signing.public_key().public_bytes(serialization.Encoding.Raw,serialization.PublicFormat.Raw).hex()!=wire.counter_public_key_hex:
+                raise ValueError('Root Counter private key differs from the original protected wire policy')
+            require_d13_counter_applicability_v2(read_installed_bytes_v1(counter_assets.applicability_path,limit=8192),
+                policy=wire,metric_id=counter_assets.metric_id,metric_source_sha256=counter_assets.metric_source_sha256,
+                program_sha256=counter_assets.program_sha256,interpreter_sha256=counter_assets.interpreter_sha256)
+            use_assets=InstalledD13CacheUseAssetsV2(namespace,authority_namespace,installation_id,manifest_digest,
+                use.policy_ref,use.digest,maintenance.link_ref,maintenance.digest,use.consumer_cohort_digest,use.policy_pair_digest)
+            d13_assets_path=sdk_assets_root/'d13-installation-assets.json'
+            protected(d13_assets_path,canonical_serialize(dict(schema='sylanne.test.beta1.d13-installation-assets.v3',
+                d13_cache_use_assets_v2=[asdict(use_assets)],d13_counter_assets_v1=[asdict(counter_assets)])).encode(),mode=0o640)
+            setup['schema']='sylanne.artifact-phase-fixture-setup.v5'
+            setup['d13_installation_assets']=str(d13_assets_path)
     descriptor = root/"setup.json"
     setup_digest = protected(descriptor,canonical_serialize(setup).encode("utf-8"))
     if beta1_node_template is not None:
@@ -1904,6 +1953,7 @@ class Beta1ProtectedNodeTemplateV3:
     root_lease_id:str
     root_grant_id:str
     root_grant_version:int
+    d13_counter_assets:object=field(default=None,kw_only=True)
 
     def __post_init__(self):
         from uuid import UUID
@@ -1925,6 +1975,8 @@ class _Beta1RootGrantTemplateContextV3:
     version:int
     allowed_work_kinds:tuple
     max_ceiling:object
+    lease_id:str
+    policy_ref:str
 
 
 @dataclass(frozen=True,slots=True)
@@ -1939,6 +1991,11 @@ class _Beta1PolicyTemplateContextV3:
     installation_id:str
     root_grant:_Beta1RootGrantTemplateContextV3
     root_lease:_Beta1RootLeaseTemplateContextV3
+
+    @property
+    def authority_namespace(self):
+        from sylanne3.graph_coordinator import namespace_ref
+        return namespace_ref(self.namespace)
 
 def _validate_beta1_original_node_template_v3(template,*,expected,now_utc,suite_root):
     from sylanne3.host import authority_profile as profile
@@ -1963,10 +2020,11 @@ def _validate_beta1_original_node_template_v3(template,*,expected,now_utc,suite_
         info=path.lstat()
         if not path.is_dir()or path.is_symlink()or info.st_uid!=0 or info.st_mode&0o022:
             raise ValueError("fresh Beta1 setup ancestry is not Root protected")
-    allowed={"model_workflows","d04_semantic_drive","d04_joint_numeric","d13_paid_precompression",
+    allowed={"model_workflows","d04_semantic_drive","d04_joint_numeric","d13_precompression","d13_paid_precompression",
         "d13_wire_policy","d13_wire_counter","foreground","artifact_draft","d06_recall","private_reply_dispatch",
         "d06_private_reply_source","ingress_encoding","d03_arrival","d03_self_identity_projection",
-        "d04_encoding_baseline","d06_first_ingress_c02","d07_attention"}
+        "d04_encoding_baseline","d06_first_ingress_c02","d07_attention",
+        "d13_cache_use_control_v2","d13_derived_cache_maintenance_v2"}
     policies=json.loads(canonical_serialize(template.profile_policies))
     if not {"model_workflows","foreground","artifact_draft"}<=set(policies)or set(policies)-allowed:
         raise ValueError("fixed Beta1 policy template has missing workflow or unknown policy sections")
@@ -1982,8 +2040,8 @@ def _validate_beta1_original_node_template_v3(template,*,expected,now_utc,suite_
         if scenario=="numeric-authorization-lease":
             if workflows.version<4 or any(getattr(workflows,name,None)is None for name in("natural_generation","natural_review")):
                 raise ValueError("original normal Foreground donor workflows missing; HOLD_PREPARATION")
-    elif "d13_paid_precompression"not in policies:
-        raise ValueError("original paid D13 policy template missing; HOLD_PREPARATION")
+    elif any(name not in policies for name in ("d13_precompression", "d13_paid_precompression")):
+        raise ValueError("fresh D13 template needs original technical and paid policies; HOLD_PREPARATION")
     budget=template.original_budget
     maximum=dict(budget.max_ceiling);total=dict(budget.limits);kinds=set(budget.allowed_work_kinds)
     for name,workflow in plain_v1(workflows).items():
@@ -1996,10 +2054,19 @@ def _validate_beta1_original_node_template_v3(template,*,expected,now_utc,suite_
     from types import MappingProxyType
     context=_Beta1PolicyTemplateContextV3(template.namespace,template.installation_id,
         _Beta1RootGrantTemplateContextV3(template.root_grant_id,template.root_grant_version,
-            budget.allowed_work_kinds,MappingProxyType(maximum)),
+            budget.allowed_work_kinds,MappingProxyType(maximum),template.root_lease_id,"d11-policy"),
         _Beta1RootLeaseTemplateContextV3(template.root_lease_id,MappingProxyType(total)))
     # Pure source input validation. Returned values never become installed/qualified or runtime authority.
     checked_payload={"schema":2,**policies}
+    from sylanne3.authority_service.d13_installed_counter_factory_v1 import InstalledD13CounterAssetsV2
+    from sylanne3.runtime.d13_consumer_manifest_v3 import installed_d13_consumer_cohort_digest_v3
+    if (type(template.d13_counter_assets)is not InstalledD13CounterAssetsV2
+            or template.d13_counter_assets.namespace!=template.namespace
+            or template.d13_counter_assets.installation_id!=template.installation_id
+            or not {'d13_cache_use_control_v2','d13_derived_cache_maintenance_v2'}<=set(policies)
+            or policies['d13_cache_use_control_v2']['consumer_cohort_digest']!=installed_d13_consumer_cohort_digest_v3()
+            or policies['d13_cache_use_control_v2']['valid_until']!=budget.absolute_valid_until_utc):
+        raise ValueError('new selected SDK template requires actual Counter assets and explicit full consumer cohort; HOLD_PREPARATION')
     _validate_beta1_profile_policy_sections_v3(checked_payload,context)
     return policies
 
@@ -2106,6 +2173,7 @@ def _validate_beta1_profile_policy_sections_v3(payload,context):
     bound={
         "d04_semantic_drive":profile._d04_semantic_drive_from_payload,
         "d04_joint_numeric":profile._d04_joint_numeric_from_payload,
+        "d13_precompression":profile._d13_precompression_from_payload,
         "d13_paid_precompression":profile._d13_paid_precompression_from_payload,
         "d13_wire_policy":profile._d13_wire_policy_from_payload,
         "foreground":profile._foreground_for_policy_from_payload_v1,
@@ -2113,7 +2181,18 @@ def _validate_beta1_profile_policy_sections_v3(payload,context):
     }
     values={name:parser(payload)for name,parser in simple.items()if name in payload}
     values.update({name:parser(payload,context)for name,parser in bound.items()if name in payload})
+    from sylanne3.runtime.d13_technical_policy import d13_cache_policy_pair_from_payload_v2
+    use,maintenance=d13_cache_policy_pair_from_payload_v2(payload,context,
+        d13_policies=(values.get('d13_precompression'),values.get('d13_paid_precompression')))
+    if use is not None:
+        values.update(d13_cache_use_control_v2=use,d13_derived_cache_maintenance_v2=maintenance)
     workflows=values["model_workflows"]
+    paid = values.get("d13_paid_precompression")
+    if paid is not None:
+        technical = values.get("d13_precompression")
+        if (technical is None or technical.history_token_budget != paid.history_token_budget
+                or technical.max_slots > paid.max_slots):
+            raise ValueError("fresh D13 policies need the same history budget and compatible complete window; HOLD_PREPARATION")
     if values.get("d06_recall")is not None:
         workflow=workflows.d07_cognition
         if (type(values.get("foreground"))is not profile.AdminForegroundPolicyV1

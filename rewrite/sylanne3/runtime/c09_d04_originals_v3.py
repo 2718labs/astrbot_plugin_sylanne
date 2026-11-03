@@ -155,12 +155,22 @@ def validate_d04_original_payload_v3(kind, raw):
         D04NumericBindingV3, D04NumericClaimV3, D04NumericMeasurementV3, D04NumericTerminalV3, from_wire,
     )
     if kind == "appraisal":
-        _dto_fields(raw, D04AppraisalOriginalV3, "d04.paid_appraisal_original.v3")
+        names=set(D04AppraisalOriginalV3.__dataclass_fields__)
+        if 'role_support_manifest' not in raw:names.remove('role_support_manifest')
+        _fields(raw,names,'d04.paid_appraisal_original.v3')
+        if raw.get('role_support_manifest') is not None:
+            from .d04_ordinary_readout_v3 import validate_d04_role_manifest_wire_v3
+            validate_d04_role_manifest_wire_v3(raw['role_support_manifest'],NamespaceId(**raw['namespace']))
         from ..model_broker.d04_appraisal import thaw_appraisal_request_v1
         thaw_appraisal_request_v1(_json(raw["frozen_json"]))
         _reads(raw["read_rows"])
     elif kind == "appraisal_acceptance":
-        _dto_fields(raw, D04AppraisalAcceptanceV3, "d04.appraisal_acceptance_original.v3")
+        names=set(D04AppraisalAcceptanceV3.__dataclass_fields__)
+        if 'role_support_manifest' not in raw:names.remove('role_support_manifest')
+        _fields(raw,names,'d04.appraisal_acceptance_original.v3')
+        if raw.get('role_support_manifest') is not None:
+            from .d04_ordinary_readout_v3 import validate_d04_role_manifest_wire_v3
+            validate_d04_role_manifest_wire_v3(raw['role_support_manifest'],NamespaceId(**raw['namespace']))
         _reads(raw["read_rows"])
     elif kind == "appraisal_request":
         from .natural_reply_job_v2 import _request_from_wire
@@ -185,8 +195,16 @@ def validate_d04_original_payload_v3(kind, raw):
         _fields(raw, ("schema", "namespace", "dose_policy", "signed_budget_grant", "dose_policy_authority",
             "appraisal_acceptance_ref", "appraisal_acceptance_digest", "mapping_installation", "mapping_installation_digest",
             "role", "condition", "clock", "interpretation_level", "mapping_candidate", "family_candidates",
-            "read_rows", "source_family_by_ref", "unknown_fields", "output_writes"), "d04.semantic_mapping_acceptance.v3")
+            "read_rows", "source_family_by_ref", "unknown_fields", "output_writes",
+            *(("role_support_manifest",)if "role_support_manifest"in raw else())), "d04.semantic_mapping_acceptance.v3")
         _reads(raw["read_rows"])
+        if raw.get('role_support_manifest') is not None:
+            manifest=raw['role_support_manifest']
+            if manifest.get('purpose')=='consolidation' and manifest.get('schema')in {'d06.ordinary-role-support-manifest.v3','d06.ordinary-role-support-manifest.v4'}:
+                        c09_life_role_manifest_metadata_v4(manifest,NamespaceId(**raw['namespace']))
+            else:
+                from .d04_ordinary_readout_v3 import validate_d04_role_manifest_wire_v3
+                validate_d04_role_manifest_wire_v3(manifest,NamespaceId(**raw['namespace']))
     elif kind == "joint_evidence_payloads":
         from .d04_semantic_mapping_v3 import D04ProductEvidencePayloadsV3
         _dto_fields(raw, D04ProductEvidencePayloadsV3, "d04.product-evidence-payloads.v3")
@@ -344,13 +362,21 @@ def d04_original_dispositions_v3(columns, rows, *, affected, affected_operations
         elif type(value) is list:
             for item in value:
                 yield from identities(item)
+    def ordinary_support_hit(raw):
+        manifest=raw.get('role_support_manifest')
+        if manifest is None:return False
+        from ..graph_types import AtomKey
+        for head in manifest['support_heads']:
+            key=AtomKey.from_token(head['ref'])
+            if head['ref'] in affected or key.owner.subject in source_ids:return True
+        return False
     while True:
         before = len(removed)
         for index, (kind, ref, raw, committed) in enumerate(originals):
             if kind not in BODY_KINDS or index in removed:
                 continue
             body = decoded_nested_original_v3(raw)
-            if (ref in links or nested_hits(body, affected, source_ids)
+            if (ref in links or ordinary_support_hit(raw) or nested_hits(body, affected, source_ids)
                     or set(identities(body)) & links):
                 removed.add(index)
                 links.update((ref, committed, *identities(body)))
@@ -358,3 +384,214 @@ def d04_original_dispositions_v3(columns, rows, *, affected, affected_operations
             break
     return tuple("derived_removed" if index in removed else "preserved_exact"
                  for index in range(len(originals)))
+
+
+def c09_life_role_manifest_metadata_v4(raw,namespace):
+    """Closed metadata only: ordinary blocks carry claim commitments, never claim text."""
+    from .d06_ordinary_readout_v3 import validate_life_role_manifest_wire_v3,LifeOrdinaryReadoutManifestV4
+    from .d01_single_event_readout_v4 import single_event_control_versions_v4
+    from ..graph_types import AtomKey,GraphVersion
+    manifest=validate_life_role_manifest_wire_v3(raw,namespace)
+    versions=[GraphVersion(AtomKey.from_token(ref),revision)for ref,revision in
+        (manifest.plan_ref,manifest.activation_ref)]
+    versions.extend(GraphVersion(AtomKey.from_token(head.ref),head.revision)for head in manifest.support_heads)
+    if type(manifest)is LifeOrdinaryReadoutManifestV4:
+        versions.extend(single_event_control_versions_v4(manifest.single_event_controls))
+        support={head.ref for head in manifest.support_heads if head.valid and head.revision>0
+            and AtomKey.from_token(head.ref).type_name=='memory.source'}
+        for control in manifest.single_event_controls:
+            selector=control.consumer_selector
+            if (len(selector)!=3 or NamespaceId.from_key(AtomKey.from_token(selector[0]))!=namespace
+                    or AtomKey.from_token(selector[0]).type_name!='memory.episode.v1'
+                    or type(selector[1])is not int or selector[1]<1):
+                raise D04ErasureInventoryHold('Life V4 actual consumer episode selector differs')
+            for digest in (selector[2],control.policy_digest,control.input_digest,control.adoption_digest,
+                    control.review_digest,control.scope_digest,control.counter_census_digest):
+                if type(digest)is not str or len(digest)!=64 or any(c not in '0123456789abcdef'for c in digest):
+                    raise D04ErasureInventoryHold('Life V4 original metadata commitment differs')
+            if (not control.policy_ref or not control.input_ref or len(set(control.source_refs))!=len(control.source_refs)
+                    or not set(control.source_refs)<=support or len(control.counter_census)>128):
+                raise D04ErasureInventoryHold('Life V4 control Source ALL/counter census differs from its actual support')
+            for source in control.source_refs:
+                key=AtomKey.from_token(source)
+                if NamespaceId.from_key(key)!=namespace or key.type_name!='memory.source':
+                    raise D04ErasureInventoryHold('Life V4 control Source crossed its registered namespace/type')
+            for values,census in ((control.guard_heads,False),(control.counter_census,True)):
+                if len({head.ref for head in values})!=len(values):
+                    raise D04ErasureInventoryHold('Life V4 historical metadata repeats a guard')
+                for head in values:
+                    if head.revision==0 and (head.valid or head.cell_id is not None):
+                        raise D04ErasureInventoryHold('Life V4 absence guard has a physical member')
+                    if census and (head.revision<1 or AtomKey.from_token(head.ref).type_name!='d07.current_interpretation.v1'
+                            or (head.semantic_digest is None)!= (not head.valid)):
+                        raise D04ErasureInventoryHold('Life V4 counter row differs from its actual metadata census')
+    unique={}
+    for version in versions:
+        if version.key in unique and unique[version.key]!=version.revision:
+            raise D04ErasureInventoryHold('Life role manifest repeats a conflicting original version')
+        unique[version.key]=version.revision
+    return manifest,tuple(GraphVersion(key,revision)for key,revision in sorted(unique.items(),key=lambda item:item[0].token))
+
+
+def iter_c09_life_role_manifest_links_v4(raw,namespace):
+    manifest,versions=c09_life_role_manifest_metadata_v4(raw,namespace)
+    yield from (version.key.token for version in versions)
+    for origin in manifest.origins:
+        yield origin['producing_operation_id']
+        for related in origin['related_originals']:
+            yield related['original_ref']
+            yield related['original_digest']
+    from .d06_ordinary_readout_v3 import LifeOrdinaryReadoutManifestV4
+    if type(manifest)is LifeOrdinaryReadoutManifestV4:
+        for control in manifest.single_event_controls:
+            yield control.policy_ref
+            yield control.input_ref
+            yield control.consumer_selector[0]
+            yield from control.source_refs
+
+
+def verify_c09_life_mapping_manifest_history_v4(build,original,*,meter):
+    """The real historical mapping event carries metadata CAS omitted from Body read_rows."""
+    if original.family!=TABLE or original.kind!='semantic_mapping':return
+    raw=original.payload;manifest=raw.get('role_support_manifest')
+    if type(manifest)is not dict or manifest.get('schema')!='d06.ordinary-role-support-manifest.v4':return
+    from ..graph_types import AtomKey,Owner
+    from ..runtime.c09_paged_sql_v2 import legacy_cell_read_transaction_v2,read_legacy_sql_cell_fragment_v2,read_c09_table_shape_v2
+    from hashlib import sha256
+    namespace=NamespaceId(**raw['namespace'])
+    value,versions=c09_life_role_manifest_metadata_v4(manifest,namespace)
+    build.require_current()
+    if namespace.as_tuple!=tuple(json.loads(build.scope.graph_namespace)):
+        raise D04ErasureInventoryHold('Life V4 mapping historical proof crossed its actual capture namespace')
+    expected={(v.key.token,v.revision)for v in versions}
+    if not raw['output_writes']:
+        raise D04ErasureInventoryHold('Life V4 mapping has no actual immutable drive producer')
+    origin=None
+    writes=set()
+    for write in raw['output_writes']:
+        _fields(write,('key','value','dependencies'))
+        key_raw=write['key'];_fields(key_raw,('owner','type_name','name'))
+        key=AtomKey(Owner(**key_raw['owner']),key_raw['type_name'],key_raw['name'])
+        if NamespaceId.from_key(key)!=namespace or key.token in writes:
+            raise D04ErasureInventoryHold('Life V4 mapping output repeats or crosses its original namespace')
+        spec=build.session._control.maintenance.graph._registry.spec(key.type_name)
+        if spec.writer_domain!='d04' or not spec.immutable:
+            raise D04ErasureInventoryHold('Life V4 mapping output is not its registered immutable D04 drive')
+        spec.validator(write['value'])
+        history=meter.read_fixed_row(build.pair.source,'graph_history',
+            ('valid','event_bot','event_persona','event_session','event_id'),'token=? AND revision=?',(key.token,1))
+        if history is None or history[:3]!=(1,*namespace.as_tuple) or origin is not None and history[3:]!=origin:
+            raise D04ErasureInventoryHold('Life V4 mapping writes lost their same-W01 historical producer')
+        origin=history[3:];writes.add(key.token)
+        shape=read_c09_table_shape_v2(build.pair.source,'graph_history',meter=meter)
+        digest=sha256()
+        if 'value_cell_id'in shape.columns:
+            scope=build.session.begin_source_physical_read_v3(build.pair,meter=meter)
+            cell=meter.read_fixed_row(build.pair.source,'graph_history',('value_cell_id',),'token=? AND revision=?',(key.token,1))
+            header=scope.read_cell_header_v3(cell[0],meter=meter)
+            if header[1]!='canonical-json.ascii.v1' or header[2]!=key.token:
+                raise D04ErasureInventoryHold('Life V4 drive physical codec/owner differs')
+            meter.require_available(header[4]*2+header[5]*1024+8192)
+            root=canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell[0]));offset=0
+            for ordinal in range(header[5]):
+                segment=scope.read_cell_segment_v3(cell[0],ordinal,meter=meter)
+                if segment is None or segment[0]!=offset:
+                    raise D04ErasureInventoryHold('Life V4 drive physical Source order differs')
+                digest.update(segment[1]);root=canonical_digest(('sylanne3.segmented-cell-link.v1',
+                    root,cell[0],ordinal,offset,len(segment[1]),segment[2]));offset+=len(segment[1])
+            scope.require_cell_eof_v3(cell[0],header[5],meter=meter)
+            if (offset,root,digest.hexdigest())!=(header[4],header[7],header[6]):
+                raise D04ErasureInventoryHold('Life V4 drive physical Source SHA/root/EOF differs')
+        else:
+            with legacy_cell_read_transaction_v2(build.pair.source):
+                _,total,kind=read_legacy_sql_cell_fragment_v2(build.pair.source,table='graph_history',column='value',
+                    where='token=? AND revision=?',parameters=(key.token,1),start=0,length=0,meter=meter)
+                if kind!='text':raise D04ErasureInventoryHold('Life V4 drive native Source codec differs')
+                meter.require_available(total*2+8192);offset=0
+                while offset<total:
+                    block,size,kind=read_legacy_sql_cell_fragment_v2(build.pair.source,table='graph_history',column='value',
+                        where='token=? AND revision=?',parameters=(key.token,1),start=offset,length=min(4096,total-offset),meter=meter)
+                    if kind!='text' or size!=total or not block:raise D04ErasureInventoryHold('Life V4 drive native Source EOF changed')
+                    digest.update(block);offset+=len(block)
+        if digest.hexdigest()!=canonical_digest(write['value']):
+            raise D04ErasureInventoryHold('Life V4 drive historical value differs from its complete mapping original')
+    event=meter.read_fixed_row(build.pair.source,'graph_events',('reads','revisions','digest','epoch_revision'),
+        'bot=? AND persona=? AND session=? AND event_id=?',(*namespace.as_tuple,*origin))
+    bundle=meter.read_fixed_row(build.pair.source,'graph_bundle_operations',('digest','activity_id','effect_id','commit_seq'),
+        'bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,origin[1]))
+    if event is None or bundle is None or bundle[1]!=origin[0] or bundle[3]<1 or event[3]<1:
+        raise D04ErasureInventoryHold('Life V4 mapping actual W01 event/bundle is absent')
+    _require_life_mapping_event_identity_v4(build,original,namespace,origin,event,bundle,meter)
+    reads=_json(event[0]);revisions=_json(event[1])
+    if (type(reads)is not list or type(revisions)is not list
+            or any(type(item)is not list or len(item)!=2 for item in (*reads,*revisions))
+            or len({item[0]for item in reads})!=len(reads)
+            or not expected<=set(tuple(item)for item in reads)
+            or not {(token,1)for token in writes}<=set(tuple(item)for item in revisions)):
+        raise D04ErasureInventoryHold('Life V4 original support/control versions are absent from their real historical metadata CAS')
+    build.require_current()
+
+
+def _require_life_mapping_event_identity_v4(build,original,namespace,origin,event,bundle,meter):
+    # The actual selected Drive producer uses initial_now_utc for both
+    # Frame.now_utc and envelope.source_qualification.learned_at. Graph events
+    # persist the digest, not an occurred_at column.
+    from .domain_production_original_codec_v1 import ORIGINAL_COLUMNS,decode_domain_production_original_row_v1
+    from .domain_production_originals_v1 import _receipt
+    from .d06_life_numeric_drive_v1 import OPERATION,decode_life_numeric_drive_original_v1
+    from ..contracts import Event,Scope
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from .c09_paged_sql_v2 import _quote,c09_row_commitment_v2
+    db=build.pair.source;key=(*namespace.as_tuple,origin[1])
+    header=meter.read_fixed_row(db,'graph_domain_production_originals_v1',
+        ('domain','operation_kind'),'bot=? AND persona=? AND operation_id=?',key)
+    if header is None:
+        if build.prior_view is None:
+            raise D04ErasureInventoryHold('Life V4 mapping lacks its exact original producer or authenticated prior certificate')
+        # Only this exact already-qualified V4 mapping row can use the existing
+        # preservation certificate. A retired Domain Body is never reopened.
+        source_key=(*namespace.as_tuple,'semantic_mapping',original.original_ref)
+        lengths=db.execute('SELECT '+','.join('length(CAST('+_quote(c)+' AS BLOB))'for c in COLUMNS)
+            +' FROM '+TABLE+' WHERE bot=? AND persona=? AND kind=? AND original_ref=?',source_key).fetchone()
+        meter.charge_read(8*len(COLUMNS))
+        if lengths is None:raise D04ErasureInventoryHold('Life V4 mapping source row disappeared')
+        build.session._control.require_c09_retained_arena_v3(meter=meter,
+            additional_bytes=sum(n or 0 for n in lengths)*12+32768)
+        row=meter.read_fixed_row(db,TABLE,COLUMNS,
+            'bot=? AND persona=? AND kind=? AND original_ref=?',source_key)
+        if (row[4]!=canonical_serialize(original.payload)or row[5]!=original.original_commitment):
+            raise D04ErasureInventoryHold('Life V4 prior mapping changed its complete current source bytes')
+        commitment=c09_row_commitment_v2(row)
+        proof=build.prior_view.require_target_row_disposition(TABLE,source_key,commitment,meter=meter)
+        if proof.disposition!='preserved_exact' or (proof.old_commitment,proof.new_commitment)!=(commitment,commitment):
+            raise D04ErasureInventoryHold('Life V4 mapping has no exact previously qualified preservation')
+        return
+    if header!=('d04',OPERATION):
+        raise D04ErasureInventoryHold('Life V4 mapping was not produced by the actual registered Drive operation')
+    lengths=db.execute('SELECT '+','.join('length(CAST('+_quote(c)+' AS BLOB))'for c in ORIGINAL_COLUMNS)
+        +' FROM graph_domain_production_originals_v1 WHERE bot=? AND persona=? AND operation_id=?',key).fetchone()
+    meter.charge_read(8*len(ORIGINAL_COLUMNS))
+    if lengths is None:raise D04ErasureInventoryHold('Life V4 actual Drive producer disappeared')
+    build.session._control.require_c09_retained_arena_v3(meter=meter,
+        additional_bytes=sum(n or 0 for n in lengths)*12+32768)
+    row=meter.read_fixed_row(db,'graph_domain_production_originals_v1',ORIGINAL_COLUMNS,
+        'bot=? AND persona=? AND operation_id=?',key)
+    actual=decode_domain_production_original_row_v1(row,namespace,
+        registry=build.session._control.maintenance.graph._registry)
+    payload=_json(row[7]);receipt=_receipt(_json(row[10]))
+    drive=decode_life_numeric_drive_original_v1(payload['provenance']['life_numeric_drive_original'])
+    from ..graph_types import AtomKey
+    expected_writes={(AtomKey.from_token(token),revision)for token,revision in drive.drive_versions}
+    if (actual['operation_id']!=origin[1]or actual['operation_kind']!=OPERATION
+            or (drive.namespace,drive.operation_id,drive.mapping_ref,drive.mapping_digest)!=(
+                namespace,origin[1],original.original_ref,original.original_commitment)
+            or plain_v1(drive.clock)!=original.payload['clock']
+            or payload['writes']!=original.payload['output_writes']
+            or (receipt.status,receipt.operation_id,receipt.activity_id,receipt.operation_digest,receipt.effect_id,receipt.commit_seq)!=(
+                'committed',origin[1],origin[0],bundle[0],bundle[2],bundle[3])
+            or canonical_digest(receipt)!=row[11]or { (v.key,v.revision)for v in receipt.write_versions}!=expected_writes
+            or { (v.key.token,v.revision)for v in receipt.read_versions}!=set(tuple(v)for v in _json(event[0]))
+            or len(receipt.invalidated_epochs)!=1 or receipt.invalidated_epochs[0].revision!=event[3]
+            or event[2]!=Event(Scope(*namespace.as_tuple,origin[0]),origin[1],payload['now_utc'],
+                'domain_bundle',{'bundle_digest':bundle[0]}).digest):
+        raise D04ErasureInventoryHold('Life V4 mapping changed its actual Drive clock/receipt/event/full write membership')

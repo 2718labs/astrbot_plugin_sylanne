@@ -52,18 +52,20 @@ def require_complete_provider_cache_binding_v1(bundle, provider_id):
 def load_linux_deployment_config_v1(path):
     require_linux_administrator_v1()
     launch = read_installed_json_v1(path)
-    process_mode = launch.get("schema") in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}
+    process_mode = launch.get("schema") in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3","sylanne3.authority.linux-deployment.v4"}
     fields = (_FIELDS - {"host_systemd_unit"}) | {"host_supervisor_provider"} if process_mode else _FIELDS
-    if launch.get('schema')=='sylanne3.authority.linux-deployment.v3':
+    if launch.get('schema') in {'sylanne3.authority.linux-deployment.v3','sylanne3.authority.linux-deployment.v4'}:
         fields=fields|{'root_lifetime_spec_path','root_lifetime_spec_digest'}
+    if launch.get('schema')=='sylanne3.authority.linux-deployment.v4':
+        fields=fields|{'maintenance_console_role_path','maintenance_console_role_sha256'}
     if set(launch) != fields or launch["schema"] not in {
-            "sylanne3.authority.linux-deployment.v1", "sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}:
+            "sylanne3.authority.linux-deployment.v1", "sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3","sylanne3.authority.linux-deployment.v4"}:
         raise AuthorityUnavailable("installed Linux deployment fields differ")
     if process_mode:
         from .d12_installed_supervisor_v1 import decode_installed_supervisor_config_v1
         from .installed_process_supervisor_v1 import InstalledProcessSupervisorSpecV2
         selected_provider = decode_installed_supervisor_config_v1(launch["host_supervisor_provider"])
-        if launch['schema']=='sylanne3.authority.linux-deployment.v3':
+        if launch['schema'] in {'sylanne3.authority.linux-deployment.v3','sylanne3.authority.linux-deployment.v4'}:
             from .installed_root_lifetime_observer_v3 import (SPEC_PATH,read_installed_root_lifetime_spec_v3,
                 read_root_lifetime_resource_approval_v3)
             if launch['root_lifetime_spec_path']!=SPEC_PATH:
@@ -101,10 +103,24 @@ def load_linux_deployment_config_v1(path):
             or installed["max_utc_error_seconds"] != bundle.ingress_clock.max_utc_error_seconds):
         raise AuthorityUnavailable("installed Host and Authority profiles differ")
     peer = (installed["certificate_sha256"], launch["profile_id"])
+    if launch['schema']=='sylanne3.authority.linux-deployment.v4':
+        from .maintenance_console_role_v1 import load_protected_maintenance_console_role_config_v1
+        console_role=load_protected_maintenance_console_role_config_v1(launch['maintenance_console_role_path'])
+        if (console_role.raw_sha256!=launch['maintenance_console_role_sha256']
+                or console_role.binding.installation_id!=policy.installation_id
+                or console_role.binding.authority_id!=policy.expected_authority_id
+                or console_role.binding.namespace!=policy.namespace
+                or console_role.binding.package_manifest_digest!=policy.manifest_digest
+                or console_role.binding.console_cert_sha256==peer[0]
+                or console_role.binding.console_profile_id==peer[1]):
+            raise AuthorityUnavailable('independent console role differs from the protected Linux installation')
     authorizer = InstalledAuthorityPolicyV2(
         peer_scopes={peer[0]: InstalledPeerScopeV1(policy.authority_namespace, policy.administrator_holder)},
         profile_peers={peer[1]: peer[0]}, package_root=launch["package_root"],
-        trusted_manifest_sha256=launch["trusted_manifest_sha256"])
+        trusted_manifest_sha256=launch["trusted_manifest_sha256"],
+        d13_owner_peers_v3=({peer[0]: (peer[1], policy.authority_namespace,
+            policy.administrator_holder, bundle.d13_cache_use_control_v2.consumer_cohort_digest)}
+            if bundle.d13_cache_use_control_v2 is not None and bundle.d13_cache_use_control_v2.enabled else None))
     raw_inventory = read_installed_bytes_v1(launch["inventory_path"], limit=1048576)
     if hashlib.sha256(raw_inventory).hexdigest() != launch["inventory_sha256"]:
         raise AuthorityUnavailable("installed C09 filesystem inventory pin differs")
@@ -149,8 +165,9 @@ def load_linux_deployment_config_v1(path):
         actual_spec=decode_installed_supervisor_config_v1(lifecycle['supervisor'])
         if actual_spec!=selected_provider:
             raise AuthorityUnavailable('registry genesis and installed Host starts use different supervisors')
-        factory.install_peer_registry_census_v3(InstalledPeerRegistryCensusV3(
-            supervisor=build_installed_supervisor_v1(actual_spec),inventory_manifest=inventory,peer=peer))
+        census=InstalledPeerRegistryCensusV3(supervisor=build_installed_supervisor_v1(actual_spec),
+            inventory_manifest=inventory,peer=peer)
+        factory.install_peer_registry_census_v3(census)
     c09 = config.c09_storage_v2 or config.c09_storage_v1
     if (c09 is None or c09.authority_id != policy.expected_authority_id
             or config.namespace_bindings_v2.get((*peer, policy.namespace)) != policy.authority_namespace):
@@ -162,6 +179,22 @@ def load_linux_deployment_config_v1(path):
             budget_issuer, bundle.model_workflows, peer, bundle)},
         self_identity_readers_v2={namespace: peer}, worker_result_fact_committers_v2={namespace: peer},
         host_onebot_observations_v2={namespace: observer})
+    if factory is not None and process_mode:
+        from ..runtime.d13_consumer_manifest_v3 import requires_current_core_birth_v4
+        if requires_current_core_birth_v4(config):
+            from .d12_package_files_v2 import InstalledPackageSelectionFilesV2
+            from .d12_fixed_supervisor_policy_v2 import read_fixed_supervisor_policy_v2
+            fixed,host_spec,authority_spec=read_fixed_supervisor_policy_v2(InstalledPackageSelectionFilesV2(
+                control_directory=actual_spec.selection_control_directory))
+            if host_spec!=actual_spec or fixed['instance_lock']!=str(config.instance_lock):
+                raise AuthorityUnavailable('current Core uses another actual fixed Host/Authority supervisor policy')
+            census.prepare_authority_birth_spec_v4(authority_spec)
+    use_assets = config.d13_cache_use_assets_v2 or {}
+    use = bundle.d13_cache_use_control_v2
+    if set(use_assets) != ({namespace} if use is not None and use.enabled else set()):
+        raise AuthorityUnavailable("D13 enabled pair and protected asset scope differ")
+    if use_assets:
+        use_assets[namespace].require_installation_v2(bundle)
     # Every service private key and asset is pinned below administrator-owned
     # parents, independently of the Host's group-readable installation profile.
     for item in (config.tls.certificate, config.tls.client_trust_root):
@@ -176,6 +209,98 @@ def load_linux_deployment_config_v1(path):
     from ..host.selected_profile_cohort_v2 import require_current_bundle_selection_v2
     require_current_bundle_selection_v2(bundle, launch['package_root'], require_selected_python=True, authority_private_config=True)
     return config, launch
+
+
+def install_linux_d13_cache_use_v2(config, *, core, bundle, coverage_installation=None):
+    """Explicit administrator install/migration on the protected existing Core.
+
+    Normal and cold opens verify these originals; neither invokes this signer.
+    The caller retains the actual installation window and storage composition.
+    """
+    require_linux_administrator_v1()
+    from .core import AuthorityServiceCore
+    from .deployment_config import AuthorityDeploymentConfig
+    from ..host.authority_profile import AdminInstallationBundle
+    from .d13_cache_use_control_v2 import install_d13_cache_use_policy_pair_v2
+    if type(config) is not AuthorityDeploymentConfig or type(core) is not AuthorityServiceCore or type(bundle) is not AdminInstallationBundle:
+        raise AuthorityUnavailable("D13 installation requires actual protected config, Core and bundle")
+    namespace = bundle.installation_policy.authority_namespace
+    installed = (config.natural_model_authorities_v2 or {}).get(namespace)
+    assets = (config.d13_cache_use_assets_v2 or {}).get(namespace)
+    if (installed is None or installed.installation_bundle is not bundle or assets is None
+            or core._authorize_callback is not config.core_authorizer
+            or core.path.resolve() != config.authority_db.resolve()):
+        raise AuthorityUnavailable("D13 explicit install differs from actual protected Core composition")
+    assets.require_installation_v2(bundle)
+    credential = config.local_administrator_credential("d13_cache_use_install", namespace)
+    install_d13_cache_use_policy_pair_v2(core=core, credential=credential, bundle=bundle,
+        budget_issuer=installed.d11_issuer, coverage_installation=coverage_installation)
+
+
+
+def _fresh_linux_d13_request_v3(path,*,mode,publication_receipt=None):
+    from ..runtime.d13_consumer_manifest_v3 import _issue_fresh_d13_installation_request_v3
+    from ..host.authority_profile import _MAX_PROFILE_BYTES
+    config,launch=load_linux_deployment_config_v1(path)
+    from .d12_package_files_v2 import InstalledPackageSelectionFilesV2
+    from .d12_fixed_supervisor_policy_v2 import read_fixed_supervisor_policy_v2
+    census=config.c09_maintenance_factory._peer_registry_census_v3
+    fixed,host_spec,authority_spec=read_fixed_supervisor_policy_v2(InstalledPackageSelectionFilesV2(
+        control_directory=census.supervisor.config.selection_control_directory))
+    if (host_spec!=census.supervisor.config or fixed['installation_id']!=config.c09_storage_v1.installation_id
+            or fixed['authority_id']!=config.c09_storage_v1.authority_id
+            or fixed['namespace_cohort']!=list(host_spec.namespace_cohort)
+            or fixed['profile_id']!=launch['profile_id'] or Path(fixed['instance_lock'])!=config.instance_lock):
+        raise AuthorityUnavailable('fresh Core Authority birth and Host registry use different protected fixed policy')
+    if census.authority_spec_v4 is None:census.prepare_authority_birth_spec_v4(authority_spec)
+    elif census.authority_spec_v4!=authority_spec:
+        raise AuthorityUnavailable('fresh and current fixed Authority specs differ')
+    profile_path=Path('/etc/sylanne/client/profiles')/launch['profile_id']/'profile.json'
+    profile_bytes=read_installed_bytes_v1(profile_path,limit=_MAX_PROFILE_BYTES)
+    assets_bytes=read_installed_bytes_v1(launch['assets_path'],limit=65536)
+    request=_issue_fresh_d13_installation_request_v3(config,mode=mode,
+        profile_bytes=profile_bytes,assets_bytes=assets_bytes,expected=publication_receipt)
+    return config,launch,request
+
+
+async def prepare_linux_d13_fresh_installation_v3(path):
+    """Return exact protected publication bytes; install no policy and start no business."""
+    from .daemon import open_fresh_d13_authority_installation_v3
+    config,launch,request=_fresh_linux_d13_request_v3(path,mode='prepare')
+    bootstrap=open_fresh_d13_authority_installation_v3(config,fresh_request=request)
+    try:
+        prepared=await bootstrap.await_fresh_prepared_v3()
+        return dict(status=prepared.status,profile_path=str(Path('/etc/sylanne/client/profiles')/
+            launch['profile_id']/'profile.json'),assets_path=launch['assets_path'],
+            profile_bytes=prepared.profile_bytes,assets_bytes=prepared.assets_bytes,
+            publication_receipt=prepared.publication_receipt,
+            supported_mode='production_root_prehost',controlled_sdk='NOT_YET_SUPPORTED')
+    finally:await bootstrap.aclose()
+
+
+async def finalize_linux_d13_fresh_installation_v3(path,*,publication_receipt):
+    """Cold-read the actually published cohort; sign only after a new exact fresh census."""
+    from .daemon import open_fresh_d13_authority_installation_v3
+    config,launch,request=_fresh_linux_d13_request_v3(path,mode='finalize',publication_receipt=publication_receipt)
+    bootstrap=open_fresh_d13_authority_installation_v3(config,fresh_request=request)
+    try:
+        daemon=await bootstrap.await_business_ready_v3()
+        return daemon,launch
+    except BaseException:
+        await bootstrap.aclose()
+        raise
+
+
+
+def open_controlled_sdk_d13_fresh_installation_v3(config,*,mode,profile_bytes,assets_bytes,
+        publication_receipt=None,consumer_closures=()):
+    """Explicit finite SDK installer; all dormant/ready work retains its actual worker."""
+    from .daemon import open_fresh_d13_authority_installation_v3
+    from ..runtime.d13_consumer_manifest_v3 import _issue_fresh_d13_installation_request_v3
+    request=_issue_fresh_d13_installation_request_v3(config,mode=mode,profile_bytes=profile_bytes,
+        assets_bytes=assets_bytes,expected=publication_receipt,consumer_mode='controlled_sdk',
+        consumer_closures=consumer_closures)
+    return open_fresh_d13_authority_installation_v3(config,fresh_request=request)
 
 
 def open_linux_authority_v1(path):
@@ -199,7 +324,7 @@ def install_linux_lifecycle_v1(daemon, launch):
     if type(specification) is not dict or set(specification) != {"supervisor", "drain_timeout_seconds"}:
         raise AuthorityUnavailable("exact installed lifecycle configuration required")
     supervisor_config = decode_installed_supervisor_config_v1(specification["supervisor"])
-    if launch["schema"] in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3"}:
+    if launch["schema"] in {"sylanne3.authority.linux-deployment.v2","sylanne3.authority.linux-deployment.v3","sylanne3.authority.linux-deployment.v4"}:
         supervisor=daemon.config.c09_maintenance_factory._peer_registry_census_v3.supervisor
         if supervisor.config!=supervisor_config:
             raise AuthorityUnavailable("actual bootstrap and lifecycle Root supervisors differ")
@@ -259,4 +384,33 @@ def install_linux_lifecycle_v1(daemon, launch):
         catalogue.install_schema(daemon.config.local_administrator_credential('d12_lifecycle_install',namespace))
         daemon.server._d12_graph_catalogue_upgrade_services_v1 = {
             (namespace, installation.installation_id): catalogue}
+        from .source_inspection_migration_v1 import InstalledSourceInspectionMigrationV1
+        from .d12_installation_lifecycle_rpc_v1 import install_d12_source_inspection_migration_v1
+        from .source_inspection_workflow_resource_v1 import InstalledInspectionWorkflowResourceV1
+        resource = (InstalledInspectionWorkflowResourceV1.from_controlled_sdk_v4(daemon=daemon)
+            if daemon.c09_gate._controlled_sdk_activation_v3 is not None
+            else InstalledInspectionWorkflowResourceV1())
+        migration=InstalledSourceInspectionMigrationV1(lifecycle=service,package_files=files,
+            registry=catalogue.registry,workflow_resource=resource)
+        migration.install_schema(daemon.config.local_administrator_credential('d12_lifecycle_install',namespace))
+        install_d12_source_inspection_migration_v1(daemon.server,migration)
+        from ..runtime.source_inspection_member_admission_v1 import install_source_inspection_migration_history_v1
+        install_source_inspection_migration_history_v1(daemon.server, migration,
+            credential=daemon.config.local_administrator_credential('c09_maintenance', namespace))
+        if launch['schema']=='sylanne3.authority.linux-deployment.v4':
+            from .v2_model_egress_service import install_d13_accounting_metadata_producer_v3
+            model=daemon.server._v2_model_egress.get(namespace)
+            if model is None:
+                raise AuthorityUnavailable('new Linux cohort requires its actual installed model accounting producer')
+            install_d13_accounting_metadata_producer_v3(model,server=daemon.server,
+                bundle=daemon.config.natural_model_authorities_v2[namespace].installation_bundle)
+            from .maintenance_console_deployment_v1 import install_linux_maintenance_console_v1
+            role_bytes=read_installed_bytes_v1(launch['maintenance_console_role_path'],limit=32768)
+            if hashlib.sha256(role_bytes).hexdigest()!=launch['maintenance_console_role_sha256']:
+                raise AuthorityUnavailable('installed console role changed before Authority composition')
+            install_linux_maintenance_console_v1(daemon,role_config_path=launch['maintenance_console_role_path'])
+        migration.workflow.resume_pending_v1()
+    if (launch['schema']=='sylanne3.authority.linux-deployment.v4'
+            and not getattr(daemon.server,'_maintenance_console_bindings_v1',None)):
+        raise AuthorityUnavailable('new Linux deployment requires its actual Source service and independent console binding')
     return service

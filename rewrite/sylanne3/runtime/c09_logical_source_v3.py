@@ -111,6 +111,12 @@ def read_c09_logical_source_shape_v3(scope, table, *, meter):
         if physical.columns!=registered or physical.primary_key_columns!=('bot','persona','operation_id') or actual!=(PHYSICAL_DDL.replace(' IF NOT EXISTS',''),):
             raise C09PagedCaptureHold('registered actual13-column Domain Source schema differs')
         mapped={'original_payload_cell_id':'original_payload_json'}
+    elif scope.role=='core' and table=='authority_platform_observation_facts_v3':
+        from ..authority_service.c09_platform_observation_fact_storage_v3 import PHYSICAL_DDL,PHYSICAL_COLUMNS,BLOB_COLUMNS
+        actual=meter.read_fixed_row(scope.source,'sqlite_master',('sql',),'type=? AND name=?',('table',table))
+        if physical.columns!=PHYSICAL_COLUMNS or physical.primary_key_columns!=('fact_operation_id',) or actual!=(PHYSICAL_DDL,):
+            raise C09PagedCaptureHold('actual registered three-BLOB Fact physical schema differs')
+        mapped={name+'_cell_id':name for name in BLOB_COLUMNS}
     elif scope.role=='graph' and table=='graph_contact_expression_plan_originals_v3':
         from .contact_plan_adoption_v3 import TABLE,COLUMNS,DDL
         actual=meter.read_fixed_row(scope.source,'sqlite_master',('sql',),'type=? AND name=?',('table',TABLE))
@@ -127,7 +133,7 @@ def read_c09_logical_source_shape_v3(scope, table, *, meter):
         physical_column = row[1]
         logical_column = mapped.get(physical_column, physical_column)
         columns.append(logical_column)
-        types.append('TEXT' if physical_column in mapped else row[2])
+        types.append(('BLOB' if table=='authority_platform_observation_facts_v3' else 'TEXT') if physical_column in mapped else row[2])
         bindings.append((logical_column, physical_column,
                          'segmented_cell' if physical_column in mapped else 'physical_scalar'))
     columns, types, bindings = tuple(columns), tuple(types), tuple(bindings)
@@ -276,6 +282,10 @@ class C09LogicalSourceRowReadV3:
         meter.require_available(65536)
         if binding == 'segmented_cell':
             row = meter.read_fixed_row(self.scope.source, self.shape.table, (name,), self._where(), self.primary_key)
+            if row is not None and row[0] is None and self.shape.table=='authority_platform_observation_facts_v3' and logical_column in ('receipt','updated_fact_permit'):
+                encoded=comma+self._encode(legacy._cell(None),meter)
+                self._write(encoded,physical=True,logical=True);self.metadata[logical_column]=None
+                self.column+=1;return
             if row is None or type(row[0]) is not str:
                 raise C09PagedCaptureHold('actual mapped Source cell reference is absent or differs')
             header = self.scope.read_cell_header_v3(row[0], meter=meter)
@@ -297,8 +307,15 @@ class C09LogicalSourceRowReadV3:
                 if (header[2] != atom.token
                         or (atom.owner.bot, atom.owner.persona) != tuple(json.loads(self.scope.session.scope.graph_namespace))):
                     raise C09PagedCaptureHold('mapped Source header erasure owner/namespace differs from its actual Graph row')
+            elif self.scope.role=='core' and self.shape.table=='authority_platform_observation_facts_v3':
+                from ..authority_service.c09_platform_observation_fact_storage_v3 import require_fact_cell_binding_v3
+                row_ns=meter.read_fixed_row(self.scope.source,self.shape.table,('namespace','fact_operation_id'),self._where(),self.primary_key)
+                if row_ns!=(self.scope.session.scope.authority_namespace,self.primary_key[0]):
+                    raise C09PagedCaptureHold('actual Fact Source namespace/primary key differs')
+                require_fact_cell_binding_v3(namespace=row_ns[0],operation_id=row_ns[1],column=logical_column,header=header)
             elif self.shape.table in _CORE_PAYLOAD_TABLES:
-                phases = ('draft', 'header', 'evidence') if self.shape.table == 'authority_d13_counter_originals_v1' else ('expected', 'observed_before_send')
+                from ..authority_service.d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+                phases = {'draft','header','evidence','pressure_mapping_v1'} if self.shape.table == 'authority_d13_counter_originals_v1' else {'expected','observed_before_send'} | D13_ACCOUNTING_PHASES_V3
                 if (self.primary_key[0] != self.scope.session.scope.authority_namespace
                         or self.primary_key[2] not in phases
                         or header[2] != _core_payload_owner_v3(self.shape.table, self.primary_key)):
@@ -307,7 +324,7 @@ class C09LogicalSourceRowReadV3:
             self.cell = C09LogicalSourceCellDescriptorV3(logical_column, name, row[0], tuple(header))
             self.metadata[logical_column] = self.cell
             self.physical.update(comma + self._encode(legacy._cell(row[0]), meter))
-            prefix = comma + b'["text","'
+            prefix = comma + (b'["blob","' if self.shape.logical_types[self.column]=='BLOB' else b'["text","')
             meter.charge_encode(len(prefix)); self.logical.update(prefix)
             self.total, self.offset, self.ordinal = header[4], 0, 0
             self.cell_hash = sha256()
@@ -383,7 +400,7 @@ class C09LogicalSourceRowReadV3:
         meter.require_available(len(raw) * 8 + 4096)
         self.parser.feed(raw, lambda event: None)
         self.last_logical_fragment = (self.cell.logical_column, raw)
-        encoded = legacy._canonical(self.decoder.decode(raw, final=False))[1:-1]
+        encoded = raw.hex().encode('ascii') if self.shape.logical_types[self.column]=='BLOB' else legacy._canonical(self.decoder.decode(raw, final=False))[1:-1]
         meter.charge_encode(len(encoded)); self.logical.update(encoded)
         self.fragment_offset = end
         if end == len(self.fragment):
@@ -392,7 +409,7 @@ class C09LogicalSourceRowReadV3:
     def _cell_eof(self, meter):
         header = self.scope.require_cell_eof_v3(self.cell.cell_id, self.ordinal, meter=meter)
         parsed = self.parser.finish()
-        tail = legacy._canonical(self.decoder.decode(b'', final=True))[1:-1]
+        tail = b'' if self.shape.logical_types[self.column]=='BLOB' else legacy._canonical(self.decoder.decode(b'', final=True))[1:-1]
         meter.charge_encode(len(tail) + 2); self.logical.update(tail + b'"]')
         if (tuple(header) != self.cell.header or self.offset != self.total
                 or self.cell_hash.hexdigest() != header[6] or self.cell_root != header[7]

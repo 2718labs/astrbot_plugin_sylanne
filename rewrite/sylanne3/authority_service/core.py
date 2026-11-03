@@ -45,13 +45,18 @@ from .c09_graph_rebase_issue_v1 import (
 from dataclasses import asdict
 
 
+AUTHORITY_META_DDL_V4 = """CREATE TABLE IF NOT EXISTS authority_meta(
+    key TEXT PRIMARY KEY, value TEXT NOT NULL);
+"""
+
+
 class AuthorityServiceCore:
     """Transactional authority state; no role content and no network listener."""
 
     def __init__(self, path, *, authorizer, deletion_verifier,
                  execution_verifier, effect_verifier, dispatch_verifier,
                  create: bool = False, execution_redaction_c04_service=None,
-                 selected_storage=None, storage_context=None, maintenance_basis=None):
+                 selected_storage=None, storage_context=None, maintenance_basis=None, initial_storage=None, initial_maintenance=None):
         for name, value in (
             ("authorizer", authorizer), ("deletion_verifier", deletion_verifier),
             ("execution_verifier", execution_verifier),
@@ -88,13 +93,34 @@ class AuthorityServiceCore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._runtime_storage_v3 = None
-        if selected_storage is not None or maintenance_basis is not None:
+        if any(value is not None for value in (selected_storage, maintenance_basis, initial_storage, initial_maintenance)):
             from ..runtime_storage_v3 import (install_selected_runtime_storage_v3,
                 install_selected_maintenance_storage_v3,install_runtime_storage_schema_v3)
             try:
-                if selected_storage is not None and maintenance_basis is not None:
-                    raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
-                if maintenance_basis is not None:
+                if sum(value is not None for value in (selected_storage, maintenance_basis, initial_storage, initial_maintenance)) != 1:
+                    raise AuthorityUnavailable("initial business, initial maintenance, selected business and selected maintenance are mutually exclusive")
+                if initial_maintenance is not None:
+                    from .c09_initial_segmented_genesis_v4 import VerifiedInitialMaintenanceCompositionV4
+                    from ..runtime_storage_v3 import install_initial_maintenance_runtime_storage_v4
+                    from .daemon import _bootstrap_control_quantum_v3
+                    if type(initial_maintenance) is not VerifiedInitialMaintenanceCompositionV4:
+                        raise AuthorityUnavailable("actual initial metadata maintenance composition required")
+                    with _bootstrap_control_quantum_v3(initial_maintenance.control) as meter:
+                        initial_maintenance.require_layout(self._db, "core", meter=meter)
+                        self._runtime_storage_v3 = install_initial_maintenance_runtime_storage_v4(
+                            self._db, role="core", composition=initial_maintenance, context=storage_context)
+                elif initial_storage is not None:
+                    from .c09_initial_segmented_genesis_v4 import VerifiedInitialSegmentedStorageV4
+                    from ..runtime_storage_v3 import install_initial_runtime_storage_v4
+                    from .daemon import _bootstrap_control_quantum_v3
+                    if type(initial_storage) is not VerifiedInitialSegmentedStorageV4:
+                        raise AuthorityUnavailable("actual independently qualified initial Core storage required")
+                    with _bootstrap_control_quantum_v3(initial_storage.control) as meter:
+                        initial_storage.require_layout(self._db, "core", meter=meter)
+                        self._runtime_storage_v3 = install_initial_runtime_storage_v4(
+                            self._db, role="core", initial=initial_storage, context=storage_context)
+                        install_runtime_storage_schema_v3(self._db, handle=self._runtime_storage_v3)
+                elif maintenance_basis is not None:
                     from .daemon import _bootstrap_control_quantum_v3
                     with _bootstrap_control_quantum_v3(maintenance_basis.basis.control):
                         self._runtime_storage_v3=install_selected_maintenance_storage_v3(
@@ -113,9 +139,7 @@ class AuthorityServiceCore:
             self._install_schema()
 
     def _install_schema(self) -> None:
-        self._db.executescript("""
-            CREATE TABLE IF NOT EXISTS authority_meta(
-                key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        self._db.executescript(AUTHORITY_META_DDL_V4 + """
             CREATE TABLE IF NOT EXISTS authority_namespaces(
                 namespace TEXT PRIMARY KEY, holder TEXT, generation INTEGER NOT NULL,
                 phase TEXT NOT NULL, transfer_id TEXT, target TEXT,
@@ -177,6 +201,19 @@ class AuthorityServiceCore:
         with self._lock:
             if self._db is None:
                 raise AuthorityUnavailable("authority service is unavailable")
+            if self._db.in_transaction:
+                from .d13_cache_use_control_v2 import (
+                    _borrow_fresh_d13_constructor_transaction_v3,
+                    _finish_fresh_d13_constructor_transaction_v3)
+                installation = _borrow_fresh_d13_constructor_transaction_v3(self)
+                if installation is not None:
+                    failed = True
+                    try:
+                        yield self._db
+                        failed = False
+                    finally:
+                        _finish_fresh_d13_constructor_transaction_v3(installation, failed=failed)
+                    return
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 yield self._db

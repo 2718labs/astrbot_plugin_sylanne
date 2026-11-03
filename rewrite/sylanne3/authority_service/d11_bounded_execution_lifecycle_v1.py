@@ -201,8 +201,13 @@ class InstalledD11BoundedExecutionLifecycleV1:
             permit = self.bridge.fences.begin_fence_locked(db, subject=self._subject, holder=holder,
                 operation="write", current_anchor=anchor, operation_id=self._gate_id(binding, "claim"))
         prepared = self._prepared(binding)
-        owner, returned = self.owner_service.get_current_background_owner_authority_for_fence_v1(
-            credential=self.credential, subject=self._subject, permit=permit)
+        from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+        from ..runtime.d11_life_contract_v1 import D11LifeExecutionBindingV1
+        if type(self) is AuthorityD11LifeServiceV1 and type(binding) is D11LifeExecutionBindingV1:
+            owner, returned = self._own_life_owner_for_claim_v1(binding, permit)
+        else:
+            owner, returned = self.owner_service.get_current_background_owner_authority_for_fence_v1(
+                credential=self.credential, subject=self._subject, permit=permit)
         if returned != permit:
             raise AuthorityUnavailable("offline Owner qualification changed its real permit")
         with independent_append_core_guard_v3(self.bridge) as (db, deletion):
@@ -216,6 +221,11 @@ class InstalledD11BoundedExecutionLifecycleV1:
                 now = self._now()
                 if now >= min(_utc(binding.deadline_utc).timestamp(), _utc(binding.job_lease_expires_utc).timestamp()):
                     raise AuthorityUnavailable("offline deadline/worker expired before durable claim")
+                from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+                if type(self) is AuthorityD11LifeServiceV1:
+                    from ..runtime.d11_character_work_segment_v1 import require_character_labor_claim_current_v1
+                    require_character_labor_claim_current_v1(self._character_labor_claim_v1,
+                        service=self, prepared=prepared, binding=binding, permit=permit)
                 payload = self._payload(self._claim_payload_type,
                     binding_digest=binding.digest, prepared_digest=prepared.digest,
                     execution_id=binding.execution_id, claim_id=self._execution_mutation_id(binding, "claim"),

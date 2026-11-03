@@ -26,6 +26,7 @@ class CurrentDispatchProjectionV1:
     digest: str
     coverage: str = "full"
     missing_sources: tuple[str, ...] = ()
+    policy_versions: tuple[GraphVersion, ...] | None = None
 
 
 
@@ -65,9 +66,59 @@ def _bound_dispatch_projection_v3(db,namespace,query,*,snapshot=None,prepared_in
     return projection
 
 
+
+
+def read_current_dispatch_policy_route_v3(db,namespace,query,*,source_ref,c02_operation_id,
+        platform_ref,conversation_ref,sender_ref,scene_ref):
+    from ..authority_service.current_authority_graph_read_v3 import authority_graph_projection_for_db_v3
+    if authority_graph_projection_for_db_v3(db,namespace)is not None or runtime_storage_v3(db)is None:
+        return None
+    from .current_graph_full_read_v3 import (
+        CURRENT_DISPATCH_FAMILY_V3,PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3,
+        require_bound_graph_full_read_proof_for_db_v3,require_bound_current_full_ingress_route_v3)
+    proof=require_bound_graph_full_read_proof_for_db_v3(db,namespace,
+        required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3}))
+    if type(proof)not in(PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3):
+        return None
+    return require_bound_current_full_ingress_route_v3(db,namespace,query,
+        source_ref=source_ref,c02_operation_id=c02_operation_id,platform_ref=platform_ref,
+        conversation_ref=conversation_ref,sender_ref=sender_ref,scene_ref=scene_ref)
+
+
+def _bound_ordinary_policy_v3(db,namespace,query):
+    from .current_graph_full_read_v3 import (
+        CURRENT_DISPATCH_FAMILY_V3,PreparedCurrentGraphFullReadV3,
+        PreparedCurrentGraphFullWriteViewV3,require_bound_graph_full_read_proof_for_db_v3,
+        require_bound_graph_full_policy_projection_v3)
+    proof=require_bound_graph_full_read_proof_for_db_v3(db,namespace,
+        required_families=frozenset({CURRENT_DISPATCH_FAMILY_V3}))
+    if type(proof)not in(PreparedCurrentGraphFullReadV3,PreparedCurrentGraphFullWriteViewV3):
+        return None
+    roles,boundaries,selection=require_bound_graph_full_policy_projection_v3(proof,db,query)
+    return proof,roles,boundaries,selection
+
+
+def _require_ordinary_policy_request_v3(policy,db,query,request,route):
+    from ..authority_service.contract import AuthorityUnavailable
+    if (type(request)is not RoleBindingRequest or type(route)is not tuple or len(route)!=5
+            or request.group_ref is not None or not request.scope_complete
+            or request.scene_ref!=route[4]):
+        raise AuthorityUnavailable('ordinary policy projection requires its actual issued request and complete route')
+    proof,_roles,_boundaries,selection=policy
+    selection.require_policy_for_v3(proof,db,query,subject=request.subject_persona_ref,
+        target=request.target_entity_ref,route=route,now=request.at_time,
+        action_kind=request.requested_action_kind,purpose=request.purpose)
+
+
+def _projection_digest_v3(namespace,epoch,roles,boundaries,policy_versions=None):
+    value={'namespace':namespace,'graph_epoch':epoch,'role_bindings':roles,'boundary_rules':boundaries}
+    if policy_versions is not None:value['policy_versions']=policy_versions
+    return canonical_digest(value)
+
+
 def read_current_dispatch_projection(
     db, namespace: NamespaceId, snapshot: GraphSnapshot, query: QueryEpoch,
-    *, prepared_inventory=None,
+    *, prepared_inventory=None, policy_request=None, policy_route=None,
 ) -> CurrentDispatchProjectionV1:
     """Reject a partial/stale read set while SQLite still holds the graph write lock."""
     if not db.in_transaction:
@@ -84,7 +135,21 @@ def read_current_dispatch_projection(
     if (row[0] if row else 0) != query.revision:
         raise ValueError("dispatch projection graph epoch changed")
     fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
+    if prepared_inventory is not None and prepared_inventory.family=='private_reply':
+        from .private_dispatch_source_read_v3 import require_private_dispatch_policy_projection_v3
+        roles,boundaries,_seal=require_private_dispatch_policy_projection_v3(prepared_inventory,db,query)
+        return CurrentDispatchProjectionV1(namespace,query.revision,roles,boundaries,canonical_digest({
+            'namespace':namespace,'graph_epoch':query.revision,'role_bindings':roles,'boundary_rules':boundaries}))
     from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphProjectionV3,require_authority_graph_type_rows_v3
+    if fixed is not None and type(fixed)is not AuthorityGraphProjectionV3:
+        policy=_bound_ordinary_policy_v3(db,namespace,query)
+        if policy is not None:
+            _require_ordinary_policy_request_v3(policy,db,query,policy_request,policy_route)
+            _proof,roles,boundaries,selection=policy
+            versions=selection.policy_versions
+            return CurrentDispatchProjectionV1(namespace,query.revision,roles,boundaries,
+                _projection_digest_v3(namespace,query.revision,roles,boundaries,versions),
+                policy_versions=versions)
     authority_rows=None
     if type(fixed)is AuthorityGraphProjectionV3:
         authority_rows=require_authority_graph_type_rows_v3(db,namespace,('d03.role_binding','d05.boundary_rule'),('token','revision','value'))
@@ -144,7 +209,7 @@ def read_current_dispatch_projection(
 def derive_current_domain_reads(
     db, projection: CurrentDispatchProjectionV1, request: RoleBindingRequest,
     context: ContextProvider,
-    *, prepared_inventory=None,
+    *, prepared_inventory=None, policy_route=None,
 ) -> tuple[RoleBindingResolution, BoundaryRuleReadSet]:
     """Decode complete current D03/D05 rows; this is not dispatch admission."""
     if not db.in_transaction:
@@ -152,11 +217,8 @@ def derive_current_domain_reads(
     namespace = projection.namespace
     if request.subject_persona_ref != f"persona:{namespace.persona_id}":
         raise ValueError("binding request differs from projected persona")
-    if projection.digest != canonical_digest({
-        "namespace": namespace, "graph_epoch": projection.graph_epoch,
-        "role_bindings": projection.role_bindings,
-        "boundary_rules": projection.boundary_rules,
-    }):
+    if projection.digest != _projection_digest_v3(namespace,projection.graph_epoch,
+            projection.role_bindings,projection.boundary_rules,projection.policy_versions):
         raise ValueError("current domain projection digest changed")
     row = db.execute(
         "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
@@ -166,6 +228,23 @@ def derive_current_domain_reads(
         raise ValueError("current domain projection epoch changed")
     query = QueryEpoch(namespace,"all",projection.graph_epoch)
     fixed = _bound_dispatch_projection_v3(db,namespace,query,prepared_inventory=prepared_inventory)
+    if prepared_inventory is not None and prepared_inventory.family=='private_reply':
+        from .private_dispatch_source_read_v3 import (require_private_dispatch_policy_projection_v3,
+            require_private_dispatch_policy_request_v3)
+        require_private_dispatch_policy_request_v3(prepared_inventory,db,query,request)
+        roles,boundaries,_seal=require_private_dispatch_policy_projection_v3(prepared_inventory,db,query)
+        if (projection.role_bindings,projection.boundary_rules)!=(roles,boundaries):
+            raise ValueError('private policy rows differ from the exact actual applicability predicate')
+        return _derive_verified_current_domain_reads_v1(db,projection,request,context)
+    from ..authority_service.current_authority_graph_read_v3 import AuthorityGraphProjectionV3
+    if fixed is not None and type(fixed)is not AuthorityGraphProjectionV3:
+        policy=_bound_ordinary_policy_v3(db,namespace,query)
+        if policy is not None:
+            _require_ordinary_policy_request_v3(policy,db,query,request,policy_route)
+            _proof,roles,boundaries,selection=policy
+            if (projection.role_bindings,projection.boundary_rules,projection.policy_versions)!=(roles,boundaries,selection.policy_versions):
+                raise ValueError('ordinary policy rows or metadata census changed from their actual request')
+            return _derive_verified_current_domain_reads_v1(db,projection,request,context)
     projected = projection.role_bindings + projection.boundary_rules
     by_token = {atom.key.token: atom for atom in projected}
     if len(by_token) != len(projected):
@@ -230,7 +309,8 @@ def _derive_verified_current_domain_reads_v1(db,projection,request,context):
     role_read = RoleBindingResolution(
         resolved.status, resolved.matched_bindings, resolved.applicable_norm_refs,
         resolved.missing_items,
-        tuple(GraphVersion(atom.key, atom.revision) for atom in projection.role_bindings),
+        (projection.policy_versions if projection.policy_versions is not None else
+         tuple(GraphVersion(atom.key, atom.revision) for atom in projection.role_bindings)),
         QueryEpoch(namespace, "d03.role_binding", projection.graph_epoch),
         resolved.valid_until, request,
     )
@@ -268,5 +348,5 @@ def _derive_verified_current_domain_reads_v1(db,projection,request,context):
 
 __all__ = [
     "CurrentDispatchProjectionV1", "read_current_dispatch_projection",
-    "derive_current_domain_reads",
+    "derive_current_domain_reads", "read_current_dispatch_policy_route_v3",
 ]

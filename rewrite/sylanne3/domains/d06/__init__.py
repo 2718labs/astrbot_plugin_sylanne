@@ -887,6 +887,10 @@ class D06DomainProvider:
         specs.append(internal_life_trace_type_spec_v3())
         from ...runtime.artifact_task_amendment_v1 import amendment_type_spec_v1
         specs.append(amendment_type_spec_v1())
+        from .inspection_metadata_v1 import inspection_metadata_type_specs_v1
+        specs.extend(inspection_metadata_type_specs_v1())
+        from .retention_v1 import retention_type_specs_v1
+        specs.extend(retention_type_specs_v1())
         return tuple(sorted(specs, key=lambda item: item.name))
 
     def register_types(self) -> tuple[str, ...]:
@@ -899,6 +903,8 @@ class D06DomainProvider:
             raise ValueError("proposal is not a D06 memory proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:
             raise ValueError("D06 proposal schema hash is not recognized")
+        from .inspection_metadata_v1 import validate_inspection_proposal_v1
+        validate_inspection_proposal_v1(proposal)
         from .source_access_revocation import validate_revocation_proposal_shape
         validate_revocation_proposal_shape(proposal)
         from ...graph_types import GraphSnapshot
@@ -927,6 +933,13 @@ class D06DomainProvider:
             if spec.writer_domain != "d06":
                 raise ValueError("D06 proposal contains a non-D06 graph write")
             registry.validate(write.key, write.value)
+            from .retention_v1 import (POLICY_TYPE,DETAIL_TYPE,READ_TYPE,CONTRIBUTION_TYPE,
+                decode_retention_graph_row_v1)
+            if write.key.type_name in {POLICY_TYPE,DETAIL_TYPE,READ_TYPE,CONTRIBUTION_TYPE}:
+                versions=tuple(v for v in proposal.envelope.version_guard.read_versions if v.key==write.key)
+                if (len(versions)!=1 or NamespaceId.from_key(write.key)!=proposal.envelope.authority.namespace):
+                    raise ValueError('retention graph member lacks its exact current namespace/CAS read')
+                decode_retention_graph_row_v1(write.key,versions[0].revision+1,write.value)
             if write.key.type_name == SOURCE_CORRECTION_HEAD_TYPE:
                 validate_source_correction_head(write.key, write.value)
                 if write.value["state"] != "pending_reevaluation":
@@ -1336,24 +1349,17 @@ class D06DomainAdapter:
             context.read_versions,
         )
 
-    def compile_encoding(self, envelope: CommandEnvelope, prepared: object) -> DomainProposal:
-        return self._compile_encoding(envelope, prepared, encoding_baseline_ref=None)
-
     def compile_encoding_v2(
         self, envelope: CommandEnvelope, prepared: object, *, encoding_baseline_ref: str,
     ) -> DomainProposal:
-        """Compile C02 with D04 baseline and a committed D03 self perspective.
-
-        A sender entity or scene binding cannot stand in for the role's self.
-        The legacy unversioned compiler remains for historical fixture data.
-        """
+        """Compile C02 against an actual committed D04 baseline and D03 self view."""
         return self._compile_encoding(
             envelope, prepared, encoding_baseline_ref=encoding_baseline_ref,
         )
 
     def _compile_encoding(
         self, envelope: CommandEnvelope, prepared: object, *,
-        encoding_baseline_ref: str | None,
+        encoding_baseline_ref: str,
     ) -> DomainProposal:
         """Compile a proof-bound C02 candidate; only GraphCoordinator may admit it."""
         from .pipeline import PreparedEncoding
@@ -1397,19 +1403,16 @@ class D06DomainAdapter:
             return key
 
         event = graph_ref(proposal.episode.event_ref, "event_ref", frozenset({"d03.world_event"}))
-        perspective_types = (frozenset({"d03.self_perspective.v1"})
-                             if encoding_baseline_ref is not None else
-                             frozenset({"d03.role_binding", "d03.entity_anchor"}))
-        perspective = graph_ref(proposal.trace.perspective_ref,
-                                "perspective_ref", perspective_types)
-        if encoding_baseline_ref is not None and perspective.owner.kind != "persona":
+        perspective = graph_ref(
+            proposal.trace.perspective_ref, "perspective_ref",
+            frozenset({"d03.self_perspective.v1"}),
+        )
+        if perspective.owner.kind != "persona":
             raise ValueError("C02 self perspective must be persona-owned")
-        mapping = None
-        if encoding_baseline_ref is not None:
-            from ..d03.self_perspective import self_mapping_key
-            mapping = graph_ref(self_mapping_key(self.namespace).token,
-                                "self_mapping_ref",
-                                frozenset({"d03.self_identity_mapping.v1"}))
+        from ..d03.self_perspective import self_mapping_key
+        mapping = graph_ref(self_mapping_key(self.namespace).token,
+                            "self_mapping_ref",
+                            frozenset({"d03.self_identity_mapping.v1"}))
         feelings = tuple(graph_ref(
             ref, "then_feeling_ref", frozenset({"d04.feeling_state.v1", "d04.appraisal_bundle.v1"})
         )
@@ -1419,14 +1422,11 @@ class D06DomainAdapter:
             frozenset({"d07.current_interpretation.v1", "d07.belief_revision.v1"}),
         )
                                 for ref in proposal.trace.interpretation_refs)
-        baseline = (graph_ref(
+        baseline = graph_ref(
             encoding_baseline_ref, "encoding_baseline_ref",
             frozenset({"d04.encoding_baseline.v1"}),
-        ) if encoding_baseline_ref is not None else None)
-        required = (source, event, perspective,
-                    *((mapping,) if mapping is not None else ()),
-                    *feelings, *interpretations,
-                    *((baseline,) if baseline is not None else ()))
+        )
+        required = (source, event, perspective, mapping, *feelings, *interpretations, baseline)
         context_versions: dict[AtomKey, int] = {}
         for ref, revision in proposal.read_versions:
             key = source if ref in {prepared.source_ref, source.token} else AtomKey.from_token(ref)
@@ -1439,9 +1439,7 @@ class D06DomainAdapter:
             raise ValueError("encoding context lacks required read_versions")
 
         episode = episode_key(*self.namespace.as_tuple, proposal.episode.episode_id)
-        trace = (subjective_trace_v2_key if baseline is not None else subjective_trace_key)(
-            *self.namespace.as_tuple, proposal.trace.trace_id,
-        )
+        trace = subjective_trace_v2_key(*self.namespace.as_tuple, proposal.trace.trace_id)
         if (guarded.get(episode) != GraphVersion(episode, 0)
                 or guarded.get(trace) != GraphVersion(trace, 0)):
             raise ValueError("C02 requires revision-0 episode and trace proofs")
@@ -1458,20 +1456,17 @@ class D06DomainAdapter:
             "interpretation_refs": [key.token for key in interpretations],
             "detail_weights": [[detail, float(weight)] for detail, weight in proposal.trace.detail_weights],
         }
-        if baseline is not None:
-            trace_value["encoding_baseline_ref"] = baseline.token
+        trace_value["encoding_baseline_ref"] = baseline.token
         validate_episode(episode_value)
-        (validate_subjective_trace_v2 if baseline is not None else validate_subjective_trace)(trace_value)
+        validate_subjective_trace_v2(trace_value)
         writes = (
             GraphWrite(episode, episode_value),
             GraphWrite(trace, trace_value),
         )
         historical = tuple(dict.fromkeys((
             *prepared.proof_versions,
-            *(guarded[key] for key in (event, perspective,
-                                      *((mapping,) if mapping is not None else ()),
-                                      *feelings, *interpretations,
-                                      *((baseline,) if baseline is not None else ()))),
+            *(guarded[key] for key in (event, perspective, mapping,
+                                      *feelings, *interpretations, baseline)),
         )))
         return self.wrap_runtime_proposal(
             envelope,
@@ -1505,6 +1500,16 @@ class D06DomainAdapter:
             raise ValueError("proposal namespace differs from D06 adapter")
         if not isinstance(dependencies, DependencySet):
             raise TypeError("dependencies must be DependencySet")
+        from .inspection_metadata_v1 import derive_inspection_projection_writes_v1
+        original_count = len(typed_writes)
+        typed_writes = derive_inspection_projection_writes_v1(envelope, typed_writes)
+        if len(typed_writes) != original_count:
+            guards = {version.key: version for version in envelope.version_guard.read_versions}
+            current = {version.key: version for version in dependencies.current_invalidation}
+            for write in typed_writes[original_count:]:
+                for key in write.dependencies:
+                    current[key] = guards[key]
+            dependencies = replace(dependencies, current_invalidation=tuple(current.values()))
         return DomainProposal(
             "d06",
             _D06_PROPOSAL_SCHEMA,

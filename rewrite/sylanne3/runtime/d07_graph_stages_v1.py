@@ -319,17 +319,23 @@ def acquire_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id, prepar
         acquired = acquire_job(db, job_id, holder, now_utc=datetime.fromtimestamp(now, timezone.utc).isoformat().replace("+00:00", "Z"),
             lease_seconds=min(3600, int(workflow.timeout_seconds) + 120))
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        ordinary=type(prepared)is D07OrdinaryContinuityPreparedV1
         general=type(prepared)is D07GeneralGrowthPreparedV1
         frozen=_thaw_d07_stage_frozen_v3(prepared)
         refs=tuple(source.source_ref.ref for source in _d07_stage_frozen_sources_v3(prepared,frozen))
-        if general:
+        if ordinary:
+            from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_template_digest_v1
+            template_digest=ordinary_continuity_template_digest_v1(prepared.phase)
+            model_purpose="consolidation"
+        elif general:
             from ..model_broker.general_growth_cognition_v1 import TEMPLATE_DIGEST as template_digest
             model_purpose="consolidation"
         else:
             template_digest=TEMPLATE_DIGEST;model_purpose="proposal"
         deadline = min(datetime.fromisoformat(acquired.deadline_utc.replace("Z", "+00:00")).timestamp(),
             datetime.fromisoformat(acquired.lease_expires_utc.replace("Z", "+00:00")).timestamp())
-        if general:deadline=min(deadline,prepared.original_deadline_utc)
+        if general or ordinary:deadline=min(deadline,prepared.original_deadline_utc)
         content_reads = _content_versions(db, service.d11_issuer, prepared)
         member_writes = (job_graph_write(acquired),)
         extra = None
@@ -518,8 +524,21 @@ def finish_current_d07_execution_v1(graph, bootstrap, bundle, *, job_id, prepare
             record_d07_body_cost_after_cas_v1(db, prepared=prepared, issuer=service.d11_issuer, writes=writes, original=body_original)
             metadata, epoch = graph._v2_graph_stamp(prepared.namespace)
         job = get_job(db, job_id)
-        execution, job_writes = stage_d07_execution_original_in_transaction_v1(db, prepared=prepared,
-            issuer=service.d11_issuer, holder=job.lease_holder, fence=job.fence)
+        from .d07_single_event_review_v1 import (SingleEventReviewCardinalityRejectedV1,
+            stage_single_event_review_cardinality_rejection_v1,
+            record_single_event_review_cardinality_rejection_after_cas_v1)
+        try:
+            execution, job_writes = stage_d07_execution_original_in_transaction_v1(db, prepared=prepared,
+                issuer=service.d11_issuer, holder=job.lease_holder, fence=job.fence)
+        except SingleEventReviewCardinalityRejectedV1 as rejected:
+            rejection=stage_single_event_review_cardinality_rejection_v1(db,prepared=prepared,error=rejected,
+                issuer=service.d11_issuer,holder=job.lease_holder,fence=job.fence)
+            actual=_commit_graph_stage(graph,db,metadata,epoch,prepared,rejection.rejection_operation_id,
+                "case_parse_rejected",now,rejection.writes,rejection.reads)
+            original=record_single_event_review_cardinality_rejection_after_cas_v1(db,stage=rejection,
+                receipt=actual,issuer=service.d11_issuer)
+            return {"status":"actual_case_parse_rejected","job_id":job_id,"terminal_ref":original.original_ref,
+                "original_digest":original.original_digest}
         if job_writes:
             row = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (job_writes[0].key.token,)).fetchone()
             operation = "d07-complete:" + canonical_digest((prepared.namespace, prepared.call_id))[:48]
@@ -564,7 +583,15 @@ def resume_current_d07_behavior_v1(graph, bootstrap, bundle, *, job_id, prepared
             (*prepared.namespace.as_tuple, prepared.operation_id)).fetchone()
         committed = CommitReceipt("committed", prepared.operation_id, row[0], prepared.activity_id, prepared.effect_id,
             row[1], staged.read_versions, receipt.revisions, (receipt.epoch,), execution.cost_receipt_refs, ())
-        record_adopted_domain_operation_v1(db, staged, committed)
+        domain_original=record_adopted_domain_operation_v1(db, staged, committed)
+        from .d07_ordinary_continuity_cognition_v1 import record_actual_ordinary_continuity_adoption_v1
+        record_actual_ordinary_continuity_adoption_v1(db,issuer=service.d11_issuer,prepared=prepared,
+            execution=execution,writes=interpretation_writes,receipt=receipt,commit_receipt=committed,
+            domain_original=domain_original)
+        from .d07_single_event_review_v1 import record_actual_single_event_review_adoption_v1
+        record_actual_single_event_review_adoption_v1(db,issuer=service.d11_issuer,prepared=prepared,
+            execution=execution,writes=interpretation_writes,receipt=receipt,commit_receipt=committed,
+            domain_original=domain_original)
         from .d07_budget_v1 import close_actual_d07_child_after_adoption_v1
         close_actual_d07_child_after_adoption_v1(db, prepared=prepared, issuer=service.d11_issuer)
         return {"status": "adopted", "job_id": job_id, "operation_id": prepared.operation_id,
@@ -711,8 +738,16 @@ def _read_d07_adoption_inputs_v3(graph, bootstrap, bundle, service, *, job_id, m
         from .d07_reflection_execution_v1 import stage_reflection_from_actual_cognition_v1, record_actual_reflection_after_cas_v1
         reflection_request, reflection_writes = stage_reflection_from_actual_cognition_v1(db,
             prepared=prepared, issuer=service.d11_issuer)
-        plan = read_plan_current_d07_operation_v1(db, namespace=prepared.namespace,
-            activity_id=prepared.activity_id, operation_kind=kind, request=request)
+        from .d07_ordinary_continuity_cognition_v1 import (
+            D07OrdinaryContinuityPreparedV1,ordinary_continuity_adoption_read_plan_v1)
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1,single_event_review_adoption_read_plan_v1
+        if type(prepared)is D07OrdinaryContinuityPreparedV1:
+            plan=ordinary_continuity_adoption_read_plan_v1(prepared,reads)
+        elif type(prepared)is D07SingleEventReviewPreparedV1:
+            plan=single_event_review_adoption_read_plan_v1(prepared,reads)
+        else:
+            plan = read_plan_current_d07_operation_v1(db, namespace=prepared.namespace,
+                activity_id=prepared.activity_id, operation_kind=kind, request=request)
         exact = [*plan.exact_keys, *(v.key for v in interpretation_reads),
             *(w.key for w in reflection_writes),
             *(AtomKey.from_token(ref) for ref in execution.cost_receipt_refs)]
@@ -914,11 +949,15 @@ def _finish_d07_stage_read_v3(graph, prepared):
 
 
 def _thaw_d07_stage_frozen_v3(prepared):
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1,thaw_current_ordinary_continuity_prepared_request_v1
+    if type(prepared)is D07OrdinaryContinuityPreparedV1:return thaw_current_ordinary_continuity_prepared_request_v1(prepared)
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,thaw_current_general_growth_prepared_request_v1
     if type(prepared)is D07GeneralGrowthPreparedV1:return thaw_current_general_growth_prepared_request_v1(prepared)
     return thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json))
 
 def _d07_stage_frozen_sources_v3(prepared,frozen):
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    if type(prepared)is D07OrdinaryContinuityPreparedV1:return(*frozen.input.context_sources,*frozen.input.support_sources)
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,general_growth_frozen_sources_v1
     if type(prepared)is D07GeneralGrowthPreparedV1:return general_growth_frozen_sources_v1(frozen)
     return frozen.input.sources

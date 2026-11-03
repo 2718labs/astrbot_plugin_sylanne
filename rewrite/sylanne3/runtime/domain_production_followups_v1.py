@@ -13,7 +13,7 @@ from ..runtime_contracts import NamespaceId, canonical_digest, canonical_seriali
 from ..domains.d10 import decode_contact_policy, decode_proactive_opportunity
 from ..domains.d10.production_operations_v1 import PrepareCurrentContactRequestV1
 from .d01_production_operations_v1 import CurrentDomainReadV1, MissingProductionOriginalV1, production_read_plan_v1
-from .domain_production_contracts_v1 import ProductionOutboxStageV1
+from .domain_production_contracts_v1 import ProductionOutboxStageV1, ProductionOriginalRefV1
 from .domain_production_original_codec_v1 import _EVENTS
 from .domain_production_originals_v1 import read_adopted_domain_operation_v1
 
@@ -50,6 +50,19 @@ def verify_current_followup_trigger_v1(db, namespace, event, causal_original, is
                 or causal_original.get('general_lifecycle_original')is None
                 or event.trigger_original.original_digest!=causal_original['general_lifecycle_digest']):
             raise ValueError('General lifecycle trigger differs from the actual signed same-CAS input')
+        return event.trigger_original
+    if single_event_review_event_v1(event.event_kind):
+        if (event.trigger_original.kind!=single_event_review_trigger_kind_v1(event.event_kind)
+                or causal_original['original_digest']!=event.trigger_original.original_digest):
+            raise ValueError('review trigger changed its actual signed native cause')
+        return event.trigger_original
+    if ordinary_continuity_event_v1(event.event_kind):
+        if (causal_original is None or causal_original['receipt'].operation_id!=event.causal_operation_id
+                or causal_original['original_digest']!=event.trigger_original.original_digest):
+            raise ValueError('ordinary continuity trigger lost its actual native/domain cause')
+        expected=ordinary_continuity_trigger_kind_v1(event.event_kind)
+        if event.trigger_original.kind!=expected:
+            raise ValueError('ordinary continuity trigger cannot masquerade as another original family')
         return event.trigger_original
     if event.event_kind == "actual_internal_experience_requires_encoding":
         if (causal_original["domain"], causal_original["operation_kind"]) != ("d10", "advance_life"):
@@ -143,9 +156,9 @@ class DomainFollowupResolutionV1:
 
     def __post_init__(self):
         from .contact_followup_v1 import ContactFollowupCommandV1
-        if (self.status not in {"ready", "waiting_for_original", "partial", "no_matching_general_start"}
+        if (self.status not in {"ready", "waiting_for_original", "partial", "no_matching_general_start", "growth_review_observed", "ordinary_service_observed", "single_event_review_service_observed"}
                 or type(self.commands) is not tuple or len(self.commands) > 16
-                or any(type(command) not in {DomainFollowupCommandV1,ContactFollowupCommandV1,GeneralGrowthTrialFollowupCommandV1} for command in self.commands)
+                or any(type(command) not in {DomainFollowupCommandV1,ContactFollowupCommandV1,GeneralGrowthTrialFollowupCommandV1,OrdinaryContinuityFollowupCommandV1,SingleEventReviewFollowupCommandV1} for command in self.commands)
                 or type(self.target_refs) is not tuple or len(self.target_refs) > 128
                 or type(self.missing_originals) is not tuple or len(self.missing_originals) > 128
                 or self.status == "ready" and (not self.commands or self.missing_originals or self.continuation_ref)):
@@ -163,6 +176,12 @@ def _adopted_event(db, namespace, event):
             event.trigger_original.original_ref, event.trigger_original.original_digest)
             or row[5] not in {"pending", "waiting"}):
         raise ValueError("followup has no matching current unconsumed durable outbox original")
+    from .domain_background_read_v3 import _active_v3
+    active=_active_v3(db)
+    if ordinary_continuity_event_v1(event.event_kind):
+        return read_ordinary_continuity_cause_v1(db,namespace=namespace,event_kind=event.event_kind,
+            causal_operation_id=event.causal_operation_id,original_ref=event.trigger_original.original_ref,
+            issuer=active.graph._GraphCoordinator__d11_issuer)
     from .d07_general_growth_attention_v1 import read_general_growth_followup_cause_v1
     from .domain_background_read_v3 import _active_v3
     active = _active_v3(db)
@@ -185,7 +204,37 @@ def _adopted_event(db, namespace, event):
 def read_plan_current_domain_followup_v1(db, *, namespace, event):
     if not db.in_transaction or type(namespace) is not NamespaceId:
         raise ValueError("followup plan needs the actual current W01 SQL transaction")
+    if single_event_review_event_v1(event.event_kind):
+        if event.event_kind=='single_event_review_cognition_adopted_v1':
+            from .d07_single_event_review_v1 import single_event_review_completion_followup_plan_v1
+            return single_event_review_completion_followup_plan_v1(db,namespace=namespace,event=event)
+        from .d07_single_event_review_v1 import single_event_review_followup_plan_v1
+        return single_event_review_followup_plan_v1(db,namespace=namespace,event=event)
+    if ordinary_continuity_event_v1(event.event_kind):
+        if event.event_kind==_ORDINARY_ADOPTION_EVENT_V1:
+            from .d07_ordinary_continuity_cognition_v1 import ordinary_continuity_adoption_followup_plan_v1
+            return ordinary_continuity_adoption_followup_plan_v1(db,namespace=namespace,event=event)
+        if event.event_kind==_ORDINARY_ATTENTION_EVENT_V1:
+            from .d07_ordinary_continuity_attention_v1 import ordinary_continuity_attention_followup_plan_v1
+            return ordinary_continuity_attention_followup_plan_v1(db,namespace=namespace,event=event)
+        from .d01_ordinary_cumulative_growth_v1 import ordinary_continuity_followup_plan_v1
+        return ordinary_continuity_followup_plan_v1(db,namespace=namespace,event=event)
+    if event.event_kind=='single_event_growth_review_required_v1':
+        from .d01_single_event_growth_v1 import single_event_followup_plan_v1
+        return single_event_followup_plan_v1(db,namespace=namespace,event=event)
     original = _adopted_event(db, namespace, event)
+    if event.event_kind in {"commitment_terms_accepted_requires_current_performance_qualification","commitment_fulfilled_requires_current_plan_reevaluation"}:
+        expected="acknowledge_commitment_terms"if event.event_kind.startswith("commitment_terms_accepted_")else"settle_current_commitment_fulfillment"
+        if (original["domain"],original["operation_kind"])!=("d08",expected):
+            raise ValueError("terms followup has another actual producer operation")
+        keys=tuple(v.key for v in original["receipt"].write_versions if v.key.type_name=="d08.commitment.v1")
+        if len(keys)!=1:raise ValueError("terms followup lacks its exact actual committed target")
+        roots=tuple(original["payload"]["provenance"]["commitment_after"]["source_refs"])
+        return production_read_plan_v1(("d08.personal_plan.v1","d08.joint_plan.v1"),keys,roots)
+    from .persona_growth_review_contract_v1 import GROWTH_EVENTS_V1
+    if event.event_kind in GROWTH_EVENTS_V1.values():
+        from .persona_growth_review_v1 import growth_followup_read_plan_v1
+        return growth_followup_read_plan_v1(db, namespace=namespace, event=event)
     if event.event_kind=='qualified_joint_contact_requires_prospective_v1':
         from .domain_background_read_v3 import _active_v3
         from .contact_prospective_v1 import read_plan_joint_contact_prospective_followup_v1
@@ -257,7 +306,62 @@ def resolve_domain_followup_v1(db, current_frame, event, *, installed_graph=None
     read = CurrentDomainReadV1(current_frame)
     read.check(db)
     ns = current_frame.envelope.authority.namespace
+    if single_event_review_event_v1(event.event_kind):
+        if event.event_kind=='single_event_review_cognition_adopted_v1':
+            from .d07_single_event_review_v1 import resolve_single_event_review_completion_followup_v1 as resolve_review
+        else:
+            from .d07_single_event_review_v1 import resolve_single_event_review_followup_v1 as resolve_review
+        original=read_single_event_review_cause_v1(db,namespace=ns,event_kind=event.event_kind,
+            causal_operation_id=event.causal_operation_id,original_ref=event.trigger_original.original_ref,issuer=issuer)
+        resolution=resolve_review(db,frame=current_frame,event=event,original=original)
+        return bind_single_event_review_commands_v1(db,frame=current_frame,event=event,original=original,
+            resolution=resolution,issuer=issuer)
+    if ordinary_continuity_event_v1(event.event_kind):
+        original=read_ordinary_continuity_cause_v1(db,namespace=ns,event_kind=event.event_kind,
+            causal_operation_id=event.causal_operation_id,original_ref=event.trigger_original.original_ref,issuer=issuer)
+        if event.event_kind==_ORDINARY_ADOPTION_EVENT_V1:
+            from .d07_ordinary_continuity_cognition_v1 import resolve_ordinary_continuity_adoption_followup_v1
+            resolution=resolve_ordinary_continuity_adoption_followup_v1(db,frame=current_frame,event=event,original=original)
+        elif event.event_kind==_ORDINARY_ATTENTION_EVENT_V1:
+            from .d07_ordinary_continuity_attention_v1 import resolve_ordinary_continuity_attention_followup_v1
+            resolution=resolve_ordinary_continuity_attention_followup_v1(db,frame=current_frame,event=event,original=original)
+        else:
+            from .d01_ordinary_cumulative_growth_v1 import resolve_ordinary_continuity_followup_v1
+            resolution=resolve_ordinary_continuity_followup_v1(db,frame=current_frame,event=event,original=original)
+        return bind_ordinary_continuity_commands_v1(db,frame=current_frame,event=event,original=original,
+            resolution=resolution,issuer=issuer)
+    if event.event_kind=='single_event_growth_review_required_v1':
+        from .d01_single_event_growth_v1 import read_single_event_followup_cause_v1,resolve_single_event_followup_v1
+        original=read_single_event_followup_cause_v1(db,namespace=ns,event_kind=event.event_kind,
+            causal_operation_id=event.causal_operation_id,original_ref=event.trigger_original.original_ref,issuer=issuer)
+        return resolve_single_event_followup_v1(db,frame=current_frame,event=event,original=original)
     original = _adopted_event(db, ns, event)
+    if event.event_kind in {"commitment_terms_accepted_requires_current_performance_qualification","commitment_fulfilled_requires_current_plan_reevaluation"}:
+        read=CurrentDomainReadV1(current_frame);read.check(db)
+        keys=tuple(v.key for v in original["receipt"].write_versions if v.key.type_name=="d08.commitment.v1")
+        if len(keys)!=1:raise ValueError("terms notification has no unique actual commitment target")
+        atom=read.head(db,keys[0],required=True)
+        from ..domains.d08.execution import _decode
+        current=_decode("d08.commitment.v1",atom.value)
+        previous=original["payload"]["provenance"]["commitment_after"]
+        if current.commitment_id!=previous["commitment_id"] or atom.revision<previous["revision"]:
+            raise ValueError("terms notification lost its actual current commitment continuation")
+        targets=(atom.key.token,)
+        missing=("owner_approved_current_terms_performance_scope",)
+        if event.event_kind=="commitment_fulfilled_requires_current_plan_reevaluation":
+            targets+=tuple(a.key.token for kind in ("d08.personal_plan.v1","d08.joint_plan.v1")for a in read.complete_inventory(db,kind)if a.valid)
+            missing=("actual_current_remaining_plan_qualification",)
+        if len(targets)>128:
+            continuation="terms-followup:"+canonical_digest((ns,event.dedupe_key,current_frame.snapshot.epochs))[:48]
+            return DomainFollowupResolutionV1("partial",(),targets[:128],missing+("bounded_current_remaining_plan_tail",),continuation)
+        return DomainFollowupResolutionV1("waiting_for_original",(),targets,missing)
+    from .persona_growth_review_contract_v1 import GROWTH_EVENTS_V1
+    if event.event_kind in GROWTH_EVENTS_V1.values():
+        from .persona_growth_review_v1 import resolve_growth_followup_v1
+        epoch = current_frame.snapshot.epochs[0].revision
+        continuation = "growth-review-followup:" + canonical_digest((ns, event.dedupe_key, epoch))[:48]
+        return resolve_growth_followup_v1(db, frame=current_frame, event=event,
+            original=original, continuation=continuation)
     if event.event_kind in _GENERAL_GROWTH_LIFECYCLE_V1:
         return resolve_general_growth_lifecycle_followup_v1(db,current_frame,event,original)
     epoch = current_frame.snapshot.epochs[0].revision
@@ -376,7 +480,7 @@ def resolve_domain_followup_v1(db, current_frame, event, *, installed_graph=None
         goals = tuple(atom.key.token for atom in read.complete_inventory(db, "d08.goal.v1") if atom.valid)
         plans = tuple(atom.key.token for atom in read.complete_inventory(db, "d08.joint_plan.v1") if atom.valid)
         if event.event_kind in {"relationship_changed_requires_action_recheck", "boundary_changed_requires_action_recheck",
-                "source_correction_requires_boundary_recheck", "persona_growth_requires_commitment_reevaluation"}:
+                "source_correction_requires_boundary_recheck"}:
             if not actions:
                 return wait("actual_current_d08_action_intents")
             from ..domains.d08.production_operations_v1 import RecheckCurrentActionRequestV1
@@ -668,3 +772,337 @@ def _verified_general_start_metadata_v1(db,namespace,ref,row,raw):
             or producer['payload']['parent_budget']!=start.parent_budget_lease_ref):
         raise ValueError('General Start lost the exact signed producer/request/receipt identity')
     return start,producer,request
+
+
+
+_ORDINARY_ATTENTION_EVENT_V1='ordinary_continuity_attention_available_for_service'
+_ORDINARY_ADOPTION_EVENT_V1='ordinary_continuity_cognition_adopted_v1'
+_ORDINARY_EVENTS_V1=frozenset({'ordinary_continuity_basis_available_for_screen',
+    'ordinary_continuity_deep_required','ordinary_continuity_assessment_available',_ORDINARY_ATTENTION_EVENT_V1,_ORDINARY_ADOPTION_EVENT_V1})
+
+def ordinary_continuity_trigger_kind_v1(kind):
+    if kind==_ORDINARY_ATTENTION_EVENT_V1:return 'd07.ordinary_continuity_attention_v1'
+    if kind==_ORDINARY_ADOPTION_EVENT_V1:return 'd07.ordinary_continuity_adoption_v1'
+    if kind in _ORDINARY_EVENTS_V1:return 'd01.current-assess_ordinary_continuity_v1'
+    return None
+
+
+def ordinary_continuity_event_v1(kind):
+    return kind in _ORDINARY_EVENTS_V1
+
+
+def read_ordinary_continuity_cause_v1(db,*,namespace,event_kind,causal_operation_id,original_ref,issuer):
+    if not ordinary_continuity_event_v1(event_kind):return None
+    if event_kind==_ORDINARY_ADOPTION_EVENT_V1:
+        from .d07_ordinary_continuity_cognition_v1 import read_ordinary_continuity_adoption_followup_cause_v1
+        return read_ordinary_continuity_adoption_followup_cause_v1(db,namespace=namespace,event_kind=event_kind,
+            causal_operation_id=causal_operation_id,original_ref=original_ref,issuer=issuer)
+    if event_kind==_ORDINARY_ATTENTION_EVENT_V1:
+        from .d07_ordinary_continuity_attention_v1 import read_ordinary_continuity_attention_followup_cause_v1
+        return read_ordinary_continuity_attention_followup_cause_v1(db,namespace=namespace,event_kind=event_kind,
+            causal_operation_id=causal_operation_id,original_ref=original_ref,issuer=issuer)
+    from .d01_ordinary_cumulative_growth_v1 import read_ordinary_continuity_followup_cause_v1
+    return read_ordinary_continuity_followup_cause_v1(db,namespace=namespace,event_kind=event_kind,
+        causal_operation_id=causal_operation_id,original_ref=original_ref,issuer=issuer)
+
+
+def ordinary_continuity_parent_budget_v1(original):
+    if 'ordinary_continuity_adoption'in original:
+        p=original['ordinary_continuity_adoption']
+        return p.namespace,p.original_parent_budget_lease_ref,p.original_parent_grant_digest,p.original_deadline_utc
+    if 'ordinary_continuity_attention'in original:
+        p=original['ordinary_continuity_attention']
+        return p.namespace,p.original_parent_budget_lease_ref,p.original_parent_grant_digest,p.original_deadline_utc
+    p=original['ordinary_budget_basis']
+    return NamespaceId(**p['namespace']),p['original_parent_budget_lease_ref'],p['original_parent_grant_digest'],p['original_deadline_utc']
+
+
+def require_ordinary_continuity_budget_v1(db,*,namespace,original,issuer,now):
+    from .budget import get_budget_lease,require_budget_family_admissible
+    ns,parent,digest,deadline=ordinary_continuity_parent_budget_v1(original)
+    if ns!=namespace:raise ValueError('ordinary continuity causal budget crossed namespace')
+    lease=get_budget_lease(db,parent);require_budget_family_admissible(db,parent)
+    grant=issuer.current_budget_grant(db,parent)
+    if ((lease.bot_id,lease.persona_id)!=namespace.as_tuple or canonical_digest(grant)!=digest
+            or not now<min(deadline,grant.valid_until_utc)):
+        raise MissingProductionOriginalV1('ordinary_original_parent_budget_grant_or_deadline_unavailable')
+    return parent,digest,deadline
+
+
+@dataclass(frozen=True,slots=True)
+class OrdinaryContinuityFollowupCommandV1:
+    receiver_domain:str
+    operation_kind:str
+    request:object
+    activity_id:str
+    audience_ref:str
+    audience_refs:tuple[str,...]
+    source_authority:object
+    causal_original:ProductionOriginalRefV1
+    parent_budget_lease_ref:str
+    original_grant_digest:str
+    original_deadline_utc:float
+    def __post_init__(self):
+        from ..runtime_contracts import AuthorityContext
+        from .d07_ordinary_continuity_cognition_v1 import RegisterOrdinaryContinuityAttentionRequestV1
+        from .d07_current_behavior_v1 import ServeCurrentConcernRequestV1
+        from .d01_ordinary_cumulative_growth_v1 import AssessOrdinaryContinuityRequestV1
+        import math
+        expected={'register_ordinary_continuity_attention_v1':('d07',RegisterOrdinaryContinuityAttentionRequestV1),
+            'serve_concern':('d07',ServeCurrentConcernRequestV1),
+            'assess_ordinary_continuity_v1':('d01',AssessOrdinaryContinuityRequestV1)}
+        if (self.operation_kind not in expected or self.receiver_domain!=expected[self.operation_kind][0]
+                or type(self.request)is not expected[self.operation_kind][1]
+                or type(self.source_authority)is not AuthorityContext or self.source_authority.purpose!='consolidation'
+                or self.audience_refs!=self.source_authority.audience or not self.audience_refs or self.audience_ref!=self.audience_refs[0]
+                or type(self.causal_original)is not ProductionOriginalRefV1 or not self.parent_budget_lease_ref
+                or type(self.original_grant_digest)is not str or len(self.original_grant_digest)!=64
+                or not math.isfinite(self.original_deadline_utc)):
+            raise ValueError('ordinary continuity command requires its exact native cause/current authority/original budget')
+        if self.operation_kind=='serve_concern'and(self.request.category!='background'
+                or not self.request.trigger_original_ref.startswith('ordinary-continuity-question:')):
+            raise ValueError('ordinary continuity service cannot borrow an unrelated concern')
+
+
+def ordinary_continuity_command_operation_v1(namespace,command):
+    from .d07_ordinary_continuity_attention_v1 import ordinary_continuity_attention_ids_v1
+    from ..domains.d01.ordinary_cumulative_growth_v1 import _ordinary_continuity_question_key_fields_v1
+    if type(command)is not OrdinaryContinuityFollowupCommandV1: return None
+    if command.operation_kind=='register_ordinary_continuity_attention_v1':
+        q=command.request
+        key=_ordinary_continuity_question_key_fields_v1(q.basis_original,q.basis_original.original_digest,q.phase,q.trigger_assessment_original)
+        tag=ordinary_continuity_attention_ids_v1(namespace,key)['attention'].removeprefix('ordinary-continuity-attention:')
+        return 'ordinary-continuity-register:'+tag
+    if command.operation_kind=='serve_concern':
+        return 'ordinary-continuity-serve:'+command.request.trigger_original_ref.removeprefix('ordinary-continuity-question:')
+    return 'ordinary-continuity-final-assess:'+canonical_digest((namespace,command.causal_original,command.request))[:48]
+
+
+def bind_ordinary_continuity_commands_v1(db,*,frame,event,original,resolution,issuer):
+    from dataclasses import replace
+    if not resolution.commands:return resolution
+    parent,digest,deadline=require_ordinary_continuity_budget_v1(db,namespace=frame.envelope.authority.namespace,
+        original=original,issuer=issuer,now=frame.now_utc)
+    authority=replace(frame.envelope.authority,purpose='consolidation')
+    from .domain_background_read_v3 import _active_v3,require_background_followup_handoff_v3
+    reader=_active_v3(db)
+    if reader is not None and reader.kind=='followup_child':
+        handoff=require_background_followup_handoff_v3(reader.handoff,reader.graph,reader.bundle)
+        prior=handoff.command
+        if(type(prior)is not OrdinaryContinuityFollowupCommandV1
+                or handoff.causal_operation_id!=event.causal_operation_id or handoff.trigger_original!=event.trigger_original
+                or (authority.namespace,authority.actor,authority.purpose,authority.audience,authority.activation_generation)
+                    !=(prior.source_authority.namespace,prior.source_authority.actor,prior.source_authority.purpose,
+                        prior.source_authority.audience,prior.source_authority.activation_generation)):
+            raise ValueError('ordinary continuity child changed its actual causal Owner/Source authority')
+        authority=prior.source_authority
+    commands=[]
+    for c in resolution.commands:
+        causal=event.trigger_original
+        activity=c.activity_id
+        if c.operation_kind=='register_ordinary_continuity_attention_v1':
+            from .d07_ordinary_continuity_attention_v1 import ordinary_continuity_attention_ids_v1
+            from ..domains.d01.ordinary_cumulative_growth_v1 import _ordinary_continuity_question_key_fields_v1
+            q=c.request;key=_ordinary_continuity_question_key_fields_v1(q.basis_original,q.basis_original.original_digest,q.phase,q.trigger_assessment_original)
+            activity=ordinary_continuity_attention_ids_v1(frame.envelope.authority.namespace,key)['activity']
+        commands.append(OrdinaryContinuityFollowupCommandV1(c.receiver_domain,c.operation_kind,c.request,activity,
+            c.audience_ref,c.audience_refs,authority,causal,parent,digest,deadline))
+    return replace(resolution,commands=tuple(commands))
+
+_SINGLE_EVENT_REVIEW_EVENTS_V1 = frozenset({
+    'd01.single_event_review_case_registered_v1',
+    'single_event_review_attention_available_for_service','single_event_review_cognition_adopted_v1'})
+
+
+def single_event_review_event_v1(kind):
+    return kind in _SINGLE_EVENT_REVIEW_EVENTS_V1
+
+
+def single_event_review_trigger_kind_v1(kind):
+    if kind=='d01.single_event_review_case_registered_v1':return 'd01.single_event_review_case_v1'
+    if kind=='single_event_review_attention_available_for_service':return 'd07.single_event_review_attention_v1'
+    if kind=='single_event_review_cognition_adopted_v1':return 'd07.single_event_review_adoption_v1'
+    return None
+
+
+def require_single_event_review_budget_v1(db,*,namespace,original,issuer,now):
+    from .budget import get_budget_lease,require_budget_family_admissible
+    parent=original['single_event_review_completion'].value if 'single_event_review_completion'in original else original['single_event_review_parent']
+    lease=get_budget_lease(db,parent.original_parent_budget_lease_ref)
+    require_budget_family_admissible(db,parent.original_parent_budget_lease_ref)
+    grant=issuer.current_budget_grant(db,parent.original_parent_budget_lease_ref)
+    if ((lease.bot_id,lease.persona_id)!=namespace.as_tuple
+            or canonical_digest(grant)!=parent.original_parent_grant_digest
+            or not now<min(parent.original_deadline_utc,grant.valid_until_utc)):
+        raise MissingProductionOriginalV1('single_event_review_actual_parent_budget_or_deadline_unavailable')
+    return parent.original_parent_budget_lease_ref,parent.original_parent_grant_digest,parent.original_deadline_utc
+
+
+@dataclass(frozen=True,slots=True)
+class SingleEventReviewFollowupCommandV1:
+    receiver_domain:str
+    operation_kind:str
+    request:object
+    activity_id:str
+    audience_ref:str
+    audience_refs:tuple[str,...]
+    source_authority:object
+    causal_original:ProductionOriginalRefV1
+    parent_budget_lease_ref:str
+    original_grant_digest:str
+    original_deadline_utc:float
+    service_operation_id:str|None=None
+
+    def __post_init__(self):
+        import math
+        from ..runtime_contracts import AuthorityContext
+        from .d07_single_event_review_v1 import RegisterSingleEventReviewAttentionRequestV1
+        from .d07_current_behavior_v1 import ServeCurrentConcernRequestV1
+        from .d01_single_event_growth_v1 import ReviewSingleEventGrowthRequestV1
+        expected={'register_single_event_review_attention_v1':('d07',RegisterSingleEventReviewAttentionRequestV1),
+            'serve_concern':('d07',ServeCurrentConcernRequestV1),
+            'review_single_event_growth_v1':('d01',ReviewSingleEventGrowthRequestV1)}
+        if (self.operation_kind not in expected or self.receiver_domain!=expected[self.operation_kind][0]
+                or type(self.request)is not expected[self.operation_kind][1]
+                or type(self.source_authority)is not AuthorityContext
+                or self.source_authority.purpose!='consolidation'
+                or self.audience_refs!=self.source_authority.audience or not self.audience_refs
+                or self.audience_ref!=self.audience_refs[0]
+                or type(self.causal_original)is not ProductionOriginalRefV1
+                or self.causal_original.kind!=({'register_single_event_review_attention_v1':'d01.single_event_review_case_v1','serve_concern':'d07.single_event_review_attention_v1','review_single_event_growth_v1':'d07.single_event_review_adoption_v1'}[self.operation_kind])
+                or not self.activity_id or not self.parent_budget_lease_ref
+                or type(self.original_grant_digest)is not str or len(self.original_grant_digest)!=64
+                or not math.isfinite(self.original_deadline_utc)):
+            raise ValueError('review child requires its exact native command/current authority/original budget')
+        if (self.operation_kind=='serve_concern' and not self.service_operation_id
+                or self.operation_kind!='serve_concern' and self.service_operation_id is not None):
+            raise ValueError('review child service identity must come from its actual native attention')
+        if self.operation_kind=='serve_concern' and (self.request.category!='background'
+                or not self.request.trigger_original_ref.startswith('single-event-review-question:')):
+            raise ValueError('review service cannot borrow an unrelated cognition question')
+
+
+def single_event_review_command_operation_v1(namespace,command):
+    if type(command)is not SingleEventReviewFollowupCommandV1:return None
+    if command.operation_kind=='register_single_event_review_attention_v1':
+        from .d07_single_event_review_v1 import single_event_review_attention_ids_v1
+        ids=single_event_review_attention_ids_v1(namespace,command.request.case_original)
+        return 'single-event-review-register:'+ids['attention'].removeprefix('single-event-review-attention:')
+    if command.operation_kind=='serve_concern':
+        return command.service_operation_id
+    return 'single-event-review-final:'+canonical_digest((namespace,command.causal_original,command.request))[:48]
+
+
+def native_growth_followup_command_v1(command):
+    return (type(command)is OrdinaryContinuityFollowupCommandV1
+        or type(command)is SingleEventReviewFollowupCommandV1 and command.operation_kind in {
+            'register_single_event_review_attention_v1','serve_concern'})
+
+
+def native_growth_followup_command_operation_v1(namespace,command):
+    if type(command)is SingleEventReviewFollowupCommandV1:
+        return single_event_review_command_operation_v1(namespace,command)
+    return ordinary_continuity_command_operation_v1(namespace,command)
+
+
+def bind_single_event_review_commands_v1(db,*,frame,event,original,resolution,issuer):
+    from dataclasses import replace
+    if not resolution.commands:return resolution
+    parent,digest,deadline=require_single_event_review_budget_v1(db,
+        namespace=frame.envelope.authority.namespace,original=original,issuer=issuer,now=frame.now_utc)
+    authority=replace(frame.envelope.authority,purpose='consolidation')
+    from .domain_background_read_v3 import _active_v3,require_background_followup_handoff_v3
+    reader=_active_v3(db)
+    if reader is not None and reader.kind=='followup_child':
+        handoff=require_background_followup_handoff_v3(reader.handoff,reader.graph,reader.bundle)
+        prior=handoff.command
+        if (type(prior)is not SingleEventReviewFollowupCommandV1
+                or handoff.causal_operation_id!=event.causal_operation_id or handoff.trigger_original!=event.trigger_original
+                or (authority.namespace,authority.actor,authority.purpose,authority.audience,authority.activation_generation)!=(
+                    prior.source_authority.namespace,prior.source_authority.actor,prior.source_authority.purpose,
+                    prior.source_authority.audience,prior.source_authority.activation_generation)):
+            raise ValueError('review child changed its actual native causal Owner/Source authority')
+        authority=prior.source_authority
+    from .d07_single_event_review_v1 import single_event_review_service_operation_id_v1
+    commands=tuple(SingleEventReviewFollowupCommandV1(c.receiver_domain,c.operation_kind,c.request,c.activity_id,
+        c.audience_ref,c.audience_refs,authority,event.trigger_original,parent,digest,deadline,
+        single_event_review_service_operation_id_v1(original['single_event_review_parent'])if c.operation_kind=='serve_concern'else None)
+        for c in resolution.commands)
+    return replace(resolution,commands=commands)
+
+
+def read_single_event_review_cause_v1(db,*,namespace,event_kind,causal_operation_id,original_ref,issuer):
+    if event_kind=='single_event_review_cognition_adopted_v1':
+        from .d07_single_event_review_v1 import read_single_event_review_completion_followup_cause_v1 as read_cause
+    else:
+        from .d07_single_event_review_v1 import read_single_event_review_followup_cause_v1 as read_cause
+    return read_cause(db,namespace=namespace,event_kind=event_kind,
+        causal_operation_id=causal_operation_id,original_ref=original_ref,issuer=issuer)
+
+_NATIVE_ATTENTION_JOB_SCHEMA_V1="sylanne.native-attention-job-disposition.v1"
+_NATIVE_ATTENTION_SERVICE_EVENTS_V1=frozenset({
+    "ordinary_continuity_attention_available_for_service","single_event_review_attention_available_for_service"})
+_NATIVE_ATTENTION_JOB_FIELDS_V1=frozenset({
+    "family","phase","operation_id","activity_id","job_id","call_id","prepared_original",
+    "prepare_commit_original","question_original","subject_original","job_ref","job_revision",
+    "prepare_operation_id","prepare_receipt_digest","parent_budget_lease_ref","original_grant_digest","original_deadline_utc"})
+
+
+def validate_native_attention_job_preparation_v1(value,namespace):
+    """Closed metadata, not an issuance or Source/budget capability."""
+    import math
+    from ..graph_types import AtomKey
+    from .d07_execution_v1 import d07_execution_ids_v1
+    if (type(value)is not dict or set(value)!=_NATIVE_ATTENTION_JOB_FIELDS_V1
+            or value["family"]not in {"ordinary_continuity","single_event_review"}
+            or value["phase"]not in (None,"ordinary_screen","deep_review")
+            or (value["phase"]is None)!=(value["family"]=="single_event_review")
+            or type(value["job_revision"])is not int or value["job_revision"]<1
+            or type(value["original_deadline_utc"])not in (int,float)or not math.isfinite(value["original_deadline_utc"])):
+        raise ValueError("native attention job preparation fields differ")
+    for name in ("operation_id","activity_id","job_id","call_id","parent_budget_lease_ref"):
+        if type(value[name])is not str or not value[name]:raise ValueError("native attention actual job locator required")
+    ids=d07_execution_ids_v1(namespace,value["operation_id"],"concern")
+    if (value["job_id"],value["call_id"],value["prepare_operation_id"])!=(ids["job"],ids["call"],"d07-prepare:"+value["operation_id"]):
+        raise ValueError("native attention job/prepare identity differs")
+    key=AtomKey.from_token(value["job_ref"])
+    if (NamespaceId.from_key(key)!=namespace or key.type_name!="runtime.job"or key.owner.kind!="activity"or key.name!=value["job_id"]
+            or key.owner.subject!=value["activity_id"]):
+        raise ValueError("native attention birth job belongs to another namespace/activity")
+    for name in ("prepare_receipt_digest","original_grant_digest"):
+        digest=value[name]
+        if type(digest)is not str or len(digest)!=64 or any(c not in "0123456789abcdef"for c in digest):
+            raise ValueError("native attention actual commitment required")
+    for name,kind in (("prepared_original","d07.prepared"),("prepare_commit_original","d07.prepare_commit"),
+            ("question_original","d07.semantic_question"),("subject_original",None)):
+        ref=value[name]
+        if type(ref)is not dict or set(ref)!={"kind","original_ref","original_digest"}:
+            raise ValueError("native attention immutable original locator differs")
+        actual=ProductionOriginalRefV1(**ref)
+        if kind is not None and actual.kind!=kind:raise ValueError("native attention original has another kind")
+    if (value["prepared_original"]["original_ref"]!=value["job_id"]
+            or value["prepare_commit_original"]["original_ref"]!=value["job_id"]):
+        raise ValueError("native attention signed job originals have another actual PK")
+    return value
+
+
+def native_attention_job_preparation_wire_v1(fact,namespace):
+    """Serialize already-qualified data; the actual consumer retains authority."""
+    def ref(value):
+        return {name:getattr(value,name)for name in ("kind","original_ref","original_digest")}
+    value={"family":fact.family,"phase":fact.phase,"operation_id":fact.operation_id,
+        "activity_id":fact.activity_id,"job_id":fact.job_id,"call_id":fact.call_id,
+        "prepared_original":ref(fact.prepared_original),"prepare_commit_original":ref(fact.prepare_commit_original),
+        "question_original":ref(fact.question_original),"subject_original":ref(fact.subject_original),
+        "job_ref":fact.birth_job_version.key.token,"job_revision":fact.birth_job_version.revision,
+        "prepare_operation_id":fact.prepare_receipt.operation_id,
+        "prepare_receipt_digest":canonical_digest(fact.prepare_receipt),
+        "parent_budget_lease_ref":fact.original_parent_budget_lease_ref,
+        "original_grant_digest":fact.original_parent_grant_digest,"original_deadline_utc":fact.original_deadline_utc}
+    return validate_native_attention_job_preparation_v1(value,namespace)
+
+
+def native_attention_job_observer_operation_v1(namespace,dedupe_key,preparation,epoch):
+    validate_native_attention_job_preparation_v1(preparation,namespace)
+    if type(epoch)is not int or epoch<0:raise ValueError("actual observer namespace epoch required")
+    return "native-attention-job-observe:"+canonical_digest((namespace,dedupe_key,canonical_digest(preparation),epoch))[:48]

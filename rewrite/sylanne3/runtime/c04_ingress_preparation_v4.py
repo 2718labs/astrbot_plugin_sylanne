@@ -331,6 +331,9 @@ def require_self_c04_persistent_member_v4(witness,ref):
 def _freeze_after_cas(db,pure,resources,child,after_parent,receipt,graph,environment):
     from ..authority_service.internal_work_contract import InternalWorkBindingV1
     from .c04_interpretation_policy_v3 import record_installed_c04_interpretation_policy_v3
+    if resources.resource_inputs is not None:
+        from .c04_body_resource_inputs_v3 import require_consumed_c04_body_resource_inputs_v3
+        require_consumed_c04_body_resource_inputs_v3(resources.resource_inputs,db=db)
     ns=pure.work.namespace
     metadata,epoch=graph._v2_graph_stamp(ns)
     if (epoch.revision!=pure.work.graph_epoch+2 or receipt.status!="committed"
@@ -383,7 +386,16 @@ def commit_self_c04_prepare_v4(runtime,db,*,operation,request,frame,stage,reader
         raise ValueError("Self C04 pure preparation changed")
     with issue_self_c04_scope_v4(graph,issued=readers.issued,scope=scope,frame=frame,request=request,bundle=readers.installed_bundle) as qualified:
         self_scope_original=export_self_c04_scope_original_v5(qualified,db,expected_digest=stage.work.self_scope_digest)
-        resources=prepare_self_c04_body_resources_v4(db,scope=qualified,work=stage.work)
+        from ..runtime_storage_v3 import runtime_storage_v3
+        resource_inputs=None
+        if runtime_storage_v3(db)is not None:
+            from .current_method_learning_read_v3 import _BOUND
+            from .c04_body_resource_inputs_v3 import issue_self_c04_body_resource_inputs_v3
+            bound=_BOUND.get()
+            if bound is None or bound[1]is not graph or bound[2]is not db:
+                raise ValueError("Self C04 resources have no actual originating Source binder")
+            resource_inputs=issue_self_c04_body_resource_inputs_v3(qualified,db=db,prepared_inputs=bound[0])
+        resources=prepare_self_c04_body_resources_v4(db,scope=qualified,work=stage.work,resource_inputs=resource_inputs)
     quote_ref=resources.envelope.version_guard.resource_lease_versions[0]
     db.execute("INSERT INTO graph_guard_versions(bot,persona,kind,ref,version) VALUES(?,?,?,?,?)",
         (*stage.work.namespace.as_tuple,"resource_lease",quote_ref.ref,str(quote_ref.version)))
@@ -392,6 +404,9 @@ def commit_self_c04_prepare_v4(runtime,db,*,operation,request,frame,stage,reader
         Event(Scope(*stage.work.namespace.as_tuple,stage.work.activity_id),"c04-prepare:"+stage.work.operation_id,
             frame.now_utc,"c04.self_body_prepared.v4",{"request_digest":stage.stage.request_digest}),
         resources.read_versions,(body,),(epoch,)),_capability=cap)
+    if resources.resource_inputs is not None:
+        from .c04_body_resource_inputs_v3 import require_c04_resource_reservation_after_cas_v3
+        require_c04_resource_reservation_after_cas_v3(db,resources.resource_inputs,first)
     if first.status!="committed" or first.epoch.revision!=epoch.revision+1:
         raise ValueError("Self C04 first reservation CAS differs")
     store.cas_graph_recovery_metadata(metadata,metadata.requirements,_capability=cap)

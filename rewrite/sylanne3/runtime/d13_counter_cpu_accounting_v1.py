@@ -72,7 +72,7 @@ def read_d13_counter_body_cost_original_v1(db,namespace,operation_id):
     return _read(db,namespace,operation_id,BODY_TABLE,D13CounterBodyCostOriginalV1)
 
 
-def stage_d13_counter_cost_in_transaction_v1(db, namespace, evidence, *, resource_issuer, body_authority):
+def stage_d13_counter_cost_in_transaction_v1(db, namespace, evidence, *, resource_issuer, body_authority, accounting_inputs=None):
     if (not db.in_transaction or type(namespace) is not NamespaceId
             or type(evidence) is not HistoricalInternalCostEvidenceV1):
         raise D13CounterAccountingHold("installed historical accounting transaction required")
@@ -80,6 +80,16 @@ def stage_d13_counter_cost_in_transaction_v1(db, namespace, evidence, *, resourc
     prepared = read_c04_internal_work_prepared_v1(db, namespace, operation_id)
     if prepared is None or prepared.binding != binding:
         raise D13CounterAccountingHold("original C04 preparation differs")
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_accounting_inputs_v3 import C04BodyAccountingInputsV3
+        if type(accounting_inputs)is not C04BodyAccountingInputsV3:
+            raise D13CounterAccountingHold("historical Body accounting needs its actual independent two-token EOF packet")
+        accounting_inputs.require_v3(db,namespace=namespace,evidence=evidence,prepared=prepared).consume_v3()
+    def completed(stage):
+        if accounting_inputs is None:return stage
+        from .c04_body_accounting_inputs_v3 import register_c04_body_accounting_stage_v3
+        return register_c04_body_accounting_stage_v3(accounting_inputs,stage)
     quote = resource_issuer.original_signed_quote(db, binding.resource_quote_ref, binding.resource_quote_version)
     if (canonical_digest(quote) != binding.resource_quote_digest
             or quote.work_kind != "d13.full_http_counter.v1"
@@ -129,18 +139,27 @@ def stage_d13_counter_cost_in_transaction_v1(db, namespace, evidence, *, resourc
     if body_original is not None:
         if body_original.binding_digest != binding.binding_digest or body_original.proof_digest != evidence.proof_digest:
             raise D13CounterAccountingHold("historical body original conflicts")
-        return D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), body_original, None)
-    state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                          (prepared.body_state_ref, *namespace.as_tuple)).fetchone()
-    reservation_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                          (binding.body_reservation_ref, *namespace.as_tuple)).fetchone()
+        return completed(D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), body_original, None))
+    if accounting_inputs is None:
+        state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                              (prepared.body_state_ref, *namespace.as_tuple)).fetchone()
+        reservation_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                              (binding.body_reservation_ref, *namespace.as_tuple)).fetchone()
+    else:
+        state_member,reservation_member=accounting_inputs.current_rows_v3()
+        state_row=None if state_member is None else(state_member[1],state_member[3],state_member[2])
+        reservation_row=None if reservation_member is None else(reservation_member[1],reservation_member[3],reservation_member[2])
     if state_row is None or reservation_row is None or state_row[2] != 1 or reservation_row[2] != 1:
-        return D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), None, "target_erased")
+        return completed(D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), None, "target_erased"))
     try:
-        state = BodyState(**json.loads(state_row[1]))
-        reserved = BodyReservation(**json.loads(reservation_row[1]))
-        _body_lineage(db, prepared.body_state_ref, prepared.body_state_revision, state_row[0], BodyState)
-        _body_lineage(db, binding.body_reservation_ref, prepared.body_reservation_revision, reservation_row[0], BodyReservation)
+        state = state_row[1] if accounting_inputs is not None else BodyState(**json.loads(state_row[1]))
+        reserved = reservation_row[1] if accounting_inputs is not None else BodyReservation(**json.loads(reservation_row[1]))
+        if accounting_inputs is None:
+            _body_lineage(db, prepared.body_state_ref, prepared.body_state_revision, state_row[0], BodyState)
+            _body_lineage(db, binding.body_reservation_ref, prepared.body_reservation_revision, reservation_row[0], BodyReservation)
+        else:
+            accounting_inputs.require_lineages_v3()
+
         body_quote = body_authority.original_body_quote(db, binding.body_quote_ref,
             binding.body_quote_version, quote, operation_id)
         if (canonical_digest(body_quote) != binding.body_quote_digest
@@ -174,12 +193,12 @@ def stage_d13_counter_cost_in_transaction_v1(db, namespace, evidence, *, resourc
             row = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
             reads.append(GraphVersion(write.key, row[0] if row else 0))
         writes.extend(body_writes)
-        return D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), body_original, None)
+        return completed(D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), body_original, None))
     except (D13CounterAccountingHold, TypeError, ValueError) as exc:
-        return D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), None,
-                                       "unpaid_requires_reconciliation:" + type(exc).__name__)
+        return completed(D13CounterCostStageV1(cpu, tuple(writes), tuple(reads), None,
+                                       "unpaid_requires_reconciliation:" + type(exc).__name__))
 
-def record_d13_counter_body_after_cas_v1(db, stage):
+def record_d13_counter_body_after_cas_v1(db, stage, *, receipt=None):
     if not db.in_transaction:
         raise D13CounterAccountingHold("historical body original requires same graph CAS")
     original = stage.body_original
@@ -190,15 +209,20 @@ def record_d13_counter_body_after_cas_v1(db, stage):
         if prior != original:
             raise D13CounterAccountingHold("historical body original replay conflicts")
         return prior
-    for write in stage.writes:
-        row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
-        if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
-            raise D13CounterAccountingHold("historical body graph CAS missing")
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_accounting_inputs_v3 import require_c04_body_accounting_after_cas_v3
+        require_c04_body_accounting_after_cas_v3(db,stage,receipt)
+    else:
+        for write in stage.writes:
+            row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+            if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
+                raise D13CounterAccountingHold("historical body graph CAS missing")
     db.execute("INSERT INTO d02_d13_counter_body_cost_originals_v1 VALUES(?,?,?,?,?)",
         (*original.namespace.as_tuple, original.operation_id, canonical_serialize(asdict(original)), canonical_digest(asdict(original))))
     return original
 
-def settle_current_d13_counter_cpu_v1(graph,bootstrap,bundle,*,frame_intent_id,counter_operation_id,awaiting):
+def settle_current_d13_counter_cpu_v1(graph,bootstrap,bundle,*,frame_intent_id,counter_operation_id,awaiting,accounting_inputs=None):
     graph._admin(bootstrap)
     if (type(awaiting) is not D13CounterAwaitingAccountingV1 or awaiting.frame_intent_id!=frame_intent_id
             or awaiting.counter_operation_id!=counter_operation_id or awaiting.namespace!=bundle.installation_policy.namespace):
@@ -240,6 +264,28 @@ def settle_current_d13_counter_cpu_v1(graph,bootstrap,bundle,*,frame_intent_id,c
             or grant.evidence.terminal_receipt_digest!=awaiting.terminal_receipt_digest or grant.evidence.status!=awaiting.status):
         raise D13CounterAccountingHold('actual Core observed counter terminal differs')
     port.internal_accounting(request,'validate',grant)
+    from ..runtime_storage_v3 import runtime_storage_v3,bind_runtime_storage_operation_v3
+    if runtime_storage_v3(db)is not None and accounting_inputs is None:
+        from .c04_body_accounting_inputs_v3 import begin_c04_body_accounting_inputs_v3
+        work=begin_c04_body_accounting_inputs_v3(graph,bootstrap,request=request,grant=grant,prepared=prepared)
+        def completed(packet):
+            with bind_runtime_storage_operation_v3(packet.reader.operation,db):
+                return _commit_current_d13_counter_accounting_v3(graph,bundle,frame_intent_id=frame_intent_id,
+                    counter_operation_id=counter_operation_id,awaiting=awaiting,request=request,grant=grant,
+                    prepared=prepared,job=job,metadata=metadata,epoch=epoch,accounting_inputs=packet)
+        def failed(error):raise error
+        return work.map_terminal_v3("issuer",completed,failed)
+    return _commit_current_d13_counter_accounting_v3(graph,bundle,frame_intent_id=frame_intent_id,
+        counter_operation_id=counter_operation_id,awaiting=awaiting,request=request,grant=grant,
+        prepared=prepared,job=job,metadata=metadata,epoch=epoch,accounting_inputs=accounting_inputs)
+
+
+def _commit_current_d13_counter_accounting_v3(graph,bundle,*,frame_intent_id,counter_operation_id,awaiting,
+        request,grant,prepared,job,metadata,epoch,accounting_inputs):
+    store=graph._GraphCoordinator__store;db=store._db
+    port=graph._GraphCoordinator__c04_authority_port_v3
+    content=graph._GraphCoordinator__content_fence_v2;ns=awaiting.namespace
+    port.internal_accounting(request,"validate",grant)
     now=trusted_upper(content.read_ingress_clock(graph._GraphCoordinator__scene_clock_policy))
     with store._lock:
         db.execute('BEGIN IMMEDIATE')
@@ -248,7 +294,7 @@ def settle_current_d13_counter_cpu_v1(graph,bootstrap,bundle,*,frame_intent_id,c
             if (current,current_epoch)!=(metadata,epoch) or get_job(db,job.job_id)!=job:
                 raise D13CounterAccountingHold('original counter accounting snapshot changed')
             stage=stage_d13_counter_cost_in_transaction_v1(db,ns,grant.evidence,
-                resource_issuer=graph._GraphCoordinator__d02_issuer,body_authority=graph._GraphCoordinator__body_quote_authority)
+                resource_issuer=graph._GraphCoordinator__d02_issuer,body_authority=graph._GraphCoordinator__body_quote_authority,accounting_inputs=accounting_inputs)
             if stage.body_gap is not None:raise D13CounterAccountingHold('actual Body bill requires reconciliation')
             binding=prepared.binding
             if (job.operation_id,job.activity_id,job.effect_id,job.work_kind)!=(counter_operation_id,binding.activity_id,binding.execution_id,'d13.full_http_counter.v1'):
@@ -257,17 +303,32 @@ def settle_current_d13_counter_cpu_v1(graph,bootstrap,bundle,*,frame_intent_id,c
                 raise D13CounterAccountingHold('counter original job is not the adopted execution')
             closed=replace(job,phase='completed' if awaiting.status=='completed' else 'failed',lease_holder=None,lease_expires_utc=None,
                 usage={**job.usage,'cpu_ms':grant.evidence.actual_cpu_ms},result_ref='d13-counter-terminal:'+awaiting.terminal_digest[:48],wake_condition=None)
-            job_write=job_graph_write(closed);row=db.execute('SELECT revision,value,valid FROM graph_atoms WHERE token=?',(job_write.key.token,)).fetchone()
-            if row is None or row[2]!=1 or json.loads(row[1])!=job_graph_write(job).value:
+            job_write=job_graph_write(closed);row=db.execute('SELECT revision,valid FROM graph_atoms WHERE token=?',(job_write.key.token,)).fetchone()
+            if row is None or row[1]!=1:
                 raise D13CounterAccountingHold('counter job Graph projection changed')
+            if accounting_inputs is not None:
+                from ..runtime_storage_v3 import runtime_storage_quantum_v3
+                with runtime_storage_quantum_v3(db)as meter:
+                    cell=meter.read_fixed_row(db,"graph_atoms",("value_cell_id",),"token=? AND bot=? AND persona=?",
+                        (job_write.key.token,*ns.as_tuple))
+                    header=None if cell is None else meter.read_fixed_row(db,"segmented_cells_v1",
+                        ("codec_id","total_bytes","payload_sha256"),"cell_id=?",(cell[0],))
+                    expected=canonical_json(job_graph_write(job).value).encode("utf-8")
+                    accounting_inputs.reader.operation.retain(len(expected)*8+8192);meter.charge_encode(len(expected))
+                    if header!=("canonical-json.ascii.v1",len(expected),hashlib.sha256(expected).hexdigest()):
+                        raise D13CounterAccountingHold("counter signed job metadata projection changed")
+            else:
+                original=db.execute("SELECT value FROM graph_atoms WHERE token=?",(job_write.key.token,)).fetchone()
+                if original is None or json.loads(original[0])!=job_graph_write(job).value:
+                    raise D13CounterAccountingHold("counter original inline job projection changed")
             candidate=GraphCandidate(Event(Scope(*ns.as_tuple,'d13-counter-v1'),counter_operation_id+':settle',now,
                 'd13.counter.cpu.accounted.v1',{'frame_intent_id':frame_intent_id,'binding_digest':binding.binding_digest,'terminal_digest':awaiting.terminal_digest}),
                 (*stage.reads,GraphVersion(job_write.key,row[0])),(*stage.writes,job_write),(current_epoch,))
             _save_job(db,closed)
             receipt=GraphStore._graph_commit_in_transaction(store,candidate,_capability=graph._GraphCoordinator__graph_capability)
-            body=record_d13_counter_body_after_cas_v1(db,stage)
+            body=record_d13_counter_body_after_cas_v1(db,stage,receipt=receipt)
             anchor=request.expected_anchor
-            replacement=replace(current.requirements,activation_generation=anchor.activation_generation,fence_epoch=anchor.fence_epoch,
+            replacement=replace(current.requirements,activation_generation=anchor.activation_generation,
                 deletion_seq=anchor.deletion_seq,deletion_digest=anchor.deletion_digest,execution_seq=anchor.execution_seq,
                 execution_digest=anchor.execution_digest,revocation_epoch=anchor.revocation_epoch)
             store.cas_graph_recovery_metadata(current,replacement,_capability=graph._GraphCoordinator__graph_capability)

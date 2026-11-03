@@ -106,11 +106,17 @@ def commit_life_preparation_v1(runtime, db, *, operation, request, preparation, 
         receipt = graph._commit_domain_bundle_fenced(bundle, process_lease, in_transaction=True,
             v2_write=(metadata, epoch, "finish:" + scope.operation_id, finish_digest, canonical_json(to_wire(scope.permit))),
             now_utc=preparation.frame.now_utc, domain_production_issuance_v1=witness)
+        from .current_method_learning_read_v3 import (
+            _method_active, bind_actual_character_labor_method_postcas_v1)
+        actual_method=_method_active(db)
+        actual_inputs=None if actual_method is None else actual_method.result
+        with bind_actual_character_labor_method_postcas_v1(graph,db,witness=witness,
+                frame=preparation.frame,stage=preparation,receipt=receipt,prepared_inputs=actual_inputs):
+            prepared_original=record_life_preparation_after_cas_v1(db,issuer=readers.issuer,
+                preparation=preparation,graph_receipt=receipt)
+            original=record_adopted_domain_operation_v1(db,preparation.stage,receipt)
     finally:
         _ACTIVE.pop(id(witness), None)
-    prepared_original = record_life_preparation_after_cas_v1(db, issuer=readers.issuer,
-        preparation=preparation, graph_receipt=receipt)
-    original = record_adopted_domain_operation_v1(db, preparation.stage, receipt)
     return {"schema": "sylanne.domain-production-receipt.v1", "domain": "d10",
         "operation_kind": operation.operation_kind, "operation_id": binding.prepare_operation_id,
         "action_operation_id": binding.operation_id,

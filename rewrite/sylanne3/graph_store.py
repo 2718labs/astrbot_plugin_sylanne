@@ -258,16 +258,21 @@ class GraphStore(Store):
 
     def __init__(self, path, registry: TypeRegistry, *,
                  migration_transfer_verifier: GraphMigrationTransferVerifier | None = None,
-                 selected_storage=None, storage_context=None, maintenance_basis=None):
+                 selected_storage=None, storage_context=None, maintenance_basis=None, initial_storage=None, initial_maintenance=None, host_storage_binding=None):
         if not isinstance(registry, TypeRegistry):
             raise TypeError("registry must be TypeRegistry")
         self._registry = registry.freeze()
         self._migration_transfer_verifier = migration_transfer_verifier
         super().__init__(path, selected_storage=selected_storage, storage_context=storage_context,
-                         maintenance_basis=maintenance_basis)
+                         maintenance_basis=maintenance_basis,initial_storage=initial_storage,initial_maintenance=initial_maintenance,
+                         host_storage_binding=host_storage_binding)
         if self._runtime_storage_v3 is not None:
-            with self._lock:
-                self._check_catalog()
+            try:
+                with self._lock:
+                    self._check_catalog()
+            except BaseException:
+                self.close()
+                raise
             return
         with self._lock:
             try:

@@ -388,3 +388,103 @@ def verify_d04_numeric_artifact_commitments_v3(prepared, claim, measurement, raw
             or value.output.original_digest != canonical_digest(output_body)):
         raise D04NumericArtifactHold("numeric artifact output bytes differ from measured commitment")
     return value
+
+
+@dataclass(frozen=True,slots=True)
+class HistoricalNumericReadCommitmentV1:
+    ref:str
+    revision:int
+    valid:bool
+    value_digest:str
+
+
+@dataclass(frozen=True,slots=True)
+class HistoricalNumericModelMetadataV1:
+    binding:object
+    prepared_digest:str
+    input_digest:str
+    current:D04CurrentJointReplayInputV2
+    predecessors:JointStateFrozenPredecessorsV1
+    envelope:CommandEnvelope
+    numeric_policy:AdminD04JointNumericPolicyV3
+    read_rows:tuple[HistoricalNumericReadCommitmentV1,...]
+    field_digests:tuple[tuple[str,str],...]
+    holder:str
+    worker_fence:int
+
+
+def decode_historical_d04_numeric_metadata_v1(binding,prepared_digest,raw,input_digest,string_digests,fieldsets):
+    """Decode numeric structure only; an actual Source Task authenticates all EOFs."""
+    required={'schema','read_rows','installed_identity','mapping_original_refs','numeric_request',
+        'evidence_inputs','command_envelope','worker_original','numeric_policy'}
+    if (fieldsets.get(())!=required or set(raw)!=required or raw['schema']!='d04.numeric-frozen-work-input.v3'
+            or input_digest!=binding.input_digest):
+        raise D04NumericArtifactHold('historical numeric complete input EOF/fields differ')
+    request=raw['numeric_request']
+    if set(request)!={'component','checkpoints','drives','families','predecessors','max_iterations','tolerance','clock'}:
+        raise D04NumericArtifactHold('historical numeric recipe fields differ')
+    component=decode_numeric_dto_v3(JointNumericComponentCandidate,request['component'])
+    authored=component.root_original_digest is not None
+    checkpoints=tuple(decode_numeric_dto_v3(AuthoredNumericCheckpointV2 if authored else NumericCheckpoint,row)
+        for row in request['checkpoints'])
+    drives=tuple(decode_numeric_dto_v3(SourcedNumericDrive,row)for row in request['drives'])
+    families=tuple(decode_numeric_dto_v3(D04FamilyAssignment,row)for row in request['families'])
+    predecessors=decode_numeric_dto_v3(JointStateFrozenPredecessorsV1,request['predecessors'])
+    envelope=decode_numeric_dto_v3(CommandEnvelope,raw['command_envelope'])
+    policy=decode_numeric_dto_v3(AdminD04JointNumericPolicyV3,raw['numeric_policy'])
+    evidence=raw['evidence_inputs']
+    if set(evidence)!={'namespace','component_digest','member_refs','field_payloads','read_rows','clock','schema'}:
+        raise D04NumericArtifactHold('historical numeric evidence fields differ')
+    def rows(values,prefix):
+        result=[]
+        for index,row in enumerate(values):
+            if(fieldsets.get((*prefix,index))!={'ref','revision','valid','value_json'}
+                    or set(row)!={'ref','revision','valid'}or type(row['revision'])is not int or row['revision']<0
+                    or type(row['valid'])is not bool or row['revision']==0 and row['valid']):
+                raise D04NumericArtifactHold('historical numeric read commitment fields differ')
+            key=AtomKey.from_token(row['ref'])
+            if NamespaceId.from_key(key)!=binding.namespace:
+                raise D04NumericArtifactHold('historical numeric read commitment crossed namespace')
+            result.append(HistoricalNumericReadCommitmentV1(key.token,row['revision'],row['valid'],
+                string_digests[(*prefix,index,'value_json')]))
+        return tuple(result)
+    read_rows=rows(raw['read_rows'],('read_rows',))
+    evidence_rows=rows(evidence['read_rows'],('evidence_inputs','read_rows'))
+    if(read_rows!=evidence_rows or len({row.ref for row in read_rows})!=len(read_rows)
+            or decode_numeric_dto_v3(NamespaceId,evidence['namespace'])!=binding.namespace
+            or component.namespace!=binding.namespace or evidence['component_digest']!=component.candidate_digest
+            or tuple(evidence['member_refs'])!=component.checkpoint_refs or envelope.authority.namespace!=binding.namespace
+            or envelope.identity.operation_id!=binding.operation_id or envelope.identity.activity_id!=binding.activity_id
+            or envelope.authority.activation_generation!=binding.activation_generation
+            or envelope.parent_budget_lease_ref!=binding.parent_budget_lease_ref
+            or predecessors.namespace!=binding.namespace or predecessors.operation_id!=binding.operation_id
+            or evidence_payload_v3(decode_numeric_dto_v3(D04RoleClockOriginalV3,evidence['clock']))!=request['clock'] or evidence['schema']!='d04.frozen-joint-evidence-inputs.v3'):
+        raise D04NumericArtifactHold('historical numeric model/evidence/identity differs')
+    expected={name:getattr(binding,name)for name in('installation_id','owner_grant_ref','owner_grant_revision',
+        'owner_grant_digest','algorithm_id','algorithm_build_digest','native_manifest_sha256','native_sha256','output_policy_digest')}
+    if(raw['installed_identity']!=expected or policy.namespace!=binding.namespace or policy.installation_id!=binding.installation_id
+            or policy.lease_id!=binding.parent_budget_lease_ref or policy.cpu_ceiling_ms!=binding.cpu_ceiling_ms
+            or request['max_iterations']!=policy.max_iterations or request['tolerance']!=evidence_payload_v3(policy.tolerance)):
+        raise D04NumericArtifactHold('historical numeric installed/limit identity differs')
+    versions=tuple(GraphVersion(AtomKey.from_token(row.ref),row.revision)for row in read_rows)
+    actual={v.key.token:v.revision for v in versions}
+    if(any(actual.get(v.key.token)!=v.revision for v in component.read_versions)
+            or versions!=envelope.version_guard.read_versions
+            or envelope.version_guard.query_epochs!=(component.query_epoch,)
+            or(envelope.version_guard.access_epoch,envelope.version_guard.delete_epoch)!=(component.access_epoch,component.delete_epoch)):
+        raise D04NumericArtifactHold('historical numeric complete readset/CAS differs')
+    worker=raw['worker_original']
+    if(set(worker)!={'holder','fence','cancel_epoch','lease_expires_utc','deadline_utc'}
+            or type(worker['holder'])is not str or not worker['holder']or type(worker['fence'])is not int
+            or worker['fence']<1 or worker['cancel_epoch']!=0 or worker['fence']!=envelope.authority.worker_fence
+            or worker['deadline_utc']!=binding.deadline_utc):
+        raise D04NumericArtifactHold('historical numeric original worker differs')
+    fields_=[]
+    for index,row in enumerate(evidence['field_payloads']):
+        if len(row)!=1 or type(row[0])is not str:
+            raise D04NumericArtifactHold('historical numeric field payload commitment differs')
+        fields_.append((row[0],string_digests[('evidence_inputs','field_payloads',index,1)]))
+    if len(dict(fields_))!=len(fields_):raise D04NumericArtifactHold('historical numeric field payloads repeat')
+    return HistoricalNumericModelMetadataV1(binding,prepared_digest,input_digest,
+        D04CurrentJointReplayInputV2(component,checkpoints,drives,families),predecessors,envelope,policy,
+        read_rows,tuple(fields_),worker['holder'],worker['fence'])

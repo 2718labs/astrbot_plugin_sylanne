@@ -16,6 +16,8 @@ from .mtls_server import MtlsPeerCredential
 from ..host.installed_package import verify_installed_backend_runtime_v1
 
 _PEER = CONTENT_OPERATIONS | frozenset({
+    "d13_cache_use_observe", "d13_cache_use_reclaim", "d13_cache_use_acquire",
+    "d13_cache_use_transfer", "d13_cache_use_release", "d13_cache_use_inspect",
     "current", "anchor", "release", "delete", "deletion", "execution", "accounting",
     "namespace_genesis", "owner_pair", "owner_claim", "owner_proof", "owner_session",
     "owner_session_revoke", "owner_guard_read", "owner_authorization_revoke", "self_identity_read",
@@ -26,6 +28,7 @@ _PEER = CONTENT_OPERATIONS | frozenset({
     "installation_management", "installation_management_startup",
 })
 _LOCAL = frozenset({
+    "d13_cache_use_install",
     "install", "seal_v2_only", "activate", "recover", "transfer", "revoke",
     "owner_identity_pair", "owner_identity_revoke", "self_identity_mutate",
     "migration_pair_install", "migration_pair_register", "migration_pair_revoke",
@@ -35,13 +38,16 @@ _LOCAL = frozenset({
     "d12_package_install",
     "installation_management_install", "installation_management_grant", "installation_management_revoke",
 })
+_D13_OWNER_PEER_V3 = frozenset({"d13_cache_use_register_original", "d13_cache_use_close_original",
+    "d13_cache_use_inspect_original", "d13_cache_use_attest_retention_release"})
+_CONSOLE_ACTIONS_V1 = frozenset({'owner_session','owner_guard_read','d12_lifecycle_control','d12_operation_status'})
 _C09 = frozenset({"current", "read", "write", "delete", "deletion", "execution",
     "recover", "erasure_closure_install", "execution_redaction_install"})
 
 
 class InstalledAuthorityPolicyV2:
     def __init__(self, *, peer_scopes, profile_peers, package_root,
-                 trusted_manifest_sha256, authority_uid=0):
+                 trusted_manifest_sha256, authority_uid=0, d13_owner_peers_v3=None):
         root = Path(package_root)
         if not root.is_absolute() or root.is_symlink():
             raise AuthorityUnavailable("absolute installed package root required")
@@ -62,7 +68,16 @@ class InstalledAuthorityPolicyV2:
             identifier(profile, "profile_id")
             if certificate not in scopes:
                 raise AuthorityUnavailable("profile has no installed certificate scope")
+        owner_peers = {} if d13_owner_peers_v3 is None else dict(d13_owner_peers_v3)
+        for certificate, role in owner_peers.items():
+            if (type(role) is not tuple or len(role) != 4 or certificate not in scopes
+                    or profiles.get(role[0]) != certificate or role[1] != scopes[certificate].namespace
+                    or role[2] != scopes[certificate].holder or type(role[3]) is not str
+                    or len(role[3]) != 64 or any(c not in "0123456789abcdef" for c in role[3])):
+                raise AuthorityUnavailable("D13 owner producer needs its exact installed certificate/profile/cohort role")
+        self._d13_owner_peers_v3 = owner_peers
         self._scopes, self._profiles = scopes, profiles
+        self._maintenance_console_peers_v1 = {}
         self._package_root, self._manifest_pin = root.resolve(strict=True), trusted_manifest_sha256
         self._authority_uid, self._issuer = authority_uid, object()
 
@@ -86,7 +101,16 @@ class InstalledAuthorityPolicyV2:
                 or credential.action == "c09_maintenance" and action in _C09)
             return (credential._issuer is self._issuer and credential.namespace == namespace
                     and permitted and self._local_identity())
-        if type(credential) is not MtlsPeerCredential or action not in _PEER:
+        if type(credential) is not MtlsPeerCredential:
+            return False
+        console = self._maintenance_console_peers_v1.get(credential.certificate_sha256)
+        if console is not None:
+            return action in _CONSOLE_ACTIONS_V1 and console.authority_namespace == namespace and holder is None
+        if action in _D13_OWNER_PEER_V3:
+            role = self._d13_owner_peers_v3.get(credential.certificate_sha256)
+            return (role is not None and role[1] == namespace
+                and (holder is None or role[2] == holder))
+        if action not in _PEER:
             return False
         scope = self._scopes.get(credential.certificate_sha256)
         return (scope is not None and scope.namespace == namespace
@@ -105,3 +129,21 @@ class InstalledAuthorityPolicyV2:
         manifest = self._package_root / "release-manifest.json"
         return (manifest.is_file() and not manifest.is_symlink()
                 and hashlib.sha256(manifest.read_bytes()).hexdigest() == self._manifest_pin)
+
+
+def install_maintenance_console_policy_v1(server, *, binding, role_proof):
+    """Root composition registers this peer only for finite management actions."""
+    from .maintenance_console_contract_v1 import MaintenanceConsoleBindingV1
+    from .maintenance_console_role_v1 import VerifiedMaintenanceConsoleRoleV1
+    policy = getattr(server._core._authorize_callback, '__self__', None)
+    if (type(policy) is not InstalledAuthorityPolicyV2 or not policy._local_identity()
+            or type(binding) is not MaintenanceConsoleBindingV1 or type(role_proof) is not VerifiedMaintenanceConsoleRoleV1
+            or binding.package_manifest_digest != policy._manifest_pin
+            or binding.console_cert_sha256 in policy._scopes
+            or binding.console_profile_id in policy._profiles):
+        raise AuthorityUnavailable('independent Root-installed console policy required')
+    role_proof.require_installed_v1(binding=binding, server=server)
+    prior = policy._maintenance_console_peers_v1.get(binding.console_cert_sha256)
+    if prior is not None and prior != binding:
+        raise AuthorityUnavailable('console certificate cannot replace its installed management scope')
+    policy._maintenance_console_peers_v1[binding.console_cert_sha256] = binding

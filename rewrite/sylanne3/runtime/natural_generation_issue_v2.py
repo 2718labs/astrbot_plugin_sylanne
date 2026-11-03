@@ -116,7 +116,7 @@ def save_original_scoped_query_proof_v2(db, saved, proof) -> None:
         raise NaturalGenerationIssueHold("original natural scope identity differs")
 
 
-def read_original_scoped_query_proof_v2(db, saved):
+def read_original_scoped_query_proof_v2(db, saved, *, prepared_scope=None):
     """Rehydrate the exact query proof bound to the immutable original seal."""
     from .natural_reply_job_v2 import SavedNaturalPreparationV2
     from .natural_scoped_query_proof_v2 import (
@@ -127,6 +127,11 @@ def read_original_scoped_query_proof_v2(db, saved):
     if (not db.in_transaction or type(saved) is not SavedNaturalPreparationV2
             or saved.stage != "generation"):
         raise NaturalGenerationIssueHold("natural scope read requires graph tx")
+    if prepared_scope is not None:
+        from .dispatch_initial_source_read_v3 import PreparedNaturalScopeOriginalV3
+        if type(prepared_scope)is not PreparedNaturalScopeOriginalV3:
+            raise NaturalGenerationIssueHold('actual private natural scope original required')
+        return prepared_scope.read_v3(db,saved)
     from ..authority_service.current_authority_graph_read_v3 import (
         read_bound_authority_graph_attachment_v3,
         require_authority_json_column_v3)

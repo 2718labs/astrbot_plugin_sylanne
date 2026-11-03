@@ -176,6 +176,9 @@ def _map_current_d08_check_versions(
         f"cancellation-epoch:{intent.action_id}":
             observed.cancellation_graph_version.revision,
     }
+    from .d08_commitment_communication_v1 import current_named_commitment_check_refs_v1
+    named_refs = current_named_commitment_check_refs_v1(db, namespace, intent, now_utc=now_utc)
+    versions.update((ref.ref, ref.version) for ref in named_refs)
     frozen = {item.ref: item.version for item in spec.required_input_versions}
     if (len(versions) != len(spec.required_input_versions)
             or len(frozen) != len(spec.required_input_versions)
@@ -340,14 +343,18 @@ def _current_action_cancellation(
         "AND type_name='d08.action_cancellation.v1'",
         namespace.as_tuple,
     ).fetchall()
-        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,('d08.action_cancellation.v1',),('token','revision','value','valid'),valid_only=False))
+        if fixed is None else (prepared_inventory.atom_rows(db,namespace,query,('d08.action_cancellation.v1',),
+            ('token','revision','value','valid'),valid_only=False,name=intent.action_id)
+            if prepared_inventory is not None and prepared_inventory.family=='private_reply' else
+            require_bound_graph_full_atom_rows_v3(db,namespace,query,('d08.action_cancellation.v1',),('token','revision','value','valid'),valid_only=False)))
     relevant = tuple(row for row in rows if AtomKey.from_token(row[0]).name == intent.action_id)
     if len(relevant) != 1 or relevant[0][0] != key.token:
         return "unknown", None, missing
     token, revision, encoded, valid = relevant[0]
     matching_atoms = tuple(item for item in
-        (snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(('d08.action_cancellation.v1',)))
-        if item.key == key)
+        (snapshot.atoms if fixed is None else ((snapshot.get(key),)if prepared_inventory is not None
+            and prepared_inventory.family=='private_reply' else fixed.atoms_for_types_v3(('d08.action_cancellation.v1',))))
+        if item is not None and item.key == key)
     if len(matching_atoms) != 1:
         return "unknown", None, missing
     atom = matching_atoms[0]
@@ -574,7 +581,12 @@ def read_current_d08_conflict_facts(
         raise ValueError("D08 conflict graph epoch changed")
 
     fixed = _bound_dispatch_projection_v3(db,namespace,query,snapshot=snapshot,prepared_inventory=prepared_inventory)
-    projected_atoms = snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(_TYPES)
+    private_versions=None
+    if prepared_inventory is not None and prepared_inventory.family=='private_reply':
+        from .private_dispatch_source_read_v3 import require_private_dispatch_conflict_metadata_v3
+        projected_atoms,private_versions=require_private_dispatch_conflict_metadata_v3(prepared_inventory,db,query)
+    else:
+        projected_atoms = snapshot.atoms if fixed is None else fixed.atoms_for_types_v3(_TYPES)
     atoms = tuple(atom for atom in projected_atoms
                   if atom.valid and atom.key.type_name in _TYPES)
     by_token = {atom.key.token: atom for atom in atoms}
@@ -587,7 +599,8 @@ def read_current_d08_conflict_facts(
         "AND valid=1 ORDER BY token",
         namespace.as_tuple,
     ).fetchall()
-        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,_TYPES,('token','revision','value','type_name')))
+        if fixed is None else require_bound_graph_full_atom_rows_v3(db,namespace,query,_TYPES,('token','revision','value','type_name'))) if private_versions is None else tuple(
+            (atom.key.token,atom.revision,atom.value,atom.key.type_name)for atom in atoms)
     if len(rows) != len(atoms):
         raise ValueError("D08 conflict snapshot omits or invents a current row")
 
@@ -641,8 +654,8 @@ def read_current_d08_conflict_facts(
     return CurrentD08ConflictFactsV1(
         namespace, QueryEpoch(namespace, "d08.conflict_graph", query.revision),
         tuple(commitments), tuple(intents), tuple(outcomes),
-        tuple(GraphVersion(by_token[token].key, revision)
-              for token, revision, _, _ in rows),
+        (tuple(GraphVersion(by_token[token].key, revision)
+              for token, revision, _, _ in rows)if private_versions is None else private_versions),
         missing_sources=tuple(dict.fromkeys(missing)),
     )
 

@@ -909,41 +909,47 @@ class InstalledNaturalDispositionMaintenanceServiceV1:
         self.owner.core._require(credential, "current", self.owner.namespace)
 
     def _snapshot(self, *, parent_original_id):
-        context, storage, member = self.owner._storage()
-        with closing(sqlite3.connect(Path(storage["graph_path"]).as_uri()+"?mode=ro",uri=True)) as db:
-            db.execute("PRAGMA query_only=ON"); db.execute("BEGIN")
-            try:
-                head = read_natural_roster_head_v1(db,self.owner.namespace_id,parent_original_id)
-            except (ValueError,TypeError) as exc:
-                raise NaturalDispositionProjectionUnavailableV1("natural roster original cannot be projected") from exc
-            if head is None:
-                return None
-            key, revision, value = head
-            self._require_committed_head_v1(head)
-            if value.installation_id != self.owner.installation_id:
-                raise AuthorityUnavailable("natural metadata roster crossed its actual installation")
-            recovery = GraphStore._decode_recovery(db.execute("SELECT schema,requirements_json,graph_revision "
-                "FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",self.owner.namespace_id.as_tuple).fetchone(),self.owner.namespace_id)
-            epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",self.owner.namespace_id.as_tuple).fetchone()[0]
-            versions = [GraphVersion(key,revision)]
-            changes = []
-            for ref in value.dependency_refs:
-                row = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?",(ref.ref,)).fetchone()
-                actual = 0 if row is None else row[0]
-                versions.append(GraphVersion(AtomKey.from_token(ref.ref),actual))
-                if (ref.version == 0 and row is not None or ref.version > 0 and row != (ref.version,1)):
-                    event = None if row is None else db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=?",(ref.ref,actual)).fetchone()
-                    changes.append((ref.ref,actual,None if row is None else row[1],None if event is None else event[0]))
-            adoptions = []
-            for child in value.children:
-                rows = db.execute("SELECT admission_ref FROM graph_dispatch_admissions WHERE bot=? AND persona=? AND operation_id=? AND effect_id=? LIMIT 2",
-                    (*value.namespace.as_tuple,child.operation_id,child.effect_id)).fetchall()
-                if len(rows)>1:
-                    raise AuthorityUnavailable("natural child admission is ambiguous")
-                adoptions.append(None if not rows else rows[0][0])
-        self.owner.control.verify_member_v1(member,prepared=False)
-        context.require_current("business")
-        return context, storage, recovery, epoch, head, tuple(versions), tuple(changes), tuple(adoptions)
+        from ..runtime.natural_roster_metadata_read_v3 import prepare_authority_natural_roster_metadata_v3
+        prepared=prepare_authority_natural_roster_metadata_v3(self,parent_original_id=parent_original_id)
+        try:
+            context, storage, member = self.owner._storage()
+            with closing(sqlite3.connect(Path(storage["graph_path"]).as_uri()+"?mode=ro",uri=True)) as db:
+                db.execute("PRAGMA query_only=ON"); db.execute("BEGIN")
+                try:
+                    head = prepared.require_current_v3(db,self.owner.namespace_id,parent_original_id)
+                except (ValueError,TypeError) as exc:
+                    raise NaturalDispositionProjectionUnavailableV1("natural roster original cannot be projected") from exc
+                if head is None:
+                    return None
+                key, revision, value = head
+                # Signed Core birth/current/committed/finished facts were prepared before Graph SQL.
+                if value.installation_id != self.owner.installation_id:
+                    raise AuthorityUnavailable("natural metadata roster crossed its actual installation")
+                recovery = GraphStore._decode_recovery(db.execute("SELECT schema,requirements_json,graph_revision "
+                    "FROM graph_recovery_metadata_v2 WHERE bot=? AND persona=?",self.owner.namespace_id.as_tuple).fetchone(),self.owner.namespace_id)
+                epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",self.owner.namespace_id.as_tuple).fetchone()[0]
+                versions = [GraphVersion(key,revision)]
+                changes = []
+                for ref in value.dependency_refs:
+                    row = db.execute("SELECT revision,valid FROM graph_atoms WHERE token=?",(ref.ref,)).fetchone()
+                    actual = 0 if row is None else row[0]
+                    versions.append(GraphVersion(AtomKey.from_token(ref.ref),actual))
+                    if (ref.version == 0 and row is not None or ref.version > 0 and row != (ref.version,1)):
+                        event = None if row is None else db.execute("SELECT event_id FROM graph_history WHERE token=? AND revision=?",(ref.ref,actual)).fetchone()
+                        changes.append((ref.ref,actual,None if row is None else row[1],None if event is None else event[0]))
+                adoptions = []
+                for child in value.children:
+                    rows = db.execute("SELECT admission_ref FROM graph_dispatch_admissions WHERE bot=? AND persona=? AND operation_id=? AND effect_id=? LIMIT 2",
+                        (*value.namespace.as_tuple,child.operation_id,child.effect_id)).fetchall()
+                    if len(rows)>1:
+                        raise AuthorityUnavailable("natural child admission is ambiguous")
+                    adoptions.append(None if not rows else rows[0][0])
+            self.owner.control.verify_member_v1(member,prepared=False)
+            context.require_current("business")
+            return context, storage, recovery, epoch, head, tuple(versions), tuple(changes), tuple(adoptions)
+        finally:
+            prepared.release_v3()
+
 
     def plan_v1(self, *, credential, subject, parent_original_id):
         self._paired(credential,subject)

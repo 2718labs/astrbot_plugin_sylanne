@@ -29,7 +29,6 @@ from sylanne3.runtime.dispatch_candidate import DispatchCandidateEvidenceV1
 from sylanne3.runtime.installed_dispatch_admission_issuer import (
     DispatchAdmissionHold, InstalledDispatchAdmissionIssuer,
     inspect_current_d06_source_grant,
-    inspect_current_d03_d05,
     inspect_current_d11_dispatch_budget,
     inspect_current_d08_commitments,
     inspect_current_private_route,
@@ -219,75 +218,6 @@ def test_no_graph_transaction_holds_before_reading():
                 db, intent, spec, candidate, audience=("entity:user",),
             )
         assert error.value.missing == ("graph.current_write_transaction",)
-    finally:
-        db.close()
-
-
-def test_d03_d05_scoped_receipts_come_from_complete_graph_rows():
-    db, candidate, context, _ = _social_case()
-    try:
-        result = inspect_current_d03_d05(
-            db, candidate, context=context, now_utc=2.0,
-        )
-        assert result.status == "checks_pass"
-        assert result.missing == ()
-        assert (result.role_receipt.result, result.boundary_receipt.result) == (
-            "pass", "pass",
-        )
-        assert result.graph_epoch == 5
-    finally:
-        db.close()
-
-
-@pytest.mark.parametrize("effect,scope,expected", [
-    ("deny", "entity:user", "d05.current_boundary_not_pass"),
-    ("allow", "conversation", "d05.audience_scope_mapping_unavailable"),
-])
-def test_d05_deny_and_unmapped_scope_hold(effect, scope, expected):
-    db, candidate, context, _ = _social_case(
-        effect=effect, rule_audience=scope,
-    )
-    try:
-        result = inspect_current_d03_d05(
-            db, candidate, context=context, now_utc=2.0,
-        )
-        assert result.status == "hold"
-        assert expected in result.missing
-    finally:
-        db.close()
-
-
-def test_current_boundary_row_change_recomputes_and_fails():
-    db, candidate, context, key = _social_case()
-    try:
-        db.execute("UPDATE graph_atoms SET value=json_set(value,'$.effect','deny') "
-                   "WHERE token=?", (key.token,))
-        result = inspect_current_d03_d05(
-            db, candidate, context=context, now_utc=2.0,
-        )
-        assert result.status == "hold"
-        assert result.boundary_receipt.result == "fail"
-    finally:
-        db.close()
-
-
-def test_new_boundary_rule_cannot_be_omitted_from_complete_read():
-    db, candidate, context, key = _social_case()
-    try:
-        row = db.execute("SELECT value FROM graph_atoms WHERE token=?",
-                         (key.token,)).fetchone()
-        new_rule = {**json.loads(row[0]), "rule_id": "boundary:new",
-                    "effect": "deny"}
-        new_key = AtomKey(key.owner, key.type_name, "boundary:new")
-        db.execute("INSERT INTO graph_atoms VALUES(?,?,?,?,?,?,?)", (
-            new_key.token, "bot", "persona", key.type_name, 1,
-            json.dumps(new_rule), 1,
-        ))
-        result = inspect_current_d03_d05(
-            db, candidate, context=context, now_utc=2.0,
-        )
-        assert result.status == "hold"
-        assert "d05.current_boundary_not_pass" in result.missing
     finally:
         db.close()
 

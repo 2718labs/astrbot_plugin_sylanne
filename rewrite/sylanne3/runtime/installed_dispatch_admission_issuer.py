@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 from ..domains.d06 import SourceGrantRead, provide_source_grant_check
 from ..domains.d03 import ContextProvider, RoleBindingRequest
 from ..domains.d03 import RoleBinding
-from ..domains.d05 import RelationshipProvider
 from ..domains.d08 import (
     ActionIntent, ActionSchema, ActionSchemaRecord, CommitmentConflictSnapshot,
     GoalExecutionProvider, RequiredCheckSpec,
@@ -24,7 +23,7 @@ from ..runtime.dispatch_candidate import dispatch_segment_payload_ref
 from ..dispatch_runtime import DispatchRequest
 from ..runtime_journal import BudgetConstraint, RecoveryConstraintFootprint
 from ..runtime_contracts import (
-    CheckReceipt, FenceScope, NamespaceId, QueryEpoch, VersionedRef,
+    CheckReceipt, FenceScope, NamespaceId, QueryEpoch,
     canonical_digest,
 )
 from .budget import BudgetError, get_budget_lease, require_budget_family_admissible
@@ -32,7 +31,6 @@ from .dispatch_admission import DispatchAdmissionV1
 from .dispatch_budget_check import provide_dispatch_budget_check
 from .dispatch_current_projection import (
     CurrentDispatchProjectionV1, derive_current_domain_reads,
-    read_current_dispatch_projection,
 )
 from .dispatch_current_commitments import read_current_d08_conflict_facts
 from .dispatch_current_commitment_check import CRITERIA_REF, CRITERIA_VERSION
@@ -73,15 +71,6 @@ class DispatchSourceInspectionV1:
     observed_versions: tuple[tuple[str, int], ...]
     provider_result: str | None
     receipt: CheckReceipt | None = None
-
-
-@dataclass(frozen=True)
-class DispatchSocialInspectionV1:
-    status: str
-    missing: tuple[str, ...]
-    role_receipt: CheckReceipt | None
-    boundary_receipt: CheckReceipt | None
-    graph_epoch: int | None
 
 
 @dataclass(frozen=True)
@@ -584,8 +573,13 @@ def _inspect_post_c02_final_reissue_v2(
             f"persona:{namespace.persona_id}", action.target_ref, None,
             route_binding.scene_ref, action.action_kind, action.purpose,
             now_utc, True)
+        from .dispatch_current_projection import read_current_dispatch_policy_route_v3
+        policy_route=read_current_dispatch_policy_route_v3(db,namespace,route_binding.query,
+            source_ref=route_binding.source_ref,c02_operation_id=route_binding.c02_operation_id,
+            platform_ref=route_binding.platform_ref,conversation_ref=route_binding.conversation_ref,
+            sender_ref=route_binding.sender_ref,scene_ref=route_binding.scene_ref)
         resolution, _ = derive_current_domain_reads(
-            db, trusted_context.projection, request, context)
+            db, trusted_context.projection, request, context,policy_route=policy_route)
         if resolution.status != "complete" or len(resolution.matched_bindings) != 1:
             raise ValueError("one current role resolution is required")
         binding_id = resolution.matched_bindings[0]
@@ -753,151 +747,6 @@ def _current_atom(db, namespace: NamespaceId, ref: str, expected_type: str,
     if expected_digest is not None and canonical_digest(atom.value) != expected_digest:
         raise ValueError("current graph atom content differs")
     return atom
-
-
-def inspect_current_d03_d05(
-    db, candidate: DispatchCandidateEvidenceV1, *,
-    context: ContextProvider, now_utc: float,
-    trusted_context: TrustedDispatchAdmissionContextV1 | None = None,
-) -> DispatchSocialInspectionV1:
-    """Issue scoped D03/D05 candidates from a complete current namespace read.
-
-    The installed ContextProvider must carry the trusted active D03 catalogue.
-    The D09 audience is read from the graph; an ambiguous audience mapping
-    stays HOLD rather than selecting a convenient D05 boundary scope.
-    """
-    def hold(*missing: str, role=None, boundary=None, epoch=None):
-        return DispatchSocialInspectionV1("hold", tuple(dict.fromkeys(missing)),
-                                          role, boundary, epoch)
-
-    if not getattr(db, "in_transaction", False):
-        return hold("graph.current_write_transaction")
-    if (type(candidate) is not DispatchCandidateEvidenceV1
-            or type(context) is not ContextProvider
-            or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
-        return hold("social.typed_installed_context_and_time")
-    try:
-        key = AtomKey.from_token(candidate.action_ref)
-        namespace = NamespaceId(key.owner.bot, key.owner.persona)
-        epoch_row = db.execute(
-            "SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
-            namespace.as_tuple,
-        ).fetchone()
-        expected_epoch = (trusted_context.graph_receipt.epoch.revision
-                          if type(trusted_context) is TrustedDispatchAdmissionContextV1
-                          else candidate.query_epoch)
-        if (epoch_row is None or epoch_row[0] != expected_epoch
-                or (trusted_context is not None
-                    and (expected_epoch != candidate.query_epoch + 1
-                         or trusted_context.scope.graph_epoch.revision
-                         != candidate.query_epoch
-                         or trusted_context.scope.namespace != namespace))):
-            return hold("social.current_graph_epoch")
-        epoch = epoch_row[0]
-        action_atom = _current_atom(db, namespace, candidate.action_ref,
-                                    "d08.action_intent.v1")
-        schema_atom = _current_atom(db, namespace, candidate.schema_ref,
-                                    "d08.action_schema.v1")
-        batch_atom = _current_atom(db, namespace, candidate.batch_ref,
-                                   "d09.verified_segment_batch.v1")
-        d08 = {item.name: item for item in GoalExecutionProvider().register_types()}
-        intent = d08["d08.action_intent.v1"].validator(action_atom.value)
-        record = d08["d08.action_schema.v1"].validator(schema_atom.value)
-        next(item for item in D09ExpressionProvider.register_types()
-             if item.name == "d09.verified_segment_batch.v1").validator(batch_atom.value)
-        batch = batch_atom.value
-        frozen = ActionSchema(record.schema_id, record.action_kind,
-                              record.proactive, record.required_checks)
-        expected_activity = intent.identity.activity_id
-        if (candidate.action_digest != canonical_digest(intent)
-                or candidate.schema_digest != canonical_digest(record)
-                or candidate.batch_digest != batch["batch_digest"]
-                or record != ActionSchemaRecord.bind(intent, frozen)
-                or intent.identity.operation_id != candidate.operation_id
-                or any(atom.key.owner.kind != "activity"
-                       or atom.key.owner.subject != expected_activity
-                       for atom in (action_atom, schema_atom, batch_atom))
-                or action_atom.key.name != intent.action_id
-                or schema_atom.key.name != record.schema_ref
-                or batch_atom.key.name != batch["batch_id"]
-                or batch["action_id"] != intent.action_id
-                or batch["target_ref"] != intent.target_ref
-                or batch["scene_ref"][:6] != "scene:"):
-            return hold("social.current_action_schema_batch_identity")
-        audience = tuple(batch["audiences"])
-        if len(audience) != 1 or audience != candidate.source_audience:
-            return hold("social.current_d09_audience_scope")
-        scene = batch["scene_ref"]
-        rows = db.execute(
-            "SELECT token,revision,value,type_name FROM graph_atoms "
-            "WHERE bot=? AND persona=? AND type_name IN "
-            "('d03.role_binding','d05.boundary_rule') AND valid=1 ORDER BY token",
-            namespace.as_tuple,
-        ).fetchall()
-        atoms = tuple(GraphAtom(AtomKey.from_token(token), revision,
-                                json.loads(raw), True)
-                      for token, revision, raw, _ in rows)
-        snapshot = GraphSnapshot(atoms, (NamespaceEpoch(*namespace.as_tuple, epoch),))
-        projection = read_current_dispatch_projection(
-            db, namespace, snapshot, QueryEpoch(namespace, "all", epoch),
-        )
-        request = RoleBindingRequest(
-            f"persona:{namespace.persona_id}", intent.target_ref, None,
-            scene, intent.action_kind, intent.purpose, now_utc, True,
-        )
-        role_read, boundary_read = derive_current_domain_reads(
-            db, projection, request, context,
-        )
-        specs = {item.check_kind: item for item in intent.required_checks
-                 if item.check_kind in {"role_binding", "boundary"}}
-        if (len(specs) != 2 or specs["role_binding"].provider_id != "d03.role_binding"
-                or specs["boundary"].provider_id != "d05.boundary"):
-            return hold("social.frozen_required_check_specs", epoch=epoch)
-        for spec in specs.values():
-            criteria = next(item for item in spec.required_input_versions
-                            if item.ref == spec.criteria_version)
-            criterion = _current_atom(
-                db, namespace, criteria.ref,
-                AtomKey.from_token(criteria.ref).type_name,
-            )
-            if criterion.revision != criteria.version:
-                return hold("social.current_criteria_version", epoch=epoch)
-        role = context.provide_required_check(
-            intent, role_read, valid_until=now_utc + 1.0,
-        )
-        boundary_criteria = next(item for item in specs["boundary"].required_input_versions
-                                 if item.ref == specs["boundary"].criteria_version)
-        from dataclasses import replace
-        boundary_read = replace(
-            boundary_read, input_versions=boundary_read.input_versions +
-            (boundary_criteria,),
-        )
-        boundary = RelationshipProvider(
-            boundary_read_verifier=lambda read: read == boundary_read,
-        ).boundary_required_check(
-            intent, frozen, boundary_read, audience_scope=audience[0],
-            scene_ref=scene, at_time=now_utc, valid_until=now_utc + 1.0,
-        )
-    except (TypeError, ValueError, KeyError, StopIteration, json.JSONDecodeError):
-        return hold("social.current_graph_provider_read_unavailable")
-    missing = []
-    if any(rule.subject_persona_ref == f"persona:{namespace.persona_id}"
-           and rule.target_entity_ref == intent.target_ref
-           and rule.action_kind == intent.action_kind
-           and (rule.scene_ref is None or rule.scene_ref == scene)
-           and rule.audience_scope != audience[0]
-           for rule in boundary_read.rules):
-        missing.append("d05.audience_scope_mapping_unavailable")
-    if role.result != "pass" or role.coverage != "full":
-        missing.append("d03.current_role_binding_not_pass")
-    if boundary.result != "pass" or boundary.coverage != "full":
-        missing.append("d05.current_boundary_not_pass")
-    if projection.coverage != "full":
-        missing.extend(projection.missing_sources)
-    return DispatchSocialInspectionV1(
-        "hold" if missing else "checks_pass", tuple(dict.fromkeys(missing)),
-        role, boundary, epoch,
-    )
 
 
 def inspect_current_d11_dispatch_budget(
@@ -1350,25 +1199,13 @@ class InstalledDispatchAdmissionIssuer:
             trusted_context=trusted_context, now_utc=now_utc,
             valid_until_utc=source_expiry,
         )
-        post_c02 = None
-        social_missing = ("d03.d05.installed_context_provider",)
-        if post_c02_final_reissue is not None:
-            post_c02 = _inspect_post_c02_final_reissue_v2(
-                db, bundle, snapshot, candidate, action,
-                post_c02_final_reissue, context=self._context,
-                trusted_context=trusted_context, now_utc=now_utc)
-            social_missing = post_c02.missing
-        elif self._context is not None:
-            social = inspect_current_d03_d05(
-                db, candidate, context=self._context, now_utc=now_utc,
-                trusted_context=trusted_context,
-            )
-            social_missing = social.missing
-        commitments = (DispatchCommitmentInspectionV1(
-            "check_pass", (), snapshot.epochs[0].revision, (), (),
-            post_c02.receipts[3]) if post_c02 is not None and not post_c02.missing
-            else inspect_current_d08_commitments(
-                db, candidate, trusted_context=trusted_context, now_utc=now_utc))
+        post_c02 = _inspect_post_c02_final_reissue_v2(
+            db, bundle, snapshot, candidate, action,
+            post_c02_final_reissue, context=self._context,
+            trusted_context=trusted_context, now_utc=now_utc)
+        social_missing = post_c02.missing
+        commitments = DispatchCommitmentInspectionV1(
+            "check_pass", (), snapshot.epochs[0].revision, (), (),post_c02.receipts[3])
         route = inspect_current_private_route(db, candidate, now_utc=now_utc)
         owner = inspect_current_owner_grant(
             db, NamespaceId(action_key.owner.bot, action_key.owner.persona),
@@ -1396,12 +1233,8 @@ class InstalledDispatchAdmissionIssuer:
                 or trusted_context.current_effect.state != "absent"
                 or bundle.envelope.parent_budget_lease_ref != budget.lease_id):
             raise DispatchAdmissionHold(("dispatch.current_trusted_context_scope",))
-        receipts = (post_c02.receipts if post_c02 is not None and not post_c02.missing
-                    else (social.role_receipt, social.boundary_receipt,
-                          inspection.receipt, commitments.receipt, budget.receipt))
-        if (post_c02 is not None and not post_c02.missing
-                and (receipts[2] != inspection.receipt
-                     or receipts[4] != budget.receipt)):
+        receipts = post_c02.receipts
+        if receipts[2] != inspection.receipt or receipts[4] != budget.receipt:
             raise DispatchAdmissionHold(("dispatch.final_source_or_budget_reissue_differs",))
         if (any(item is None or item.result != "pass" or item.coverage != "full"
                 for item in receipts)
@@ -1414,28 +1247,7 @@ class InstalledDispatchAdmissionIssuer:
                for spec in action.required_checks):
             raise DispatchAdmissionHold(("dispatch.frozen_check_provider_differs",))
         receipts = tuple(by_kind[spec.check_kind] for spec in action.required_checks)
-        if post_c02 is not None:
-            bindings = (post_c02.binding,)
-        else:
-            projection = trusted_context.projection
-            bindings = []
-            for atom in projection.role_bindings:
-                try:
-                    binding = RoleBinding(**{
-                        **atom.value, "norm_refs": tuple(atom.value["norm_refs"]),
-                        "source_refs": tuple(atom.value["source_refs"]),
-                    })
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if (binding.role_binding_id == atom.key.name
-                        and binding.binding_version == atom.revision
-                        and binding.status == "active"
-                        and binding.scene_ref == route.scene_ref
-                        and binding.target_entity_ref == action.target_ref
-                        and binding.effective_from <= now_utc
-                        and (binding.effective_until is None
-                             or now_utc <= binding.effective_until)):
-                    bindings.append(binding)
+        bindings = (post_c02.binding,)
         if len(bindings) != 1:
             raise DispatchAdmissionHold(("d03.unique_current_private_binding",))
         request = command.request
@@ -1564,7 +1376,6 @@ class InstalledDispatchAdmissionIssuer:
 __all__ = [
     "DispatchAdmissionHold", "DispatchSourceInspectionV1",
     "InstalledDispatchAdmissionIssuer", "inspect_current_d06_source_grant",
-    "DispatchSocialInspectionV1", "inspect_current_d03_d05",
     "DispatchBudgetInspectionV1",
     "inspect_current_d11_dispatch_budget",
     "DispatchCommitmentInspectionV1", "inspect_current_d08_commitments",

@@ -61,18 +61,29 @@ async def run_installed_post_c02_appraisal_v3(runtime, installation, *, context,
 
 async def _run_appraisal_on_installed_channel_v3(runtime, bundle, workflow, client, client_grant,
         *, context, trusted_umo, c02_operation_id, source_ref):
-    worker, bootstrap = runtime._worker, runtime._v2_bootstrap
+    from ..graph_worker import retained_graph_calls_v3
+    with retained_graph_calls_v3(runtime._worker) as graph_call:
+        return await _run_appraisal_with_retained_inputs_v3(runtime, bundle, workflow, client, client_grant,
+            graph_call=graph_call, context=context, trusted_umo=trusted_umo,
+            c02_operation_id=c02_operation_id, source_ref=source_ref)
+
+
+async def _run_appraisal_with_retained_inputs_v3(runtime, bundle, workflow, client, client_grant,
+        *, graph_call, context, trusted_umo, c02_operation_id, source_ref):
+    bootstrap = runtime._v2_bootstrap
     args = {"c02_operation_id": c02_operation_id, "source_ref": source_ref}
-    prepared = await worker.call(lambda graph: graph.prepare_post_c02_appraisal_v3(bootstrap, bundle, **args))
+    prepared = await graph_call(lambda graph: graph.prepare_post_c02_appraisal_v3(bootstrap, bundle, **args), slot="prepare")
     if prepared["status"] == "not_configured":
         return prepared
-    await worker.call(lambda graph: graph.acquire_post_c02_appraisal_v3(bootstrap, bundle, **args))
-    try:
-        original, job, call, draft, anchor, sealed_intent = await worker.call(lambda graph:
-            graph.read_acquired_appraisal_v3(bootstrap, bundle, **args))
-    except Exception:
-        # A completed original skips execution and proceeds to current adoption.
-        return await worker.call(lambda graph: graph.adopt_post_c02_appraisal_v3(bootstrap, bundle, **args))
+    await graph_call(lambda graph: graph.acquire_post_c02_appraisal_v3(bootstrap, bundle, **args), slot="acquire")
+    acquired = await graph_call(lambda graph:
+        graph.read_acquired_appraisal_v3(bootstrap, bundle, **args), slot="acquired_input")
+    from ..runtime.d04_appraisal_driver_v3 import D04SettledAppraisalLocatorV3
+    if type(acquired) is D04SettledAppraisalLocatorV3:
+        # Only an actual completed/paid original selects recovery. Source,
+        # transport, expired-worker and identity failures keep their first cause.
+        return await graph_call(lambda graph: graph.adopt_post_c02_appraisal_v3(bootstrap, bundle, **args), slot="adoption")
+    original, job, call, draft, anchor, sealed_intent = acquired
     descriptor = ModelProviderDescriptor(workflow.provider_id, "astrbot-openai-official-v1", workflow.model_id,
         frozenset({"text"}), frozenset({workflow.purpose}), frozenset({workflow.privacy_tier}),
         workflow.provider_config_ref, "unknown", False, False)
@@ -93,18 +104,18 @@ async def _run_appraisal_on_installed_channel_v3(runtime, bundle, workflow, clie
     if ModelEgressDraftV1.from_intent(record.intent) != draft or permit.pinned_anchor != anchor:
         raise ValueError("D04 Authority returned another original call")
     if record.state == "prepared":
-        await worker.call(lambda graph: graph.seal_appraisal_egress_v3(bootstrap, bundle.installation_policy.namespace,
-            intent=record.intent, permit=permit))
+        await graph_call(lambda graph: graph.seal_appraisal_egress_v3(bootstrap, bundle.installation_policy.namespace,
+            intent=record.intent, permit=permit), slot="seal")
         terminal = await executor.execute_once(intent=record.intent, expected_anchor=anchor, request=call, appraisal_original=original)
         if terminal is None:
             return {"status": "original_terminal_unknown", "job_id": job.job_id}
     elif record.state != "observed":
         return {"status": "original_terminal_unknown", "job_id": job.job_id}
     try:
-        paid = await worker.call(lambda graph: graph.settle_post_c02_appraisal_v3(bootstrap, bundle, **args))
+        paid = await graph_call(lambda graph: graph.settle_post_c02_appraisal_v3(bootstrap, bundle, **args), slot="settlement")
     except Exception:
-        await worker.call(lambda graph: graph.reconcile_d04_appraisal_cost_v3(bootstrap, bundle, **args))
+        await graph_call(lambda graph: graph.reconcile_d04_appraisal_cost_v3(bootstrap, bundle, **args), slot="reconciliation")
         raise
     if paid.get("paid") is not True:
         return paid
-    return await worker.call(lambda graph: graph.adopt_post_c02_appraisal_v3(bootstrap, bundle, **args))
+    return await graph_call(lambda graph: graph.adopt_post_c02_appraisal_v3(bootstrap, bundle, **args), slot="adoption")

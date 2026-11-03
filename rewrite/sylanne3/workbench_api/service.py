@@ -99,6 +99,10 @@ _INPUT_FIELDS = {
     "configure_or_control": frozenset({"config_diff", "object_ref", "control", "test_intent"}),
 }
 
+_ACTIONS |= {"read_onboarding_choices"}
+_READ_ACTIONS |= {"read_onboarding_choices"}
+_INPUT_FIELDS["read_onboarding_choices"] = frozenset()
+
 from .creator_configuration_v1 import READ_ACTION as _CONFIGURATION_READ, SAVE_ACTION as _CONFIGURATION_SAVE, SAVE_FIELDS as _CONFIGURATION_SAVE_FIELDS
 _ACTIONS |= {_CONFIGURATION_READ, _CONFIGURATION_SAVE}
 _READ_ACTIONS |= {_CONFIGURATION_READ}
@@ -139,7 +143,11 @@ _READ_ACTIONS |= {_OWNER_STATE_ACTION}
 _WIRED_COMMANDS |= {_OWNER_STATE_ACTION}
 _INPUT_FIELDS[_OWNER_STATE_ACTION] = _OWNER_STATE_INPUT_FIELDS
 
-from .domain_operations_v1 import ACTIONS as _DOMAIN_OPERATION_ACTIONS, INPUT_FIELDS as _DOMAIN_OPERATION_FIELDS
+from .domain_operations_v1 import (ACTIONS as _DOMAIN_OPERATION_ACTIONS, INPUT_FIELDS as _DOMAIN_OPERATION_FIELDS,
+    LABOR_OPTIONS_ACTION_V1 as _LABOR_OPTIONS_ACTION,LABOR_OPTIONS_FIELDS_V1 as _LABOR_OPTIONS_FIELDS)
+_ACTIONS|={_LABOR_OPTIONS_ACTION}
+_READ_ACTIONS|={_LABOR_OPTIONS_ACTION}
+_INPUT_FIELDS[_LABOR_OPTIONS_ACTION]=_LABOR_OPTIONS_FIELDS
 _ACTIONS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
 _WIRED_COMMANDS |= frozenset(_DOMAIN_OPERATION_ACTIONS)
 from .domain_operations_v1 import input_fields_for_action_v1
@@ -153,6 +161,12 @@ _ACTIONS |= {"d07_cognition_budget"}
 _WIRED_COMMANDS |= {"d07_cognition_budget"}
 _INPUT_FIELDS["d07_cognition_budget"] = frozenset({"parent_budget_lease_ref", "ceiling"})
 _MUTATION_CAPABILITIES["d07_cognition_budget"] = "workbench.create"
+from .source_owner_read_v1 import ACTIONS as _SOURCE_READ_ACTIONS, INPUT_FIELDS as _SOURCE_READ_INPUTS
+_ACTIONS |= _SOURCE_READ_ACTIONS
+_READ_ACTIONS |= _SOURCE_READ_ACTIONS
+_WIRED_COMMANDS |= _SOURCE_READ_ACTIONS
+_INPUT_FIELDS.update(_SOURCE_READ_INPUTS)
+
 from .context_catalogue_v1 import ACTION as _CONTEXT_CATALOGUE_ACTION, INPUT_FIELDS as _CONTEXT_CATALOGUE_FIELDS
 _ACTIONS |= {_CONTEXT_CATALOGUE_ACTION}
 _WIRED_COMMANDS |= {_CONTEXT_CATALOGUE_ACTION}
@@ -163,6 +177,18 @@ _ACTIONS |= set(_C04_ACTIONS)
 _WIRED_COMMANDS |= set(_C04_ACTIONS)
 _INPUT_FIELDS.update(_C04_INPUTS)
 _MUTATION_CAPABILITIES.update(_C04_ACTIONS)
+
+from .commitment_communication_v1 import ACTION as _COMMITMENT_ACTION, INPUT_FIELDS as _COMMITMENT_FIELDS
+_ACTIONS |= {_COMMITMENT_ACTION}
+_WIRED_COMMANDS |= {_COMMITMENT_ACTION}
+_INPUT_FIELDS[_COMMITMENT_ACTION] = _COMMITMENT_FIELDS
+_MUTATION_CAPABILITIES[_COMMITMENT_ACTION] = 'workbench.activate'
+
+from .source_inspection_migration_v1 import ACTIONS as _INSPECTION_ACTIONS, INPUT_FIELDS as _INSPECTION_INPUT_FIELDS, ACCEPT as _INSPECTION_ACCEPT, READ as _INSPECTION_READ
+_ACTIONS |= _INSPECTION_ACTIONS
+_READ_ACTIONS |= {_INSPECTION_READ}
+_INPUT_FIELDS.update(_INSPECTION_INPUT_FIELDS)
+_MUTATION_CAPABILITIES[_INSPECTION_ACCEPT]="workbench.maintain"
 
 _PACKAGE_ACTIONS=frozenset({"read_package_maintenance","accept_package_switch","read_package_operation"})
 _ACTIONS |= _PACKAGE_ACTIONS
@@ -195,11 +221,27 @@ class AuthenticatedSession:
         default=None, repr=False)
     backend_operation_ref: str | None = None
     package_operation_id: str | None = None
+    inspection_operation_id: str | None = None
 
     def allows(self, scope: str, capability: str, purpose: str, audience: str) -> bool:
         return (capability in self.scope_capabilities.get(scope, frozenset())
                 and audience in self.scope_audiences.get(scope, frozenset())
                 and purpose in self.scope_purposes.get(scope, frozenset()))
+
+
+def owner_session_identity_view_v1(session):
+    """Public correlation data from an already verified current Owner session."""
+    from ..authority_service.v2_owner_contract import OwnerPrincipalV1
+    from ..runtime_contracts import canonical_digest
+    if (type(session)is not AuthenticatedSession or not session.actor_id
+            or type(session.owner_session_request)is not OwnerSessionLoginRequestV1
+            or type(session.owner_session_request.principal)is not OwnerPrincipalV1):
+        raise ValueError('actual current Owner identity required')
+    login=session.owner_session_request
+    return {'schema':'d12.owner-session-identity.v1','owner_binding_digest':canonical_digest({
+        'schema':'d12.owner-session-binding.v1','authority_id':login.authority_id,
+        'authority_namespace':login.authority_namespace,'installation_id':login.installation_id,
+        'actor_id':session.actor_id,'principal':login.principal})}
 
 
 @dataclass(frozen=True)
@@ -259,7 +301,9 @@ class WorkbenchService:
             command = self._parse(payload)
         except (TypeError, ValueError) as exc:
             return self._problem("unavailable", "invalid_request", str(exc), False)
-        capability = ("workbench.package_status" if command["action"] == "read_package_operation"
+        capability = ("workbench.read" if command["action"]=="domain_rebuild_character_labor_body"
+            and command["input"]["request"]["expected_choice_digest"]is None
+            else "workbench.package_status" if command["action"] == "read_package_operation"
             else "workbench.operation_status" if command["action"] == "read_backend_operation"
             else "workbench.read" if command["action"] in _READ_ACTIONS
             else _MUTATION_CAPABILITIES[command["action"]])
@@ -275,6 +319,15 @@ class WorkbenchService:
                                      "C09 删除权威尚未接入；未准备删除。", False)
             return self._problem("unavailable", "provider_unavailable", "工作台协调器尚未接入；未执行任何领域写入。", True)
         try:
+            if command["action"] in _INSPECTION_ACTIONS:
+                from .issuer import GraphWorkbenchIssuer
+                from .source_inspection_migration_v1 import execute_inspection_maintenance_v1
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable","inspection_maintenance_unavailable","Inspection maintenance unavailable.",False)
+                returned=execute_inspection_maintenance_v1(self._issuer,session=session,action=command["action"],
+                    scope=command["scope"],purpose=command["purpose"],audience=command["audience"],
+                    operation_id=command["operation_id"],input_data=command["input"])
+                return ApiResponse(**returned)
             if command['action']in {_NAMED_NODE_ACTION,_FREEZE_NODE_ACTION,_PREPARE_NODE_ACTION}:
                 from .named_joint_node_v1 import execute_named_joint_node_v1,execute_frozen_joint_command_v1,execute_prepared_joint_command_v1,named_node_service_terminal_v1,named_node_error_v1
                 execute_named={_NAMED_NODE_ACTION:execute_named_joint_node_v1,_FREEZE_NODE_ACTION:execute_frozen_joint_command_v1,_PREPARE_NODE_ACTION:execute_prepared_joint_command_v1}[command['action']]
@@ -286,6 +339,18 @@ class WorkbenchService:
                 if type(returned)is not GraphStorageWorkV3:raise TypeError('Named node requires its actual Source READ Work')
                 terminal=named_node_service_terminal_v1 if command['action']==_NAMED_NODE_ACTION else self._projection_response
                 return returned.map_terminal_v3('service',terminal,named_node_error_v1)
+            if command['action']==_LABOR_OPTIONS_ACTION:
+                from .issuer import GraphWorkbenchIssuer
+                from .domain_operations_v1 import execute_character_labor_options_read_v1
+                from ..graph_worker import GraphStorageWorkV3
+                if type(self._issuer)is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable','labor_options_issuer_unavailable','当前角色劳动政策读取未接入。',False)
+                returned=execute_character_labor_options_read_v1(self._issuer,session=session,
+                    scope=command['scope'],purpose=command['purpose'],audience=command['audience'],input_data=command['input'])
+                if type(returned)is GraphStorageWorkV3:
+                    return returned.map_terminal_v3('service',
+                        lambda value:self._projection_response({'status':'ready','projection':value}),self._projection_error_v3)
+                return self._projection_response(returned)
             if command['action'] == _OWNER_STATE_ACTION:
                 from .issuer import GraphWorkbenchIssuer
                 from .beta1_owner_state_v1 import execute_owner_state_read_v1, require_owner_state_command_work_v1
@@ -408,6 +473,28 @@ class WorkbenchService:
             if command["action"] == "read_d04_initialization_profile":
                 return self._projection_response(self._issuer.read_d04_initialization_profile(
                     session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"]))
+            if command["action"] == "read_onboarding_choices":
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "onboarding_reader_unavailable",
+                                         "当前安装未接通创建与绑定目录。", False)
+                return self._projection_response(self._issuer.read_onboarding_choices(
+                    session=session, scope=command["scope"], purpose=command["purpose"],
+                    audience=command["audience"]))
+            if command["action"] in _SOURCE_READ_ACTIONS:
+                from .issuer import GraphWorkbenchIssuer
+                from .source_owner_read_v1 import execute_source_owner_read_v1, require_source_owner_command_work_v1
+                from ..graph_worker import GraphStorageWorkV3
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem('unavailable', 'source_read_unavailable', '来源读取尚未接入。', False)
+                returned = execute_source_owner_read_v1(self._issuer, session=session, action=command['action'],
+                    scope=command['scope'], purpose=command['purpose'], audience=command['audience'],
+                    operation_id=command['operation_id'], input_data=command['input'])
+                if type(returned) is GraphStorageWorkV3:
+                    require_source_owner_command_work_v1(self._issuer, returned, action=command['action'],
+                        scope=command['scope'], input_data=command['input'])
+                    return returned.map_terminal_v3('service', self._projection_response, self._projection_error_v3)
+                return self._projection_response(returned)
             if command["action"] == "open_workspace":
                 returned = self._issuer.open_workspace(session=session, scope=command["scope"],
                                                        purpose=command["purpose"],
@@ -452,6 +539,9 @@ class WorkbenchService:
                     return self._problem("unavailable", "creator_configuration_unavailable", "当前配置权威尚未接入。", False)
                 returned = self._issuer.read_configuration_draft(
                     session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"])
+                from ..graph_worker import GraphStorageWorkV3
+                if type(returned)is GraphStorageWorkV3:
+                    return returned.map_terminal_v3('service',self._projection_response,self._projection_error_v3)
                 return self._projection_response(returned)
             if command['action']=='read_owner_material_source_status_v1':
                 from .issuer import GraphWorkbenchIssuer
@@ -512,6 +602,11 @@ class WorkbenchService:
                     session=session, scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
                     operation_id=command["operation_id"], input_data=command["input"])
                 return self._command_response(command["action"], command["operation_id"], command["input"], returned)
+            if command["action"] == _COMMITMENT_ACTION:
+                from .issuer import GraphWorkbenchIssuer
+                if type(self._issuer) is not GraphWorkbenchIssuer:
+                    return self._problem("unavailable", "commitment_communication_issuer_unavailable",
+                                         "当前沟通提交权威尚未接入。", False)
             if command["action"] == "run_experiment":
                 # This route depends on W01's signed Owner read and persisted
                 # paid original. A generic WorkbenchIssuer receipt is not proof.
@@ -544,6 +639,26 @@ class WorkbenchService:
             from ..graph_worker import GraphStorageWorkV3
             if type(returned) is GraphStorageWorkV3:
                 action, operation_id, input_data = command["action"], command["operation_id"], command["input"]
+                if action=='domain_rebuild_character_labor_body':
+                    from .domain_operations_v1 import (require_character_labor_rebuild_command_work_v1,
+                        character_labor_rebuild_terminal_v1)
+                    require_character_labor_rebuild_command_work_v1(self._issuer,returned,scope=command['scope'],
+                        purpose=command['purpose'],audience=command['audience'],operation_id=operation_id,input_data=input_data)
+                    def labor_terminal(value):
+                        packaged=character_labor_rebuild_terminal_v1(action=action,operation_id=operation_id,
+                            input_data=input_data,result=value)
+                        return(self._projection_response(packaged) if input_data['request']['expected_choice_digest']is None
+                            else self._command_response(action,operation_id,input_data,packaged))
+                    return returned.map_terminal_v3('service',labor_terminal,self._projection_error_v3)
+                if action == _COMMITMENT_ACTION:
+                    from .commitment_communication_v1 import (require_commitment_communication_work_v1,
+                        commitment_communication_result_v1)
+                    require_commitment_communication_work_v1(self._issuer, returned,
+                        scope=command["scope"], purpose=command["purpose"], audience=command["audience"],
+                        operation_id=operation_id, input_data=input_data)
+                    return returned.map_terminal_v3("service", lambda value: self._command_response(
+                        action, operation_id, input_data,
+                        commitment_communication_result_v1(operation_id, input_data, value)), self._projection_error_v3)
                 if returned.kind in {"current_world_source_read_v3","current_d07_source_read_v3","current_d07_simulation_source_read_v3","current_d07_dispatch_read_v3"}:
                     from .domain_operations_v1 import ACTIONS,decode_request_v1
                     from ..runtime.current_beta1_source_read_v3 import require_beta1_source_w09_command_v3
@@ -561,6 +676,19 @@ class WorkbenchService:
                         raise ValueError("World continuation changed its actual Owner scope/purpose/audience")
                     return returned.map_terminal_v3("service",lambda value:self._command_response(
                         action,operation_id,input_data,value),self._projection_error_v3)
+                if returned.kind == "d02_fixed_policy_read_v3":
+                    from .body_policy_v1 import (ACTION,decode_fixed_body_policy_v1,
+                        require_body_policy_command_work_v3,body_policy_result_v1)
+                    if action != ACTION:
+                        raise ValueError("D02 continuation crossed its registered policy command")
+                    state=require_body_policy_command_work_v3(self._issuer,returned,
+                        operation_id=operation_id,policy=decode_fixed_body_policy_v1(input_data["policy"]))
+                    if (state.owner.scope!=command["scope"] or state.authority.purpose!=command["purpose"]
+                            or state.authority.audience!=(command["audience"],)):
+                        raise ValueError("D02 continuation changed current Owner scope/purpose/audience")
+                    return returned.map_terminal_v3("service",lambda value:self._command_response(
+                        action,operation_id,input_data,body_policy_result_v1(operation_id,input_data,value)),
+                        self._projection_error_v3)
                 if returned.kind == "current_method_learning_read_v3":
                     from .domain_operations_v1 import ACTIONS
                     from ..runtime.current_method_learning_read_v3 import (
@@ -646,10 +774,22 @@ class WorkbenchService:
             json.dumps(input_data, sort_keys=True, allow_nan=False)
         except (TypeError, ValueError) as exc:
             raise ValueError("input must be JSON-safe") from exc
+        if action == "read_onboarding_choices" and (
+                input_data or purpose != "workbench_user_action"
+                or audience != "owner" or len(scope.split("/")) != 2):
+            raise ValueError("onboarding choices require the exact current Owner scope")
+        if action in _INSPECTION_ACTIONS:
+            from .source_inspection_migration_v1 import validate_inspection_input_v1
+            validate_inspection_input_v1(action,input_data,scope=scope,purpose=purpose,audience=audience,operation_id=operation_id)
         if action in _PACKAGE_ACTIONS:
             from .package_maintenance_v2 import validate_package_input_v2
             if len(scope.split("/"))!=2:raise ValueError("exact Owner package namespace required")
             validate_package_input_v2(action,input_data,purpose=purpose,audience=audience)
+        if action == _COMMITMENT_ACTION:
+            from .commitment_communication_v1 import validate_commitment_communication_input_v1
+            if purpose != 'context' or audience != 'owner' or len(scope.split('/')) != 2:
+                raise ValueError('communication requires its exact current signed Owner scope')
+            validate_commitment_communication_input_v1(input_data)
         if action in _C04_ACTIONS:
             from .c04_work_v3 import validate_c04_input_v3
             if audience != "owner" or len(scope.split("/")) != 2:
@@ -665,6 +805,13 @@ class WorkbenchService:
             if audience != "owner" or len(scope.split("/")) != 2 or set(input_data) != {"policy"}:
                 raise ValueError("fixed body policy requires exact signed Owner input")
             decode_fixed_body_policy_v1(input_data["policy"])
+        if action in _SOURCE_READ_ACTIONS:
+            from .source_owner_read_v1 import validate_source_owner_input_v1
+            if purpose != 'context' or audience != 'owner' or len(scope.split('/')) != 2:
+                raise ValueError('Source READ requires its exact signed Owner scope')
+            validate_source_owner_input_v1(action, input_data)
+            return {'action': action, 'scope': scope, 'purpose': purpose, 'audience': audience,
+                'operation_id': operation_id, 'input': input_data}
         if action == _CONTEXT_CATALOGUE_ACTION:
             from .context_catalogue_v1 import validate_context_catalogue_input_v1
             if audience != "owner" or len(scope.split("/")) != 2:
@@ -679,6 +826,11 @@ class WorkbenchService:
             from .named_joint_node_v1 import validate_named_joint_node_input_v1
             if purpose!='context'or audience!='owner'or len(scope.split('/'))!=2:raise ValueError('Named node requires current signed Owner scope')
             validate_named_joint_node_input_v1(input_data)
+        if action==_LABOR_OPTIONS_ACTION:
+            from .domain_operations_v1 import validate_character_labor_options_input_v1
+            if purpose!='context' or audience!='owner' or len(scope.split('/'))!=2:
+                raise ValueError('labor options require their exact current Owner context scope')
+            validate_character_labor_options_input_v1(input_data)
         if action == _OWNER_STATE_ACTION:
             from .beta1_owner_state_v1 import validate_owner_state_input_v1
             if purpose != 'context' or audience != 'owner' or len(scope.split('/')) != 2:
@@ -1075,6 +1227,10 @@ class WorkbenchService:
             from .creator_configuration_v1 import valid_creator_save_receipt_v1
             if not valid_creator_save_receipt_v1(receipt, operation_id, input_data):
                 return cls._problem("unavailable", "invalid_provider_response", "配置保存缺少当前草稿的真实原件。", False)
+        if action == _COMMITMENT_ACTION:
+            from .commitment_communication_v1 import valid_commitment_communication_receipt_v1
+            if not valid_commitment_communication_receipt_v1(receipt, operation_id, input_data):
+                return cls._problem("unavailable", "invalid_provider_response", "沟通提交缺少匹配的真实原件。", False)
         if action in _C04_ACTIONS:
             from ..runtime_contracts import canonical_digest
             if (receipt.get("schema") != "d12.c04-work-receipt.v3" or receipt.get("action") != action

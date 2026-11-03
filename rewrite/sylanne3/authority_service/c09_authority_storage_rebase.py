@@ -47,7 +47,10 @@ from .c09_life_completed_archive_v1 import (
 )
 
 
+from .d13_cache_use_control_v2 import CACHE_USE_DDLS_V2 as D13_CACHE_USE_DDLS_V2
+
 _KNOWN_CORE_TABLES = frozenset({
+    *D13_CACHE_USE_DDLS_V2,
     "authority_meta", "authority_namespaces", "authority_transfers",
     "authority_natural_disposition_originals_v1",
     "authority_permits", "authority_effects", "authority_events",
@@ -98,6 +101,9 @@ _KNOWN_CORE_TABLES = frozenset({
     "authority_self_identity_heads_v1", "authority_self_identity_operations_v1",
     "authority_terminal_c02_read_attempts_v1",
     "authority_worker_result_read_attempts_v1",
+    "authority_source_inspection_migrations_v1",
+    "authority_source_inspection_workflows_v1",
+    "authority_platform_observation_facts_v3",
     "authority_c09_consumed_execution_v1", "authority_c09_unresolved_effects_v1",
     "authority_c09_originals_archive_v1", "authority_c09_deletion_continuations_v1",
     "authority_c09_recovery_bindings_v1", "authority_c09_execution_source_seals_v4",
@@ -765,6 +771,11 @@ class _CoreTransform:
                  rows: tuple[tuple, ...]) -> tuple[tuple[tuple, ...],
                                                  tuple[RowDispositionV1, ...]]:
         changes: list[RowDispositionV1] = []
+        if table in D13_CACHE_USE_DDLS_V2:
+            from .d13_cache_use_control_v2 import validate_d13_cache_use_core_row_v2
+            for row in rows:
+                validate_d13_cache_use_core_row_v2(table,columns,row)
+            return rows, ()
         if table == "authority_natural_disposition_originals_v1":
             from .natural_disposition_maintenance_v1 import ORIGINAL_COLUMNS, core_original_from_wire_v1
             if columns != ORIGINAL_COLUMNS:

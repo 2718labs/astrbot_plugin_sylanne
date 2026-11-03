@@ -31,6 +31,36 @@ def numeric_authority_source_reader_v3(work):
     return None if reader is None else require_authority_numeric_metadata_work_v3(reader)
 
 
+
+def read_current_authority_numeric_life_scope_v1(db,*,namespace,episode_ref,causal_operation_id):
+    """Select the actual signed Life project of this Numeric occurrence only."""
+    from .current_authority_graph_read_v3 import _authority_attachment_owner_v3
+    from ..runtime.d11_life_contract_v1 import LifeInputRefV1,D11LifeExecutionBindingV1,life_from_wire_v1
+    from ..runtime_storage_v3 import runtime_storage_quantum_v3
+    work=_authority_attachment_owner_v3(db)
+    reader=None if work is None else numeric_authority_source_reader_v3(work)
+    if (reader is None or reader.namespace!=namespace or reader.request is None
+            or (reader.request.episode_ref,reader.request.causal_operation_id)!=(episode_ref,causal_operation_id)
+            or reader.progress_prepared_metadata is None):
+        raise AuthorityUnavailable('Life scope requires its actual Numeric occurrence and signed prepared metadata')
+    raw=reader.progress_prepared_metadata
+    binding=life_from_wire_v1(raw['binding'],D11LifeExecutionBindingV1)
+    if (reader.life_bindings.get(binding.execution_id)!=binding
+            or binding.prepared_original_ref!=reader.progress_prepared_ref
+            or binding.execution_id!=reader.activity['execution_id']
+            or reader.progress_prepared_task.column.canonical_digest!=reader.before['prepared_digest']):
+        raise AuthorityUnavailable('Life scope changed its actual Before/prepared/binding identity')
+    project=LifeInputRefV1(**raw['plan']['project'])
+    key=AtomKey.from_token(project.ref)
+    if (NamespaceId.from_key(key)!=namespace or key.type_name!='d10.life_project.v1'
+            or tuple(row['revision']for row in raw['read_rows']if row['ref']==project.ref)!=(project.revision,)):
+        raise AuthorityUnavailable('Life project selector is not in its actual signed original readset')
+    with runtime_storage_quantum_v3(db)as meter:
+        reader.require_current(meter=meter)
+        reader.progress_prepared_task.require_header_v1(meter)
+    return project
+
+
 def numeric_metadata_issuers_v3(reader):
     require_authority_numeric_metadata_work_v3(reader)
     return reader.installed_reader.readers.issuer, reader.installed_reader.readers.resource_issuer
@@ -359,6 +389,8 @@ class AuthorityNumericSourceReadV3:
         return self
 
     def release_v3(self):
+        from ..runtime.d06_ordinary_readout_v3 import release_life_ordinary_readout_v3
+        release_life_ordinary_readout_v3(self.work)
         self.operation.unregister_retained_state_v3(self)
         from ..runtime.current_life_numeric_metadata_v1 import _COLUMNS
         from ..runtime.current_method_learning_read_v3 import _JSON_COLUMNS

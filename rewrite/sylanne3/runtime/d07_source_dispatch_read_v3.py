@@ -57,6 +57,7 @@ def finish_d07_dispatch_metadata_v3(task,value):
     from .d07_execution_v1 import SIGN_KIND,D07SemanticQuestionV1,D07RelationshipSemanticQuestionV2
     from .d07_method_growth_semantic_v2 import D07MethodGrowthSemanticQuestionV2,QUESTION_SCHEMA as METHOD_SCHEMA
     from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+    from .d07_ordinary_continuity_attention_v1 import D07OrdinaryContinuityQuestionV1
     from .d07_reflection_execution_v1 import D07ReflectionExecutionRequestV1
     r=task.reader;require_d07_dispatch_read_v3(r)
     if task.identity[0]=="d07_classify_graph":
@@ -72,12 +73,13 @@ def finish_d07_dispatch_metadata_v3(task,value):
         "d07.relationship-semantic-question.v2":D07RelationshipSemanticQuestionV2,
         METHOD_SCHEMA:D07MethodGrowthSemanticQuestionV2,
         "d07.general-growth-semantic-question.v1":D07GeneralGrowthQuestionV1,
+        "d07.ordinary-continuity-question.v1":D07OrdinaryContinuityQuestionV1,
         "d07.actual-reflection-request.v1":D07ReflectionExecutionRequestV1}
     cls=known.get(schema)
     if(cls is None or task.column.beta1_metadata_fields_seen!={f.name for f in fields(cls)}
             or(kind=="reflection_request")!=(cls is D07ReflectionExecutionRequestV1)):
         raise AuthorityUnavailable("D07 classifier rejects an unknown or misshaped registered signed original")
-    route="registered_native"
+    route="ordinary_continuity_owner"if cls is D07OrdinaryContinuityQuestionV1 else"registered_native"
     if cls is not D07ReflectionExecutionRequestV1:
         from ..domains.d03.world_history_v1 import VIEW_TYPE
         target=value["target_ref"]
@@ -135,6 +137,16 @@ def advance_current_d07_dispatch_read_v3(graph,work):
                     r.store._registry.spec(key.type_name)
                     record["phase"]="graph_original";return GraphStorageStepV3("progress")
                 raise AuthorityUnavailable("D07 concern has no authenticated positive registered original")
+            locator=task.result
+            from .d07_single_event_review_v1 import QUESTION_PREFIX,create_single_event_review_classifier_metadata_v1
+            if(locator[0]=="semantic_question"and locator[4]=="d07.registered-semantic-question.v1"
+                    and locator[5]=="registered_joint_plan"and locator[1].startswith(QUESTION_PREFIX)):
+                review=record.get("review_classifier")
+                if review is None:
+                    review=create_single_event_review_classifier_metadata_v1(r,task);record["review_classifier"]=review
+                if not review.complete:
+                    review.advance(meter);return GraphStorageStepV3("progress")
+                review.require_current_v1();locator=review.result
             if record["owner"]!=r.owner_binding:
                 raise AuthorityUnavailable("D07 classifier lost its completed independent current Owner")
             r.operation.retain(32768)
@@ -145,7 +157,7 @@ def advance_current_d07_dispatch_read_v3(graph,work):
                 "audience_ref":r.audience_ref,"parent_budget_lease_ref":r.parent_budget_lease_ref,
                 "request_digest":r.request_digest,"owner":r.owner_binding,
                 "deadline":r.operation.deadline_utc,"monotonic_deadline":r.initial_monotonic_deadline,
-                "locator":task.result,"status":"classified"}
+                "locator":locator,"status":"classified"}
         graph._finish_read_fence_v3(r.fence);r.read_finished=True
         return GraphStorageStepV3("complete",proof)
 
@@ -289,6 +301,19 @@ def resume_current_d07_classified_command_v3(graph,proof):
                 if(type(result)is not GraphStorageWorkV3 or result.kind!="current_d07_source_read_v3"
                         or result.operation is not value["operation"]):
                     raise AuthorityUnavailable("World classifier did not re-enter its actual independent Source Work")
+                for stage,success,failed in value["mappers"]:result.map_terminal_v3(stage,success,failed)
+                result.adopt_request_lifetime_v3(value["lifetime"])
+                value["mappers"]=[];value["lifetime"]=None
+                _HANDOFFS.pop(proof)
+                return result
+            if value["locator"][-1]in {"ordinary_continuity_owner","single_event_review_owner"}:
+                from .current_method_learning_read_v3 import _MethodLearningReadV3
+                if(type(result)is not GraphStorageWorkV3 or result.kind!="current_method_learning_read_v3"
+                        or result.operation is not value["operation"]or type(result.state)is not _MethodLearningReadV3
+                        or result.deadline_utc!=value["deadline"]or result.selection_digest!=value["operation"].selection_digest
+                        or result.state.request!=value["request"]
+                        or result.state.d07_dispatch_pin_v3!=(*value["locator"],value["owner"],value["deadline"],value["monotonic_deadline"])):
+                    raise AuthorityUnavailable("ordinary continuity classifier did not enter its exact fresh Method Source Work")
                 for stage,success,failed in value["mappers"]:result.map_terminal_v3(stage,success,failed)
                 result.adopt_request_lifetime_v3(value["lifetime"])
                 value["mappers"]=[];value["lifetime"]=None

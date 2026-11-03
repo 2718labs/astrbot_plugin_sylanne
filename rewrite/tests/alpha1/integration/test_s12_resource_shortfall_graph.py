@@ -54,9 +54,9 @@ def test_unknown_reservation_shortfall_survives_graph_restart(tmp_path):
     quote = domain.quote_work(
         profile, initial, "activity:one", "thinking", 5.0,
         (WorkComponent("work", "duration", duration_rate=0.1),),
-        valid_until=20.0)
+        valid_until=20.0, now_utc=10.0)
     reservation = domain.reserve_work(
-        initial, (), quote, "reservation:one", "effect:one")
+        initial, (), quote, "reservation:one", "effect:one", now_utc=10.0)
     state_write = domain.state_write(ROLE, initial)
     reserved_write = domain.reservation_write(ROLE, "activity:one", reservation)
     path = tmp_path / "business.db"

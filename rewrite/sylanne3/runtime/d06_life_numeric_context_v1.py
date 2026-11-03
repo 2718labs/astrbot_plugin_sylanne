@@ -144,7 +144,7 @@ def read_plan_life_numeric_context_v1(db, *, namespace, activity_id, operation_k
     keys, roots, originals = internal_life_episode_read_inputs_v2(db, namespace, request.episode_ref)
     before_keys, before_roots, before_originals = life_d04_before_current_read_inputs_v1(
         db, namespace=namespace, episode_ref=request.episode_ref)
-    return production_read_plan_v1(('d01.persona_activation.v1', 'd01.persona_plan.v1', 'd03.self_perspective.v1'),
+    return production_read_plan_v1(('d03.self_perspective.v1',),
         (*keys, *before_keys, *life_numeric_context_keys_v1(namespace, request.episode_ref, activity_id)),
         tuple(dict.fromkeys((*roots, *before_roots))), (*originals, *before_originals, request.causal_operation_id))
 
@@ -391,12 +391,18 @@ def freeze_current_life_numeric_appraisal_v1(db, *, frame, request, installed_re
     source_atom = read.head(db, original.source_ref, required=True)
     access = read.head(db, access_key(*original.namespace.as_tuple, source.source_id), required=True)
     correction = read.head(db, source_correction_head_key(original.namespace, source.source_id))
-    role = PersonaDomain.resolve_active_role(frame.snapshot, namespace=original.namespace, current_guard=guard)
+    from .d06_ordinary_readout_v3 import require_bound_life_ordinary_readout_v3
+    from .selected_persona_readout_v4 import require_selected_persona_control_header_v4
+    readout=require_bound_life_ordinary_readout_v3(db,frame=frame);role=readout.control
+    current_control=PersonaDomain.resolve_active_role_control_v3(frame.snapshot,namespace=original.namespace,current_guard=guard)
+    if ((role.namespace,role.head_id,role.plan_key,role.plan_version,role.graph_epoch,role.authorization_revision)!=
+            (current_control.namespace,current_control.head_id,current_control.plan_key,current_control.plan_version,current_control.graph_epoch,current_control.authorization_revision)
+            or not set(current_control.read_versions)<=set(role.read_versions)):
+        raise ValueError('Life appraisal control differs from its actual current activation/Owner metadata')
     for version in role.read_versions:
-        if read.head(db, version.key, required=True).revision != version.revision:
-            raise ValueError('Life appraisal role is not the actual complete current plan')
+        require_selected_persona_control_header_v4(readout.selected_readout,version.key,version.revision)
     # No social-role completeness is inferred from an internal occurrence.
-    view = PersonaDomain().project(role.plan, context_tags=(), role_binding_complete=False)
+    view=readout.project_selected_v4()
     role_atom = read.head(db, _activation_key(original.namespace), required=True)
     event_atom = read.head(db, original.event_ref, required=True)
     interpretation_atom = read.head(db, original.interpretation_ref, required=True)

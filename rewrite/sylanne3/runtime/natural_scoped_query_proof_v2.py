@@ -211,7 +211,8 @@ def natural_scoped_query_proof_from_wire_v2(value: dict) -> NaturalScopedQueryPr
             raise ValueError("scoped proof group must be a list")
         groups[name] = tuple(ScopedAtomEvidenceV2(**row) for row in rows)
     proof = NaturalScopedQueryProofV2(scope, **groups, schema=value["schema"])
-    if json.loads(json.dumps(asdict(proof))) != value:
+    from ..runtime_contracts import _canonical_value
+    if _canonical_value(asdict(proof), set()) != value:
         raise ValueError("scoped proof wire differs")
     return proof
 
@@ -340,9 +341,14 @@ def read_natural_scoped_query_proof_v2(
         ).fetchall()
     else:
         from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
-        if type(prepared_inventory)is not PreparedCurrentDispatchInventoryV3:
-            raise NaturalScopedQueryHold("actual private full-EOF natural inventory required")
-        projection=prepared_inventory.require_current(db,namespace,prepared_inventory.query)
+        from .natural_outbound_receipt_adoption_read_v3 import PreparedNaturalOutboundReceiptAdoptionV3
+        if type(prepared_inventory) in (PreparedCurrentDispatchInventoryV3, PreparedNaturalOutboundReceiptAdoptionV3):
+            projection=prepared_inventory.require_current(db,namespace,prepared_inventory.query)
+        else:
+            from .natural_dispatch_initial_read_v1 import _PreparedNaturalInitialReadV1
+            if type(prepared_inventory)is not _PreparedNaturalInitialReadV1:
+                raise NaturalScopedQueryHold("actual independent Natural readonly original proof required")
+            projection=prepared_inventory.require_current(db,namespace,prepared_inventory.query)
         rows=tuple((atom.key.token,atom.revision,atom.value,atom.key.type_name)
             for atom in projection.atoms_for_types_v3(frozenset({'d03.account_binding','d03.role_binding','d05.boundary_rule'}))if atom.valid)
         rows=tuple(sorted(rows,key=lambda row:row[0]))

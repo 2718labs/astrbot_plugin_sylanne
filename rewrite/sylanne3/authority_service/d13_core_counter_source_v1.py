@@ -14,6 +14,7 @@ from contextvars import ContextVar
 from threading import get_ident
 from weakref import WeakKeyDictionary,WeakSet
 import json
+import secrets
 from ..contracts import StaleRead
 from ..graph_store import GraphStore
 from ..graph_types import AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, NamespaceEpoch, Owner
@@ -50,6 +51,9 @@ def read_current_counter_attention_v1(
     from .current_authority_graph_read_v3 import require_authority_current_reply_attention_v3
     actual=require_authority_current_reply_attention_v3(db,namespace,source_ref=source_ref,now_utc=now_utc,epoch=epoch)
     if actual is not None:return actual
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        raise UnavailableGuard("selected counter attention lacks its actual complete Source Work")
     source_id = AtomKey.from_token(source_ref).owner.subject
     ingress = db.execute(
         "SELECT conversation_ref FROM graph_first_ingress_identity_v1 "
@@ -168,6 +172,17 @@ def read_current_counter_scope_v1(
     if not db.in_transaction or type(context) is not ContextProvider:
         raise ValueError('actual current Core read transaction and installed D03 resolver required')
     from ..runtime.reply_model_job import read_current_reply_route_manifest_v2
+    from ..runtime.d13_counter_prepare_resource_inputs_v1 import (
+        bound_d13_counter_prepare_source_v1,read_host_d13_counter_scope_v1)
+    host=bound_d13_counter_prepare_source_v1(db,namespace)
+    if host is not None:
+        return read_host_d13_counter_scope_v1(host,db=db,d02_issuer=d02_issuer,context=context,
+            namespace=namespace,c02_operation_id=c02_operation_id,source_ref=source_ref,
+            now_utc=now_utc,epoch=epoch)
+    from ..runtime_storage_v3 import runtime_storage_v3
+    from .current_authority_graph_read_v3 import authority_graph_projection_for_db_v3
+    if runtime_storage_v3(db)is not None and authority_graph_projection_for_db_v3(db,namespace)is None:
+        raise UnavailableGuard("selected counter prospective plan lacks its actual Host or Authority Source Work")
     inputs = read_current_counter_inputs_v1(db, d02_issuer, namespace, c02_operation_id, source_ref, now_utc, epoch)
     route = read_current_reply_route_manifest_v2(db, namespace, inputs, source_ref)
     from .current_authority_graph_read_v3 import authority_graph_projection_for_db_v3,AuthorityRouteMetadataInventoryV6
@@ -230,6 +245,10 @@ def read_current_counter_scope_v1(
 
 
 def _counter_source_expression_kwargs_v3(db,namespace):
+    from ..runtime.d13_counter_prepare_resource_inputs_v1 import bound_d13_counter_prepare_source_v1
+    host=bound_d13_counter_prepare_source_v1(db,namespace)
+    if host is not None:
+        return {"prepared_source_material":host.source_material,"prepared_full_read":host,"db":db}
     from .current_authority_graph_read_v3 import authority_source_expression_kwargs_v3
     value=authority_source_expression_kwargs_v3(db,namespace)
     return{}if value is None else value
@@ -496,6 +515,8 @@ class _CounterSourceCallV3:
             raise UnavailableGuard('actual installed Core counter call lifetime required')
         service.fences.validate_fence(credential=credential,subject=subject,permit=permit)
         outer=require_counter_call_resource_scope_v3(service,selector.counter_operation_id)
+        from .d13_original_owner_v3 import require_actual_counter_parent_open_v3
+        require_actual_counter_parent_open_v3(service, selector)
         original=service._original(selector.counter_operation_id,'draft')
         if(original is None)!=(draft is None)or(original is not None and original!=draft):
             raise UnavailableGuard('counter original draft cannot be omitted or replaced at current-source entry')
@@ -514,11 +535,18 @@ class _CounterSourceCallV3:
     def close_v3(self):
         if self.closed:return
         self.closed=True;_COUNTER_CALLS_V3.discard(self)
-        if self.work is not None:
-            from .current_authority_graph_read_v3 import finish_authority_graph_read_work_v3
-            finish_authority_graph_read_work_v3(self.work)
-        self.work=None
-        self.resource_scope.clear_source_call_v3(self)
+        try:
+            if self.work is not None:
+                from .current_authority_graph_read_v3 import finish_authority_graph_read_work_v3
+                work, self.work = self.work, None
+                self.resource_scope.d13_source_receivers_v3.append(work)
+                try:
+                    finish_authority_graph_read_work_v3(work)
+                finally:
+                    work.counter_result = None
+        finally:
+            self.resource_scope.clear_source_call_v3(self)
+
 
 
 @contextmanager
@@ -527,9 +555,17 @@ def retain_authority_counter_source_call_v3(service,*,selector,credential,subjec
         subject=subject,permit=permit,draft=draft)
     if _COUNTER_CALL_BINDING_V3.get()is not None:raise UnavailableGuard('counter Source call lifetime is already bound')
     token=_COUNTER_CALL_BINDING_V3.set(call)
+    first=None
     try:yield call
+    except BaseException as error:
+        first=error;call.resource_scope.failure=error
+        raise
     finally:
-        _COUNTER_CALL_BINDING_V3.reset(token);call.close_v3()
+        _COUNTER_CALL_BINDING_V3.reset(token)
+        try:call.close_v3()
+        except BaseException as later:
+            if first is None:raise
+            first.add_note('Counter Source final release failed: '+type(later).__name__)
 
 
 class PreparedAuthorityCounterMaterialScopeV7:
@@ -607,6 +643,10 @@ class _CounterCallResourceScopeV3:
         self.core,self.db,self.handle=service.core,service.core._db,runtime_storage_v3(service.core._db)
         self.thread=get_ident();self.active=True;self.source_call=self.child=None
         self.readers=[];self.originals={};self.failure=None
+        self.d13_frame_owner_registration_v3=None
+        self.d13_owner_metadata_v3=None
+        self.d13_frame_retention_instance_v3='d13-counter-retention-v3:'+secrets.token_hex(24)
+        self.d13_source_receivers_v3=[]
         self.lease=begin_runtime_storage_operation_v3(self.db,selector.counter_operation_id,None)
         _COUNTER_RESOURCE_SCOPES_V3.add(self)
     def require_current_v3(self):
@@ -655,14 +695,48 @@ class _CounterCallResourceScopeV3:
         if self.source_call is call:self.source_call=None
     def close_v3(self):
         if not self.active:return
+        first=self.failure
+        def failed(error):
+            nonlocal first
+            if first is None:first=error
+            elif error is not first:first.add_note('Counter final release failed: '+type(error).__name__)
+        if self.source_call is not None:
+            try:self.source_call.close_v3()
+            except BaseException as error:failed(error)
+        remaining=[]
+        for reader in self.readers:
+            try:reader.release_payload_v3()
+            except BaseException as error:
+                remaining.append(reader);failed(error)
+        self.readers=remaining
+        self.originals={phase:item for phase,item in self.originals.items()if item[0]in remaining}
+        self.active=False
+        self.d13_owner_metadata_v3=None
+        from .current_authority_graph_read_v3 import actual_authority_graph_release_v3
+        from ..runtime_storage_v3 import finish_runtime_storage_operation_v3
         try:
-            if self.source_call is not None:self.source_call.close_v3()
-            for reader in self.readers:reader.release_payload_v3()
-            self.readers.clear();self.originals.clear()
-        finally:
-            self.active=False;_COUNTER_RESOURCE_SCOPES_V3.discard(self)
-            from ..runtime_storage_v3 import finish_runtime_storage_operation_v3
+            if (self.source_call is not None or self.readers or self.originals
+                    or any(actual_authority_graph_release_v3(work)is not self.lease
+                        for work in self.d13_source_receivers_v3)):
+                raise UnavailableGuard('Counter actual final material release is incomplete; retain its obligation')
             finish_runtime_storage_operation_v3(self.lease)
+            from .d13_original_owner_v3 import record_d13_counter_scope_retention_v3
+            record_d13_counter_scope_retention_v3(self)
+        except BaseException as error:failed(error)
+        finally:_COUNTER_RESOURCE_SCOPES_V3.discard(self)
+        from ..runtime.d13_cache_use_admission_v2 import release_authority_d13_cache_use_v2
+        retained=[]
+        for work in self.d13_source_receivers_v3:
+            try:
+                if self.lease.closed and actual_authority_graph_release_v3(work)is self.lease:
+                    release_authority_d13_cache_use_v2(work)
+                else:retained.append(work)
+            except BaseException as error:
+                retained.append(work);failed(error)
+        self.d13_source_receivers_v3=retained
+        prior=self.failure;self.failure=first
+        if first is not None and prior is None:raise first
+
 
 
 @contextmanager
@@ -673,6 +747,9 @@ def retain_counter_call_resource_scope_v3(service,*,selector,read_credential,sub
     token=_COUNTER_RESOURCE_BOUND_V3.set(scope)
     try:
         with bind_runtime_storage_operation_v3(scope.lease,scope.db):yield scope
+    except BaseException as error:
+        scope.failure=error
+        raise
     finally:
         try:scope.close_v3()
         finally:_COUNTER_RESOURCE_BOUND_V3.reset(token)

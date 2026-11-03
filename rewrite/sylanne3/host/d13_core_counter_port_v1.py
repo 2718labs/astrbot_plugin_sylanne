@@ -29,6 +29,25 @@ class InstalledD13CoreCounterPortV1:
         verify_signed_d13_core_wire_evidence_v1(self.policy,envelope,selector=selector,frame=frame,now_utc=now_utc)
         return envelope
 
+    def read_or_finalize_accounted_d13_wire_v1(self,selector,*,frame,awaiting,accounting_receipt,now_utc):
+        if (type(selector)is not D13CurrentWireCountSelectorV1 or type(frame)is not D13CoreFrameIntentHeaderV7
+                or type(awaiting)is not D13CounterAwaitingAccountingV1):
+            raise TypeError('accounted-only counter requires its exact original frame and terminal')
+        envelope=self._port.read_or_finalize_accounted_d13_wire_v1(selector,frame=frame,
+            awaiting=awaiting,accounting_receipt=accounting_receipt)
+        verify_signed_d13_core_wire_evidence_v1(self.policy,envelope,selector=selector,frame=frame,now_utc=now_utc)
+        return envelope
+
+    def read_or_finalize_accounted_original_header_v7(self,*,frame,awaiting,accounting_receipt,now_utc):
+        if type(frame)is not D13CoreFrameIntentHeaderV7 or frame.policy_digest!=self.policy.policy_digest:
+            raise ValueError('accounted-only counter requires the original installed frame')
+        selector=D13CurrentWireCountSelectorV1(frame.install_id,frame.authority_namespace,
+            frame.frame_intent_id,frame.frame_intent_digest,frame.counter_operation_id,
+            frame.raw_authority_digest,frame.compressed_authority_digest,
+            frame.raw_http_template_digest,frame.compressed_http_template_digest)
+        return selector,self.read_or_finalize_accounted_d13_wire_v1(selector,frame=frame,
+            awaiting=awaiting,accounting_receipt=accounting_receipt,now_utc=now_utc)
+
     def count_actual_current_pair_v7(self,*,pair,frame,now_utc):
         """Count only the pair independently reconstructed for this original Core frame."""
         from ..runtime.installed_d13_natural_frame_v7 import (NaturalHistoryPairV7,

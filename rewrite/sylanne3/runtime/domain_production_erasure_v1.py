@@ -306,6 +306,7 @@ def _input_types():
     from .d10_production_operations_v1 import RegisteredLifePlanV1, RegisteredLifeOutcomeV1, RegisteredOfflineIntervalV1
     from ..domains.d10.offline_interval import OfflineTickRecipeV1, OfflineObservedTickV1
     from .d02_artifact_phase_price_v1 import ArtifactPhasePricePolicyV1
+    from ..domains.d02.character_labor_v1 import CharacterLaborPolicyV1
     return {
         "graph_d08_joint_node_originals_v1": JOINT_D08_ORIGINAL_TYPES,
         "graph_d01_production_inputs_v1": {**_ORIGINAL_TYPES,
@@ -313,7 +314,7 @@ def _input_types():
             "general_growth_trial_start_v1":GeneralGrowthTrialStartV1,
             "general_growth_trial_v1":GeneralGrowthTrialOriginalV1},
         "graph_d02_production_policies_v1": {"passive": PassiveBodyPolicyV1, "effect": SettledBodyEffectPolicyV1,
-            "artifact_phase_price": ArtifactPhasePricePolicyV1},
+            "artifact_phase_price": ArtifactPhasePricePolicyV1, "labor": CharacterLaborPolicyV1},
         "graph_d02_action_components_v1": {"completed_action_component": CompletedActionBodyComponentV1},
         "graph_d05_production_policies_v1": {"policy": InstalledRelationshipPolicyV1},
         "graph_d05_boundary_intents_v1": {"boundary_intent": BoundaryIntentOriginalV1},
@@ -435,7 +436,7 @@ def domain_production_source_closure_v1(table, kind, payload_json):
             raw = life_original_content_projection_v1(kind, _json(payload_json))
             return tuple(sorted({ref for ref in _references(raw) if AtomKey.from_token(ref).type_name == "memory.source"}))
     if (table == "graph_d11_offline_originals_v1" and kind == "prepared_tick"
-            or table == "graph_d11_life_originals_v1" and kind == "prepared"):
+            or table == "graph_d11_life_originals_v1" and kind in {"prepared","character_labor_prepared_v1"}):
         raw = _json(payload_json)
         for item in raw["read_rows"]:
             item["value_json"] = _json(item["value_json"])
@@ -540,6 +541,10 @@ def validate_domain_production_row_v1(table, columns, row, *, authority_namespac
     if table == "graph_d10_observed_ticks_v1" and data["scheduled_at_utc"] != decoded.scheduled_at_utc:
         raise DomainProductionErasureHold("observed tick schedule SQL identity differs")
     if table == "graph_d11_life_originals_v1":
+        from .c09_character_labor_originals_v1 import LABOR_KINDS,validate_character_labor_original_identity_v1
+        if kind in LABOR_KINDS:
+            validate_character_labor_original_identity_v1(kind,namespace=ns,original_ref=data["original_ref"],
+                producing_operation_id=data["producing_operation_id"],raw=raw)
         from .c09_life_originals_v1 import (C4_KINDS, C4_PHASE_KINDS, POSTCONDITION_KINDS, validate_c4_life_original_row_v1,
             validate_c4_phase_life_original_row_v2,
             FOREGROUND_CAUSE_KIND, validate_foreground_post_c02_cause_row_v1)
@@ -944,6 +949,12 @@ def _general_growth_provenance_types_v1(operation_kind):
 
 
 def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
+    from .d06_retention_v1 import OPERATIONS as RETENTION_OPERATIONS,validate_memory_retention_provenance_v1
+    if operation_kind in RETENTION_OPERATIONS:
+        return validate_memory_retention_provenance_v1(domain,operation_kind,provenance)
+    from .persona_growth_review_v1 import validate_growth_review_provenance_v1
+    growth=validate_growth_review_provenance_v1(domain,operation_kind,provenance)
+    if growth is not None:return growth
     from .named_joint_binding_provenance_v1 import KEY as NAMED_JOINT_KEY,validate_named_joint_provenance_v1
     if type(provenance)is dict and NAMED_JOINT_KEY in provenance:
         selector,current,scope,refs=validate_named_joint_provenance_v1(domain,operation_kind,provenance[NAMED_JOINT_KEY])
@@ -1046,6 +1057,45 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         body = {key:value for key,value in provenance.items() if key != 'semantic_mesh'}
         refs = validate_domain_stage_provenance_v1(domain,operation_kind,body)
         return tuple(sorted(set((*refs,*_references(provenance['semantic_mesh'])))))
+    from .d01_ordinary_cumulative_growth_v1 import (OPERATION_KINDS as ORDINARY_CUMULATIVE_OPERATIONS,
+        provenance_types_ordinary_cumulative_v1)
+    if operation_kind in ORDINARY_CUMULATIVE_OPERATIONS:
+        if domain != 'd01':raise DomainProductionErasureHold('ordinary cumulative original has another actual domain writer')
+        if provenance == {}:return ()
+        shape=provenance_types_ordinary_cumulative_v1(operation_kind)
+        required=({'ordinary_policy'} if operation_kind=='register_ordinary_cumulative_growth_policy_v1' else
+            {'ordinary_basis','ordinary_basis_original','growth_request','basis_new','ordinary_state'}
+            if operation_kind=='assess_ordinary_continuity_v1' else set(shape))
+        if type(provenance)is not dict or not required<=set(provenance)or set(provenance)-set(shape):
+            raise DomainProductionErasureHold('ordinary cumulative original lost its closed typed provenance')
+        if ('ordinary_assessment'in provenance)!=('ordinary_assessment_original'in provenance):
+            raise DomainProductionErasureHold('ordinary assessment lost its immutable original binding')
+        for name,raw in provenance.items():
+            if shape[name]is not None:decode_typed_production_value_v1(raw,shape[name])
+        return tuple(sorted(set(_references(provenance))))
+    from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1
+    if operation_kind in SINGLE_EVENT_OPERATION_KINDS_V1:
+        if domain!='d01':raise DomainProductionErasureHold('single-event growth has another actual domain writer')
+        if provenance=={}:return ()
+        from .d01_single_event_growth_v1 import provenance_types_single_event_v1
+        shape=provenance_types_single_event_v1(operation_kind)
+        if (operation_kind=='review_single_event_growth_v1'
+                and type(provenance)is dict
+                and set(provenance)=={'single_event_adoption','single_event_review'}
+                and type(provenance['single_event_review'])is dict
+                and provenance['single_event_review'].get('schema')=='d01.single-event-growth-review.v1'):
+            from .d01_single_event_growth_v1 import legacy_single_event_review_provenance_types_v1
+            shape=legacy_single_event_review_provenance_types_v1()
+        _exact(provenance,shape)
+        for name,cls in shape.items():
+            if cls is not None:decode_typed_production_value_v1(provenance[name],cls)
+        if operation_kind=='adopt_single_event_growth_v1':
+            validate_domain_stage_provenance_v1('d01','adopt_growth',provenance['growth'])
+            general=provenance['general_growth']
+            if general is not None:
+                _exact(general,{'general_growth_intent','trial_start_originals','trial_originals'})
+                validate_domain_stage_provenance_v1('d01','adopt_general_growth_v1',{**general,'growth':provenance['growth']})
+        return tuple(sorted(set(_references(provenance))))
     if operation_kind in {'freeze_general_growth_intent_v1','register_general_growth_trial_start_v1',
             'derive_general_growth_trial_v1','adopt_general_growth_v1'}:
         if domain!='d01':
@@ -2186,7 +2236,9 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         return ()
     shapes = {
         ("d01", "evaluate_values"): [{"persona_view", "candidate_original", "context_original", "evaluation"},
-            {"persona_view", "candidate_original", "context_original", "evaluation", "method_strategy"}],
+            {"persona_view", "candidate_original", "context_original", "evaluation", "method_strategy"},
+            {"persona_values", "candidate_original", "context_original", "evaluation"},
+            {"persona_values", "candidate_original", "context_original", "evaluation", "method_strategy"}],
         ("d01", "adopt_growth"): [{"proposal", "originals"}, {"candidate", "originals"}],
         ("d01", "migrate_semantic_identity_v3"): [{"candidate", "originals"}, {}],
         ("d01", "project_self_model_v3"): [{"self_model"}, {}],
@@ -2200,8 +2252,12 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
             "self_mapping_ref", "perspective_ref", "episode_ref", "encoding_status", "duplicate"}],
         ("d08", "acknowledge_bilateral"): [{"acknowledgement", "read", "acceptance", "outbound", "actor"}],
         ("d08", "adopt_joint_plan"): [{"plan", "proposal", "consents", "terms_digest", "current_goals", "current_boundaries", "execution"}],
+        ("d08", "cancel_action"): [{"action_intent_ref", "cancellation_before", "cancellation_after", "action_original", "cancellation_original"}],
+        ("d08", "acknowledge_commitment_terms"): [{"commitment_before","commitment_after","terms","acceptance","actual_observation_digest"}],
+        ("d08", "settle_current_commitment_fulfillment"): [{"commitment_before","commitment_after","terms","fulfillment_evidence","actual_observation_digest"}],
         ("d08", "recheck_action"): [{"action_recovery", "commitment_check", "boundary_check", "required_specs", "actual_originals", "admission"}],
-        ("d08", "settle_observed_action"): [{"action_outcome", "outcome_settlement", "observation_original", "cost_original"}],
+        ("d08", "settle_observed_action"): [{"action_outcome", "outcome_settlement", "observation_original", "cost_original"},
+            {"action_outcome", "outcome_settlement", "observation_original", "cost_original", "communicated_commitments"}],
         ("d10", "advance_life"): [{"life_progress", "actual_progress", "terminal", "adopted_plan", "duplicate"}],
         ("d10", "advance_offline"): [{"interval"}, {"observed_prefix", "interval_original"},
             {"observed_prefix", "interval", "interval_original", "checkpoint", "content_reality", "actuality"}],
@@ -2218,12 +2274,12 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
     if (domain, operation_kind) not in shapes or set(provenance) not in shapes[(domain, operation_kind)]:
         raise DomainProductionErasureHold("unknown current domain stage provenance variant")
     from .domain_production_contracts_v1 import ProductionOriginalRefV1
-    from ..domains.d01 import PersonaView, ValueEvaluation, GrowthAdoptionCandidate, GrowthProposal
+    from ..domains.d01 import PersonaView, PersonaValuesProjectionV1, ValueEvaluation, GrowthAdoptionCandidate, GrowthProposal
     from ..domains.d01.identity_v3 import SelfModelProjectionV3
     from ..domains.d02 import BodyState, BodyQuote, SettlementResult
     from ..domains.d05.relationship import RelationshipContribution, BoundaryRule
     from ..domains.d08.commitment_acknowledgement import BilateralAcknowledgementCandidateV1, BilateralAcknowledgementReadV1
-    from ..domains.d08.execution import ActionOutcome, JointPlan, OutcomeSettlement
+    from ..domains.d08.execution import ActionOutcome, Commitment, JointPlan, OutcomeSettlement
     from ..domains.d08.execution import RequiredCheckSpec
     from ..domains.d08.action_recovery import CurrentActionRecoveryCandidateV1
     from ..domains.d05.relationship import BoundaryCheck
@@ -2237,10 +2293,11 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
     from ..memory_types import SourceRecord
     from ..domains.d03.context import WorldEvent
     from ..domains.d01.production_operations_v1 import MethodStrategyProjectionV1
-    types_by_name = {"persona_view": PersonaView, "evaluation": ValueEvaluation,
+    types_by_name = {"persona_view": PersonaView, "persona_values": PersonaValuesProjectionV1, "evaluation": ValueEvaluation,
         "method_strategy": MethodStrategyProjectionV1,
         "action_outcome": ActionOutcome, "outcome_settlement": OutcomeSettlement,
         "observation_original": ProductionOriginalRefV1, "cost_original": ProductionOriginalRefV1,
+        "communicated_commitments": tuple[Commitment, ...],
         "policy_approval": ProductionOriginalRefV1 | None,
         "self_model": SelfModelProjectionV3, "candidate": GrowthAdoptionCandidate, "state": BodyState, "prior_state": BodyState,
         "settlement": SettlementResult, "body_quote": BodyQuote, "contribution": RelationshipContribution,
@@ -2258,6 +2315,15 @@ def validate_domain_stage_provenance_v1(domain, operation_kind, provenance):
         "terms_digest": str, "execution": str, "content_reality": str, "actuality": str,
         "claim_phase": str, "processed_until": float, "requested_until": float,
         "duplicate": bool, "duplicate_interval": bool}
+    if domain=="d08" and operation_kind in {"acknowledge_commitment_terms","settle_current_commitment_fulfillment"}:
+        from ..domains.d08.commitment_fulfillment_v1 import CommitmentFulfillmentTermsV1,CommitmentTermsAcceptanceV1,CommitmentFulfillmentEvidenceV1
+        types_by_name.update({"commitment_before":Commitment,"commitment_after":Commitment,"terms":CommitmentFulfillmentTermsV1,
+            "acceptance":CommitmentTermsAcceptanceV1,"fulfillment_evidence":CommitmentFulfillmentEvidenceV1,"actual_observation_digest":str})
+    if (domain,operation_kind) == ("d08","cancel_action"):
+        from ..domains.d08.execution import ActionCancellationState
+        types_by_name.update({"action_intent_ref":str,"cancellation_before":ActionCancellationState,
+            "cancellation_after":ActionCancellationState,"action_original":ProductionOriginalRefV1,
+            "cancellation_original":ProductionOriginalRefV1})
     if domain == "d06":
         types_by_name.update({"source": SourceRecord, "world_event": WorldEvent,
             "causal_original": ProductionOriginalRefV1, "self_identity_original": ProductionOriginalRefV1,

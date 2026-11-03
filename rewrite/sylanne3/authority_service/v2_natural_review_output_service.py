@@ -199,6 +199,7 @@ class AuthorityV2NaturalReviewOutputService(
         self._holder, self._clock = holder, trusted_now_utc
         self._delivery_lock = threading.RLock()
         self._inflight_deliveries: dict[str, FencePermitV2 | None] = {}
+        self._d13_review_parse_v3 = {}
 
     def prepare(self, *, credential: object,
                 request: NaturalReviewOutputReadRequestV2,
@@ -270,6 +271,15 @@ class AuthorityV2NaturalReviewOutputService(
             credential=credential, subject=self._read_subject, permit=permit)
         if self._graph.read(request, intent, receipt) != original:
             raise AuthorityUnavailable("review original changed after copy")
+        with self._delivery_lock:
+            self._d13_review_parse_v3[request.read_attempt_id] = (
+                request, original, observation, intent, receipt, permit, parsed, output)
+        try:
+            from .d13_original_owner_v3 import record_actual_d13_natural_review_verdict_v3
+            record_actual_d13_natural_review_verdict_v3(self, credential=credential, request=request)
+        finally:
+            with self._delivery_lock:
+                self._d13_review_parse_v3.pop(request.read_attempt_id, None)
         return NaturalReviewOutputDeliveryV2(output, permit)
 
     def finish_delivery(self, *, credential: object,

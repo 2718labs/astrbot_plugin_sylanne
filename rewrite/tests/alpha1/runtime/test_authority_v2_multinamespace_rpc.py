@@ -103,12 +103,12 @@ def installed(tmp_path):
 def paired(server, namespace):
     peer = _PEERS[namespace]
     channel = f"channel-{namespace}".encode()
-    binding = server._dispatch_for_test(
+    binding = server.dispatch(
         "handshake", _REQUEST, peer, channel,
     )["channel_binding_sha256"]
 
     def call(method, command):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, _REQUEST, peer, channel,
             handshake_binding=binding, command=command,
         )

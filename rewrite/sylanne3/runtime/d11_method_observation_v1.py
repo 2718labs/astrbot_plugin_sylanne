@@ -330,10 +330,9 @@ def _generation_billing_group_v1(db, *, read, milestone, readers, parent_budget_
 
 
 def _measurement_source_identity_v1(namespace, experiment_ref, pair, calls):
-    family = "method-billing-family:" + canonical_digest(calls)
-    identity = "method-measurement:" + canonical_digest((namespace, experiment_ref,
-        tuple(value.digest for value in pair), calls))[:48]
-    return family, identity, source_key(*namespace.as_tuple, identity), access_key(*namespace.as_tuple, identity)
+    from .source_inspection_producer_targets_v1 import method_measurement_source_identity_from_metadata_v1
+    return method_measurement_source_identity_from_metadata_v1(namespace, experiment_ref,
+        tuple(value.digest for value in pair), calls)
 
 
 def _derive_observation_v1(db, *, read, request, readers):
@@ -457,7 +456,11 @@ def read_plan_method_observation_v1(db, *, namespace, request, installed_readers
             originals.append(prepared.frozen_ref); roots.extend(source.ref for source in frozen.sources)
             if index == 0: treatment_calls.append(prepared.call_id)
     _, _, sk, ak = _measurement_source_identity_v1(namespace, request.experiment_ref, pair, tuple(sorted(treatment_calls)))
-    keys.extend((sk, ak))
+    from ..domains.d06.inspection_metadata_v1 import inspection_key_v1
+    from ..runtime_storage_v3 import read_graph_row_v3
+    source_head = read_graph_row_v3(db, ("revision",), where="token=? AND bot=? AND persona=?",
+        parameters=(sk.token, *namespace.as_tuple))
+    keys.extend((sk, ak, inspection_key_v1(sk, (source_head[0] if source_head is not None else 0) + 1)))
     return production_read_plan_v1((), keys, roots, originals)
 
 

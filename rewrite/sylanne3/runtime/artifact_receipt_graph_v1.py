@@ -249,19 +249,17 @@ def _receipt_prepare_bundle_v1(self,*,authority,scope,installed_bundle,receipt,c
         yield (receipt,task.route,envelope,action.expression,grant,quote,job,staged,candidate)
 
 
-def prepare_current_artifact_receipt_dispatch_v1(graph,bootstrap,installed_bundle,*,c02_operation_id,source_ref):
+def prepare_current_artifact_receipt_dispatch_v1(graph,bootstrap,installed_bundle,*,c02_operation_id,source_ref,completion_original):
     """Produce no model work: admit the fixed Source only after full current pre-read."""
     graph._admin(bootstrap)
     if installed_bundle is not graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle:
         raise UnavailableGuard("Artifact receipt dispatch requires its actual installed Admin bundle")
-    produced=graph.prepare_current_artifact_completion_source_v1(bootstrap,installed_bundle,
-        c02_operation_id=c02_operation_id,source_ref=source_ref)
-    if produced.get("status")!="artifact_completion_source_current":return produced
-    locator=produced["receipt_original"]
+    locator=completion_original
     port=graph._GraphCoordinator__content_fence_v2
     clock=port.read_ingress_clock(graph._GraphCoordinator__dispatch_clock_policy);now=trusted_upper(clock)
     namespace=installed_bundle.installation_policy.namespace
-    if(type(locator)is not ArtifactCompletionReceiptOriginalV1 or locator.namespace!=namespace):
+    if(type(locator)is not ArtifactCompletionReceiptOriginalV1 or locator.namespace!=namespace
+            or locator.selector.task.c02_operation_id!=c02_operation_id):
         raise UnavailableGuard("Artifact message lacks its actual D06 completion Source locator")
     # This read grant authorizes preparation only. The actual completed Self is
     # derived from the authenticated D06 original before the writer grant exists.
@@ -273,7 +271,7 @@ def prepare_current_artifact_receipt_dispatch_v1(graph,bootstrap,installed_bundl
     handed_off=False
     try:
         authority=AuthorityContext("artifact-receipt-reader","d11",cap,namespace,("persona","activity"),"expression",
-            (produced["receipt_original"].selector.task.namespace.persona_id,), "policy:artifact-receipt-read.v1",
+            (locator.selector.task.namespace.persona_id,), "policy:artifact-receipt-read.v1",
             generation)
         # Audience is read from the current original ingress by the installed caller,
         # never from the receipt Source. The preliminary completion-source producer
@@ -286,7 +284,8 @@ def prepare_current_artifact_receipt_dispatch_v1(graph,bootstrap,installed_bundl
             fresh=port.read_ingress_clock(graph._GraphCoordinator__dispatch_clock_policy)
             fresh_now=trusted_upper(fresh)
             if fresh_now>=deadline:raise UnavailableGuard("Artifact receipt original frozen dispatch deadline elapsed during FULL preparation")
-            return _receipt_assemble_from_full_v1(graph,bootstrap,installed_bundle,proof,fresh,fresh_now,deadline)
+            return _receipt_assemble_from_full_v1(graph,bootstrap,installed_bundle,proof,fresh,fresh_now,deadline,
+                completion_original=locator)
         work=prepare_artifact_receipt_full_read_then_call_v1(graph,authority,lease,operation_id=locator.message_operation_id,
             now_utc=now,deadline_utc=deadline,callback=assembled,on_release=lambda:graph.release_authority_lease(bootstrap,lease))
         handed_off=True
@@ -295,7 +294,7 @@ def prepare_current_artifact_receipt_dispatch_v1(graph,bootstrap,installed_bundl
         if not handed_off:graph.release_authority_lease(bootstrap,lease)
 
 
-def _receipt_assemble_from_full_v1(self,bootstrap,installed_bundle,proof,clock,now,deadline):
+def _receipt_assemble_from_full_v1(self,bootstrap,installed_bundle,proof,clock,now,deadline,*,completion_original):
     from ..authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
     from ..authority_service.v2_contract import to_wire
     store=self._GraphCoordinator__store;port=self._GraphCoordinator__content_fence_v2;namespace=proof.namespace
@@ -303,6 +302,8 @@ def _receipt_assemble_from_full_v1(self,bootstrap,installed_bundle,proof,clock,n
         db=store._db;db.execute("BEGIN")
         try:
             receipt=require_artifact_receipt_assembly_original_v1(proof,self,db,now_utc=now)
+            if receipt!=completion_original:
+                raise UnavailableGuard("Artifact receipt FULL original differs from its completed Source locator")
             if proof.artifact_receipt_originals.task.candidate_recovery is not None:
                 return {"status":"artifact_receipt_dispatch_committed","operation_id":receipt.message_operation_id,
                     "receipt_original":receipt,"commit_receipt":_receipt_committed_operation_v1(self,proof,receipt,now)}
@@ -514,25 +515,12 @@ def _receipt_current_account_route_v1(
     _,current,_=_receipt_base_v1(graph,now_utc)
     if current.query!=query:
         raise ValueError("receipt account scan lost its actual complete FULL query epoch")
-    rows=tuple((atom.key.token,atom.revision,atom.value)
-        for atom in sorted(current.projection.atoms_for_types_v3(frozenset({'d03.account_binding'})),key=lambda item:item.key.token)
-        if atom.key.type_name=='d03.account_binding' and atom.valid
-        and (atom.key.owner.bot,atom.key.owner.persona)==namespace.as_tuple)
-    scan = tuple(GraphVersion(AtomKey.from_token(token), revision)
-                 for token, revision, _ in rows)
+    from .current_graph_full_read_v3 import read_bound_reply_account_metadata_census_v3
+    scan,matches=read_bound_reply_account_metadata_census_v3(db,namespace,query,
+        platform_ref=account_ref,sender_ref=sender_ref,now_utc=now_utc)
     if scan != binding.binding_scan_versions:
         raise ValueError("current account binding scan changed")
-    matches = []
-    for token, _, value in rows:
-        row = AccountBinding(**value)
-        key = AtomKey.from_token(token)
-        _receipt_current_atom_v1(db, snapshot, namespace, key)
-        if (row.platform_namespace == account_ref
-                and row.platform_identifier == sender_ref
-                and row.valid_from <= now_utc
-                and (row.valid_until is None or now_utc < row.valid_until)):
-            matches.append(key)
-    if matches != [binding.binding_version.key]:
+    if matches != (binding.binding_version.key,):
         raise ValueError("current reply account binding is ambiguous")
     return tuple(dict.fromkeys((*versions, *scan)))
 
@@ -659,14 +647,15 @@ def _receipt_social_v1(
             expression.payload_digest, expression.provenance_digest,
             route.route_digest,
         )
-        projection = read_current_dispatch_projection(
-            db, namespace, snapshot, query)
         request = RoleBindingRequest(
             f"persona:{namespace.persona_id}", intent.target_ref, None,
             scene_ref, intent.action_kind, intent.purpose, now_utc, True,
         )
+        policy_route=(account_ref,destination_ref,sender_ref,message_id,scene_ref)
+        projection = read_current_dispatch_projection(
+            db, namespace, snapshot, query,policy_request=request,policy_route=policy_route)
         role_read, boundary_read = derive_current_domain_reads(
-            db, projection, request, context)
+            db, projection, request, context,policy_route=policy_route)
         specs = {item.check_kind: item for item in intent.required_checks
                  if item.check_kind in {"role_binding", "boundary"}}
         if (len(specs) != 2
@@ -788,14 +777,19 @@ def _receipt_read_check_versions_v1(
                if type(issuer) is InstalledDispatchAdmissionIssuer else None)
     if type(context) is not ContextProvider:
         raise UnavailableGuard("installed D03 context provider unavailable; HOLD")
-    projection = read_current_dispatch_projection(
-        db, namespace, snapshot, query)
     request = RoleBindingRequest(
         f"persona:{namespace.persona_id}",
         route_binding.target_entity_ref,
         None, route.scene_ref, action_kind, "expression", now_utc, True)
+    from .dispatch_current_projection import read_current_dispatch_policy_route_v3
+    policy_route=read_current_dispatch_policy_route_v3(db,namespace,query,
+        source_ref=route.source_ref,c02_operation_id=route.c02_operation_id,
+        platform_ref=route.platform_ref,conversation_ref=route.conversation_ref,
+        sender_ref=route_binding.sender_ref,scene_ref=route.scene_ref)
+    projection = read_current_dispatch_projection(
+        db, namespace, snapshot, query,policy_request=request,policy_route=policy_route)
     role_read, boundary_read = derive_current_domain_reads(
-        db, projection, request, context)
+        db, projection, request, context,policy_route=policy_route)
     if (projection.coverage != "full" or role_read.status != "complete"
             or boundary_read.coverage != "full"):
         raise UnavailableGuard("current D03/D05 reply versions unavailable; HOLD")
@@ -1126,6 +1120,7 @@ def _receipt_seal_v1(
         dispatch_admission_effect_snapshot=effect_snapshot,
         provisional_check_candidate=candidate,
         installed_final_check_reissuer=reissue,
+        dispatch_policy_binding=original_binding,
         _prepared_full_read=prepared_full_read,
         _full_read_write_scope=scope)
 

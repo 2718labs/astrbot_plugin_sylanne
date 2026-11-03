@@ -138,6 +138,14 @@ def _semantic(read, db, ref):
 
 
 def _require_relationship_auxiliary_budget_v2(db, read, interpretation_ref, policy, issuer):
+    from .current_relationship_source_read_v3 import _active,require_current_relationship_numeric_reader_v3
+    reader=_active(db)
+    if reader is not None and reader.operation_kind=='adopt_relationship_revision_v2':
+        state=require_current_relationship_numeric_reader_v3(reader)
+        from .relationship_call_plan_budget_v3 import require_relationship_call_plan_budget_v3
+        require_relationship_call_plan_budget_v3(db,namespace=read.frame.envelope.authority.namespace,
+            interpretation_ref=interpretation_ref,prepared=state.numeric_prepared,policy=policy)
+        return
     from .d07_execution_v1 import TABLE, read_d07_original_v1, read_prepared_d07_execution_v1
     from .budget import get_budget_lease, require_budget_family_admissible
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
@@ -354,7 +362,8 @@ def _record_dependencies_v2(db, read, scope, source_refs, extra_refs=()):
 def stage_adopt_current_relationship_revision_in_transaction_v2(db, *, frame, request, installed_readers):
     if type(request) is not AdoptCurrentRelationshipRevisionRequestV2 or type(installed_readers) is not InstalledD05ProductionReadersV1:
         raise TypeError("relationship revision needs exact installed request/readers")
-    read = CurrentDomainReadV1(frame)
+    from .current_relationship_source_read_v3 import relationship_domain_read_v3
+    read = relationship_domain_read_v3(db,frame)
     try:
         read.check(db)
         candidate, policy, policy_original, semantic_original, sequence, trigger, identity, aliases, families, records = _candidate(db, read, request, installed_readers)
@@ -505,119 +514,10 @@ def stage_adopt_current_relationship_revision_in_transaction_v2(db, *, frame, re
 def read_plan_current_relationship_revision_v2(db, *, namespace, activity_id, operation_kind, request):
     if operation_kind != REVISION_OPERATION or type(request) is not AdoptCurrentRelationshipRevisionRequestV2:
         raise ValueError("exact relationship revision read plan required")
-    from ..graph_types import owner_grant_key
-    from .d05_production_operations_v1 import read_plan_current_d05_operation_v1
-    keys = [owner_grant_key(*namespace.as_tuple), AtomKey.from_token(request.interpretation_ref)]
-    roots, originals = [], [request.interpretation_ref, request.policy_ref]
-    types = [PROFILE_TYPE, ESTIMATE_TYPE, CONTRIBUTION_TYPE, CHECKPOINT_TYPE, EXPECTATION_TYPE, RECIPROCITY_TYPE, REPAIR_TYPE,
-        "d03.entity_anchor", "d03.account_binding", "d05.contribution", "d05.relationship_projection"]
-    from .d07_execution_v1 import TABLE
-    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
-        adopted = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='adopted' AND original_ref=?",
-            (*namespace.as_tuple, request.interpretation_ref)).fetchone()
-        if adopted:
-            actual = json.loads(adopted[0])
-            prepared_rows = db.execute("SELECT payload_json FROM " + TABLE + " WHERE bot=? AND persona=? AND kind='prepared' AND payload_digest=? LIMIT 2",
-                (*namespace.as_tuple, actual["prepared_digest"])).fetchall()
-            if len(prepared_rows) == 1:
-                prepared = json.loads(prepared_rows[0][0])
-                if prepared.get("schema") == "d07.relationship-prepared.v2":
-                    cycle_version = decode_typed_production_value_v1(prepared["cycle_ref"], GraphVersion)
-                    keys.append(cycle_version.key)
-                    originals.extend((prepared["semantic_question_ref"], prepared["c02_operation_id"]))
-    raw = raw_head_value_v1(db, namespace, AtomKey.from_token(request.interpretation_ref))
-    if raw:
-        candidate = _decode_candidate(raw)
-        scope = candidate.scope
-        keys.extend((scope.subject_head.key, scope.key(ESTIMATE_TYPE), scope.key(PROFILE_TYPE, "profile"), scope.key(CHECKPOINT_TYPE, request.interpretation_ref)))
-        if scope.context_head is not None:
-            keys.append(scope.context_head.key)
-            context = raw_head_value_v1(db, namespace, scope.context_head.key)
-            if context:
-                roots.extend((scope.context_head.key.token,) if scope.context_head.key.type_name == "memory.source" else context["source_refs"])
+    from .current_relationship_source_read_v3 import read_plan_relationship_source_v3
+    return read_plan_relationship_source_v3(db,namespace=namespace,activity_id=activity_id,
+        operation_kind=operation_kind,request=request)
 
-        roots.extend(candidate.source_refs)
-        from .d05_production_operations_v1 import _relationship_trigger_sources_v1
-        trigger_key = AtomKey.from_token(candidate.trigger_original_ref)
-        trigger_value = raw_head_value_v1(db, namespace, trigger_key)
-        trigger_roots = _relationship_trigger_sources_v1(namespace, trigger_key, trigger_value) if trigger_value else ()
-        if candidate.contribution_kind == "internal_recollection":
-            from .domain_production_read_plans_v1 import read_committed_recollection_original_v1
-            _, canonical_identity = read_committed_recollection_original_v1(db, namespace, candidate.trigger_original_ref)
-        else:
-            first_source = raw_head_value_v1(db, namespace, AtomKey.from_token(trigger_roots[0])) if trigger_roots else None
-            canonical_identity = first_source["provenance_root"] if first_source else None
-        if canonical_identity is not None:
-            keys.append(scope.key(CONTRIBUTION_TYPE, (candidate.contribution_kind, canonical_identity)))
-        keys.extend(AtomKey.from_token(ref) for ref in (*candidate.support_refs, *candidate.counter_refs, *candidate.interpretation_refs, *candidate.affect_refs))
-        originals.extend((*candidate.interpretation_refs, candidate.trigger_original_ref))
-        if candidate.reassessment_interpretation_ref is not None:
-            keys.append(AtomKey.from_token(candidate.reassessment_interpretation_ref)); originals.append(candidate.reassessment_interpretation_ref)
-            keys.append(scope.key(CHECKPOINT_TYPE, candidate.reassessment_interpretation_ref))
-            keys.extend(version.key for version in candidate.reassessment_basis_versions)
-
-        if candidate.contribution_kind != "administrative_edit":
-            semantics = {"external_interaction": "external_observation", "internal_recollection": "recollection", "simulated_trial": "simulation"}[candidate.contribution_kind]
-            oldplan = read_plan_current_d05_operation_v1(db, namespace=namespace, activity_id=activity_id,
-                operation_kind="adopt_relationship_contribution", request=AdoptCurrentRelationshipContributionRequestV1(candidate.trigger_original_ref,
-                    scope.subject_entity_ref, scope.dimension, semantics, request.policy_ref))
-            types.extend(oldplan.fixed_type_ids); keys.extend(oldplan.exact_keys); roots.extend(oldplan.source_roots); originals.extend(oldplan.required_original_refs)
-        for type_name in (PROFILE_TYPE, ESTIMATE_TYPE, CONTRIBUTION_TYPE, CHECKPOINT_TYPE, EXPECTATION_TYPE, RECIPROCITY_TYPE, REPAIR_TYPE):
-            for (encoded,) in db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129", (*namespace.as_tuple, type_name)):
-                value = json.loads(encoded)
-                if canonical_digest((NamespaceId(**value["scope"]["namespace"]), AtomKey.from_token(value["scope"]["subject_head"]["key"]).name,
-                        value["scope"]["relationship_domain"], value["scope"]["context_ref"], value["scope"]["dimension"],
-                        value["scope"]["dimension_schema_version"])) == scope.scope_id:
-                    roots.extend(value["source_refs"])
-                    if type_name == CONTRIBUTION_TYPE:
-                        refs = (value["evaluation_interpretation_ref"], value["trigger_original_ref"], value["checkpoint_ref"],
-                            *value["support_refs"], *value["counter_refs"], *value["interpretation_refs"], *value["affect_refs"])
-                        keys.extend(AtomKey.from_token(ref) for ref in refs)
-                        originals.extend((value["evaluation_interpretation_ref"], value["trigger_original_ref"], *value["interpretation_refs"]))
-                    elif type_name == CHECKPOINT_TYPE:
-                        if value["initialization_kind"] != "authored_prior":
-                            keys.append(AtomKey.from_token(value["initialization_original_ref"]))
-                        originals.append(value["initialization_original_ref"])
-                    elif type_name == ESTIMATE_TYPE:
-                        keys.extend(AtomKey.from_token(ref) for ref in (value["checkpoint_ref"], *value["contribution_refs"],
-                            *value["support_refs"], *value["counter_refs"], *value["interpretation_refs"]))
-                        originals.extend(value["interpretation_refs"])
-        entity = raw_head_value_v1(db, namespace, scope.subject_head.key)
-        if entity:
-            for ref in entity["creation_evidence_refs"]:
-                if AtomKey.from_token(ref).type_name == "memory.source": roots.append(ref)
-                else:
-                    keys.append(AtomKey.from_token(ref)); originals.append(ref)
-        policy_row = db.execute("SELECT payload_json FROM graph_d05_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? ORDER BY revision DESC LIMIT 1", (*namespace.as_tuple, request.policy_ref)).fetchone()
-        if policy_row:
-            policy = json.loads(policy_row[0])
-            roots.extend(policy.get("policy_source_refs", ()))
-        for value, type_name in ((candidate.expectation, EXPECTATION_TYPE), (candidate.reciprocity, RECIPROCITY_TYPE), (candidate.repair, REPAIR_TYPE)):
-            if value is None: continue
-            suffix = value.expectation_ref if type_name == EXPECTATION_TYPE else value.pattern_ref if type_name == RECIPROCITY_TYPE else (value.dispute_ref, value.action_kind)
-            keys.append(scope.key(type_name, suffix))
-            if type_name == EXPECTATION_TYPE:
-                keys.extend(AtomKey.from_token(ref) for ref in value.negotiated_interpretation_refs)
-                originals.extend(value.negotiated_interpretation_refs)
-                if value.commitment_ref: keys.append(AtomKey.from_token(value.commitment_ref))
-            elif type_name == RECIPROCITY_TYPE:
-                keys.extend(AtomKey.from_token(ref) for ref in value.visible_sample_refs)
-            else:
-                keys.extend(AtomKey.from_token(ref) for ref in (*value.proposal_interpretation_refs, *value.response_interpretation_refs,
-                    *value.practice_progress_refs, *value.reevaluated_estimate_refs, *value.contact_basis_refs))
-                originals.extend((*value.proposal_interpretation_refs, *value.response_interpretation_refs))
-                if value.communication_original_ref: originals.append(value.communication_original_ref)
-                if value.communication_action_ref: keys.append(AtomKey.from_token(value.communication_action_ref))
-                if value.practice_progress_refs or value.communication_action_ref:
-                    types.append("d08.action_intent.v1")
-                for outcome_ref in value.practice_progress_refs:
-                    outcome = raw_head_value_v1(db, namespace, AtomKey.from_token(outcome_ref))
-                    if outcome: originals.extend(outcome["observation_refs"])
-
-    for key in tuple(keys):
-        raw = raw_head_value_v1(db, namespace, key)
-        if raw: roots.extend(raw.get("source_refs", ()))
-    return production_read_plan_v1(types, keys, roots, originals)
 
 
 
@@ -735,7 +635,8 @@ def read_current_relationship_preferences_v2(db, *, frame, prepared, issuer):
 def stage_initialize_current_relationship_prior_v2(db, *, frame, request, installed_readers):
     if type(request) is not InitializeCurrentRelationshipPriorRequestV2 or type(installed_readers) is not InstalledD05ProductionReadersV1:
         raise TypeError("named relationship prior requires its actual installed Owner reader")
-    read = CurrentDomainReadV1(frame)
+    from .current_relationship_source_read_v3 import relationship_domain_read_v3
+    read = relationship_domain_read_v3(db,frame)
     read.check(db)
     if request.scope.namespace != frame.envelope.authority.namespace:
         raise ValueError("relationship prior initialization belongs to another actual Owner namespace")
@@ -756,7 +657,7 @@ def stage_initialize_current_relationship_prior_v2(db, *, frame, request, instal
     records = read.source_family(db, tuple(dict.fromkeys((rule.authored_prior_source_ref, *policy.policy_source_refs,
         *_scope_source_refs_v2(db, read, scope)))))
     source = records[rule.authored_prior_source_ref]
-    if source.qualification != "authored":
+    if source.source_kind != "authored":
         raise ValueError("relationship prior requires its independently authored actual Source")
     origin = read.head(db, rule.authored_prior_source_ref, required=True)
     original = read.original(rule.authored_prior_source_ref)
@@ -795,34 +696,6 @@ def stage_initialize_current_relationship_prior_v2(db, *, frame, request, instal
 
 
 def read_plan_initialize_current_relationship_prior_v2(db, *, namespace, activity_id, operation_kind, request, operation_id):
-    from ..graph_types import owner_grant_key
-    if operation_kind != INITIALIZE_OPERATION or type(request) is not InitializeCurrentRelationshipPriorRequestV2:
-        raise ValueError("named relationship prior requires its exact read plan")
-    scope = request.scope
-    keys = [owner_grant_key(*namespace.as_tuple), scope.subject_head.key, scope.key(ESTIMATE_TYPE), scope.key(PROFILE_TYPE), scope.key(CHECKPOINT_TYPE, operation_id)]
-    roots, originals = [], [request.policy_ref]
-    if scope.context_head is not None:
-        keys.append(scope.context_head.key)
-    for key in (scope.subject_head.key, *((scope.context_head.key,) if scope.context_head is not None else ())):
-        value = raw_head_value_v1(db, namespace, key)
-        if value:
-            evidence = (key.token,) if key.type_name == "memory.source" else value.get("source_refs", value.get("creation_evidence_refs", ()))
-            for ref in evidence:
-                if AtomKey.from_token(ref).type_name == "memory.source": roots.append(ref)
-                else:
-                    keys.append(AtomKey.from_token(ref)); originals.append(ref)
-    row = db.execute("SELECT payload_json FROM graph_d05_production_policies_v1 WHERE bot=? AND persona=? AND policy_ref=? ORDER BY revision DESC LIMIT 1",
-        (*namespace.as_tuple, request.policy_ref)).fetchone()
-    if row:
-        policy = decode_typed_production_value_v1(json.loads(row[0]), InstalledRelationshipPolicyV2)
-        rule = policy.rule(scope)
-        roots.extend(policy.policy_source_refs)
-        if rule.authored_prior_source_ref is not None:
-            roots.append(rule.authored_prior_source_ref)
-            originals.append(rule.authored_prior_source_ref)
-    types = [PROFILE_TYPE, ESTIMATE_TYPE, CHECKPOINT_TYPE]
-    for type_name in types:
-        for (encoded,) in db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name=? ORDER BY token LIMIT 129",
-                (*namespace.as_tuple, type_name)):
-            roots.extend(json.loads(encoded)["source_refs"])
-    return production_read_plan_v1(types, keys, tuple(dict.fromkeys(roots)), originals)
+    from .current_relationship_source_read_v3 import read_plan_relationship_source_v3
+    return read_plan_relationship_source_v3(db,namespace=namespace,activity_id=activity_id,
+        operation_kind=operation_kind,request=request,operation_id=operation_id)

@@ -193,6 +193,31 @@ class IndependentCostTests(unittest.TestCase):
         self.assertEqual(original_model_budget_actual(fact, quote),
                          {"input_tokens": 40, "output_tokens": 72})
 
+    def test_reported_usage_binds_original_settlement_without_claiming_a_signed_bill(self):
+        from dataclasses import asdict
+        from sylanne3.runtime_contracts import canonical_digest
+        from sylanne3.runtime.model_cost_settlement import reported_model_usage_original_v1
+
+        fact = self.original_fact(usage={"input_tokens": 40, "output_tokens": 20,
+            "cached_input_tokens": 30}, cost={"model_microusd": 9})
+        receipt = settle_budget(self.db, "lease", "original", "b" * 64,
+            {"model_tokens": 60, "model_microusd": 9}, execution_revoked=True)
+        recorded = reported_model_usage_original_v1(fact,
+            budget_receipt_digest=canonical_digest(asdict(receipt)))
+        assert (recorded["call_id"], recorded["request_digest"], recorded["observation_digest"]) == (
+            fact.intent.call_id, fact.intent.request_digest, fact.recovery.observation_digest)
+        assert recorded["terminal_receipt_digest"] == canonical_digest(asdict(fact.receipt))
+        assert recorded["budget_receipt_digest"] == canonical_digest(asdict(receipt))
+        assert (recorded["input_tokens"], recorded["cached_input_tokens"]) == (40, 30)
+        assert recorded["token_semantics"] == "provider_reported_not_exact"
+        assert all(recorded[name] is None for name in (
+            "total_billed_microusd", "cache_write_tokens", "cache_storage_microusd"))
+        assert get_budget_lease(self.db, "lease").used == {"model_tokens": 60, "model_microusd": 9}
+        unknown = self.original_fact(state="unknown")
+        with self.assertRaisesRegex(ModelCostUnavailable, "observed original terminal"):
+            reported_model_usage_original_v1(unknown,
+                budget_receipt_digest=canonical_digest(asdict(receipt)))
+
     def test_wrong_terminal_receipt_cannot_form_cost_fact(self):
         fact = self.original_fact()
         wrong = ModelTerminalReceiptV2(

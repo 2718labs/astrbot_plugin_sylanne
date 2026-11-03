@@ -7,6 +7,7 @@ from types import MappingProxyType
 from ..authority_service.contract import AuthorityUnavailable
 from ..runtime_contracts import _canonical_value
 from .owner_material_source_storage_v3 import CanonicalValueStreamV3
+from .c09_canonical_json_stream_v2 import _CanonicalJSONValueBuilderV3
 
 _ISSUER=object()
 _ISSUED=WeakKeyDictionary()
@@ -97,8 +98,12 @@ class PreparedNaturalFrozenReadV3:
         if type(column)is not DispatchOriginalJSONReadV3:
             raise TypeError('actual complete original column required')
         if type(owner)not in (_DispatchInventoryReadV3,_OrdinaryFullReadV3):
-            from ..authority_service.current_authority_graph_read_v3 import require_actual_authority_graph_attachment_owner_v3
-            require_actual_authority_graph_attachment_owner_v3(owner,db=column.db)
+            from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+            if type(owner)is _NaturalInitialReadV1:
+                owner.require_actual_v1()
+            else:
+                from ..authority_service.current_authority_graph_read_v3 import require_actual_authority_graph_attachment_owner_v3
+                require_actual_authority_graph_attachment_owner_v3(owner,db=column.db)
         if type(owner)is _OrdinaryFullReadV3:
             if owner.prefinal is None or owner.work.state is not owner or owner.work.operation is not owner.operation:
                 raise TypeError('actual prefinal originating FULL Work required')
@@ -136,6 +141,13 @@ class PreparedNaturalFrozenReadV3:
         if (_ISSUED.get(self)!=(self.owner,self.column,self.column.sha256,self.column.byte_count,self.owner.operation,self.owner.fence.scope,self.raw,self.version,self.input_type,self.frozen_type)
                 or self.column.owner is not self.owner or self.owner.operation.closed):
             raise AuthorityUnavailable('actual immutable Source frozen original changed')
+        from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3
+        from .current_graph_full_read_v3 import _OrdinaryFullReadV3
+        if type(self.owner)not in (_DispatchInventoryReadV3,_OrdinaryFullReadV3):
+            from .natural_dispatch_initial_read_v1 import _NaturalInitialReadV1
+            if type(self.owner)is _NaturalInitialReadV1:
+                self.owner.require_actual_v1()
+                return
         for source in self.owner.sources.values():
             if source not in _SOURCE_ISSUED or source.scope is not self.owner.fence.scope:
                 raise AuthorityUnavailable('actual same-work Source full EOF differs')
@@ -378,3 +390,126 @@ def _require_natural_canonical_owner_type_v3(witness):
     if type(witness)is PreparedAuthorityNaturalFrozenReadV3 and witness in _AUTHORITY_FROZEN_V3:
         witness._actual();return witness
     raise AuthorityUnavailable('actual independently issued canonical original required')
+
+
+class _CanonicalReviewTextReadV3(_CanonicalJSONValueBuilderV3):
+    """Canonical embedded text, using the same bounded value builder as columns."""
+    def __init__(self,operation,text):
+        from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
+        if type(text)is not str:raise AuthorityUnavailable('Authority canonical original must be actual text')
+        self.operation,self.text=operation,text
+        self.parser=C09CanonicalJSONStreamV2(ensure_ascii=True)
+        from .dispatch_current_inventory_v3 import _FrozenObjectV3,_FrozenArrayV3
+        self._initialize_json_value_v3(incremental_retention=True,
+            frozen_object_type=_FrozenObjectV3,frozen_array_type=_FrozenArrayV3)
+        self.offset=0;self.complete=False
+        self._reserve(65536)
+    def advance_v3(self,meter):
+        if self.offset<len(self.text):
+            end=min(self.offset+1024,len(self.text))
+            fragment=self.text[self.offset:end].encode('ascii')
+            meter.charge_encode(len(fragment));self._reserve(len(fragment)*4+1024)
+            self.fragment=fragment
+            self.parser.feed(fragment,self._emit);self.offset=end;self.fragment=b''
+            return False
+        self.summary=self.parser.finish()
+        # Typed review consumers require detached JSON only after actual EOF.
+        from .dispatch_current_inventory_v3 import _detach_value_v3
+        self.operation.retain(self._detached_container_bytes+1024)
+        self.value=_detach_value_v3(self.value)
+        self.nodes={};self.scalar=bytearray();self.fragment=b'';self.parser=None
+        self.complete=True
+        return True
+
+class _NaturalReviewCanonicalStateV3:
+    """One review canonical algorithm; wrappers alone qualify actual originals."""
+    def __init__(self,raw,generation,operation,original_sha256,original_bytes):
+        from .dispatch_initial_source_read_v3 import _container_bytes_v3
+        from ..model_broker.natural_review import FrozenNaturalReplyReviewV1
+        from dataclasses import fields
+        if type(raw)is not dict or set(raw)!={field.name for field in fields(FrozenNaturalReplyReviewV1)}:
+            raise AuthorityUnavailable('review frozen fieldset differs')
+        self.raw,self.generation,self.operation=raw,generation,operation
+        self.original_sha256,self.original_bytes=original_sha256,original_bytes
+        operation.retain(_container_bytes_v3(raw)*2+65536)
+        self.inner=_CanonicalReviewTextReadV3(operation,raw['canonical_input'])
+        self.phase='input';self.complete=False;self.comparison=None;self.result=None
+
+    def _comparison_v3(self,value,target=None):
+        from .natural_frozen_original_read_v3 import _CanonicalComparisonV3
+        self.comparison=_CanonicalComparisonV3(value,target,operation=self.operation)
+
+    def advance(self,meter):
+        if self.complete:return True
+        if self.phase=='input':
+            if self.inner.advance_v3(meter):self.payload=self.inner.value;self.phase='fields'
+            return False
+        if self.phase=='fields':
+            from ..model_broker.natural_review import _natural_review_value_fields_v3,NaturalReviewInstallationV1
+            from .natural_reply_job_v2 import _unit
+            payload=self.payload
+            if type(payload)is not dict or type(payload.get('qualified_basis'))is not list or not payload['qualified_basis']:
+                raise AuthorityUnavailable('Authority review qualified basis is missing')
+            self.basis=tuple(_unit(item['source_unit'])for item in payload['qualified_basis'])
+            self.grants=tuple(payload['qualified_basis'][0]['promise_grant_refs'])
+            if any(tuple(item['promise_grant_refs'])!=self.grants for item in payload['qualified_basis']):
+                raise AuthorityUnavailable('Authority review promise grant family changed')
+            output={'schema':payload.get('generation_output_schema','sylanne.d09.context_reply_output.v2'),
+                'body':payload['body'],'units':payload['units']}
+            from ..model_broker.natural_review import INPUT_SCHEMA_V2
+            if payload.get('schema')==INPUT_SCHEMA_V2:output['semantic_segments']=payload['semantic_segments']
+            self.installation=NaturalReviewInstallationV1(**self.raw['installation'])
+            self.body,self.units,self.output,self.policy,self.semantic=_natural_review_value_fields_v3(
+                self.generation,output,self.basis,self.grants,payload['review_policy_version'],self.installation)
+            self._comparison_v3(self.basis);self.phase='basis';return False
+        if self.phase=='basis':
+            if not self.comparison.advance(meter):return False
+            self.basis_digest=self.comparison.digest
+            if self.basis_digest!=self.generation.qualified_units_digest:
+                raise AuthorityUnavailable('Authority review actual basis differs from generation seal')
+            self._comparison_v3(self.output);self.phase='output';return False
+        if self.phase=='output':
+            if not self.comparison.advance(meter):return False
+            self.output_digest=self.comparison.digest
+            from dataclasses import asdict
+            from ..model_broker.natural_review import (NaturalReviewQualifiedUnitV1,INPUT_SCHEMA,INPUT_SCHEMA_V2,
+                REVIEW_TEMPLATE_VERSION,REVIEW_TEMPLATE_VERSION_V2)
+            self.expected_input={'schema':INPUT_SCHEMA_V2 if self.semantic else INPUT_SCHEMA,
+                'template_version':REVIEW_TEMPLATE_VERSION_V2 if self.semantic else REVIEW_TEMPLATE_VERSION,
+                'generation_frozen_input_digest':self.generation.frozen_input_digest,
+                'generation_output_digest':self.output_digest,'qualified_units_digest':self.basis_digest,
+                'review_policy_version':self.policy,'body':self.body,'units':[asdict(unit)for unit in self.units],
+                'qualified_basis':[asdict(NaturalReviewQualifiedUnitV1(unit,self.grants))for unit in self.basis]}
+            if self.semantic:
+                self.expected_input['semantic_segments']=self.output['semantic_segments']
+                self.expected_input['generation_output_schema']=self.output['schema']
+            self._comparison_v3(self.expected_input,self.raw['canonical_input']);self.phase='input_compare';return False
+        if self.phase=='input_compare':
+            if not self.comparison.advance(meter):return False
+            self.input_digest=self.comparison.digest
+            from ..model_broker.natural_review import SYSTEM_MESSAGE,SYSTEM_MESSAGE_V2
+            self.messages=[{'role':'system','content':SYSTEM_MESSAGE_V2 if self.semantic else SYSTEM_MESSAGE},
+                {'role':'user','content':self.raw['canonical_input']}]
+            self._comparison_v3(self.messages,self.raw['messages_wire']);self.phase='messages';return False
+        if self.phase=='messages':
+            if not self.comparison.advance(meter):return False
+            self.expected_wire={'provider_id':self.installation.provider_id,'model':self.installation.model_id,
+                'messages':self.messages,'max_output_tokens':self.installation.max_output_tokens}
+            self._comparison_v3(self.expected_wire,self.raw['canonical_wire']);self.phase='wire';return False
+        if self.phase=='wire':
+            if not self.comparison.advance(meter):return False
+            self.wire_digest=self.comparison.digest
+            self.expected_payload_digest=self.wire_digest
+            from dataclasses import asdict
+            from ..model_broker.natural_review import FrozenNaturalReplyReviewV1
+            self.result=FrozenNaturalReplyReviewV1(self.generation.frozen_input_digest,self.output_digest,
+                self.basis_digest,self.body,self.units,self.basis,self.policy,self.installation,
+                self.raw['canonical_input'],self.raw['messages_wire'],self.raw['canonical_wire'],
+                self.input_digest,self.wire_digest)
+            self._comparison_v3(asdict(self.result));self.phase='roundtrip';return False
+        if self.phase=='roundtrip':
+            if not self.comparison.advance(meter):return False
+            if(self.comparison.digest,self.comparison.offset)!=(self.original_sha256,self.original_bytes):
+                raise AuthorityUnavailable('Authority review typed roundtrip differs from its original full EOF')
+            self.complete=True;return True
+        raise AuthorityUnavailable('unregistered Authority review canonical phase')

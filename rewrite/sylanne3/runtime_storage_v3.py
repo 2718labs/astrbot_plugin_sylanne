@@ -190,6 +190,8 @@ def begin_runtime_storage_operation_v3(db,operation_id,deadline_utc):
         return None
     if handle.purpose != "business":
         raise AuthorityUnavailable("physical maintenance handle cannot issue ordinary operation")
+    if handle.host_binding is not None:
+        handle.host_binding.require_business_v4()
     return RuntimeStorageOperationV3(_INSTALLED,handle,operation_id,deadline_utc)
 
 
@@ -245,7 +247,11 @@ def _operation(handle):
     operation = _OPERATION.get()
     if operation is None or operation.closed or operation.pool is not handle.pool or operation.selection_digest!=handle.selection_digest:
         raise AuthorityUnavailable("ordinary storage requires its actual business retention operation")
-    if (handle.purpose == "business" and operation.kind != "business"
+    if handle.host_binding is not None:
+        handle.host_binding.require_business_v4()
+    if type(operation) in (RetiredReceiverRuntimeOperationV4, PreparedReceiverEOFRuntimeOperationV4):
+        operation.require_current(handle)
+    elif (handle.purpose == "business" and operation.kind != "business"
             or handle.purpose == "physical_maintenance" and operation.kind != "maintenance"):
         raise AuthorityUnavailable("actual runtime operation purpose differs from physical composition")
     return operation
@@ -272,15 +278,25 @@ class RuntimeStorageNeedsContinuationV3(RuntimeError):
 
 class InstalledRuntimeStorageV3:
     """Exact selected SQLite handle plus independently allocated local resources."""
-    def __init__(self, issuer, db, role, selected, context):
+    def __init__(self, issuer, db, role, selected, context, *, initial=None, host_binding=None):
         if issuer is not _INSTALLED:
             raise AuthorityUnavailable("installed runtime storage factory required")
         self.db, self.role, self.selected, self.context = db, role, selected, context
-        self.member = selected.basis.member(role)
-        self.instance = selected.basis.manifest["segmented_layouts"][role]["storage_instance_id"]
-        self.selection_digest = selected.basis.selection_digest
+        self.initial, self.host_binding = initial, host_binding
+        if host_binding is not None:
+            self.source_kind = 'host_graph_v4'
+            self.member = host_binding.member('graph')
+            self.instance = host_binding.storage_instance_id
+            self.selection_digest = host_binding.selection_digest
+            pool_key = (host_binding.authority_id, host_binding.installation_id)
+        else:
+            self.source_kind = 'initial_segmented_v4' if initial is not None else 'selected_v3'
+            basis = initial if initial is not None else selected.basis
+            self.member = basis.member(role)
+            self.instance = basis.manifest["segmented_layouts"][role]["storage_instance_id"]
+            self.selection_digest = basis.selection_digest
+            pool_key = (basis.control.authority_id, basis.control.installation_id)
         self.purpose = "business"
-        pool_key = (selected.basis.control.authority_id, selected.basis.control.installation_id)
         if pool_key not in _POOLS:
             _POOLS[pool_key] = _RuntimeResourcePoolV3()
         self.pool = _POOLS[pool_key]
@@ -320,9 +336,18 @@ class InstalledRuntimeStorageV3:
     def require_current(self, meter):
         if self._closed or type(self.db) is not sqlite3.Connection:
             raise AuthorityUnavailable("actual installed runtime database required")
-        current = self.selected.basis.require_current(meter=meter)
-        if current["stage"] != "RELEASED":
-            raise AuthorityUnavailable("ordinary runtime storage requires actual RELEASED")
+        retirement = _OPERATION.get()
+        if type(retirement) in (RetiredReceiverRuntimeOperationV4, PreparedReceiverEOFRuntimeOperationV4):
+            current = retirement.require_current(self, meter=meter)
+        elif self.source_kind == 'host_graph_v4':
+            current = self.host_binding.require_current(db=self.db,meter=meter)
+        elif self.source_kind == 'initial_segmented_v4':
+            self.initial.require_current(meter=meter)
+            current = self.context
+        else:
+            current = self.selected.basis.require_current(meter=meter)
+            if current["stage"] != "RELEASED":
+                raise AuthorityUnavailable("ordinary runtime storage requires actual RELEASED")
         stat = Path(self.member["resolved_path"]).stat()
         if (stat.st_dev, stat.st_ino) != (self.member["device"], self.member["file_id"]):
             raise AuthorityUnavailable("ordinary runtime selected file identity changed")
@@ -334,6 +359,10 @@ class InstalledRuntimeStorageV3:
                 del _BINDINGS[self.db]
         self._closed = True
         self.db = None
+        if self.host_binding is not None:
+            _HOST_GRAPH_BASES_V4.pop(id(self.host_binding),None)
+            self.host_binding.close_v4()
+            self.host_binding = None
 
 
 def install_selected_runtime_storage_v3(db, *, role, selected, context):
@@ -361,6 +390,123 @@ def install_selected_runtime_storage_v3(db, *, role, selected, context):
         handle = InstalledRuntimeStorageV3(_INSTALLED, db, role, selected, context)
         with handle.quantum() as meter:
             selected.basis.require_layout(db, role, meter=meter)
+        _BINDINGS[db] = handle
+        return handle
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeSourceIdentityV4:
+    control: object
+    namespace: object
+    authority_namespace: str
+    selection_digest: str
+    member: dict
+    instance: str
+    role: str
+    origin_kind: str
+    genesis_digest: str | None
+    capture_scope_digest: str | None
+    storage_generation: int
+    host_binding: object | None = None
+
+    @property
+    def authority_id(self):
+        return self.control.authority_id if self.control is not None else self.host_binding.authority_id
+
+    @property
+    def installation_id(self):
+        return self.control.installation_id if self.control is not None else self.host_binding.installation_id
+
+
+def runtime_storage_basis_identity_v4(basis, *, role, meter):
+    """Authenticate each real origin kind without constructing selected history."""
+    if _HOST_GRAPH_BASES_V4.get(id(basis)) is basis:
+        if role != 'graph':
+            raise AuthorityUnavailable('remote Host storage proof cannot address Core or journals')
+        return _host_graph_runtime_identity_v4(basis,meter=meter)
+    from .authority_service.c09_selected_history_v3 import (
+        _InstalledSelectedStorageBasisV3, VerifiedSelectedHistoryReadV3)
+    from .authority_service.c09_initial_segmented_genesis_v4 import (
+        VerifiedInitialSegmentedStorageV4, VerifiedInitialSegmentedPhysicalMetadataV4,
+        VerifiedInitialSegmentedRetirementMetadataV4, VerifiedInitialMaintenanceCompositionV4)
+    from .runtime_contracts import NamespaceId, namespace_ref
+    if type(basis) in (VerifiedInitialSegmentedStorageV4, VerifiedInitialSegmentedPhysicalMetadataV4,
+            VerifiedInitialSegmentedRetirementMetadataV4, VerifiedInitialMaintenanceCompositionV4):
+        if type(basis) in (VerifiedInitialSegmentedPhysicalMetadataV4, VerifiedInitialSegmentedRetirementMetadataV4):
+            if basis.role != role:
+                raise AuthorityUnavailable('initial metadata belongs to another actual role')
+            if type(basis) is VerifiedInitialSegmentedRetirementMetadataV4:
+                basis.require_graph(db=basis.db,meter=meter)
+            else:
+                basis.require_current(db=basis.db,meter=meter)
+        else:
+            basis.require_current(meter=meter)
+        origin_kind, genesis, capture = 'initial_segmented_v4', basis.genesis_digest, None
+        namespace, authority_namespace = basis.namespace, basis.authority_namespace
+        source = basis
+    elif type(basis) in (VerifiedSelectedHistoryReadV3, _InstalledSelectedStorageBasisV3):
+        if type(basis) is VerifiedSelectedHistoryReadV3:
+            scope, source = basis.scope, basis.basis
+        else:
+            source = basis
+            from .authority_service.c09_prepared_storage_v3 import _read_original
+            from .runtime.c09_paged_capture_contract_v2 import C09CaptureScopeV2
+            with source.control._db() as control_db:
+                scope = C09CaptureScopeV2(**_read_original(source.control, control_db,
+                    source.prepared['operation_id'], 'capture_scope_v2', None, meter))
+        source.require_current(meter=meter)
+        if scope.scope_digest != source.prepared['capture_scope_digest']:
+            raise AuthorityUnavailable('selected origin scope differs from its actual original')
+        namespace, authority_namespace = NamespaceId(*json.loads(scope.graph_namespace)), source.prepared['namespace']
+        origin_kind, genesis, capture = 'selected_v3', None, scope.scope_digest
+    else:
+        raise AuthorityUnavailable('actual selected or initial-segmented storage proof required')
+    if role not in ('graph', 'core', 'deletion', 'execution') or namespace_ref(namespace) != authority_namespace:
+        raise AuthorityUnavailable('runtime origin role/namespace differs from its actual scope')
+    return RuntimeSourceIdentityV4(source.control, namespace, authority_namespace, source.selection_digest,
+        source.member(role), source.manifest['segmented_layouts'][role]['storage_instance_id'],
+        role, origin_kind, genesis, capture, source.manifest['generation'])
+
+
+def runtime_source_identity_v4(handle, *, meter=None):
+    if handle is None or _BINDINGS.get(handle.db) is not handle:
+        raise AuthorityUnavailable('actual registered runtime handle required for origin identity')
+    if meter is None:
+        with handle.quantum() as actual:
+            return runtime_source_identity_v4(handle, meter=actual)
+    handle.require_current(meter)
+    retirement = _OPERATION.get()
+    if type(retirement) in (RetiredReceiverRuntimeOperationV4, PreparedReceiverEOFRuntimeOperationV4):
+        return retirement.source_identity_v4(handle, meter=meter)
+    if handle.source_kind == 'host_graph_v4':
+        return _host_graph_runtime_identity_v4(handle.host_binding,meter=meter)
+    source = handle.initial if handle.source_kind == 'initial_segmented_v4' else handle.selected
+    return runtime_storage_basis_identity_v4(source, role=handle.role, meter=meter)
+
+
+def install_initial_runtime_storage_v4(db, *, role, initial, context):
+    from .authority_service.c09_initial_segmented_genesis_v4 import VerifiedInitialSegmentedStorageV4
+    from .authority_service.c09_storage_control_v1 import VerifiedStorageOpenContextV1
+    if (type(db) is not sqlite3.Connection or type(initial) is not VerifiedInitialSegmentedStorageV4
+            or type(context) is not VerifiedStorageOpenContextV1 or context._reader is not initial.control
+            or context.manifest_digest != initial.manifest['manifest_digest']
+            or role not in ('graph', 'core', 'deletion', 'execution')):
+        raise AuthorityUnavailable('actual initial-segmented proof/context/role required')
+    context.require_current('business')
+    member = initial.member(role)
+    databases = db.execute('PRAGMA database_list').fetchall()
+    if (len(databases) != 1 or databases[0][1] != 'main'
+            or Path(databases[0][2]).resolve(strict=True) != Path(member['resolved_path']).resolve(strict=True)):
+        raise AuthorityUnavailable('initial runtime connection differs from the actual role file')
+    with _BINDINGS_LOCK:
+        prior = _BINDINGS.get(db)
+        if prior is not None:
+            if prior.initial is not initial or prior.role != role:
+                raise AuthorityUnavailable('runtime connection cannot change its initial origin')
+            return prior
+        handle = InstalledRuntimeStorageV3(_INSTALLED, db, role, None, context, initial=initial)
+        with handle.quantum() as meter:
+            initial.require_layout(db, role, meter=meter)
         _BINDINGS[db] = handle
         return handle
 
@@ -699,7 +845,7 @@ def seal_runtime_cell_in_transaction_v3(db, *, locator, erasure_owner_ref,
         raise RuntimeStorageNeedsContinuationV3(RuntimeStorageProgressV3(
             handle.selection_digest, canonical_digest(locator), 0, 0,
             sha256(payload.encode('utf-8')).hexdigest(), operation.operation_id, operation.deadline_utc))
-    authority = handle.selected.basis.control
+    authority = runtime_source_identity_v4(handle)
     origin = dict(schema='sylanne3.runtime-cell-origin.v3', selection_digest=handle.selection_digest,
         role=handle.role, authority_id=authority.authority_id, installation_id=authority.installation_id,
         namespace=namespace, operation_id=operation_id, event_digest=event_digest,
@@ -934,7 +1080,7 @@ class _CorePayloadReadV3:
         if issuer is not _CORE_STREAM_ISSUER_V3 or table not in _CORE_PAYLOAD_KEYS or type(key)is not tuple or len(key)!=3:
             raise AuthorityUnavailable('actual fixed Core original reader required')
         handle=runtime_storage_v3(db)
-        if handle is None or handle.role!='core'or key[0]!=handle.selected.basis.prepared['namespace']:
+        if handle is None or handle.role!='core'or key[0]!=runtime_source_identity_v4(handle).authority_namespace:
             raise AuthorityUnavailable('Core original reader requires its actual selected Core namespace')
         self.db,self.table,self.key,self.handle=db,table,key,handle
         self.operation=_operation(handle);self.where=' AND '.join(column+'=?'for column in _CORE_PAYLOAD_KEYS[table])
@@ -1022,7 +1168,7 @@ class _CorePayloadWriteV3:
         if issuer is not _CORE_STREAM_ISSUER_V3 or table not in _CORE_PAYLOAD_KEYS or type(key)is not tuple or len(key)!=3:
             raise AuthorityUnavailable('actual fixed Core payload writer required')
         self.db,self.table,self.key=db,table,key;self.handle=runtime_storage_v3(db)
-        if self.handle is None or self.handle.role!='core'or key[0]!=self.handle.selected.basis.prepared['namespace']:
+        if self.handle is None or self.handle.role!='core'or key[0]!=runtime_source_identity_v4(self.handle).authority_namespace:
             raise AuthorityUnavailable('Core original writer requires actual selected namespace')
         self.operation=_operation(self.handle)
         from .runtime.natural_frozen_original_read_v3 import _canonical_container_bytes_v3
@@ -1065,7 +1211,7 @@ class _CorePayloadWriteV3:
             return self
         if self.phase=='origin':
             from .runtime_contracts import canonical_serialize
-            authority=self.handle.selected.basis.control
+            authority=runtime_source_identity_v4(self.handle,meter=meter).control
             locator=dict(table=self.table,primary_key=self.key,column='payload_json')
             origin=dict(schema='sylanne3.runtime-cell-origin.v3',selection_digest=self.handle.selection_digest,
                 role=self.handle.role,authority_id=authority.authority_id,installation_id=authority.installation_id,
@@ -1144,7 +1290,7 @@ def begin_core_payload_write_v3(db,table,key,payload):
 def read_core_payload_row_v3(db, table, key):
     columns = _CORE_PAYLOAD_KEYS[table]
     handle = runtime_storage_v3(db)
-    if handle is not None and (handle.role != 'core' or key[0] != handle.selected.basis.prepared['namespace']):
+    if handle is not None and (handle.role != 'core' or key[0] != runtime_source_identity_v4(handle).authority_namespace):
         raise AuthorityUnavailable('Core original crosses its actual selected namespace')
     where = ' AND '.join(column+'=?' for column in columns)
     field = 'payload_json' if handle is None else 'payload_cell_id'
@@ -1163,7 +1309,7 @@ def insert_core_payload_row_v3(db, table, key, encoded, digest, *, read_proof):
     if handle is None:
         db.execute('INSERT INTO '+table+' VALUES(?,?,?,?,?)',(*key,encoded,digest))
         return
-    if not db.in_transaction or handle.role != 'core' or key[0] != handle.selected.basis.prepared['namespace']:
+    if not db.in_transaction or handle.role != 'core' or key[0] != runtime_source_identity_v4(handle).authority_namespace:
         raise AuthorityUnavailable('Core payload requires its actual selected writer transaction')
     cell_id = seal_runtime_cell_in_transaction_v3(db,
         locator=dict(table=table,primary_key=key,column='payload_json'),
@@ -1179,8 +1325,16 @@ def read_runtime_cell_origin_v3(db,cell_id,*,header=None,meter=None):
     if meter is None:
         with handle.quantum() as actual:
             return read_runtime_cell_origin_v3(db,cell_id,header=header,meter=actual)
-    original=read_selected_runtime_cell_origin_v3(db,selected_basis=handle.selected,role=handle.role,
-        cell_id=cell_id,header=header,meter=meter)
+    if handle.source_kind == 'host_graph_v4':
+        identity = runtime_source_identity_v4(handle,meter=meter)
+        original = _read_runtime_cell_origin_from_identity_v4(db,basis=handle.host_binding,identity=identity,
+            role='graph',cell_id=cell_id,header=header,meter=meter)
+    elif handle.source_kind == 'initial_segmented_v4':
+        original=read_initial_runtime_cell_origin_v4(db,initial=handle.initial,role=handle.role,
+            cell_id=cell_id,header=header,meter=meter)
+    else:
+        original=read_selected_runtime_cell_origin_v3(db,selected_basis=handle.selected,role=handle.role,
+            cell_id=cell_id,header=header,meter=meter)
     if (original is not None and original.get('producer_kind')=='owner_material_source_prepared_v3'
             and original['phase']!='committed'):
         raise AuthorityUnavailable('unattached prepared Source cells are not ordinary business values')
@@ -1205,26 +1359,51 @@ def _runtime_bounded_fixed_row_v3(db,meter,table,columns,where,parameters):
 
 
 def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header,meter):
-    """Pure installed cold read: no business handle, mutation or fresh budget."""
+    """Pure installed selected cold read; initial genesis has its own issuer."""
     from .authority_service.c09_selected_history_v3 import (
-        _InstalledSelectedStorageBasisV3,VerifiedSelectedHistoryReadV3)
-    from .runtime_contracts import canonical_digest
-    if type(selected_basis) is VerifiedSelectedHistoryReadV3:
-        basis=selected_basis.basis
-        selected_scope_digest=selected_basis.scope.scope_digest
-    elif type(selected_basis) is _InstalledSelectedStorageBasisV3:
-        basis=selected_basis
-        selected_scope_digest=basis.prepared['capture_scope_digest']
-    else:
+        _InstalledSelectedStorageBasisV3, VerifiedSelectedHistoryReadV3)
+    if type(selected_basis) not in (_InstalledSelectedStorageBasisV3, VerifiedSelectedHistoryReadV3):
         raise AuthorityUnavailable('actual private installed selected cold basis required')
+    identity=runtime_storage_basis_identity_v4(selected_basis,role=role,meter=meter)
+    basis=selected_basis.basis if type(selected_basis) is VerifiedSelectedHistoryReadV3 else selected_basis
+    return _read_runtime_cell_origin_from_identity_v4(db,basis=basis,identity=identity,
+        role=role,cell_id=cell_id,header=header,meter=meter)
+
+
+def read_initial_runtime_cell_origin_v4(db,*,initial,role,cell_id,header,meter):
+    from .authority_service.c09_initial_segmented_genesis_v4 import (
+        VerifiedInitialSegmentedStorageV4, VerifiedInitialSegmentedPhysicalMetadataV4,
+        VerifiedInitialSegmentedRetirementMetadataV4, VerifiedInitialMaintenanceCompositionV4)
+    if type(initial) not in (VerifiedInitialSegmentedStorageV4, VerifiedInitialSegmentedPhysicalMetadataV4,
+            VerifiedInitialSegmentedRetirementMetadataV4, VerifiedInitialMaintenanceCompositionV4):
+        raise AuthorityUnavailable('actual initial-segmented cold proof required')
+    if type(initial) is VerifiedInitialSegmentedPhysicalMetadataV4:
+        initial.require_current(db=db,meter=meter)
+    elif type(initial) is VerifiedInitialSegmentedRetirementMetadataV4:
+        initial.require_graph(db=db,meter=meter)
+    identity=runtime_storage_basis_identity_v4(initial,role=role,meter=meter)
+    return _read_runtime_cell_origin_from_identity_v4(db,basis=initial,identity=identity,
+        role=role,cell_id=cell_id,header=header,meter=meter)
+
+
+def read_initial_runtime_cell_origin_for_capture_v4(db,*,qualification,role,cell_id,header,meter):
+    """Read only this actual C09 immutable source pair under its physical gate."""
+    from .authority_service.c09_initial_segmented_genesis_v4 import require_initial_segmented_physical_metadata_v4
+    initial = require_initial_segmented_physical_metadata_v4(qualification, db=db, meter=meter)
+    if initial.role != role:
+        raise AuthorityUnavailable('initial capture origin belongs to another actual role')
+    return read_initial_runtime_cell_origin_v4(db,initial=initial,role=role,
+        cell_id=cell_id,header=header,meter=meter)
+
+
+def _read_runtime_cell_origin_from_identity_v4(db,*,basis,identity,role,cell_id,header,meter):
     if type(db) is not sqlite3.Connection or role not in ('graph','core'):
         raise AuthorityUnavailable('actual selected cold SQLite Graph/Core role required')
-    basis.require_current(meter=meter)
-    member=basis.member(role)
+    member=identity.member
     databases=db.execute('PRAGMA database_list').fetchall()
     if len(databases)!=1 or Path(databases[0][2]).resolve(strict=True)!=Path(member['resolved_path']).resolve(strict=True):
         raise AuthorityUnavailable('cold producer database differs from its actual selected role')
-    instance=basis.manifest['segmented_layouts'][role]['storage_instance_id']
+    instance=identity.instance
     if header is None:
         full = _runtime_bounded_fixed_row_v3(db,meter,'segmented_cells_v1',
             ('codec_id','erasure_owner_ref','producer_operation_id','total_bytes','segment_count',
@@ -1234,7 +1413,7 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
         header = full
     exists = db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='runtime_cell_origins_v3'").fetchone()
     if exists is None:
-        if header[7] != selected_scope_digest:
+        if identity.capture_scope_digest is None or header[7] != identity.capture_scope_digest:
             raise AuthorityUnavailable('cell has neither selected capture nor actual runtime producer')
         return None
     row = _runtime_bounded_fixed_row_v3(db,meter,'runtime_cell_origins_v3',
@@ -1245,7 +1424,7 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
             from .runtime.owner_material_source_storage_v3 import read_selected_owner_source_cell_v3
             owner_source=read_selected_owner_source_cell_v3(db,basis=basis,cell_id=cell_id,header=header,meter=meter)
             if owner_source is not None:return owner_source
-        if header[7] != selected_scope_digest:
+        if identity.capture_scope_digest is None or header[7] != identity.capture_scope_digest:
             raise AuthorityUnavailable('cell runtime producer original is absent')
         return None
     namespace,locator,proof = json.loads(row[5]),json.loads(row[8]),json.loads(row[9])
@@ -1253,8 +1432,8 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
         role=row[2],authority_id=row[3],installation_id=row[4],namespace=namespace,
         operation_id=row[6],event_digest=row[7],locator=locator,read_proof=proof)
     if (canonical_digest(original) != row[0] or row[0] != header[7]
-            or row[2] != role or row[3] != basis.control.authority_id
-            or row[4] != basis.control.installation_id or row[6] != header[2]):
+            or row[2] != role or row[3] != identity.authority_id
+            or row[4] != identity.installation_id or row[6] != header[2]):
         raise AuthorityUnavailable('actual immutable runtime producer identity or digest differs')
     expected_cell = canonical_digest(dict(schema='sylanne3.runtime-cell-identity.v3',
         instance=instance,origin_digest=row[0],locator=locator,payload_sha256=header[5]))
@@ -1270,7 +1449,7 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
         key = AtomKey.from_token(locator['token'])
         if (locator['table'] != 'graph_atoms' or header[1] != key.token
                 or namespace != [key.owner.bot,key.owner.persona]
-                or namespace_ref(NamespaceId(*namespace)) != basis.prepared['namespace']
+                or namespace_ref(NamespaceId(*namespace)) != identity.authority_namespace
                 or proof['event_scope'][:2] != namespace or proof['event_scope'][3] != row[6]):
             raise AuthorityUnavailable('runtime Graph producer locator or namespace differs')
         event = _runtime_bounded_fixed_row_v3(db,meter,'graph_events',('digest','reads','epoch_reads'),
@@ -1282,11 +1461,14 @@ def read_selected_runtime_cell_origin_v3(db,*,selected_basis,role,cell_id,header
                 or history is None or history[0] != cell_id or list(history[2:]) != proof['event_scope']
                 or sorted(item[0] for item in json.loads(history[1])) != sorted(proof['dependencies'])):
             raise AuthorityUnavailable('runtime Graph cell lacks its exact committed event/history producer')
+    elif role == 'core' and proof.get('schema')=='sylanne3.platform-observation-fact-cells.v3':
+        from .authority_service.c09_platform_observation_fact_storage_v3 import verify_fact_runtime_origin_v3
+        return verify_fact_runtime_origin_v3(db,identity=identity,cell_id=cell_id,header=header,original=original,meter=meter)
     elif role == 'core':
         key = tuple(locator['primary_key'])
         table = locator['table']
         if (table not in _CORE_PAYLOAD_KEYS or locator['column'] != 'payload_json'
-                or namespace != key[0] or namespace != basis.prepared['namespace']
+                or namespace != key[0] or namespace != identity.authority_namespace
                 or key[1] != row[6] or header[1] != _core_payload_owner_v3(table,key)):
             raise AuthorityUnavailable('runtime Core producer original locator differs')
         where = ' AND '.join(column+'=?' for column in _CORE_PAYLOAD_KEYS[table])
@@ -1305,6 +1487,10 @@ def bind_runtime_database_from_control_v3(db, *, control, role):
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='segmented_storage_layout_v1'").fetchone() is None:
         return None
     context = control.read_verified_current_storage_v3()
+    from .authority_service.c09_initial_segmented_genesis_v4 import INITIAL_MANIFEST_SCHEMA_V4
+    if context.manifest['schema'] == INITIAL_MANIFEST_SCHEMA_V4:
+        return install_initial_runtime_storage_v4(db,role=role,
+            initial=control._initial_segmented_storage_v4,context=context)
     selected = control._selected_history_read_v3
     return install_selected_runtime_storage_v3(db,role=role,selected=selected,context=context)
 
@@ -1401,7 +1587,7 @@ class RuntimeGraphRowsReadV3:
         self.stored=tuple('value_cell_id' if c=='value' else c for c in columns)
         self.projected=self.keys+self.stored
         self.cell_reader,self.buffer,self.buffer_offset=None,None,0
-        self.namespace=tuple(json.loads(self.handle.selected.scope.graph_namespace))
+        self.namespace=runtime_source_identity_v4(self.handle).namespace.as_tuple
         self.expected_stamp=None
 
     def _require_stamp(self,meter):
@@ -1595,10 +1781,44 @@ class PhysicalRuntimeHandleV3(InstalledRuntimeStorageV3):
             raise AuthorityUnavailable('actual selected maintenance role identity changed')
         operation=_OPERATION.get()
         if operation is not None:
-            if type(operation) is not MaintenanceRuntimeOperationV3:
+            if type(operation) not in (MaintenanceRuntimeOperationV3, RetiredReceiverRuntimeOperationV4, PreparedReceiverEOFRuntimeOperationV4):
                 raise AuthorityUnavailable('physical maintenance handle refuses ordinary business operation')
             operation.require_current(self)
         return current
+
+
+
+class PhysicalInitialRuntimeHandleV4(PhysicalRuntimeHandleV3):
+    """Existing initial roles opened under a real cold maintenance composition."""
+    def __init__(self, issuer, db, role, composition, context):
+        if issuer is not _PHYSICAL:
+            raise AuthorityUnavailable('actual initial physical composition issuer required')
+        InstalledRuntimeStorageV3.__init__(self, _INSTALLED, db, role, None, context, initial=composition)
+        self.capability = composition
+        self.purpose = 'physical_maintenance'
+
+
+def install_initial_maintenance_runtime_storage_v4(db, *, role, composition, context):
+    from .authority_service.c09_initial_segmented_genesis_v4 import VerifiedInitialMaintenanceCompositionV4
+    if (type(db) is not sqlite3.Connection or type(composition) is not VerifiedInitialMaintenanceCompositionV4
+            or context is not composition.context or role not in ('graph', 'core', 'deletion', 'execution')):
+        raise AuthorityUnavailable('actual initial maintenance composition/context/role required')
+    member = composition.member(role)
+    databases = db.execute('PRAGMA database_list').fetchall()
+    if (len(databases) != 1 or databases[0][1] != 'main'
+            or Path(databases[0][2]).resolve(strict=True) != Path(member['resolved_path']).resolve(strict=True)):
+        raise AuthorityUnavailable('initial maintenance connection differs from its actual role file')
+    if composition.stage == 'PREPARED':
+        db.execute('PRAGMA query_only=ON')
+    with _BINDINGS_LOCK:
+        if db in _BINDINGS:
+            raise AuthorityUnavailable('initial maintenance role connection is already composed')
+        handle = PhysicalInitialRuntimeHandleV4(_PHYSICAL, db, role, composition, context)
+        with handle.quantum() as meter:
+            composition.require_layout(db, role, meter=meter)
+            composition.register_role_v4(db, role, meter=meter)
+        _BINDINGS[db] = handle
+        return handle
 
 
 class MaintenanceRuntimeOperationV3(RuntimeStorageOperationV3):
@@ -1678,3 +1898,245 @@ def require_maintenance_runtime_operation_v3(db):
         raise AuthorityUnavailable('actual bound maintenance operation required')
     lease.require_current(handle)
     return lease
+
+
+_RETIRED_RUNTIME_ISSUER_V4 = object()
+
+
+class RetiredReceiverRuntimeOperationV4(RuntimeStorageOperationV3):
+    """One registered C09 actor's terminal/owner-release metadata transactions."""
+    def __init__(self, issuer, progress):
+        if issuer is not _RETIRED_RUNTIME_ISSUER_V4:
+            raise AuthorityUnavailable('actual receiver-retirement runtime issuer required')
+        from .authority_service.c09_maintenance_actor_v3 import InstalledC09MaintenanceActorV3
+        from .authority_service.d13_original_owner_v3 import _RetiredReceiverCleanupV3, _RETIRED_RECEIVER_CLEANUPS_V3
+        if (type(progress) is not _RetiredReceiverCleanupV3
+                or _RETIRED_RECEIVER_CLEANUPS_V3.get(progress.maintenance) is not progress):
+            raise AuthorityUnavailable('registered actual receiver cleanup required')
+        maintenance = progress.maintenance
+        actor = maintenance._maintenance_actor_v3
+        if type(actor) is not InstalledC09MaintenanceActorV3 or actor.maintenance is not maintenance:
+            raise AuthorityUnavailable('actual installed same-Core C09 actor required')
+        progress.require_coverage_v3()
+        self.progress, self.actor, self.maintenance = progress, actor, maintenance
+        self.control = maintenance.control
+        self.gate_identity = (maintenance.gate._operation, maintenance.gate._epoch, maintenance.gate._closing_continuation)
+        self.quiescence_digest = canonical_digest(progress.quiescence)
+        databases = {'core': maintenance.core._db, 'execution': maintenance.closure.execution._db,
+            'deletion': maintenance.closure.deletion._db}
+        self.role_handles = {role: runtime_storage_v3(db) for role, db in databases.items()}
+        core_handle = self.role_handles['core']
+        if (type(core_handle) not in (InstalledRuntimeStorageV3, PhysicalInitialRuntimeHandleV4)
+                or core_handle.purpose != ('physical_maintenance' if type(core_handle) is PhysicalInitialRuntimeHandleV4 else 'business')
+                or core_handle.source_kind not in ('initial_segmented_v4', 'selected_v3')):
+            raise AuthorityUnavailable('actual installed business Core origin required for retirement')
+        for role, handle in self.role_handles.items():
+            if (type(handle) is not type(core_handle) or handle.role != role or handle.purpose != core_handle.purpose
+                    or handle.source_kind != core_handle.source_kind or handle.pool is not core_handle.pool
+                    or handle.selection_digest != core_handle.selection_digest):
+                raise AuthorityUnavailable('retirement cannot cross actual Core/journal origin bindings')
+        super().__init__(_INSTALLED, core_handle, actor.operation_id, None)
+        self.kind = 'maintenance'
+        self.initial_original_digest = None
+        with self.control._resource_sql_quantum_v3() as meter:
+            if core_handle.source_kind == 'initial_segmented_v4':
+                from .authority_service.c09_initial_segmented_genesis_v4 import _read_signed_initial_metadata_v4
+                with self.control._db() as control_db:
+                    _, original, manifest = _read_signed_initial_metadata_v4(self.control, control_db, meter)
+                if (canonical_digest(original) != canonical_digest(core_handle.initial.original)
+                        or manifest['manifest_digest'] != core_handle.initial.manifest['manifest_digest']):
+                    raise AuthorityUnavailable('retirement initial origin differs from its actual signed genesis')
+                self.initial_original_digest = canonical_digest(original)
+            self.require_current(core_handle, meter=meter)
+
+    def require_current(self, handle, *, meter=None):
+        if meter is None:
+            with self.control._resource_sql_quantum_v3() as actual:
+                return self.require_current(handle, meter=actual)
+        from .authority_service.d13_original_owner_v3 import _RETIRED_RECEIVER_CLEANUPS_V3
+        m, p, actor = self.maintenance, self.progress, self.actor
+        if (self.closed or p is None or _RETIRED_RECEIVER_CLEANUPS_V3.get(m) is not p
+                or m._maintenance_actor_v3 is not actor or actor.maintenance is not m
+                or actor.owner_thread != threading.get_ident() or actor.operation_id != p.operation_id
+                or actor.operation_id != self.operation_id or actor.failure is not None
+                or self.role_handles.get(handle.role) is not handle or _BINDINGS.get(handle.db) is not handle
+                or handle._closed or handle.pool is not self.pool or handle.selection_digest != self.selection_digest
+                or (m.gate._operation, m.gate._epoch, m.gate._closing_continuation) != self.gate_identity
+                or canonical_digest(p.quiescence) != self.quiescence_digest):
+            raise AuthorityUnavailable('receiver retirement lost its exact actor/Gate/role/operation')
+        p.require_gate_v3()
+        with self.control._db() as control_db:
+            current = self.control._c09_control_chain_proof_v2.require_current(control_db, meter)
+        if current['stage'] != 'INTENT' or current['active_operation_id'] != self.operation_id:
+            raise AuthorityUnavailable('receiver runtime is confined to its actual INTENT operation')
+        if handle.source_kind == 'initial_segmented_v4':
+            initial = handle.initial
+            if (canonical_digest(initial.original) != self.initial_original_digest
+                    or initial.control is not self.control or current['pointer_version'] != 0
+                    or current['current_manifest_digest'] != initial.manifest['manifest_digest']):
+                raise AuthorityUnavailable('retirement initial genesis/pointer changed')
+        else:
+            basis = handle.selected.basis
+            if basis.control is not self.control:
+                raise AuthorityUnavailable('retirement selected origin belongs to another Control')
+            basis.require_current(meter=meter)
+        stat = Path(handle.member['resolved_path']).stat()
+        if (stat.st_dev, stat.st_ino) != (handle.member['device'], handle.member['file_id']):
+            raise AuthorityUnavailable('receiver retirement role file identity changed')
+        return current
+
+    def source_identity_v4(self, handle, *, meter):
+        self.require_current(handle, meter=meter)
+        if handle.source_kind == 'selected_v3':
+            return runtime_storage_basis_identity_v4(handle.selected, role=handle.role, meter=meter)
+        initial = handle.initial
+        return RuntimeSourceIdentityV4(initial.control, initial.namespace, initial.authority_namespace,
+            initial.selection_digest, initial.member(handle.role), handle.instance, handle.role,
+            'initial_segmented_v4', initial.genesis_digest, None, initial.manifest['generation'])
+
+    def release(self):
+        try:
+            super().release()
+        finally:
+            self.role_handles.clear()
+            self.progress = self.actor = self.maintenance = None
+
+
+@contextmanager
+def bind_retired_receiver_runtime_operation_v4(progress):
+    """Only this registered cleanup can borrow Core/journal metadata write scope."""
+    handle = runtime_storage_v3(progress.maintenance.core._db)
+    if handle is None or type(handle) is PhysicalRuntimeHandleV3:
+        yield None
+        return
+    if _OPERATION.get() is not None:
+        raise AuthorityUnavailable('receiver retirement cannot borrow another business operation')
+    operation = RetiredReceiverRuntimeOperationV4(_RETIRED_RUNTIME_ISSUER_V4, progress)
+    token = _OPERATION.set(operation)
+    try:
+        yield operation
+    finally:
+        _OPERATION.reset(token)
+        operation.release()
+
+
+class PreparedReceiverEOFRuntimeOperationV4(RuntimeStorageOperationV3):
+    """Only the registered actor's query-only initial PREPARED Core EOF."""
+    def __init__(self, issuer, progress):
+        from .authority_service.d13_original_owner_v3 import _PreparedRetiredReceiverEOFV4, _RETIRED_RECEIVER_CLEANUPS_V3
+        from .authority_service.c09_maintenance_actor_v3 import InstalledC09MaintenanceActorV3
+        if (issuer is not _RETIRED_RUNTIME_ISSUER_V4 or type(progress) is not _PreparedRetiredReceiverEOFV4
+                or _RETIRED_RECEIVER_CLEANUPS_V3.get(progress.maintenance) is not progress):
+            raise AuthorityUnavailable('actual registered PREPARED receiver EOF required')
+        m = progress.maintenance
+        actor = m._maintenance_actor_v3
+        handle = runtime_storage_v3(m.core._db)
+        if (type(actor) is not InstalledC09MaintenanceActorV3 or actor.maintenance is not m
+                or type(handle) is not PhysicalInitialRuntimeHandleV4 or handle.role != 'core'
+                or handle.capability.stage != 'PREPARED'):
+            raise AuthorityUnavailable('PREPARED EOF requires the actual initial physical Core and actor')
+        progress.require_coverage_v3()
+        super().__init__(_INSTALLED, handle, actor.operation_id, None)
+        self.kind = 'maintenance'
+        self.progress, self.actor, self.maintenance, self.handle = progress, actor, m, handle
+        self.gate_identity = (m.gate._operation, m.gate._epoch, m.gate._closing_continuation)
+        self.quiescence_digest = canonical_digest(progress.quiescence)
+        self.require_current(handle)
+
+    def require_current(self, handle, *, meter=None):
+        if meter is None:
+            with self.maintenance.control._resource_sql_quantum_v3() as actual:
+                return self.require_current(handle, meter=actual)
+        from .authority_service.d13_original_owner_v3 import _RETIRED_RECEIVER_CLEANUPS_V3
+        from .authority_service.c09_writer_peer_originals_v3 import VerifiedPreparedPeerRetirementCoverageV3
+        m, p, actor = self.maintenance, self.progress, self.actor
+        if (self.closed or _RETIRED_RECEIVER_CLEANUPS_V3.get(m) is not p
+                or m._maintenance_actor_v3 is not actor or actor.owner_thread != threading.get_ident()
+                or actor.failure is not None or actor.operation_id != self.operation_id
+                or p.operation_id != self.operation_id or p.failed is not None
+                or type(p.coverage) is not VerifiedPreparedPeerRetirementCoverageV3
+                or handle is not self.handle or _BINDINGS.get(handle.db) is not handle
+                or handle._closed or handle.pool is not self.pool or handle.selection_digest != self.selection_digest
+                or handle.db is not m.core._db or handle.role != 'core'
+                or (m.gate._operation, m.gate._epoch, m.gate._closing_continuation) != self.gate_identity
+                or canonical_digest(p.quiescence) != self.quiescence_digest
+                or handle.db.execute('PRAGMA query_only').fetchone() != (1,)):
+            raise AuthorityUnavailable('PREPARED metadata EOF lost its exact read-only actor/Core/Gate scope')
+        p.require_gate_v3()
+        p.coverage.require_current(meter=meter)
+        current = handle.capability.require_current(meter=meter)
+        if (current.stage != 'PREPARED' or current.operation_id != self.operation_id
+                or current.control is not m.control or current.gate is not m.gate):
+            raise AuthorityUnavailable('PREPARED EOF cannot use another maintenance source')
+        stat = Path(handle.member['resolved_path']).stat()
+        if (stat.st_dev, stat.st_ino) != (handle.member['device'], handle.member['file_id']):
+            raise AuthorityUnavailable('PREPARED Core physical identity changed')
+        m.core._require(m.credential, 'delete', m.closure.namespace)
+        return current
+
+    def source_identity_v4(self, handle, *, meter):
+        current = self.require_current(handle, meter=meter)
+        return RuntimeSourceIdentityV4(current.control, current.namespace, current.authority_namespace,
+            current.selection_digest, current.member('core'), handle.instance, 'core',
+            'initial_segmented_v4', current.genesis_digest, None, current.manifest['generation'])
+
+    def release(self):
+        try:
+            super().release()
+        finally:
+            self.progress = self.actor = self.maintenance = self.handle = None
+
+
+@contextmanager
+def bind_prepared_receiver_eof_runtime_operation_v4(progress):
+    if _OPERATION.get() is not None:
+        raise AuthorityUnavailable('PREPARED receiver EOF cannot borrow another runtime operation')
+    operation = PreparedReceiverEOFRuntimeOperationV4(_RETIRED_RUNTIME_ISSUER_V4, progress)
+    token = _OPERATION.set(operation)
+    try:
+        yield operation
+    finally:
+        _OPERATION.reset(token)
+        operation.release()
+
+
+_HOST_GRAPH_BASES_V4 = {}
+
+
+def _host_graph_runtime_identity_v4(binding, *, meter):
+    from .host.c09_storage_admission_v1 import VerifiedHostGraphStorageBindingV4
+    if (type(binding) is not VerifiedHostGraphStorageBindingV4
+            or _HOST_GRAPH_BASES_V4.get(id(binding)) is not binding):
+        raise AuthorityUnavailable('actual independently admitted Host Graph binding required')
+    binding.require_current(db=binding.db,meter=meter)
+    return RuntimeSourceIdentityV4(None,binding.namespace,binding.authority_namespace,binding.selection_digest,
+        binding.member('graph'),binding.storage_instance_id,'graph',binding.origin_kind,
+        binding.genesis_digest,binding.capture_scope_digest,binding.storage_generation,binding)
+
+
+def install_host_graph_runtime_storage_v4(db, *, binding):
+    """Install the real channel-issued Graph binding, without a local Control."""
+    from .host.c09_storage_admission_v1 import VerifiedHostGraphStorageBindingV4
+    if type(db) is not sqlite3.Connection or type(binding) is not VerifiedHostGraphStorageBindingV4:
+        raise AuthorityUnavailable('actual Host SQLite connection and independent admission proof required')
+    with _BINDINGS_LOCK:
+        prior = _BINDINGS.get(db)
+        if prior is not None:
+            if prior.host_binding is not binding or prior.role != 'graph':
+                raise AuthorityUnavailable('Host connection cannot replace its independently admitted binding')
+            return prior
+        handle = InstalledRuntimeStorageV3(_INSTALLED,db,'graph',None,None,host_binding=binding)
+        try:
+            with handle.pool.lock:
+                budget = C09BatchBudgetV2(100,262144,25000000,250000000,handle.pool.capacity)
+                meter = C09SqlByteMeterV2(budget)
+                with c09_sql_meter_quantum_v2(meter),meter_canonical_outputs(meter):
+                    binding.bind_database_v4(db,meter=meter)
+            with handle.quantum():
+                pass
+            _BINDINGS[db] = handle
+            _HOST_GRAPH_BASES_V4[id(binding)] = binding
+            return handle
+        except BaseException:
+            handle.close()
+            raise

@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from .model_workflows_v7 import AdminModelWorkflowsV7
     from .model_workflows_v8 import AdminModelWorkflowsV8
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
 
 from ..installation_policy import AdminInstallationPolicy
 from ..runtime.budget import BudgetLease
@@ -1151,7 +1152,7 @@ class AdminD06RecallPolicyV1:
         return canonical_digest(asdict(self))
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, weakref_slot=True)
 class AdminInstallationBundle:
     """One verified installation snapshot for Authority client assembly."""
 
@@ -1164,7 +1165,7 @@ class AdminInstallationBundle:
     workbench_origin: str | None = None
     ingress_model: AdminIngressModelPolicy | None = None
     d03_arrival: AdminD03ArrivalPolicy | None = None
-    model_workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | None = None
+    model_workflows: AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | AdminModelWorkflowsV10 | None = None
     d04_encoding_baseline: AdminD04EncodingBaselinePolicy | None = None
     d06_first_ingress_c02: AdminD06FirstIngressC02Policy | None = None
     d03_self_identity_projection: AdminD03SelfIdentityProjectionPolicy | None = None
@@ -1192,13 +1193,21 @@ class AdminInstallationBundle:
     contact_effect_accounting: object | None = field(default=None, kw_only=True)
     habit_runtime_policy: object | None = field(default=None, kw_only=True)
     artifact_phase_observer: object | None = field(default=None, kw_only=True)
+    d13_cache_use_control_v2: object | None = field(default=None, kw_only=True)
+    d13_derived_cache_maintenance_v2: object | None = field(default=None, kw_only=True)
 
     def __post_init__(self):
+        if self.d13_cache_use_control_v2 is not None or self.d13_derived_cache_maintenance_v2 is not None:
+            from ..runtime.d13_technical_policy import d13_cache_interval_v2, require_d13_cache_policy_installation_v2
+            require_d13_cache_policy_installation_v2(self.d13_cache_use_control_v2,
+                self.d13_derived_cache_maintenance_v2, self.installation_policy,
+                d13_interval=d13_cache_interval_v2(self.d13_precompression, self.d13_paid_precompression))
         if self.artifact_phase_observer is not None:
             from .artifact_phase_observer_policy_v2 import ArtifactPhaseObserverPolicyV2
             from .model_workflows_v9 import AdminModelWorkflowsV9
+            from .model_workflows_v10 import AdminModelWorkflowsV10
             observer=self.artifact_phase_observer
-            if (type(observer)is not ArtifactPhaseObserverPolicyV2 or type(self.model_workflows)is not AdminModelWorkflowsV9
+            if (type(observer)is not ArtifactPhaseObserverPolicyV2 or type(self.model_workflows)not in (AdminModelWorkflowsV9,AdminModelWorkflowsV10)
                     or self.model_workflows.artifact_observation_cognition is None
                     or canonical_digest(self.model_workflows.artifact_observation_cognition)!=observer.workflow_digest
                     or 'd07.cognition'not in self.installation_policy.root_grant.allowed_work_kinds):
@@ -1243,10 +1252,11 @@ class AdminInstallationBundle:
             from .model_workflows_v7 import AdminModelWorkflowsV7
             from .model_workflows_v8 import AdminModelWorkflowsV8
             from .model_workflows_v9 import AdminModelWorkflowsV9
+            from .model_workflows_v10 import AdminModelWorkflowsV10
             artifact = self.artifact_draft
             phase = artifact.phase_model_workflow
             policy = self.installation_policy
-            if (type(self.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+            if (type(self.model_workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10}
                     or artifact.model_workflow != self.model_workflows.artifact_draft
                     or type(self.foreground) is not AdminForegroundPolicyV1
                     or self.foreground.deadline_policy.draft_mode != "signed_scope_intersection_v1"
@@ -1277,7 +1287,8 @@ class AdminInstallationBundle:
         from .model_workflows_v7 import AdminModelWorkflowsV7
         from .model_workflows_v8 import AdminModelWorkflowsV8
         from .model_workflows_v9 import AdminModelWorkflowsV9
-        if type(self.model_workflows) not in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+        from .model_workflows_v10 import AdminModelWorkflowsV10
+        if type(self.model_workflows) not in {AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10}:
             raise ValueError("provider billing requires the actual installed workflow container")
         workflows = tuple(getattr(self.model_workflows, field.name) for field in fields(self.model_workflows)
             if field.name != "version")
@@ -1298,8 +1309,9 @@ def is_installed_life_numeric_slot_v1(bundle, workflow):
     from .model_workflows_v7 import AdminModelWorkflowsV7
     from .model_workflows_v8 import AdminModelWorkflowsV8
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
     return (type(bundle) is AdminInstallationBundle and type(workflow) is AdminModelWorkflowV2
-        and type(bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+        and type(bundle.model_workflows) in {AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10}
         and workflow is bundle.model_workflows.life_numeric
         and (workflow.work_kind, workflow.purpose, workflow.template_version) ==
             ('d06.encode_internal_life_numeric', 'consolidation', 'sylanne.d06.internal_life_numeric.v1'))
@@ -1314,7 +1326,8 @@ def is_installed_artifact_draft_slot_v1(bundle,workflow):
     from ..host.model_workflows_v7 import AdminModelWorkflowsV7
     from ..host.model_workflows_v8 import AdminModelWorkflowsV8
     from ..host.model_workflows_v9 import AdminModelWorkflowsV9
-    return (type(bundle.model_workflows) in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}
+    from ..host.model_workflows_v10 import AdminModelWorkflowsV10
+    return (type(bundle.model_workflows) in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10}
         and workflow is bundle.model_workflows.artifact_draft)
 
 
@@ -1715,9 +1728,10 @@ def _d13_wire_policy_from_payload(payload, policy):
         from .model_workflows_v7 import AdminModelWorkflowsV7
         from .model_workflows_v8 import AdminModelWorkflowsV8
         from .model_workflows_v9 import AdminModelWorkflowsV9
+        from .model_workflows_v10 import AdminModelWorkflowsV10
         from ..authority_service.d13_core_counter_contract_v1 import installed_d13_wire_policy_from_payload_v7
         from ..model_broker.natural_reply_history_v7 import TEMPLATE_VERSION
-        if type(workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9} or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
+        if type(workflows) not in {AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10} or workflows.natural_generation is None or workflows.natural_generation.template_version != TEMPLATE_VERSION:
             raise ValueError("D13 Core wire V7 requires the actual named V7 natural workflow")
         configured = installed_d13_wire_policy_from_payload_v7(raw)
     elif type(raw) is dict and raw.get("schema") == "sylanne3.d13.installed-wire-policy.v6":
@@ -1738,9 +1752,16 @@ def _d13_wire_policy_from_payload(payload, policy):
     return configured
 
 
+def _d13_cache_policy_pair_from_payload_v2(payload, policy):
+    from ..runtime.d13_technical_policy import d13_cache_policy_pair_from_payload_v2
+    return d13_cache_policy_pair_from_payload_v2(payload, policy, d13_policies=(
+        _d13_precompression_from_payload(payload, policy),
+        _d13_paid_precompression_from_payload(payload, policy)))
+
+
 def _valid_schema2_fields(payload: dict[str, object]) -> bool:
     return _PROFILE_FIELDS_V2 <= set(payload) <= (
-        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff", "foreground", "artifact_draft", "provider_billing_policy_v1", "d06_recall", "astrbot_namespace_v1", "artifact_phase_counter", "artifact_phase_observer", "method_measurement_policy", "contact_effect_accounting", "life_d04_before_capture_policy", "habit_runtime_policy"}
+        _PROFILE_FIELDS_V2 | {"ingress_clock", "ingress_encoding", "ingress_model", "workbench_origin", "d03_arrival", "d03_self_identity_projection", "d04_encoding_baseline", "d04_semantic_drive", "d06_first_ingress_c02", "d06_source_correction", "d06_private_reply_source", "d07_attention", "private_reply_dispatch", "d13_precompression", "d13_paid_precompression", "d13_wire_policy", "d13_wire_counter", "d04_joint_numeric", "model_workflows", "reverse_handoff", "foreground", "artifact_draft", "provider_billing_policy_v1", "d06_recall", "astrbot_namespace_v1", "artifact_phase_counter", "artifact_phase_observer", "method_measurement_policy", "contact_effect_accounting", "life_d04_before_capture_policy", "habit_runtime_policy", "d13_cache_use_control_v2", "d13_derived_cache_maintenance_v2"}
     )
 
 
@@ -2042,7 +2063,7 @@ def _ingress_model_from_payload(payload: dict[str, object]) -> AdminIngressModel
     })
 
 
-def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | None:
+def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkflowsV2 | AdminModelWorkflowsV3 | AdminModelWorkflowsV4 | AdminModelWorkflowsV5 | AdminModelWorkflowsV6 | AdminModelWorkflowsV7 | AdminModelWorkflowsV8 | AdminModelWorkflowsV9 | AdminModelWorkflowsV10 | None:
     if "model_workflows" not in payload:
         return None
     if payload.get("schema") != 2 or "ingress_model" in payload:
@@ -2050,6 +2071,11 @@ def _model_workflows_from_payload(payload: dict[str, object]) -> AdminModelWorkf
     raw_value = payload["model_workflows"]
     if type(raw_value) is not dict:
         raise ValueError("model workflows must be an object")
+    if raw_value.get("version") == 10:
+        if not {"foreground","artifact_draft","artifact_phase_observer"} <= set(payload):
+            raise ValueError("version-10 workflows require explicit inherited foreground, artifact, and observer policies")
+        from .model_workflows_v10 import model_workflows_v10_from_payload
+        return model_workflows_v10_from_payload(raw_value)
     if raw_value.get("version") == 9:
         if not {"foreground", "artifact_draft", "artifact_phase_observer"} <= set(payload):
             raise ValueError("version-9 workflows require foreground, artifact, and phase-observer policies")
@@ -2241,8 +2267,9 @@ def _artifact_draft_for_policy_from_payload_v1(payload, policy):
     from .model_workflows_v7 import AdminModelWorkflowsV7
     from .model_workflows_v8 import AdminModelWorkflowsV8
     from .model_workflows_v9 import AdminModelWorkflowsV9
+    from .model_workflows_v10 import AdminModelWorkflowsV10
     workflows = _model_workflows_from_payload(payload)
-    if type(workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9}:
+    if type(workflows) not in {AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10}:
         raise ValueError("draft requires version-4 workflows")
     if payload["artifact_draft"] is None:
         if workflows.artifact_draft is not None or foreground.deadline_policy.draft_mode is not None:
@@ -2321,7 +2348,8 @@ def _d13_paid_precompression_from_payload(
     from .model_workflows_v7 import AdminModelWorkflowsV7
     from .model_workflows_v8 import AdminModelWorkflowsV8
     from .model_workflows_v9 import AdminModelWorkflowsV9
-    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9)
+    from .model_workflows_v10 import AdminModelWorkflowsV10
+    if (type(workflows) not in (AdminModelWorkflowsV2, AdminModelWorkflowsV3, AdminModelWorkflowsV4, AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9,AdminModelWorkflowsV10)
             or type(workflows.reply) is not AdminModelWorkflowV2
             or "d13.precompress.paid.v1"
                not in policy.root_grant.allowed_work_kinds):
@@ -2488,32 +2516,23 @@ def _policy_from_payload(payload: dict[str, object]) -> AdminInstallationPolicy:
     return policy
 
 
-def _load_profile_from_root(profile_id: str, profile_root: Path,
-                            *, prepare_tls: bool = False) -> AuthorityTlsProfile:
-    """Internal schema-test seam; production requires prepare_tls=True."""
+def _load_profile_from_root(profile_id: str, profile_root: Path) -> AuthorityTlsProfile:
+    """Load a POSIX profile from pinned descriptors and prepare its TLS context."""
     _check_profile_id(profile_id)
     profile_root = Path(profile_root)
     if not profile_root.is_absolute():
         raise ValueError("administrator profile root must be absolute")
     profile_dir = profile_root / profile_id
     system = platform.system()
-    if system in {"Linux", "Darwin"}:
-        with _opened_profile(profile_dir, system) as files:
-            payload = _read_profile_json(files["profile.json"])
-            prepared = _prepared_ssl_context(files, system) if prepare_tls else None
-    else:
-        # Internal schema-test seam only. Production Windows uses pinned handles.
-        _check_posix_tree(profile_dir)
-        payload = _read_profile_json(profile_dir / "profile.json")
-        prepared = None
+    with _opened_profile(profile_dir, system) as files:
+        payload = _read_profile_json(files["profile.json"])
+        prepared = _prepared_ssl_context(files, system)
     return _profile_from_payload(profile_id, profile_dir, payload, prepared)
 
 
 def _build_transport_from_root(profile_id: str, profile_root: Path) -> MtlsAuthorityTransport:
     from .mtls_transport import MtlsAuthorityTransport
-    profile = _load_profile_from_root(profile_id, profile_root, prepare_tls=True)
-    if platform.system() in {"Linux", "Darwin"} and profile.prepared_ssl_context is None:
-        raise AuthorityProfileUnavailable("verified TLS context was not prepared")
+    profile = _load_profile_from_root(profile_id, profile_root)
     return MtlsAuthorityTransport({profile_id: profile})
 
 
@@ -2637,38 +2656,46 @@ def _load_installation_bundle_from_root(
         )
         reverse_handoff = _reverse_handoff_from_payload(
             payload, profile_dir, policy, material_present=reverse_material)
-    return AdminInstallationBundle(profile, policy, d11_key, d02_key,
-                                   _ingress_clock_from_payload(payload),
-                                   _ingress_encoding_from_payload(payload),
-                                   _workbench_origin_from_payload(payload),
-                                   _ingress_model_from_payload(payload),
-                                   _d03_arrival_from_payload(payload),
-                                   _model_workflows_from_payload(payload),
-                                   _d04_baseline_from_payload(payload),
-                                   _d06_c02_from_payload(payload),
-                                   _d03_projection_from_payload(payload),
-                                   _d06_source_correction_from_payload(payload),
-                                   reverse_handoff,
-                                   _d06_private_reply_source_from_payload(payload),
-                                    _d07_attention_from_payload(payload),
-                                    _private_reply_dispatch_from_payload(payload),
-                                    _d13_precompression_from_payload(payload, policy),
-                                    _d04_semantic_drive_from_payload(payload, policy),
-                                    _d13_paid_precompression_from_payload(payload, policy),
-                                    _d13_wire_policy_from_payload(payload, policy),
-                                    _d13_wire_counter_from_payload(payload),
-                                    _d04_joint_numeric_from_payload(payload, policy),
-                                     package_selection=getattr(files, 'selected_package', None),
-                                     foreground=_foreground_from_payload(payload),
-                                     artifact_draft=_artifact_draft_from_payload(payload),
-                                      provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
-                                      d06_recall=_d06_recall_from_payload(payload),
-                                      artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
-                                      method_measurement_policy=_method_measurement_policy_from_payload_v1(payload),
-                                      contact_effect_accounting=_contact_effect_accounting_from_payload_v1(payload),
-                                      life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(payload,policy),
-                                   habit_runtime_policy=_habit_runtime_policy_from_payload_v1(payload,policy),
-                                   artifact_phase_observer=_artifact_phase_observer_from_payload_v2(payload))
+        cache_use, cache_maintenance = _d13_cache_policy_pair_from_payload_v2(payload, policy)
+        bundle = AdminInstallationBundle(profile, policy, d11_key, d02_key,
+                                       _ingress_clock_from_payload(payload),
+                                       _ingress_encoding_from_payload(payload),
+                                       _workbench_origin_from_payload(payload),
+                                       _ingress_model_from_payload(payload),
+                                       _d03_arrival_from_payload(payload),
+                                       _model_workflows_from_payload(payload),
+                                       _d04_baseline_from_payload(payload),
+                                       _d06_c02_from_payload(payload),
+                                       _d03_projection_from_payload(payload),
+                                       _d06_source_correction_from_payload(payload),
+                                       reverse_handoff,
+                                       _d06_private_reply_source_from_payload(payload),
+                                        _d07_attention_from_payload(payload),
+                                        _private_reply_dispatch_from_payload(payload),
+                                        _d13_precompression_from_payload(payload, policy),
+                                        _d04_semantic_drive_from_payload(payload, policy),
+                                        _d13_paid_precompression_from_payload(payload, policy),
+                                        _d13_wire_policy_from_payload(payload, policy),
+                                        _d13_wire_counter_from_payload(payload),
+                                        _d04_joint_numeric_from_payload(payload, policy),
+                                         package_selection=getattr(files, 'selected_package', None),
+                                         foreground=_foreground_from_payload(payload),
+                                         artifact_draft=_artifact_draft_from_payload(payload),
+                                          provider_billing_policy_v1=_provider_billing_policy_from_payload_v1(payload),
+                                          d06_recall=_d06_recall_from_payload(payload),
+                                          artifact_phase_counter=_artifact_phase_counter_from_payload(payload, policy),
+                                          method_measurement_policy=_method_measurement_policy_from_payload_v1(payload),
+                                          contact_effect_accounting=_contact_effect_accounting_from_payload_v1(payload),
+                                          life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(payload,policy),
+                                       habit_runtime_policy=_habit_runtime_policy_from_payload_v1(payload,policy),
+                                       artifact_phase_observer=_artifact_phase_observer_from_payload_v2(payload),
+                                        d13_cache_use_control_v2=cache_use,
+                                        d13_derived_cache_maintenance_v2=cache_maintenance)
+
+        from ..authority_service.d13_pressure_policy_origin_v1 import _retain_loaded_d13_pressure_policy_v1
+        _retain_loaded_d13_pressure_policy_v1(bundle, files=files, profile_id=profile_id,
+            profile_dir=profile_dir, system=system, payload=payload)
+        return bundle
 
 
 def _load_windows_installation_bundle(
@@ -2693,6 +2720,7 @@ def _load_windows_installation_bundle(
         )
         reverse_handoff = _reverse_handoff_from_payload(
             payload, profile_dir, policy, material_present=reverse_material)
+    cache_use, cache_maintenance = _d13_cache_policy_pair_from_payload_v2(payload, policy)
     return AdminInstallationBundle(profile, policy, d11_key, d02_key,
                                    _ingress_clock_from_payload(payload),
                                    _ingress_encoding_from_payload(payload),
@@ -2723,7 +2751,9 @@ def _load_windows_installation_bundle(
                                       contact_effect_accounting=_contact_effect_accounting_from_payload_v1(payload),
                                       life_d04_before_capture_policy=_life_d04_before_capture_policy_from_payload_v1(payload,policy),
                                    habit_runtime_policy=_habit_runtime_policy_from_payload_v1(payload,policy),
-                                   artifact_phase_observer=_artifact_phase_observer_from_payload_v2(payload))
+                                   artifact_phase_observer=_artifact_phase_observer_from_payload_v2(payload),
+                                    d13_cache_use_control_v2=cache_use,
+                                    d13_derived_cache_maintenance_v2=cache_maintenance)
 
 
 def load_admin_installation_bundle(profile_id: str) -> AdminInstallationBundle:

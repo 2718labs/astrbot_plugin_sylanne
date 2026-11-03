@@ -107,6 +107,9 @@ def mixed_execution_facts_locked_v1(bridge,db,rows,permit):
         (SERIES,"series",bridge.core._execution_redaction_d04_series_services_v1,"verify_series_journal_row_v1"),
         (OFFLINE,"offline_tick",bridge.core._execution_redaction_d11_offline_services_v1,"verify_offline_tick_journal_row_v1"),
         (LIFE,"life",bridge.core._execution_redaction_d11_life_services_v1,"verify_life_journal_row_v1"))
+    from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT,decode_fact_row_v3
+    effects=bridge._unresolved_effects_locked(db,permit=permit,execution_rows=rows)
+    actual_effects={effect.effect_id:effect for effect in effects}
     facts={}
     for row in rows:
         selected=next(((family,registry,method) for prefix,family,registry,method in registries if row[4].startswith(prefix)),None)
@@ -124,6 +127,19 @@ def mixed_execution_facts_locked_v1(bridge,db,rows,permit):
             binding,claim,terminal=bridge.journal._decode_internal_row(row)
             digest=binding.binding_digest
             effect=None
+        elif row[4].startswith(FACT):
+            # The existing bridge verified the full current Fact ledger, committed
+            # receipt/fence, original dispatch predecessors, footprint and journal.
+            fact=decode_fact_row_v3(bridge.journal,row)
+            origin=fact.original_claimed_receipt.pending.permit
+            actual=actual_effects.get(origin.effect_id)
+            if (actual is None or origin.namespace!=bridge.namespace or origin.authority_id!=permit.authority_id
+                    or (actual.operation_id,actual.mutation_id,actual.execution_seq,actual.append_digest)!=(
+                        origin.operation_id,fact.mutation_id,row[0],row[6])):
+                raise AuthorityUnavailable('Life Fact row differs from its authenticated actual dispatch effect chain')
+            # This refines the one existing unresolved dispatch obligation below.
+            # It creates no execution claim, terminal, dispatch grant or new budget.
+            continue
         else:
             pending=decode_bytes(row[4])
             if type(pending) is not PendingMutationV2: raise AuthorityUnavailable("unregistered mixed execution row")
@@ -140,7 +156,6 @@ def mixed_execution_facts_locked_v1(bridge,db,rows,permit):
                 prior.claim_sequence,prior.claim_digest,row[0],row[6],
                 ("completed" if measurement.status == "chunk_completed" else measurement.status)
                     if family in {"numeric","authored_root","series"} else terminal.status)
-    effects=bridge._unresolved_effects_locked(db,permit=permit,execution_rows=rows)
     for e in effects:
         facts[("dispatch",e.effect_id)]=LifeMixedExecutionFactV1("dispatch",e.effect_id,e.effect_id,e.operation_id,
             canonical_digest(e),e.execution_seq,e.append_digest,None,None,"dispatch_unresolved")

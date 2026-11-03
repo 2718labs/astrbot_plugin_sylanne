@@ -29,15 +29,28 @@ def derive_d04_series_numeric_verification_v1(numeric, summary, *, package_root,
 
 
 def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp):
-    frozen = root.frozen
     decoded = decode_d04_numeric_prepared_input_v3(root.prepared)
-    preparation = decoded.preparation
-    current = preparation.current
+    numeric,output,summary=_derive_d04_series_final_model_v1(root,chunks,installed_policy,
+        adoption_stamp=adoption_stamp,current=decoded.preparation.current,predecessors=decoded.preparation.predecessors,
+        binding=root.prepared.binding)
+    return decoded,numeric,output,summary
+
+
+def derive_historical_d04_series_final_v1(root,chunks,installed_policy,model,*,adoption_stamp):
+    from .d04_numeric_artifact_v3 import HistoricalNumericModelMetadataV1
+    if type(model)is not HistoricalNumericModelMetadataV1 or model.binding!=root.binding:
+        raise TypeError('historical series requires its exact numeric-model metadata')
+    return _derive_d04_series_final_model_v1(root,chunks,installed_policy,adoption_stamp=adoption_stamp,
+        current=model.current,predecessors=model.predecessors,binding=model.binding)
+
+
+def _derive_d04_series_final_model_v1(root,chunks,installed_policy,*,adoption_stamp,current,predecessors,binding):
+    frozen=root.frozen
     math_members = read_d04_series_final_members_v1(frozen, chunks, root_digest=root.digest)
     endpoint = chunks[-1].endpoints[0]
     policy = installed_policy.policy
-    if (installed_policy.manifest_sha256 != root.prepared.binding.native_manifest_sha256
-            or policy.digest != root.prepared.binding.output_policy_digest
+    if (installed_policy.manifest_sha256 != binding.native_manifest_sha256
+            or policy.digest != binding.output_policy_digest
             or frozen.readout.asset_sha256 != policy.readout_sha256
             or frozen.readout.readout_id != policy.readout_id):
         raise ValueError("series installed final output policy differs")
@@ -51,8 +64,8 @@ def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp
         trajectory_schema="d04.joint-product-series-prefix.v1")
     numeric = compile_joint_numeric_receipt_candidate_v1(component=current.component, math_result=summary,
         drives=current.drives, families=current.families, operator_version=root.payload["operator_version"],
-        native_manifest_sha256=root.prepared.binding.native_manifest_sha256,
-        native_sha256=root.prepared.binding.native_sha256, native_abi_version=2)
+        native_manifest_sha256=binding.native_manifest_sha256,
+        native_sha256=binding.native_sha256, native_abi_version=2)
     # The frozen mathematical component retains its original stamp. The final
     # atomic write is pinned to the current stamp after proven own CPU events.
     content = {field.name: getattr(numeric, field.name) for field in fields(numeric)
@@ -60,7 +73,7 @@ def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp
     content.update(graph_revision=adoption_stamp[0], graph_epoch=adoption_stamp[1])
     numeric = type(numeric)(**content, receipt_digest=canonical_digest(content))
     members = []
-    for index, (prior, math_member) in enumerate(zip(preparation.predecessors.members, math_members)):
+    for index, (prior, math_member) in enumerate(zip(predecessors.members, math_members)):
         values = endpoint.output[index * 24:(index + 1) * 24]
         boxes, scalar_error = read_d04_series_certified_box_v1(chunks[-1], values, endpoint.trajectory_error, policy)
         if (len(math_member.full.outputs) != 24 or math_member.full.asset_sha256 != policy.readout_sha256
@@ -98,7 +111,7 @@ def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp
             certificate_digest=canonical_digest(("d04.series-endpoint-certificate.v1", root.digest, prefix,
                 prior.checkpoint_ref, values, boxes, scalar_error, policy.digest)), cursor=frozen.plan.role_end,
             graph_state=CommittedRef(prior.state_ref, prior.state_revision + 1), readout_proof_digest=readout_digest,
-            commit_operation_id=preparation.predecessors.operation_id, predecessor_receipt_digest=prior.predecessor_receipt_digest)
+            commit_operation_id=predecessors.operation_id, predecessor_receipt_digest=prior.predecessor_receipt_digest)
         if current.component.root_original_digest is not None:
             checkpoint_changes["status"] = "trusted_joint_advance"
         else:
@@ -118,7 +131,7 @@ def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp
         for axis in member.axes:
             bits.extend(_bits(value) for value in (axis.certified_lower, axis.certified_upper, axis.representative, axis.representative_error))
     data = dict(schema="d04.joint-state-output.v2" if current.component.root_original_digest is not None else "d04.joint-state-output.v1",
-        namespace=numeric.namespace, operation_id=preparation.predecessors.operation_id, component_digest=numeric.component_digest,
+        namespace=numeric.namespace, operation_id=predecessors.operation_id, component_digest=numeric.component_digest,
         graph_incarnation=numeric.graph_incarnation, graph_revision=numeric.graph_revision, graph_epoch=numeric.graph_epoch,
         access_epoch=numeric.access_epoch, delete_epoch=numeric.delete_epoch, role_start=numeric.role_start, role_end=numeric.role_end,
         member_refs=numeric.member_refs, axis_ids=REGISTERED_AXIS_IDS, full_transcript_sha256=prefix,
@@ -129,4 +142,4 @@ def derive_d04_series_final_v1(root, chunks, installed_policy, *, adoption_stamp
         native_trajectory_error_2norm=endpoint.trajectory_error, members=members, write_set_digest=canonical_digest(_write_set(members)),
         binary64_bits_digest=canonical_digest(tuple(bits)))
     output = JointStateOutputOriginalV1(**data, original_digest=canonical_digest(data))
-    return decoded, numeric, output, summary
+    return numeric, output, summary

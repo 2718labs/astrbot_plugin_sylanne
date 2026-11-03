@@ -24,7 +24,7 @@ from ..runtime_storage_v3 import (
 from ..authority_service.contract import AuthorityUnavailable
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
 from .c09_graph_row_codec_v2 import (
-    C09MemorySourceJSONStreamV3, C09MemoryAccessJSONStreamV3,
+    C09MemoryAccessJSONStreamV3,
 )
 
 _QUALIFIED = object()
@@ -49,8 +49,8 @@ def _heap(value, seen=None):
 
 class _InterpretationJSONStreamV3(C09CanonicalJSONStreamV2):
     """Registered interpretation metadata, including its bounded claim."""
-    def __init__(self, owner):
-        super().__init__(ensure_ascii=True)
+    def __init__(self, owner, *, ensure_ascii):
+        super().__init__(ensure_ascii=ensure_ascii)
         self.owner = owner
         self.fields, self.metadata, self.scalar = set(), {}, bytearray()
 
@@ -109,6 +109,8 @@ class _SourceFamilyQualificationV3:
                 or read_scope.operation_id != reader.storage_lease.operation_id
                 or reader.storage_lease.selection_digest != reader.selection_digest):
             raise AuthorityUnavailable('completed same-operation Source family qualification differs')
+        with runtime_storage_quantum_v3(db) as meter:
+            reader.require_metadata_current_v3(meter)
         return reader.families[roots]
 
 
@@ -148,6 +150,9 @@ class SourceCorrectionContextReadV3:
         self.cell, self.parser, self.cell_kind, self.cell_token = None, None, None, None
         self.fragment, self.fragment_offset = b'', 0
         self.final_tokens, self.final_index = (), 0
+        self.inspection_owner = None
+        self.inspection_tasks = {}
+        self.inspection_pending = None
         self._reserved = 0
         self._reserve(32768)
 
@@ -189,16 +194,75 @@ class SourceCorrectionContextReadV3:
             raise AuthorityUnavailable('current Source correction member is absent')
         self._reserve(32768)
         self.cell = begin_runtime_cell_read_v3(self.db, head[2])
-        if self.cell.header[0] != 'canonical-json.ascii.v1':
-            raise AuthorityUnavailable('Source correction requires its actual canonical ASCII JSON codec')
+        if self.cell.header[0] not in {'canonical-json.ascii.v1', 'canonical-json.utf8.v1'}:
+            raise AuthorityUnavailable('Source correction requires its actual canonical JSON codec')
         self.cell_kind, self.cell_token = kind, token
-        if kind == 'source':
-            self.parser = C09MemorySourceJSONStreamV3(ensure_ascii=True)
-        elif kind == 'access':
-            self.parser = C09MemoryAccessJSONStreamV3(ensure_ascii=True)
+        ascii_codec = self.cell.header[0] == 'canonical-json.ascii.v1'
+        if kind == 'access':
+            self.parser = C09MemoryAccessJSONStreamV3(ensure_ascii=ascii_codec)
+        elif kind == 'interpretation':
+            original = self.inspection_tasks[token].result.require_v3(self.inspection_owner, meter)
+            if (head[0], bool(head[1]), head[2], tuple(self.cell.header)) != (
+                    original.revision, original.valid, original.cell_id, original.header):
+                raise AuthorityUnavailable('qualified Interpretation target header differs')
+            self.parser = _InterpretationJSONStreamV3(self, ensure_ascii=ascii_codec)
         else:
-            self.parser = _InterpretationJSONStreamV3(self)
+            raise AuthorityUnavailable('Source qualification never opens Source text')
         self.fragment, self.fragment_offset = b'', 0
+
+    def _metadata_open_v3(self, token, kind, meter):
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
+        self._head(token, meter)
+        task = InspectionMetadataReadV3(self.inspection_owner, AtomKey.from_token(token))
+        self.inspection_tasks[token] = task
+        self.inspection_pending = (task, kind, token)
+
+    def _metadata_step_v3(self, meter):
+        task, kind, token = self.inspection_pending
+        task.advance(meter)
+        if not task.complete:
+            return
+        original = task.result.require_v3(self.inspection_owner, meter)
+        if (original.revision, int(original.valid), original.cell_id) != self.heads[token]:
+            raise AuthorityUnavailable('inspection metadata differs from the selected correction head')
+        data = dict(original.metadata)
+        self.inspection_pending = None
+        if kind == 'source':
+            self.sources[token] = (data, original.semantic_digest)
+            self._source_loaded(token)
+        else:
+            self.scan_root = canonical_digest(('d12.source-correction-interpretation-scan.v3',
+                self.scan_root, token, original.revision, original.semantic_digest))
+            self.scan_count += 1
+            if self.source_id in data['source_ids']:
+                if len(self.targets) >= 100:
+                    raise AuthorityUnavailable('correction target page exceeds its bounded contract')
+                self.pending_target = {'target_ref': token, 'revision': original.revision,
+                                       'digest': original.semantic_digest}
+                roots = tuple(source_key(*self.namespace.as_tuple, sid).token for sid in data['source_ids'])
+                self._family(roots, 'target')
+            else:
+                task.release_v3()
+                del self.inspection_tasks[token]
+                del self.heads[token]
+                self.phase = 'scan'
+        self._reserve()
+
+    def require_metadata_current_v3(self, meter):
+        if self._epochs(meter) != self.epochs:
+            raise AuthorityUnavailable('Source correction access/deletion epochs changed')
+        for token in self.heads:
+            self._head(token, meter)
+        for task in self.inspection_tasks.values():
+            task.require_current_v3(meter)
+
+    def release_v3(self):
+        for task in self.inspection_tasks.values():
+            task.release_v3()
+        self.inspection_tasks.clear()
+        self.inspection_pending = None
+        self.cell = self.parser = None
+        self.fragment = b''
 
     def _family(self, roots, after):
         self.family_roots, self.family_after = tuple(roots), after
@@ -217,35 +281,20 @@ class SourceCorrectionContextReadV3:
 
     def _cell_complete(self, digest):
         kind, token, parser = self.cell_kind, self.cell_token, self.parser
-        if kind == 'source':
-            data = parser._source_metadata
-            if source_key(*self.namespace.as_tuple, data['source_id']).token != token:
-                raise AuthorityUnavailable('Source canonical key/payload identity differs')
-            self.sources[token] = (data, digest)
-            self._source_loaded(token)
-        elif kind == 'access':
+        if kind == 'access':
             self.accesses[token] = parser.metadata
         else:
-            self.scan_root = canonical_digest(('d12.source-correction-interpretation-scan.v3',
-                self.scan_root, token, self.heads[token][0], digest))
-            self.scan_count += 1
             record = parser.record
-            if interpretation_key(*self.namespace.as_tuple, record.interpretation_id).token != token:
-                raise AuthorityUnavailable('interpretation canonical key/payload identity differs')
-            if self.source_id in record.source_ids:
-                if len(self.targets) >= 100:
-                    raise AuthorityUnavailable('correction target page exceeds its bounded contract')
-                self.pending_target = {'target_ref': token, 'revision': self.heads[token][0],
-                                       'digest': digest, 'claim': record.claim}
-                self._reserve(sum(len(sid) * 12 + 512 for sid in record.source_ids) + 16384)
-                roots = tuple(source_key(*self.namespace.as_tuple, sid).token for sid in record.source_ids)
-                self._family(roots, 'target')
-            else:
-                # Unselected rows have complete canonical/origin proof but no
-                # target dependency. The caller's original graph epoch closes
-                # scan phantoms; keep only the keyset cursor across rows.
-                del self.heads[token]
-                self.phase = 'scan'
+            original = self.inspection_tasks[token].result
+            metadata = {'interpretation_id': record.interpretation_id, 'status': record.status,
+                        'source_ids': tuple(record.source_ids)}
+            if (metadata != dict(original.metadata) or canonical_digest(record.to_dict()) != original.semantic_digest
+                    or digest != original.payload_sha256):
+                raise AuthorityUnavailable('qualified Interpretation Body differs from its inspection original')
+            self.pending_target['claim'] = record.claim
+            self.targets.append(self.pending_target)
+            self.pending_target = None
+            self.phase = 'scan'
         self.cell, self.parser = None, None
         self.fragment, self.fragment_offset = b'', 0
         self._reserve()
@@ -269,6 +318,10 @@ class SourceCorrectionContextReadV3:
             raise AuthorityUnavailable('Source correction parser and sealed cell EOF differ')
         self._cell_complete(digest)
 
+    @property
+    def source_limit_v3(self):
+        return 32
+
     def _family_step(self, meter):
         if not self.jobs:
             versions = tuple(GraphVersion(AtomKey.from_token(token), self.heads[token][0])
@@ -276,9 +329,11 @@ class SourceCorrectionContextReadV3:
             self._reserve(_heap(versions) + 16384)
             self.families[self.family_roots] = versions
             if self.family_after == 'target':
-                self.targets.append(self.pending_target)
-                self.pending_target = None
-            self.phase = 'scan'
+                self.require_metadata_current_v3(meter)
+                self._open(self.pending_target['target_ref'], 'interpretation', meter)
+                self.phase = 'target_body'
+            else:
+                self.phase = 'scan'
             return
         kind, token = self.jobs.pop()
         key = AtomKey.from_token(token)
@@ -289,14 +344,14 @@ class SourceCorrectionContextReadV3:
                 raise AuthorityUnavailable('Source ancestry is cyclic')
             if token in self.done:
                 return
-            if len(self.done) + len(self.active) >= 32:
+            if len(self.done) + len(self.active) >= self.source_limit_v3:
                 raise AuthorityUnavailable('Source closure exceeds its bounded window')
             self.active.add(token)
             self.family_keys.add(token)
             if token in self.sources:
                 self._source_loaded(token)
             else:
-                self._open(token, 'source', meter)
+                self._metadata_open_v3(token, 'source', meter)
         elif kind == 'exit':
             self.active.remove(token)
             self.done.add(token)
@@ -329,7 +384,11 @@ class SourceCorrectionContextReadV3:
         return tuple(row)
 
     def _step(self, meter):
-        if self.cell is not None:
+        if self.inspection_pending is not None:
+            self._metadata_step_v3(meter)
+        elif self.cell is not None:
+            if self.cell_kind == 'interpretation':
+                self.require_metadata_current_v3(meter)
             self._cell_step(meter)
         elif self.phase == 'epochs':
             self.epochs = self._epochs(meter)
@@ -348,7 +407,7 @@ class SourceCorrectionContextReadV3:
                 self.phase = 'recheck'
             else:
                 self.cursor = row[0]
-                self._open(self.cursor, 'interpretation', meter)
+                self._metadata_open_v3(self.cursor, 'interpretation', meter)
         elif self.phase == 'recheck':
             if self.final_index < len(self.final_tokens):
                 token = self.final_tokens[self.final_index]
@@ -377,22 +436,73 @@ class SourceCorrectionContextReadV3:
             raise AuthorityUnavailable('Source correction read already completed')
         with bind_runtime_storage_operation_v3(self.storage_lease, self.db):
             with runtime_storage_quantum_v3(self.db) as meter:
-                self._step(meter)
+                if self.db.in_transaction:
+                    raise AuthorityUnavailable('Source inspection quantum requires its own READ transaction')
+                self.db.execute('BEGIN')
+                try:
+                    self._step(meter)
+                finally:
+                    self.db.rollback()
         return self
 
 
 class PersonalEligibilityRecoverySourcesV1(SourceCorrectionContextReadV3):
     """Exact family-only front door; it never scans Interpretation claim bodies."""
-    def __init__(self,db,*,roots,namespace,storage_lease,read_scope,graph_stamp,purpose,audiences):
+    def __init__(self,db,*,roots,namespace,storage_lease,read_scope,graph_stamp,purpose,audiences,expected_versions):
         roots=tuple(roots)
         if not roots or len(roots)>32:raise AuthorityUnavailable("finite saved eligibility Source roots required")
         super().__init__(db,namespace=namespace,source_id=AtomKey.from_token(roots[0]).owner.subject,
             storage_lease=storage_lease,read_scope=read_scope,graph_stamp=graph_stamp,
             purpose=purpose,audiences=audiences)
         self.saved_roots=roots
+        self.expected_versions={version.key.token:version.revision for version in expected_versions
+                                if version.key.type_name=='memory.source'}
+        if set(self.expected_versions)!=set(roots):
+            raise AuthorityUnavailable('saved Source roots differ from the actual original readset')
+    def _head(self,token,meter):
+        head=super()._head(token,meter)
+        expected=self.expected_versions.get(token)
+        if expected is not None and head[0]!=expected:
+            raise AuthorityUnavailable('saved eligibility Source revision changed before original Body')
+        return head
     def _step(self,meter):
-        if self.cell is None and self.phase=="epochs":
+        if self.cell is None and self.inspection_pending is None and self.phase=="epochs":
             self.epochs=self._epochs(meter);self._family(self.saved_roots,"eligibility");return
-        if self.cell is None and self.phase=="scan":
+        if self.cell is None and self.inspection_pending is None and self.phase=="scan":
             self.scan_complete=True;self.final_tokens=tuple(sorted(self.heads));self.phase="recheck";return
+        super()._step(meter)
+
+
+class SourceCorrectionCommitFamilyV3(SourceCorrectionContextReadV3):
+    """The existing correction commit's 256-Source family; no Body or preview scan."""
+    def __init__(self, owner, roots):
+        from .source_correction_commit_read_v3 import require_source_correction_commit_owner_v3
+        require_source_correction_commit_owner_v3(owner)
+        roots=tuple(roots)
+        if not roots or len(roots)>256 or len(set(roots))!=len(roots):
+            raise AuthorityUnavailable('correction commit Source roots exceed their original closure')
+        for ref in roots:
+            key=AtomKey.from_token(ref)
+            if key!=source_key(*owner.namespace.as_tuple,key.owner.subject):
+                raise AuthorityUnavailable('correction commit root is not its canonical namespace Source')
+        super().__init__(owner.db,namespace=owner.namespace,
+            source_id=AtomKey.from_token(roots[0]).owner.subject,storage_lease=owner.operation,
+            read_scope=owner.fence.scope,graph_stamp=owner.graph_stamp,purpose='context',audiences=('owner',))
+        self.saved_roots=roots
+        self.inspection_owner=owner
+
+    @property
+    def source_limit_v3(self):
+        return 256
+
+    def _step(self,meter):
+        if self.cell is None and self.inspection_pending is None and self.phase=='epochs':
+            self.epochs=self._epochs(meter)
+            self._family(self.saved_roots,'correction_commit')
+            return
+        if self.cell is None and self.inspection_pending is None and self.phase=='scan':
+            self.scan_complete=True
+            self.final_tokens=tuple(sorted(self.heads))
+            self.phase='recheck'
+            return
         super()._step(meter)

@@ -66,6 +66,8 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         self._executor, self._subject = canonical_serialize(identity), "d11-life:" + installation_id
         self._execution_lock = threading.RLock()
         self._claim_clock = None
+        self._character_labor_claim_v1 = None
+        self._current_character_labor_source_work_v1 = None
         from .current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
         from ..runtime.c09_installation_inventory_v2 import InstallationFilesystemManifestV2
         if current_source_location is not None and (type(current_source_location) is not InstalledCurrentSourceLocationQualifierV1
@@ -104,6 +106,12 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         if draft_inventory_manifest is not None:
             from .v2_worker_model_result_attempts import AuthorityV2WorkerModelResultAttempts
             self.draft_read_attempts = AuthorityV2WorkerModelResultAttempts(bridge.core._db, create=False, lock=bridge.core._lock)
+        self.character_labor_census_v1 = None
+        if current_source_location is not None and installed_bundle is not None:
+            from .current_authority_graph_read_v3 import install_authority_graph_read_controller_v3
+            install_authority_graph_read_controller_v3(self, service=self, source_location=current_source_location)
+            from .character_labor_census_v1 import InstalledCharacterLaborCensusServiceV1
+            self.character_labor_census_v1 = InstalledCharacterLaborCensusServiceV1(self)
 
     def observe_owner_artifact_for_fence_v1(self, **request):
         from .d12_owner_artifact_read_v1 import observe_owner_artifact_for_fence_v1
@@ -187,6 +195,11 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                 permit, row = self._gate(core_db, binding, "claim")
                 if row[6] != "active": raise AuthorityUnavailable("Life admission lacks its real active once gate")
         inventory = self.read_d11_life_execution_inventory_v1(permit=permit,binding=binding)
+        if type(binding) is D11LifeExecutionBindingV1:
+            selected = self._read_character_labor_source_v1(binding, permit=permit,
+                for_execution=for_execution, inventory=inventory)
+            if selected is not None:
+                return selected
         if type(binding) is D11DraftExecutionBindingV1:
             self._draft_reply_scopes[binding.execution_id] = (
                 self._observe_draft_reply_scope_v1(binding),
@@ -195,7 +208,7 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         if type(binding) is D11DraftExecutionBindingV1:
             if self.current_source_location is None or self.draft_inventory_manifest is None:
                 raise AuthorityUnavailable("actual installed draft Source qualifier/filesystem inventory unavailable")
-            claim, _ = self.read_d11_life_original_v1(binding)
+            claim, _ = self.read_own_d11_draft_execution_original_v1(binding)
             if claim is None:
                 location = self.current_source_location.observe_d11_life_claim_for_fence_v1(
                     credential=self.credential, subject=self._subject, permit=permit,service=self,binding=binding)
@@ -242,6 +255,89 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
             return prepared
         finally:
             db.close()
+
+    def _read_character_labor_source_v1(self, binding, *, permit, for_execution, inventory):
+        from .current_authority_graph_read_v3 import (
+            begin_authority_graph_read_work_v3, read_authority_graph_current_v3)
+        from .character_labor_source_read_v1 import (
+            CharacterLaborSourceReadRequestV1, _LegacyFixedSelectionV1,
+            character_labor_source_outcome_v1, require_character_labor_legacy_selection_v1)
+        if self._current_character_labor_source_work_v1 is not None:
+            raise AuthorityUnavailable("Life cannot replace its retained same-call Source Work")
+        request = CharacterLaborSourceReadRequestV1(binding,
+            "character-labor-admission:" + binding.execution_id, None,
+            phase="claim" if for_execution else "adoption")
+        deadline = min(_utc(binding.deadline_utc).timestamp(),
+            _utc(binding.job_lease_expires_utc).timestamp()) if for_execution else None
+        work = begin_authority_graph_read_work_v3(self, credential=self.credential,
+            subject=permit.subject, permit=permit, namespace=self.namespace, request=request,
+            parent_original_id=binding.prepare_operation_id, now_utc=self._now(), deadline_utc=deadline)
+        self._current_character_labor_source_work_v1 = work
+
+        def selected(db):
+            outcome = character_labor_source_outcome_v1(self, work)
+            if type(outcome) is _LegacyFixedSelectionV1:
+                require_character_labor_legacy_selection_v1(outcome, service=self, work=work)
+                return None
+            prepared, admission, body = outcome
+            if not for_execution:
+                return prepared
+            from ..runtime.d04_life_before_original_v1 import require_life_d04_before_for_claim_v1
+            from ..runtime.d08_life_admission_v1 import (
+                InstalledLifeAdmissionReaderV1, require_current_life_action_admission_v1)
+            from ..runtime_contracts import FenceScope
+            from ..graph_types import NamespaceEpoch
+            require_life_d04_before_for_claim_v1(db, prepared=prepared, issuer=self.issuer)
+            scope = FenceScope(binding.namespace, binding.authority_namespace,
+                binding.activation_generation, permit.operation, permit.operation_id, permit,
+                permit.pinned_anchor, NamespaceEpoch(*binding.namespace.as_tuple, prepared.graph_epoch),
+                prepared.graph_revision)
+            from .character_labor_body_readers_v1 import create_authority_character_labor_body_readers_v1
+            labor_body_readers = create_authority_character_labor_body_readers_v1(work)
+            reader = InstalledLifeAdmissionReaderV1(issuer=self.issuer,
+                resource_issuer=self.resource_issuer, body_quote_authority=self.body_authority,
+                execution_inventory=inventory, scope=scope, labor_body_readers=labor_body_readers)
+            require_current_life_action_admission_v1(db, prepared=prepared, reader=reader, now_utc=self._now())
+            from ..runtime.d08_project_control_v1 import require_prepared_project_control_for_new_work_v1
+            require_prepared_project_control_for_new_work_v1(db, prepared=prepared)
+            return prepared
+
+        prepared = read_authority_graph_current_v3(work, selected)
+        if prepared is not None and for_execution:
+            from ..runtime.d11_character_work_segment_v1 import qualify_character_labor_claim_v1
+            from ..runtime.d10_offline_tick_execution_v1 import _decode_json
+            from ..runtime.clock import CharacterClockMapping
+            self._character_labor_claim_v1 = qualify_character_labor_claim_v1(self, work)
+            self._claim_clock = _decode_json(prepared.clock_mapping_json, CharacterClockMapping)
+        return prepared
+
+    def _finish_character_labor_source_v1(self):
+        work = self._current_character_labor_source_work_v1
+        if work is None:
+            return
+        from .current_authority_graph_read_v3 import (
+            finish_authority_graph_read_work_v3, actual_authority_graph_release_v3)
+        finish_authority_graph_read_work_v3(work)
+        if actual_authority_graph_release_v3(work) is not work.operation or not work.operation.closed:
+            if work.failure is not None:
+                raise work.failure
+            raise AuthorityUnavailable("Life final retention is not actually released")
+        if self._character_labor_claim_v1 is not None:
+            from ..runtime.d11_character_work_segment_v1 import release_character_labor_claim_qualification_v1
+            release_character_labor_claim_qualification_v1(self._character_labor_claim_v1)
+            self._character_labor_claim_v1 = None
+        self._current_character_labor_source_work_v1 = None
+
+    def _read_own_life_originals_v1(self, binding):
+        from .d11_life_execution_owner_v1 import _CURRENT, read_own_d11_life_originals_v1
+        return read_own_d11_life_originals_v1(_CURRENT.get(), binding)
+
+    def _own_life_owner_for_claim_v1(self, binding, permit):
+        from .d11_life_execution_owner_v1 import observe_d11_life_execution_owner_v1
+        work = self._current_character_labor_source_work_v1
+        if work is None or work.request.binding != binding or work.permit != permit:
+            raise AuthorityUnavailable("Life Owner requires its retained actual same-claim Source Work")
+        return observe_d11_life_execution_owner_v1(work)
 
     def _payload(self, kind, **values):
         if kind in LIFE_START_TYPES:
@@ -325,6 +421,28 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         from .d11_life_execution_inventory_v1 import read_life_execution_inventory_v1
         return read_life_execution_inventory_v1(self, permit=permit, binding=binding)
 
+    def read_own_d11_life_execution_original_v1(self, binding):
+        """Installed execution caller's own facts; this never grants accounting or a claim."""
+        if type(binding) is not D11LifeExecutionBindingV1:
+            raise AuthorityUnavailable("own execution lookup accepts the exact SourceNote binding only")
+        self._binding(binding)
+        self.bridge.core._require(self.credential,"execution",self.bridge.namespace)
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
+        with self._execution_lock:
+            with own_d11_life_execution_invocation_v1(self,binding,phase="execute"):
+                return self._read_own_life_originals_v1(binding)
+
+    def read_own_d11_draft_execution_original_v1(self, binding):
+        """Draft-only execution/current fact lookup, independent of accounting permission."""
+        if type(binding) is not D11DraftExecutionBindingV1:
+            raise AuthorityUnavailable("own Draft lookup accepts its exact installed Draft binding only")
+        self._binding(binding)
+        self.bridge.core._require(self.credential,"execution",self.bridge.namespace)
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
+        with self._execution_lock:
+            with own_d11_life_execution_invocation_v1(self,binding,phase="execute"):
+                return self._read_own_life_originals_v1(binding)
+
     def read_d11_life_original_v1(self, binding):
         from .d11_life_historical_accounting_v1 import _scope
         _scope(self, binding)
@@ -351,7 +469,36 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
 
     def life_adoption_bridge_v1(self, binding, *, action, gate=None, outcome=None):
         from .d11_life_bridge_v1 import operate_life_adoption_bridge_v1
-        return operate_life_adoption_bridge_v1(self, binding, action, gate, outcome)
+        with self._execution_lock:
+            return operate_life_adoption_bridge_v1(self, binding, action, gate, outcome)
+
+    def read_d11_character_work_segment_for_fence_v1(self, *, binding, permit):
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
+        from ..runtime.d11_character_work_segment_v1 import issue_character_work_segment_original_v1
+        if type(binding) is not D11LifeExecutionBindingV1:
+            raise AuthorityUnavailable("character labor is the explicit installed source-note variant")
+        self._binding(binding)
+        with self._execution_lock:
+            with own_d11_life_execution_invocation_v1(self, binding,
+                    phase="adoption_metadata", permit=permit):
+                owned = self._current_character_labor_source_work_v1 is None
+                try:
+                    if owned:
+                        self._read_character_labor_source_v1(binding, permit=permit,
+                            for_execution=False, inventory=None)
+                    work = self._current_character_labor_source_work_v1
+                    if (work.request.binding != binding or work.permit != permit
+                            or work.request.phase != "adoption"):
+                        raise AuthorityUnavailable("character segment crossed its actual retained adoption Work")
+                    return issue_character_work_segment_original_v1(self, work)
+                except BaseException as error:
+                    retained = self._current_character_labor_source_work_v1
+                    if retained is not None and retained.failure is None:
+                        retained.failure = error
+                    raise
+                finally:
+                    if owned:
+                        self._finish_character_labor_source_v1()
 
     def life_historical_accounting_v1(self, binding, *, action, gate=None):
         from .d11_life_historical_accounting_v1 import operate_life_historical_accounting_v1
@@ -435,7 +582,7 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                 if admission.request_parameters_json != canonical_serialize(parameters):
                     raise AuthorityUnavailable("draft observation frozen parameters changed")
                 prepared = read_prepared_life_v1(db, binding=binding, issuer=self.issuer)
-                claim, terminal = self.read_d11_life_original_v1(binding)
+                claim, terminal = self.read_own_d11_draft_execution_original_v1(binding)
                 if prepared is None or terminal is None or terminal.original_ref != admission.original_terminal_ref:
                     raise AuthorityUnavailable("draft observation actual original terminal/preparation unavailable")
                 if canonical_digest(terminal) != admission.original_terminal_digest:
@@ -535,8 +682,28 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
             return result
 
     def recover_claimed_d11_life_v1(self, binding):
+        if type(binding) is D11DraftExecutionBindingV1:
+            return self._recover_claimed_original_v1(binding, self.read_own_d11_draft_execution_original_v1)
+        self._binding(binding)
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
         with self._execution_lock:
-            claim, terminal = self.read_d11_life_original_v1(binding)
+            with own_d11_life_execution_invocation_v1(self, binding, phase="execute"):
+                try:
+                    return self._recover_owned_source_note_v1(binding)
+                except BaseException as error:
+                    retained = self._current_character_labor_source_work_v1
+                    if retained is not None and retained.failure is None:
+                        retained.failure = error
+                    raise
+                finally:
+                    self._finish_character_labor_source_v1()
+
+    def _recover_owned_source_note_v1(self, binding):
+        return self._recover_claimed_original_v1(binding, self._read_own_life_originals_v1)
+
+    def _recover_claimed_original_v1(self, binding, read_original):
+        with self._execution_lock:
+            claim, terminal = read_original(binding)
             if claim is None:
                 raise AuthorityUnavailable("Life closed recovery requires actual consumed claim")
             continuation = self._recover_committed_append(binding)
@@ -557,71 +724,93 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                     reason_code="executor_quiesced_measurement_lost", completed_at_utc=self._utc_text(self._now()),
                     character_at=None, postcondition_build_digest=binding.postcondition_build_digest, **extra)
                 self._terminal(binding, claim, continuation, payload)
-            return self.read_d11_life_original_v1(binding)
+            return read_original(binding)
 
     def execute_d11_life_v1(self, binding):
         if type(binding) is D11DraftExecutionBindingV1:
             return self._execute_artifact_draft_v1(binding)
         self._binding(binding)
         self.bridge.core._require(self.credential, "execution", self.bridge.namespace)
+        from .d11_life_execution_owner_v1 import own_d11_life_execution_invocation_v1
         with self._execution_lock:
-            claim, terminal = self.read_d11_life_original_v1(binding)
-            if claim is not None:
-                return self.recover_claimed_d11_life_v1(binding)
-            try:
-                prepared, claim, continuation = self._claim(binding)
-            except BaseException:
-                self._close_unclaimed_gate(binding)
-                raise
-            from ..runtime.d11_life_source_note_v1 import generate_source_note_bytes_v1, write_life_artifact_stage_v1, verify_durable_life_artifact_v1
-            start = time.thread_time_ns()
-            reason, digest, length = None, None, None
-            phase = "computation_failed"
-            try:
-                data = generate_source_note_bytes_v1(prepared)
-                phase = "artifact_stage_failed"
-                db = sqlite3.connect(self.graph_path, isolation_level=None)
+            with own_d11_life_execution_invocation_v1(self, binding, phase="execute"):
                 try:
-                    db.execute("BEGIN IMMEDIATE")
-                    write_life_artifact_stage_v1(db, prepared, data)
-                    db.execute("COMMIT")
-                    phase = "postcondition_failed"
-                    db.execute("PRAGMA query_only=ON")
-                    db.execute("BEGIN")
-                    _, digest, length = verify_durable_life_artifact_v1(db, prepared)
-                    db.execute("COMMIT")
+                    return self._execute_owned_source_note_v1(binding)
+                except BaseException as error:
+                    retained = self._current_character_labor_source_work_v1
+                    if retained is not None and retained.failure is None:
+                        retained.failure = error
+                    raise
                 finally:
-                    db.close()
-            except Exception:
-                reason = phase
+                    self._finish_character_labor_source_v1()
+
+    def _execute_owned_source_note_v1(self, binding):
+        claim, terminal = self._read_own_life_originals_v1(binding)
+        if claim is not None:
+            return self.recover_claimed_d11_life_v1(binding)
+        try:
+            prepared, claim, continuation = self._claim(binding)
+        except BaseException:
+            self._close_unclaimed_gate(binding)
+            raise
+        from ..runtime.d11_life_source_note_v1 import generate_source_note_bytes_v1, write_life_artifact_stage_v1, verify_durable_life_artifact_v1
+        start = time.thread_time_ns()
+        reason, digest, length = None, None, None
+        phase = "computation_failed"
+        try:
+            data = generate_source_note_bytes_v1(prepared)
+            phase = "artifact_stage_failed"
+            db = sqlite3.connect(self.graph_path, isolation_level=None)
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                write_life_artifact_stage_v1(db, prepared, data)
+                db.execute("COMMIT")
+                phase = "postcondition_failed"
+                db.execute("PRAGMA query_only=ON")
+                db.execute("BEGIN")
+                _, digest, length = verify_durable_life_artifact_v1(db, prepared)
+                db.execute("COMMIT")
             finally:
-                cpu = (time.thread_time_ns() - start + 999999) // 1000000
-            end = self._utc_text(self._now())
-            if _utc(end) < _utc(claim.payload.claimed_at_utc):
-                reason = "clock_sample_inconsistent"
-            elif cpu > binding.cpu_ceiling_ms:
-                reason = "cpu_ceiling_exceeded"
-            elif _utc(end) >= _utc(binding.deadline_utc):
-                reason = "deadline_expired"
-            elif _utc(end) >= _utc(binding.job_lease_expires_utc):
-                reason = "job_lease_expired"
-            mapping = self._claim_clock
-            character_at = None
-            if _utc(mapping.valid_from_utc) <= _utc(end) <= _utc(mapping.valid_until_utc):
-                with localcontext() as context:
-                    context.prec = 28
-                    character_at = str(mapping.character_at(end))
-            elif reason is None:
-                reason = "deadline_expired"
-            payload = self._payload(LifeTerminalPayloadV1, binding_digest=binding.digest, prepared_digest=prepared.digest,
-                execution_id=binding.execution_id, claim_sequence=claim.claim_sequence, claim_digest=claim.claim_digest,
-                status="completed" if reason is None else "failed", actual_cpu_ms=cpu,
-                artifact_ref=binding.artifact_ref if reason is None else None,
-                artifact_digest=digest if reason is None else None, artifact_length=length if reason is None else None,
-                reason_code=reason, completed_at_utc=end, character_at=character_at,
-                postcondition_build_digest=binding.postcondition_build_digest)
-            self._terminal(binding, claim, continuation, payload)
-            return self.read_d11_life_original_v1(binding)
+                db.close()
+        except Exception:
+            reason = phase
+        finally:
+            cpu = (time.thread_time_ns() - start + 999999) // 1000000
+        end = self._utc_text(self._now())
+        if _utc(end) < _utc(claim.payload.claimed_at_utc):
+            reason = "clock_sample_inconsistent"
+        elif cpu > binding.cpu_ceiling_ms:
+            reason = "cpu_ceiling_exceeded"
+        elif _utc(end) >= _utc(binding.deadline_utc):
+            reason = "deadline_expired"
+        elif _utc(end) >= _utc(binding.job_lease_expires_utc):
+            reason = "job_lease_expired"
+        mapping = self._claim_clock
+        character_at = None
+        if _utc(mapping.valid_from_utc) <= _utc(end) <= _utc(mapping.valid_until_utc):
+            with localcontext() as context:
+                context.prec = 28
+                character_at = str(mapping.character_at(end))
+        elif reason is None:
+            reason = "deadline_expired"
+        from ..runtime.d11_life_preparation_v1 import D11CharacterLaborLifePreparedV1
+        if type(prepared) is D11CharacterLaborLifePreparedV1 and character_at is not None:
+            from decimal import Decimal
+            qualification = self._character_labor_claim_v1
+            with localcontext() as context:
+                context.prec = 28
+                elapsed = Decimal(character_at) - Decimal(claim.payload.character_at)
+                if elapsed > Decimal(str(qualification.body.quote.duration_upper)) and reason is None:
+                    reason = "character_labor_duration_upper_exceeded"
+        payload = self._payload(LifeTerminalPayloadV1, binding_digest=binding.digest, prepared_digest=prepared.digest,
+            execution_id=binding.execution_id, claim_sequence=claim.claim_sequence, claim_digest=claim.claim_digest,
+            status="completed" if reason is None else "failed", actual_cpu_ms=cpu,
+            artifact_ref=binding.artifact_ref if reason is None else None,
+            artifact_digest=digest if reason is None else None, artifact_length=length if reason is None else None,
+            reason_code=reason, completed_at_utc=end, character_at=character_at,
+            postcondition_build_digest=binding.postcondition_build_digest)
+        self._terminal(binding, claim, continuation, payload)
+        return self._read_own_life_originals_v1(binding)
 
     def _execute_artifact_draft_v1(self, binding):
         self._binding(binding)
@@ -630,7 +819,7 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
         from ..runtime.d08_life_admission_v1 import rebuild_life_admission_frame_v1
         from ..runtime.d11_life_preparation_v1 import _read
         with self._execution_lock:
-            claim, terminal = self.read_d11_life_original_v1(binding)
+            claim, terminal = self.read_own_d11_draft_execution_original_v1(binding)
             if claim is not None:
                 return self.recover_claimed_d11_life_v1(binding)
             try:
@@ -679,4 +868,4 @@ class AuthorityD11LifeServiceV1(InstalledD11BoundedExecutionLifecycleV1):
                 reason_code=reason, completed_at_utc=end, character_at=character,
                 postcondition_build_digest=binding.postcondition_build_digest, handoff_started=handoff, readback=witness)
             self._terminal(binding, claim, continuation, payload)
-            return self.read_d11_life_original_v1(binding)
+            return self.read_own_d11_draft_execution_original_v1(binding)

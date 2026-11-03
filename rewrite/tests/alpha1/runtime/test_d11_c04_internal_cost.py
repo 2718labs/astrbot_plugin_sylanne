@@ -84,8 +84,7 @@ def test_signed_terminal_import_and_replay(tmp_path, status, actual):
     body_authority.install_policy(db, policy)
     issued = body_authority.issue_fixed_quote_and_reservation(
         db, issuer, _envelope(quote), quote, policy.policy_id,
-        policy.version, state, (), "reservation", "effect",
-    )
+        policy.version, state, (), "reservation", "effect", now_utc=100.0)
     reservation_ref = issued.reservation_write.key.token
     binding = InternalWorkBindingV1(
         namespace_ref(namespace), "activity", "operation", "execution",

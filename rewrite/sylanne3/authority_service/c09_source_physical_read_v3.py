@@ -128,10 +128,23 @@ class SourcePhysicalReadScopeV3:
         if row is None or row[1] not in {'canonical-json.ascii.v1','canonical-json.utf8.v1','opaque-bytes.v1'}:
             raise AuthorityUnavailable('actual frozen mapped Source cell header absent or codec differs')
         if self.previous_selected_basis is None:
-            qualification=_initial_owner_source_qualification_v3(self,meter)
-            producer=_initial_owner_cell_values_read_v3(qualification,cell_id,tuple(row[1:]),meter)
-            if producer is None or producer['phase']!='committed':
-                raise AuthorityUnavailable('initial published Source cell lacks its actual committed Owner producer')
+            qualification=_initial_physical_source_qualification_v3(self,meter)
+            if qualification.origin_kind=='initial_segmented_v4':
+                from ..runtime_storage_v3 import read_initial_runtime_cell_origin_for_capture_v4
+                if self.source.in_transaction:
+                    producer=read_initial_runtime_cell_origin_for_capture_v4(self.source,qualification=qualification,
+                        role=self.role,cell_id=cell_id,header=tuple(row[1:]),meter=meter)
+                else:
+                    with self.read_database_v3(meter=meter):
+                        producer=read_initial_runtime_cell_origin_for_capture_v4(self.source,qualification=qualification,
+                            role=self.role,cell_id=cell_id,header=tuple(row[1:]),meter=meter)
+                if producer is None or (producer.get('producer_kind')=='owner_material_source_prepared_v3' and producer['phase']!='committed'):
+                    raise AuthorityUnavailable('initial published Source cell lacks its actual committed runtime/Owner producer')
+            else:
+                owner=_initial_owner_source_qualification_v3(self,meter)
+                producer=_initial_owner_cell_values_read_v3(owner,cell_id,tuple(row[1:]),meter)
+                if producer is None or producer['phase']!='committed':
+                    raise AuthorityUnavailable('initial published Source cell lacks its actual committed Owner producer')
             self._header=tuple(row)
             meter.require_available(self._source_heap_bytes())
             return self._header
@@ -372,7 +385,10 @@ class SourcePhysicalContainerCensusV3:
         else:
             if self.runtime is None:
                 initial=None
-                if scope.previous_selected_basis is None:initial=_initial_owner_source_qualification_v3(scope,meter)
+                if scope.previous_selected_basis is None:
+                    physical=_initial_physical_source_qualification_v3(scope,meter)
+                    initial=(physical if physical.origin_kind=='initial_segmented_v4'
+                        else _initial_owner_source_qualification_v3(scope,meter))
                 self.runtime=SelectedRuntimePhysicalReadV3(runtime_issuer,scope.previous_selected_basis,scope.session.scope,
                     roles=(scope.role,),source_scope=scope,initial_qualification=initial)
                 return False
@@ -951,13 +967,18 @@ class InitialPhysicalSourceReadQualificationV3:
             raise AuthorityUnavailable('actual initial physical Source issuer required')
         self.scope,self.role,self.source_original=scope,scope.role,scope.source_original
         self.initial_manifest_digest,self.initial_pointer=current.manifest_digest,current.pointer_version
+        from .c09_initial_segmented_genesis_v4 import INITIAL_MANIFEST_SCHEMA_V4
+        self.origin_kind=('initial_segmented_v4' if current.manifest['schema']==INITIAL_MANIFEST_SCHEMA_V4 else 'legacy_initial_v3')
         self.source_original_digest=source_digest
         _INITIAL_PHYSICAL_SOURCE.add(self);scope.arena.add(self)
     def _source_heap_bytes(self):return 4096
     def require_current(self,*,meter):
         if self not in _INITIAL_PHYSICAL_SOURCE:raise AuthorityUnavailable('issued initial physical Source qualification required')
         current,intent=_require_initial_physical_source_pin_v3(self.scope,meter)
+        from .c09_initial_segmented_genesis_v4 import INITIAL_MANIFEST_SCHEMA_V4
+        kind='initial_segmented_v4' if current.manifest['schema']==INITIAL_MANIFEST_SCHEMA_V4 else 'legacy_initial_v3'
         if (self.role!=self.scope.role or self.source_original is not self.scope.source_original
+                or self.origin_kind!=kind
                 or current.manifest_digest!=self.initial_manifest_digest or current.pointer_version!=self.initial_pointer):
             raise AuthorityUnavailable('actual initial physical Source selection or role changed')
         return self

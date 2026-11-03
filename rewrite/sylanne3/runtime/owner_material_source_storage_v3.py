@@ -18,7 +18,7 @@ from ..graph_types import GraphWrite
 from ..runtime_contracts import canonical_digest, canonical_serialize, _canonical_value
 from ..runtime_storage_v3 import (
     runtime_storage_v3, _operation, runtime_storage_quantum_v3,
-    _runtime_bounded_fixed_row_v3,
+    _runtime_bounded_fixed_row_v3, runtime_storage_basis_identity_v4, runtime_source_identity_v4,
 )
 from ..segmented_sql_cell_v1 import MAX_SEGMENT_BYTES
 
@@ -43,6 +43,15 @@ PREPARED_DDL = """CREATE TABLE IF NOT EXISTS graph_owner_source_prepared_v3 (
     original_digest TEXT NOT NULL,original_bytes INTEGER NOT NULL,
     source_sha256 TEXT NOT NULL,source_bytes INTEGER NOT NULL,phase TEXT NOT NULL,
     CHECK(input_bytes>=0 AND original_bytes>=0 AND source_bytes>=0)) STRICT"""
+
+
+def _owner_source_storage_identity_v4(db,basis,meter):
+    from ..authority_service.c09_initial_segmented_genesis_v4 import (
+        VerifiedInitialSegmentedPhysicalMetadataV4, VerifiedInitialSegmentedRetirementMetadataV4)
+    identity=runtime_storage_basis_identity_v4(basis,role='graph',meter=meter)
+    if type(basis) in (VerifiedInitialSegmentedPhysicalMetadataV4, VerifiedInitialSegmentedRetirementMetadataV4) and basis.db is not db:
+        raise AuthorityUnavailable('Owner Source physical metadata proof belongs to another actual source database')
+    return identity
 
 
 def _prepared_segment_v3(db,meter,cell_id,ordinal):
@@ -248,7 +257,7 @@ def require_owner_material_input_witness_v3(witness,*,request,operation_id):
     return witness.digest
 
 
-def _owner_source_bundle_value_v3(frame,source_key,source_value,access_write):
+def _owner_source_bundle_value_v3(frame,source_key,source_value,access_write,inspection_write):
     from ..runtime_contracts import DomainBundle,DomainProposal,DependencySet
     from ..domains.d06 import D06DomainProvider
     dependencies=DependencySet(current_invalidation=tuple(v for v in frame.snapshot.versions if v.key==source_key),
@@ -256,9 +265,9 @@ def _owner_source_bundle_value_v3(frame,source_key,source_value,access_write):
     source={'$type':GraphWrite.__module__+'.'+GraphWrite.__qualname__,
         'key':_canonical_value(source_key,set()),'value':source_value,'dependencies':[]}
     proposal={'$type':DomainProposal.__module__+'.'+DomainProposal.__qualname__,
-        'domain':'d06','proposal_schema':'d06.proposal.v1',
+        'domain':'d06','proposal_schema':'d06.contract.v1',
         'proposal_schema_hash':D06DomainProvider().descriptor.request_schema_hash,
-        'envelope':_canonical_value(frame.envelope,set()),'typed_writes':[source,_canonical_value(access_write,set())],
+        'envelope':_canonical_value(frame.envelope,set()),'typed_writes':[source,_canonical_value(access_write,set()),_canonical_value(inspection_write,set())],
         'dependencies':_canonical_value(dependencies,set()),'contribution_keys':[],'required_bundle_parts':[]}
     return {'$type':DomainBundle.__module__+'.'+DomainBundle.__qualname__,
         'envelope':_canonical_value(frame.envelope,set()),'proposals':[proposal],
@@ -316,23 +325,21 @@ class PreparedOwnerMaterialWriteV3:
         self.operation.retain(524288)
         self.source_value=self.source.to_dict()
         self.access_write=GraphWrite(self.access_key,self.access,(self.source_key,))
-        source_write=plain_v1(dict(key=self.source_key,value=self.source_value,dependencies=()))
-        self.payload=current_stage_payload_v1(frame,'d06',OPERATION,request,
-            writes=(source_write,self.access_write),
-            provenance=dict(source_ref=self.source_key.token,source=self.source,source_access=self.access))
-        self.values={'input':plain_v1(request),'source':self.source_value,'original':self.payload,
+        # The bounded Source stream supplies both commitments before the
+        # dependent original and bundle streams begin.
+        self.payload = self.bundle_value = self.inspection_write = None
+        self.values={'input':plain_v1(request),'source':self.source_value,'original':None,
             'stage_request':_canonical_value(dict(request=request,envelope=frame.envelope),set()),
-            'http_request':plain_v1(dict(request=request))}
-        self.bundle_value=_owner_source_bundle_value_v3(frame,self.source_key,self.source_value,self.access_write)
-        self.values['bundle']=self.bundle_value
+            'http_request':plain_v1(dict(request=request)), 'bundle':None}
         self.expected={}
         self.streams={name:CanonicalValueStreamV3(value) for name,value in self.values.items()}
         self.phase,self.index='hash',0
         self.names=('input','source','original','stage_request','http_request','bundle')
         self.prepared_digest=None
+        source_identity=runtime_source_identity_v4(self.handle)
         self.metadata_value=plain_v1(dict(schema='d06.owner-source-prepared.v3',
-            authority_id=self.handle.selected.basis.control.authority_id,
-            installation_id=self.handle.selected.basis.control.installation_id,namespace=self.namespace,
+            authority_id=source_identity.authority_id,
+            installation_id=source_identity.installation_id,namespace=self.namespace,
             operation_kind=OPERATION,operation_id=self.operation_id,attempt_id=attempt[1],
             request_claim_ref='graph_owner_domain_attempts_v3:'+self.operation_id,
             request_claim_digest=attempt[0],owner_guard_digest=canonical_digest(frame.owner_guard),
@@ -356,6 +363,31 @@ class PreparedOwnerMaterialWriteV3:
         self.source_fragment_offset=0
         self.seals={}
         _PREPARATIONS.add(self)
+
+    def _prepare_inspection_outputs_v3(self):
+        from ..domains.d06.inspection_metadata_v1 import SOURCE_TYPE, SOURCE_FIELDS, inspection_key_v1, validate_inspection_metadata_v1
+        from ..domains.d01.production_operations_v1 import plain_v1, current_stage_payload_v1
+        from .owner_material_source_v1 import OPERATION
+        key = inspection_key_v1(self.source_key, 1)
+        reads = {v.key: v.revision for v in self.frame.envelope.version_guard.read_versions}
+        if reads.get(self.source_key) != 0 or reads.get(key) != 0:
+            raise AuthorityUnavailable('Owner Source inspection requires both actual immutable revision-0 CAS reads')
+        digest, size = self.expected['source']
+        value = dict(schema=SOURCE_TYPE, target_ref=self.source_key.token, target_revision=1,
+            target_codec='canonical-json.ascii.v1', target_sha256=digest, target_bytes=size,
+            target_semantic_digest=digest, producer_operation_id=self.operation_id,
+            metadata={field:self.source_value[field] for field in SOURCE_FIELDS})
+        validate_inspection_metadata_v1(value, source=True)
+        self.inspection_write = GraphWrite(key, value, (self.source_key,))
+        source_write=plain_v1(dict(key=self.source_key,value=self.source_value,dependencies=()))
+        self.payload=current_stage_payload_v1(self.frame,'d06',OPERATION,self.request,
+            writes=(source_write,self.access_write,self.inspection_write),
+            provenance=dict(source_ref=self.source_key.token,source=self.source,source_access=self.access))
+        self.bundle_value=_owner_source_bundle_value_v3(self.frame,self.source_key,
+            self.source_value,self.access_write,self.inspection_write)
+        self.values['original'],self.values['bundle']=self.payload,self.bundle_value
+        for name in ('original','bundle'):
+            self.streams[name]=CanonicalValueStreamV3(self.values[name])
 
     def require_current(self):
         if self not in _PREPARATIONS or self.operation.closed:
@@ -530,6 +562,8 @@ class PreparedOwnerMaterialWriteV3:
                     self.expected[name]=self.command.expected['http_request'];self.index+=1
                 elif stream.read_fragment(meter) is None:
                     self.expected[name]=(stream.hash.hexdigest(),stream.offset);self.index+=1
+                    if name == 'source':
+                        self._prepare_inspection_outputs_v3()
                 if self.index==len(self.names):self.phase='register'
             elif self.phase=='register':
                 self._register(meter)
@@ -575,8 +609,8 @@ class StagedDomainOperationV3:
         provider=D06DomainProvider()
         source_write=SealedSourceGraphWriteV3(_SEAL,prepared,prepared.seals['source']).take_write_v3()
         dependencies=DependencySet(current_invalidation=tuple(v for v in frame.snapshot.versions if v.key==prepared.source_key))
-        self.proposals=(DomainProposal('d06','d06.proposal.v1',provider.descriptor.request_schema_hash,
-            frame.envelope,(source_write,prepared.access_write),dependencies,(),()),)
+        self.proposals=(DomainProposal('d06','d06.contract.v1',provider.descriptor.request_schema_hash,
+            frame.envelope,(source_write,prepared.access_write,prepared.inspection_write),dependencies,(),()),)
         self.jobs,self.outbox,self.paid_cost_originals=(),(),()
         self.coverage,self.missing_inputs,self.continuation_ref='complete',(),None
         seal=prepared.seals['original']
@@ -683,8 +717,9 @@ def finish_owner_source_preparation_v3(prepared,*,receipt=None,error=None):
 
 def read_selected_owner_source_cell_v3(db,*,basis,cell_id,header,meter):
     """Pure cold producer qualification; pending never becomes ordinary read authority."""
-    from ..runtime_contracts import NamespaceId,namespace_ref
+    from ..runtime_contracts import NamespaceId
     from ..graph_types import AtomKey
+    identity=_owner_source_storage_identity_v4(db,basis,meter)
     columns=('prepared_digest','bot','persona','operation_id','attempt_id','request_claim_digest','metadata_json',
         'input_sha256','input_bytes','original_digest','original_bytes','source_sha256','source_bytes','phase')
     exists=db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='graph_owner_source_prepared_v3'").fetchone()
@@ -716,8 +751,8 @@ def read_selected_owner_source_cell_v3(db,*,basis,cell_id,header,meter):
         event=_runtime_bounded_fixed_row_v3(db,meter,'graph_events',('digest','reads','epoch_reads'),
             'bot=? AND persona=? AND session=? AND event_id=?',(*ns.as_tuple,bundle[1],row[3]))
     return _qualify_owner_source_cell_values_v3(row,cursor,attempt,bundle,original,history,event,
-        cell_id=cell_id,header=header,authority_id=basis.control.authority_id,
-        installation_id=basis.control.installation_id,authority_namespace=basis.prepared['namespace'])
+        cell_id=cell_id,header=header,authority_id=identity.authority_id,
+        installation_id=identity.installation_id,authority_namespace=identity.authority_namespace)
 
 
 _SELECTED_OWNER_STAGE_READS_V3=WeakSet()
@@ -738,7 +773,7 @@ class SelectedOwnerSourceStageReadV3:
         if (type(self) is not SelectedOwnerSourceStageReadV3 or self not in _SELECTED_OWNER_STAGE_READS_V3
                 or meter is not require_c09_reserved_meter_v3(meter.budget)):
             raise AuthorityUnavailable('actual private staged Source progress and Root quantum required')
-        self.basis.require_current(meter=meter)
+        _owner_source_storage_identity_v4(self.db,self.basis,meter)
         result=copy(self);result.hash=self.hash.copy()
         _SELECTED_OWNER_STAGE_READS_V3.add(result)
         return result
@@ -751,11 +786,11 @@ class SelectedOwnerSourceStageReadV3:
     def advance(self,*,db,meter):
         from pathlib import Path
         import sqlite3
-        self.basis.require_current(meter=meter)
         if type(db) is not sqlite3.Connection:
             raise AuthorityUnavailable('actual selected cold SQLite snapshot required for pending Source')
+        identity=_owner_source_storage_identity_v4(db,self.basis,meter)
         database=db.execute('PRAGMA database_list').fetchall()
-        if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(self.basis.member('graph')['resolved_path']).resolve(strict=True):
+        if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(identity.member['resolved_path']).resolve(strict=True):
             raise AuthorityUnavailable('pending Source continuation crossed its actual selected Graph inode/path')
         self.db=db
         columns=('cell_id','origin_scope_digest','logical_locator_json','codec_id','producer_operation_id',
@@ -789,14 +824,14 @@ def begin_selected_owner_source_stage_read_v3(db,*,selected_basis,cell_id,meter)
     """Actual private selected role + registered prepared producer, no business grant."""
     from pathlib import Path
     import sqlite3
-    from ..authority_service.c09_selected_history_v3 import _InstalledSelectedStorageBasisV3,VerifiedSelectedHistoryReadV3
-    from ..runtime_contracts import NamespaceId,namespace_ref
+    from ..authority_service.c09_selected_history_v3 import VerifiedSelectedHistoryReadV3
+    from ..runtime_contracts import NamespaceId
+    identity=_owner_source_storage_identity_v4(db,selected_basis,meter)
     basis=selected_basis.basis if type(selected_basis) is VerifiedSelectedHistoryReadV3 else selected_basis
-    if type(basis) is not _InstalledSelectedStorageBasisV3 or type(db) is not sqlite3.Connection:
-        raise AuthorityUnavailable('actual private selected staged Source cold basis/SQLite required')
-    basis.require_current(meter=meter)
+    if type(db) is not sqlite3.Connection:
+        raise AuthorityUnavailable('actual private selected staged Source cold SQLite required')
     database=db.execute('PRAGMA database_list').fetchall()
-    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(basis.member('graph')['resolved_path']).resolve(strict=True):
+    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(identity.member['resolved_path']).resolve(strict=True):
         raise AuthorityUnavailable('pending Source cursor database differs from actual selected Graph')
     columns=('cell_id','origin_scope_digest','logical_locator_json','codec_id','producer_operation_id',
         'erasure_owner_ref','phase','next_ordinal','next_byte_offset','prefix_root','prefix_sha256',
@@ -812,8 +847,8 @@ def begin_selected_owner_source_stage_read_v3(db,*,selected_basis,cell_id,meter)
     name=locator.get('name');expected=value['expected_outputs'].get(name)
     if (canonical_serialize(value)!=prepared[6] or canonical_digest(value)!=prepared[0]
             or value['schema']!='d06.owner-source-prepared.v3'
-            or value['authority_id']!=basis.control.authority_id or value['installation_id']!=basis.control.installation_id
-            or value['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id} or namespace_ref(ns)!=basis.prepared['namespace']
+            or value['authority_id']!=identity.authority_id or value['installation_id']!=identity.installation_id
+            or value['namespace']!={'bot_id':ns.bot_id,'persona_id':ns.persona_id} or ns!=identity.namespace
             or value['operation_kind']!='admit_owner_material_source_v1' or value['operation_id']!=prepared[3]
             or value['attempt_id']!=prepared[4] or value['request_claim_digest']!=prepared[5]
             or name not in ('input','source','original','stage_request','http_request','bundle') or expected is None
@@ -941,9 +976,10 @@ class OwnerMaterialCommandDigestV3:
 
     def _require_seed_identity_v3(self,value):
         from ..domains.d01.production_operations_v1 import plain_v1
+        source_identity=runtime_source_identity_v4(self.handle)
         expected=dict(schema='d06.owner-source-command-seed.v3',
-            authority_id=self.handle.selected.basis.control.authority_id,
-            installation_id=self.handle.selected.basis.control.installation_id,
+            authority_id=source_identity.authority_id,
+            installation_id=source_identity.installation_id,
             namespace=plain_v1(self.authority.namespace),actor=self.authority.actor,
             operation_kind='admit_owner_material_source_v1',operation_id=self.operation_id,
             activity_id=self.activity_id,audience_ref=self.audience_ref,parent_budget_lease_ref=self.parent_budget_lease_ref,
@@ -966,9 +1002,10 @@ class OwnerMaterialCommandDigestV3:
             'WHERE bot=? AND persona=? AND operation_id=?',(*self.authority.namespace.as_tuple,self.operation_id)).fetchone()
         if actual!=(request_digest,attempt_id,metadata.graph_revision,epoch.revision):
             raise AuthorityUnavailable('Source seed does not bind actual first same-transaction Owner attempt')
+        source_identity=runtime_source_identity_v4(self.handle,meter=current_c09_sql_meter_v2())
         value=plain_v1(dict(schema='d06.owner-source-command-seed.v3',
-            authority_id=self.handle.selected.basis.control.authority_id,
-            installation_id=self.handle.selected.basis.control.installation_id,namespace=self.authority.namespace,
+            authority_id=source_identity.authority_id,
+            installation_id=source_identity.installation_id,namespace=self.authority.namespace,
             actor=self.authority.actor,operation_kind='admit_owner_material_source_v1',operation_id=self.operation_id,
             activity_id=self.activity_id,audience_ref=self.audience_ref,parent_budget_lease_ref=self.parent_budget_lease_ref,
             root_grant_digest=self.root_grant_digest,root_grant=self.root_grant,budget_scope=self.budget_scope,
@@ -1085,13 +1122,12 @@ def read_selected_owner_source_prepared_v3(db,*,basis,prepared_digest,meter):
     """Qualified real prepared row, including entries with no attached header."""
     from pathlib import Path
     import sqlite3
-    from ..authority_service.c09_selected_history_v3 import _InstalledSelectedStorageBasisV3
-    from ..runtime_contracts import NamespaceId,namespace_ref
-    if type(basis) is not _InstalledSelectedStorageBasisV3 or type(db) is not sqlite3.Connection:
-        raise AuthorityUnavailable('actual private selected Graph prepared original reader required')
-    basis.require_current(meter=meter)
+    from ..runtime_contracts import NamespaceId
+    identity=_owner_source_storage_identity_v4(db,basis,meter)
+    if type(db) is not sqlite3.Connection:
+        raise AuthorityUnavailable('actual private selected Graph prepared original SQLite required')
     database=db.execute('PRAGMA database_list').fetchall()
-    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(basis.member('graph')['resolved_path']).resolve(strict=True):
+    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(identity.member['resolved_path']).resolve(strict=True):
         raise AuthorityUnavailable('prepared Source point read crossed actual selected Graph')
     row=_runtime_bounded_fixed_row_v3(db,meter,'graph_owner_source_prepared_v3',
         ('prepared_digest','bot','persona','operation_id','attempt_id','request_claim_digest','metadata_json',
@@ -1106,8 +1142,8 @@ def read_selected_owner_source_prepared_v3(db,*,basis,prepared_digest,meter):
     bundle=meter.read_fixed_row(db,'graph_bundle_operations',('digest',),
         'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,row[3]))
     return _qualify_owner_source_prepared_values_v3(row,seed,attempt,bundle,
-        authority_id=basis.control.authority_id,installation_id=basis.control.installation_id,
-        authority_namespace=basis.prepared['namespace'],prepared_digest=prepared_digest)
+        authority_id=identity.authority_id,installation_id=identity.installation_id,
+        authority_namespace=identity.authority_namespace,prepared_digest=prepared_digest)
 
 
 def read_selected_owner_source_disposition_v3(db,*,basis,prepared_digest,meter):
@@ -1127,14 +1163,13 @@ def read_selected_owner_source_disposition_v3(db,*,basis,prepared_digest,meter):
 def read_selected_owner_source_command_seed_v3(db,*,basis,namespace,operation_id,meter):
     from pathlib import Path
     import sqlite3
-    from ..authority_service.c09_selected_history_v3 import _InstalledSelectedStorageBasisV3
-    from ..runtime_contracts import NamespaceId,namespace_ref
-    if (type(basis) is not _InstalledSelectedStorageBasisV3 or type(db) is not sqlite3.Connection
-            or type(namespace) is not NamespaceId or namespace_ref(namespace)!=basis.prepared['namespace']):
+    from ..runtime_contracts import NamespaceId
+    identity=_owner_source_storage_identity_v4(db,basis,meter)
+    if (type(db) is not sqlite3.Connection or type(namespace) is not NamespaceId
+            or namespace!=identity.namespace):
         raise AuthorityUnavailable('actual private selected Owner command-seed namespace required')
-    basis.require_current(meter=meter)
     database=db.execute('PRAGMA database_list').fetchall()
-    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(basis.member('graph')['resolved_path']).resolve(strict=True):
+    if len(database)!=1 or Path(database[0][2]).resolve(strict=True)!=Path(identity.member['resolved_path']).resolve(strict=True):
         raise AuthorityUnavailable('command seed point crossed actual selected Graph')
     row=_runtime_bounded_fixed_row_v3(db,meter,'graph_owner_source_command_seeds_v3',
         ('bot','persona','operation_id','attempt_id','request_digest','seed_digest','payload_json'),
@@ -1145,7 +1180,7 @@ def read_selected_owner_source_command_seed_v3(db,*,basis,namespace,operation_id
         ('request_digest','attempt_id','graph_revision','graph_epoch'),
         'bot=? AND persona=? AND operation_id=?',(*namespace.as_tuple,operation_id))
     return _qualify_owner_source_command_seed_values_v3(row,attempt,
-        authority_id=basis.control.authority_id,installation_id=basis.control.installation_id,
+        authority_id=identity.authority_id,installation_id=identity.installation_id,
         namespace=namespace,operation_id=operation_id)
 
 def _qualify_owner_source_command_seed_values_v3(row,attempt,*,authority_id,installation_id,namespace,operation_id):

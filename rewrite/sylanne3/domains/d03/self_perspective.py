@@ -8,12 +8,12 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from ...domains.d01 import ActiveRoleQualification
+from ...domains.d01 import ActiveRoleQualification, ActiveRoleHeadControlV3
 from ...graph_types import (
     AtomKey, GraphAtom, GraphSnapshot, GraphVersion, GraphWrite, Owner, owner_grant_key,
 )
 from ...runtime_contracts import (
-    CommandEnvelope, DependencySet, DomainBundle, DomainProposal, QueryEpoch, canonical_digest,
+    CommandEnvelope, DependencySet, DomainBundle, DomainProposal, NamespaceId, QueryEpoch, canonical_digest,
 )
 from .context import ContextProvider, WorldEvent
 
@@ -80,19 +80,43 @@ def self_perspective_id(namespace, scene_ref: str, arrival_event_ref: str) -> st
     })
 
 
+def _self_role_plan_identity_v3(role):
+    """Identity for self projection only; a control never authorizes plan claims."""
+    if type(role)is ActiveRoleQualification:
+        return role.plan.namespace,role.plan.head_id
+    if type(role)is not ActiveRoleHeadControlV3:
+        raise TypeError('actual D01 active role or head-control identity required')
+    namespace=role.namespace
+    if type(namespace)is not NamespaceId or type(role.plan_key)is not AtomKey:
+        raise TypeError('D01 head control needs its actual namespace and plan key')
+    activation_key=AtomKey(Owner('persona',*namespace.as_tuple),'d01.persona_activation.v1','current')
+    plan_key=AtomKey(Owner('persona',*namespace.as_tuple),'d01.persona_plan.v1',role.plan_key.name)
+    expected=(activation_key,plan_key,owner_grant_key(*namespace.as_tuple))
+    if (role.plan_key!=plan_key or type(role.plan_version)is not int or role.plan_version<1
+            or role.head_id!=str(role.plan_key.name)+'@'+str(role.plan_version)
+            or type(role.graph_epoch)is not int or role.graph_epoch<1
+            or type(role.authorization_revision)is not int or role.authorization_revision!=1
+            or type(role.read_versions)is not tuple or len(role.read_versions)!=3
+            or any(type(version)is not GraphVersion or version.revision<1 for version in role.read_versions)
+            or tuple(version.key for version in role.read_versions)!=expected):
+        raise ValueError('D01 head control lacks its actual activation/plan/Owner header versions')
+    return namespace,role.head_id
+
+
 def build_self_perspective_proposal(
-    envelope: CommandEnvelope, role: ActiveRoleQualification, mapping_atom: GraphAtom | None,
+    envelope: CommandEnvelope, role: ActiveRoleQualification | ActiveRoleHeadControlV3, mapping_atom: GraphAtom | None,
     arrival_atom: GraphAtom, *, perspective_revision: int = 0,
 ) -> DomainProposal:
     """Build a separate DomainBundle proposal after C01 has committed."""
     if mapping_atom is None:
         raise ValueError("certified self identity mapping is unavailable")
-    if type(envelope) is not CommandEnvelope or type(role) is not ActiveRoleQualification:
+    if type(envelope) is not CommandEnvelope or type(role) not in (ActiveRoleQualification, ActiveRoleHeadControlV3):
         raise TypeError("command and qualified D01 role are required")
     namespace = envelope.authority.namespace
     mapping_key = self_mapping_key(namespace)
-    if (role.namespace != namespace or role.plan.namespace != namespace
-            or role.head_id != role.plan.head_id or role.graph_epoch < 1
+    plan_namespace,plan_head=_self_role_plan_identity_v3(role)
+    if (role.namespace != namespace or plan_namespace != namespace
+            or role.head_id != plan_head or role.graph_epoch < 1
             or envelope.authority.issuer_domain != "d11"
             or envelope.authority.purpose != "context"
             or "persona" not in envelope.authority.owner_scope
@@ -144,7 +168,7 @@ def build_self_perspective_proposal(
 
 
 def build_self_perspective_bundle(
-    envelope: CommandEnvelope, role: ActiveRoleQualification, mapping_atom: GraphAtom | None,
+    envelope: CommandEnvelope, role: ActiveRoleQualification | ActiveRoleHeadControlV3, mapping_atom: GraphAtom | None,
     arrival_atom: GraphAtom, *, perspective_revision: int = 0,
 ) -> DomainBundle:
     """Package the post-C01 proposal for a separate guarded coordinator commit."""
@@ -156,7 +180,7 @@ def build_self_perspective_bundle(
 
 
 def build_self_identity_projection_proposal(
-    envelope: CommandEnvelope, role: ActiveRoleQualification,
+    envelope: CommandEnvelope, role: ActiveRoleQualification | ActiveRoleHeadControlV3,
     qualified_mapping: SelfIdentityMapping, mapping_atom: GraphAtom | None,
     arrival_atom: GraphAtom, *, perspective_revision: int = 0,
 ) -> DomainProposal:
@@ -166,7 +190,7 @@ def build_self_identity_projection_proposal(
     the actual write fence. Construction alone is not an issuer. An unchanged
     mapping is read-guarded but not rewritten, preserving prior perspectives.
     """
-    if (type(envelope) is not CommandEnvelope or type(role) is not ActiveRoleQualification
+    if (type(envelope) is not CommandEnvelope or type(role) not in (ActiveRoleQualification, ActiveRoleHeadControlV3)
             or type(qualified_mapping) is not SelfIdentityMapping):
         raise TypeError("current command, role, and Authority mapping are required")
     namespace = envelope.authority.namespace
@@ -184,8 +208,9 @@ def build_self_identity_projection_proposal(
                 envelope, role, mapping_atom, arrival_atom,
                 perspective_revision=perspective_revision,
             )
-    if (role.namespace != namespace or role.plan.namespace != namespace
-            or role.head_id != role.plan.head_id or role.graph_epoch < 1
+    plan_namespace,plan_head=_self_role_plan_identity_v3(role)
+    if (role.namespace != namespace or plan_namespace != namespace
+            or role.head_id != plan_head or role.graph_epoch < 1
             or envelope.authority.issuer_domain != "d11"
             or envelope.authority.purpose != "context"
             or "persona" not in envelope.authority.owner_scope
@@ -237,7 +262,7 @@ def build_self_identity_projection_proposal(
 
 
 def build_self_identity_projection_bundle(
-    envelope: CommandEnvelope, role: ActiveRoleQualification,
+    envelope: CommandEnvelope, role: ActiveRoleQualification | ActiveRoleHeadControlV3,
     qualified_mapping: SelfIdentityMapping, mapping_atom: GraphAtom | None,
     arrival_atom: GraphAtom, *, perspective_revision: int = 0,
 ) -> DomainBundle:
@@ -250,7 +275,7 @@ def build_self_identity_projection_bundle(
 
 def validate_self_identity_projection_snapshot(
     proposal: DomainProposal, snapshot: GraphSnapshot,
-    role: ActiveRoleQualification, qualified_mapping: SelfIdentityMapping,
+    role: ActiveRoleQualification | ActiveRoleHeadControlV3, qualified_mapping: SelfIdentityMapping,
 ) -> None:
     """Check the dedicated D03 stage against a locked graph snapshot.
 
@@ -258,9 +283,10 @@ def validate_self_identity_projection_snapshot(
     under its actual fence. This graph check never authenticates the DTO.
     """
     if (type(proposal) is not DomainProposal or type(snapshot) is not GraphSnapshot
-            or type(role) is not ActiveRoleQualification
+            or type(role) not in (ActiveRoleQualification, ActiveRoleHeadControlV3)
             or type(qualified_mapping) is not SelfIdentityMapping):
         raise TypeError("self projection needs typed candidate and current proofs")
+    _self_role_plan_identity_v3(role)
     namespace = proposal.envelope.authority.namespace
     mapping_key = self_mapping_key(namespace)
     mapping_atom = snapshot.get(mapping_key)
@@ -302,6 +328,12 @@ def validate_self_identity_projection_snapshot(
             or (snapshot.epochs[0].bot, snapshot.epochs[0].persona) != namespace.as_tuple
             or snapshot.epochs[0].revision != role.graph_epoch):
         raise ValueError("self projection lacks current role and graph incarnation")
+    if type(role)is ActiveRoleHeadControlV3 and (role.plan_key!=plan_key
+            or plan.value.get('namespace')!={'bot_id':namespace.bot_id,'persona_id':namespace.persona_id}
+            or plan.value.get('version')!=role.plan_version
+            or activation.value.get('plan_version')!=role.plan_version
+            or activation.value.get('authorization_revision')!=role.authorization_revision):
+        raise ValueError('self projection D01 control plan/header identity changed')
     for version in role.read_versions:
         atom = snapshot.get(version.key)
         if atom is None or not atom.valid or atom.revision != version.revision:

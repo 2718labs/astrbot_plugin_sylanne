@@ -18,6 +18,7 @@ from ..runtime_storage_v3 import (bind_runtime_database_from_control_v3,
 _ISSUER=object()
 _CONTROLLERS=WeakKeyDictionary()
 _WORKS=WeakSet()
+_RELEASED_WORKS_V3=WeakKeyDictionary()
 _PREPARED=WeakKeyDictionary()
 _DEADLINES=WeakKeyDictionary()
 _BOUND=ContextVar('sylanne_authority_graph_read_v3',default=None)
@@ -64,6 +65,27 @@ def _service_fields_v3(service,verifier):
         if verifier is not service:
             raise AuthorityUnavailable('Named Joint controller requires its exact installed service')
         return 'named_joint', service.self_identity._fences, service.self_identity._source_location, service.clock
+    from .d04_appraisal_result_service_v3 import AuthorityD04AppraisalResultServiceV3
+    if type(service)is AuthorityD04AppraisalResultServiceV3:
+        if verifier is not service or service._d04_source_reader_v3 is None:
+            raise AuthorityUnavailable('D04 result Source controller lacks its actual installed reader')
+        return 'd04_result',service._fences,service._d04_source_reader_v3.model_service._source_location,service._clock
+    from .d11_life_service_v1 import AuthorityD11LifeServiceV1
+    if type(service) is AuthorityD11LifeServiceV1:
+        if verifier is not service or service.current_source_location is None:
+            raise AuthorityUnavailable('Life execution controller needs its actual installed Source qualifier')
+        return 'character_labor', service.fences, service.current_source_location, service._clock
+    from .character_labor_census_v1 import InstalledCharacterLaborCensusServiceV1, _SERVICES
+    if type(service) is InstalledCharacterLaborCensusServiceV1:
+        if verifier is not service or service not in _SERVICES:
+            raise AuthorityUnavailable('labor census controller requires its registered installed facade')
+        life_controller=require_authority_graph_read_controller_v3(service.life)
+        if (life_controller.kind!='character_labor' or life_controller.service is not service.life
+                or service.fences is not life_controller.fences
+                or service.current_source_location is not life_controller.location
+                or service.graph_path!=service.life.graph_path):
+            raise AuthorityUnavailable('labor census controller changed its actual installed Life composition')
+        return 'character_labor_census',life_controller.fences,life_controller.location,life_controller.clock
     raise AuthorityUnavailable('unregistered Authority graph read service')
 
 
@@ -95,7 +117,8 @@ class InstalledAuthorityGraphReadControllerV3:
                 or location._fences is not self.fences or location.core is not self.fences.core
                 or self.location is not None and self.location is not location):
             raise AuthorityUnavailable('Authority reader needs its actual installed location')
-        path=(self.verifier.self_identity._graph._path if self.kind in ('counter','foreground_mesh','owner_task_mesh','named_joint') else self.verifier._path)
+        path=(self.verifier.graph_path if self.kind in ('character_labor','character_labor_census') else
+            self.verifier.self_identity._graph._path if self.kind in ('counter','foreground_mesh','owner_task_mesh','named_joint') else self.verifier._path)
         if location._graph_db_path!=path:raise AuthorityUnavailable('Authority verifier differs from selected Graph path')
         self.location,self.control=location,location._control
         return self
@@ -124,6 +147,22 @@ class _AuthorityReadScopeV3:
     namespace:NamespaceId
     permit:FencePermitV2
     operation_id:str
+
+
+
+def current_authority_graph_upper_utc_v3(work):
+    """Read the actual installed controller clock without moving the original deadline."""
+    if not isinstance(work,AuthorityGraphReadWorkV3):
+        raise AuthorityUnavailable('current Authority time requires its actual private Work')
+    work._actual()
+    controller=work.controller.require_installed_v3()
+    reading=controller.clock()
+    now=(reading.utc_seconds+reading.utc_error_seconds
+        if controller.kind in ('counter','habit','named_joint','foreground_mesh','owner_task_mesh')else reading)
+    if (type(now)not in(int,float)or not math.isfinite(now)or work.deadline_utc is None
+            or now>=work.deadline_utc):
+        raise AuthorityUnavailable('Authority current clock exceeded its actual original deadline')
+    return float(now)
 
 
 class AuthorityGraphReadWorkV3:
@@ -181,7 +220,7 @@ class AuthorityGraphReadWorkV3:
                 self.db.execute('PRAGMA query_only=ON')
                 try:self.handle=bind_runtime_database_from_control_v3(self.db,control=control,role='graph')
                 except BaseException:self.db.close();self.db=None;raise
-                if controller.kind=='model'and self.deadline_utc is None:
+                if controller.kind in {'model','d04_result'}and self.deadline_utc is None:
                     from datetime import datetime
                     row=initial_meter.read_fixed_row(self.db,'runtime_jobs',
                         ('bot_id','persona_id','deadline_utc','lease_expires_utc','work_kind'),'job_id=?',(request.job_id,))
@@ -216,9 +255,18 @@ class AuthorityGraphReadWorkV3:
             raise AuthorityUnavailable('Authority read Work no longer belongs to its live call')
         if controller.fences.core._db.in_transaction:
             raise AuthorityUnavailable('Authority permission observation must precede Graph SQL')
-        controller.fences.core._require(self.credential,self.permit.operation,
-            controller.fences.namespace,self.permit.holder)
-        controller.fences.validate_fence(credential=self.credential,subject=self.subject,permit=self.permit)
+        if controller.kind=='character_labor_census':
+            from .character_labor_census_v1 import require_character_labor_census_permission_v1
+            require_character_labor_census_permission_v1(self.service,credential=self.credential,
+                subject=self.subject,permit=self.permit,request=self.request)
+        elif controller.kind=='character_labor':
+            from .d11_life_execution_owner_v1 import require_character_labor_execution_permission_v1
+            require_character_labor_execution_permission_v1(self.service, credential=self.credential,
+                subject=self.subject, permit=self.permit, request=self.request)
+        else:
+            controller.fences.core._require(self.credential,self.permit.operation,
+                controller.fences.namespace,self.permit.holder)
+            controller.fences.validate_fence(credential=self.credential,subject=self.subject,permit=self.permit)
         from .life_numeric_source_read_v3 import require_numeric_result_source_bridge_v3
         require_numeric_result_source_bridge_v3(self)
         from .artifact_model_result_source_v3 import require_artifact_result_source_bridge_v3
@@ -284,6 +332,12 @@ class AuthorityGraphReadWorkV3:
         if not original_profile and self.controller.kind in ('foreground_mesh','owner_task_mesh'):
             from .foreground_mesh_owner_location_v3 import release_foreground_mesh_owner_v3
             release_foreground_mesh_owner_v3(self)
+        if self.controller.kind=='character_labor_census':
+            from .character_labor_census_v1 import release_character_labor_census_v1
+            release_character_labor_census_v1(self)
+        if self.controller.kind=='character_labor':
+            from .character_labor_source_read_v1 import release_character_labor_source_v1
+            release_character_labor_source_v1(self)
         from .d07_authority_model_source_read_v3 import release_current_d07_authority_source_reader_v3
         release_current_d07_authority_source_reader_v3(self)
         from .life_numeric_source_read_v3 import release_authority_numeric_model_work_v3
@@ -294,10 +348,17 @@ class AuthorityGraphReadWorkV3:
         release_artifact_model_source_v3(self)
         from .d13_authority_model_source_v3 import release_d13_authority_source_v3
         release_d13_authority_source_v3(self)
+        from .d04_ordinary_source_v3 import release_authority_d04_ordinary_readout_v3
+        release_authority_d04_ordinary_readout_v3(self)
+        from ..runtime.source_inspection_metadata_read_v3 import release_inspection_metadata_owner_v3
+        release_inspection_metadata_owner_v3(self)
         self.closed=True;_WORKS.discard(self);_DEADLINES.pop(self,None)
         for registry,original in self.issued_capabilities:registry.pop(original,None)
         self.issued_capabilities.clear()
-        if self.prepared is not None:_PREPARED.pop(self.prepared,None)
+        if self.prepared is not None:
+            _PREPARED.pop(self.prepared,None)
+            self.prepared.projection=None
+            self.prepared=None
         try:
             if self.producer_context is not None:self.producer_context.close()
             self.producer_context=self.producer_inputs=self.producer_frame=None
@@ -326,6 +387,17 @@ class AuthorityGraphReadWorkV3:
                     from .d13_core_counter_source_v1 import release_authority_counter_resource_borrow_v3
                     release_authority_counter_resource_borrow_v3(self)
                 else:finish_runtime_storage_operation_v3(self.operation)
+        _RELEASED_WORKS_V3[self]=(self.operation,self.selection_digest,self.borrowed_counter_operation)
+
+
+def actual_authority_graph_release_v3(work):
+    if type(work)is not AuthorityGraphReadWorkV3:
+        raise AuthorityUnavailable('actual Authority Work release event required')
+    released=_RELEASED_WORKS_V3.get(work)
+    if released is None:return None
+    if released!=(work.operation,work.selection_digest,work.borrowed_counter_operation)or not work.closed:
+        raise AuthorityUnavailable('Authority payload release changed its actual Work/operation/selection')
+    return released[0]
 
 
 def require_actual_authority_graph_attachment_owner_v3(owner,*,db=None):
@@ -472,12 +544,56 @@ def read_bound_authority_graph_attachment_rows_v3(db,*,table,columns,key_columns
     with runtime_storage_quantum_v3(db)as meter:return True,attachment.require_row_v3(owner,meter)
 
 
+_INSPECTION_EXECUTIONS_V3 = WeakKeyDictionary()
+
+
+def require_authority_inspection_member_service_v1(work):
+    from ..runtime.source_inspection_member_admission_v1 import require_registered_source_inspection_member_service_v1
+    if type(work) is not AuthorityGraphReadWorkV3:
+        raise AuthorityUnavailable('member verification requires the actual Authority Work')
+    work._actual()
+    work.controller.require_installed_v3()
+    if work.db.in_transaction or work.controller.fences.core._db.in_transaction:
+        raise AuthorityUnavailable('Authority member verification must precede Graph/Core SQL')
+    service = require_registered_source_inspection_member_service_v1(work.controller.fences)
+    if service.lifecycle.core is not work.controller.fences.core:
+        raise AuthorityUnavailable('member verifier crossed the actual Work Core')
+    return service
+
+
+def require_authority_inspection_execution_v3(work):
+    from .v2_execution_bridge import AuthorityV2ExecutionBridge
+    require_actual_authority_graph_attachment_owner_v3(work, db=work.db)
+    work.controller.require_installed_v3()
+    weak = _INSPECTION_EXECUTIONS_V3.get(work.controller.fences)
+    execution = None if weak is None else weak()
+    if (type(execution) is not AuthorityV2ExecutionBridge
+            or execution.core is not work.controller.fences.core
+            or execution.fences is not work.controller.fences.fences
+            or execution.namespace != work.permit.namespace):
+        raise AuthorityUnavailable('inspection historical observation lacks its actual installed execution bridge')
+    return execution
+
+
 def install_authority_graph_read_service_registry_v3(server,*,namespace,source_location):
     from .mtls_server import AuthorityRpcServer
     from .current_source_location_v1 import InstalledCurrentSourceLocationQualifierV1
     if (type(server)is not AuthorityRpcServer or type(source_location)is not InstalledCurrentSourceLocationQualifierV1
             or source_location.namespace!=namespace or server._v2_fences.get(namespace)is not source_location._fences):
         raise AuthorityUnavailable('actual late Authority service registry and installed location required')
+    execution = server._v2_execution.get(namespace)
+    if execution is not None:
+        from weakref import ref
+        from .v2_execution_bridge import AuthorityV2ExecutionBridge
+        if (type(execution) is not AuthorityV2ExecutionBridge
+                or execution.core is not source_location.core
+                or execution.fences is not source_location._fences.fences
+                or execution.namespace != namespace):
+            raise AuthorityUnavailable('inspection execution registry crossed its actual Core/fences/namespace')
+        previous = _INSPECTION_EXECUTIONS_V3.get(source_location._fences)
+        if previous is not None and previous() is not execution:
+            raise AuthorityUnavailable('inspection execution bridge cannot replace an installed registry')
+        _INSPECTION_EXECUTIONS_V3[source_location._fences] = ref(execution)
     model=server._v2_model_egress.get(namespace)
     if model is not None:
         install_authority_graph_read_controller_v3(model._graph_verifier,service=model,source_location=source_location)
@@ -539,157 +655,56 @@ def actual_authority_c04_wire_original_v3(work,wire):
     return PreparedAuthorityC04WireOriginalV3(_ISSUER,work,attachment,column)
 
 
-class _AuthorityCanonicalTextReadV3:
-    """Canonical embedded text is consumed once, in the owning Work's quanta."""
-    def __init__(self,work,text):
-        from ..runtime.c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
-        if type(text)is not str:raise AuthorityUnavailable('Authority canonical original must be actual text')
-        self.work,self.text=work,text
-        self.parser=C09CanonicalJSONStreamV2(ensure_ascii=True)
-        self.offset=0;self.nodes={};self.scalar=bytearray();self.value=None;self.complete=False;self.reserved=0
-    def _reserve_v3(self,extra=0):
-        from ..runtime.source_correction_read_v3 import _heap
-        amount=_heap((self.nodes,self.scalar))+extra+65536
-        if amount>self.reserved:self.work.operation.retain(amount-self.reserved);self.reserved=amount
-    def _put_v3(self,path,value):
-        if not path:self.value=value
-        else:
-            parent=self.nodes[path[:-1]]
-            if type(parent)is list:parent.append(value)
-            else:parent[path[-1]]=value
-    def _emit_v3(self,event):
-        import json
-        if event.kind in('object_start','array_start'):
-            self._reserve_v3(1024);value={}if event.kind=='object_start'else[]
-            self.nodes[event.path]=value;self._put_v3(event.path,value)
-        elif event.kind=='scalar_start':self.scalar=bytearray()
-        elif event.kind=='scalar_chunk':self._reserve_v3(len(event.raw)*4+1024);self.scalar.extend(event.raw)
-        elif event.kind=='scalar_end':
-            self._reserve_v3(len(self.scalar)*4+1024)
-            value=json.loads(self.scalar);self.scalar=bytearray();self._put_v3(event.path,value)
-    def advance_v3(self,meter):
-        self.work.require_current(meter=meter)
-        if self.offset<len(self.text):
-            end=min(self.offset+1024,len(self.text))
-            fragment=self.text[self.offset:end].encode('ascii')
-            meter.charge_encode(len(fragment));self._reserve_v3(len(fragment)*4+1024)
-            self.parser.feed(fragment,self._emit_v3);self.offset=end;return False
-        self.summary=self.parser.finish();self.complete=True
-        return True
+
 
 
 _AUTHORITY_REVIEW_CANONICAL_V3=WeakKeyDictionary()
 
 
-class PreparedAuthorityReviewCanonicalV3:
-    """Original review fields and all canonical carriers verified in one Work."""
+from ..runtime.natural_frozen_original_read_v3 import _NaturalReviewCanonicalStateV3,_CanonicalReviewTextReadV3
+
+
+class _AuthorityCanonicalTextReadV3(_CanonicalReviewTextReadV3):
+    """Preserve actual Authority/D13 Work ownership around the shared parser."""
+    def __init__(self,work,text):
+        self.work=work
+        super().__init__(work.operation,text)
+    def advance_v3(self,meter):
+        self.work.require_current(meter=meter)
+        return super().advance_v3(meter)
+
+
+class PreparedAuthorityReviewCanonicalV3(_NaturalReviewCanonicalStateV3):
+    """Authority-issued review proof; shared computation grants no Host power."""
     def __init__(self,issuer,work,column,generation):
-        from ..runtime.dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3,_container_bytes_v3
+        from ..runtime.dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3
         if issuer is not _ISSUER or type(column)is not DispatchOriginalJSONReadV3:
             raise TypeError('actual Authority review column producer required')
         require_actual_authority_graph_attachment_owner_v3(work,db=column.db)
         if column.owner is not work or column.table!='graph_natural_review_preparations_v2'or column.column!='frozen_json':
             raise AuthorityUnavailable('Authority review canonical original crossed its actual column')
-        self.work,self.column,self.generation=work,column,generation
-        self.raw=column.require_v3(work)
-        from ..model_broker.natural_review import FrozenNaturalReplyReviewV1
-        from dataclasses import fields
-        if type(self.raw)is not dict or set(self.raw)!={field.name for field in fields(FrozenNaturalReplyReviewV1)}:
-            raise AuthorityUnavailable('Authority review frozen fieldset differs')
-        work.operation.retain(_container_bytes_v3(self.raw)*2+65536)
-        self.inner=_AuthorityCanonicalTextReadV3(work,self.raw['canonical_input'])
-        self.phase='input';self.complete=False;self.comparison=None;self.result=None
+        self.work,self.column=work,column
+        super().__init__(column.require_v3(work),generation,work.operation,column.sha256,column.byte_count)
         _AUTHORITY_REVIEW_CANONICAL_V3[self]=(work,column,work.operation,work.scope,generation,self.raw)
         _track_authority_capability_v3(work,_AUTHORITY_REVIEW_CANONICAL_V3,self)
+
     def _actual_v3(self):
         require_actual_authority_graph_attachment_owner_v3(self.work,db=self.column.db)
         if (_AUTHORITY_REVIEW_CANONICAL_V3.get(self)!=(self.work,self.column,self.work.operation,
                 self.work.scope,self.generation,self.raw)or self.column.owner is not self.work):
             raise AuthorityUnavailable('Authority review canonical original lost its actual Work')
-    def _comparison_v3(self,value,target=None):
-        from ..runtime.natural_frozen_original_read_v3 import _CanonicalComparisonV3
-        self.comparison=_CanonicalComparisonV3(value,target,operation=self.work.operation)
+
     def advance(self,meter):
         self._actual_v3();self.work.require_current(meter=meter)
-        if self.complete:return True
-        if self.phase=='input':
-            if self.inner.advance_v3(meter):self.payload=self.inner.value;self.phase='fields'
-            return False
-        if self.phase=='fields':
-            from ..model_broker.natural_review import _natural_review_value_fields_v3,NaturalReviewInstallationV1
-            from ..runtime.natural_reply_job_v2 import _unit
-            payload=self.payload
-            if type(payload)is not dict or type(payload.get('qualified_basis'))is not list or not payload['qualified_basis']:
-                raise AuthorityUnavailable('Authority review qualified basis is missing')
-            self.basis=tuple(_unit(item['source_unit'])for item in payload['qualified_basis'])
-            self.grants=tuple(payload['qualified_basis'][0]['promise_grant_refs'])
-            if any(tuple(item['promise_grant_refs'])!=self.grants for item in payload['qualified_basis']):
-                raise AuthorityUnavailable('Authority review promise grant family changed')
-            output={'schema':payload.get('generation_output_schema','sylanne.d09.context_reply_output.v2'),
-                'body':payload['body'],'units':payload['units']}
-            from ..model_broker.natural_review import INPUT_SCHEMA_V2
-            if payload.get('schema')==INPUT_SCHEMA_V2:output['semantic_segments']=payload['semantic_segments']
-            self.installation=NaturalReviewInstallationV1(**self.raw['installation'])
-            self.body,self.units,self.output,self.policy,self.semantic=_natural_review_value_fields_v3(
-                self.generation,output,self.basis,self.grants,payload['review_policy_version'],self.installation)
-            self._comparison_v3(self.basis);self.phase='basis';return False
-        if self.phase=='basis':
-            if not self.comparison.advance(meter):return False
-            self.basis_digest='sha256:'+self.comparison.digest
-            if self.basis_digest!=self.generation.qualified_units_digest:
-                raise AuthorityUnavailable('Authority review actual basis differs from generation seal')
-            self._comparison_v3(self.output);self.phase='output';return False
-        if self.phase=='output':
-            if not self.comparison.advance(meter):return False
-            self.output_digest='sha256:'+self.comparison.digest
-            from dataclasses import asdict
-            from ..model_broker.natural_review import (NaturalReviewQualifiedUnitV1,INPUT_SCHEMA,INPUT_SCHEMA_V2,
-                REVIEW_TEMPLATE_VERSION,REVIEW_TEMPLATE_VERSION_V2)
-            self.expected_input={'schema':INPUT_SCHEMA_V2 if self.semantic else INPUT_SCHEMA,
-                'template_version':REVIEW_TEMPLATE_VERSION_V2 if self.semantic else REVIEW_TEMPLATE_VERSION,
-                'generation_frozen_input_digest':self.generation.frozen_input_digest,
-                'generation_output_digest':self.output_digest,'qualified_units_digest':self.basis_digest,
-                'review_policy_version':self.policy,'body':self.body,'units':[asdict(unit)for unit in self.units],
-                'qualified_basis':[asdict(NaturalReviewQualifiedUnitV1(unit,self.grants))for unit in self.basis]}
-            if self.semantic:
-                self.expected_input['semantic_segments']=self.output['semantic_segments']
-                self.expected_input['generation_output_schema']=self.output['schema']
-            self._comparison_v3(self.expected_input,self.raw['canonical_input']);self.phase='input_compare';return False
-        if self.phase=='input_compare':
-            if not self.comparison.advance(meter):return False
-            self.input_digest='sha256:'+self.comparison.digest
-            from ..model_broker.natural_review import SYSTEM_MESSAGE,SYSTEM_MESSAGE_V2
-            self.messages=[{'role':'system','content':SYSTEM_MESSAGE_V2 if self.semantic else SYSTEM_MESSAGE},
-                {'role':'user','content':self.raw['canonical_input']}]
-            self._comparison_v3(self.messages,self.raw['messages_wire']);self.phase='messages';return False
-        if self.phase=='messages':
-            if not self.comparison.advance(meter):return False
-            self.expected_wire={'provider_id':self.installation.provider_id,'model':self.installation.model_id,
-                'messages':self.messages,'max_output_tokens':self.installation.max_output_tokens}
-            self._comparison_v3(self.expected_wire,self.raw['canonical_wire']);self.phase='wire';return False
-        if self.phase=='wire':
-            if not self.comparison.advance(meter):return False
-            self.wire_digest=self.comparison.digest
-            self.expected_payload_digest=self.wire_digest
-            from dataclasses import asdict
-            from ..model_broker.natural_review import FrozenNaturalReplyReviewV1
-            self.result=FrozenNaturalReplyReviewV1(self.generation.frozen_input_digest,self.output_digest,
-                self.basis_digest,self.body,self.units,self.basis,self.policy,self.installation,
-                self.raw['canonical_input'],self.raw['messages_wire'],self.raw['canonical_wire'],
-                self.input_digest,self.wire_digest)
-            self._comparison_v3(asdict(self.result));self.phase='roundtrip';return False
-        if self.phase=='roundtrip':
-            if not self.comparison.advance(meter):return False
-            if(self.comparison.digest,self.comparison.offset)!=(self.column.sha256,self.column.byte_count):
-                raise AuthorityUnavailable('Authority review typed roundtrip differs from its original full EOF')
-            self.complete=True;return True
-        raise AuthorityUnavailable('unregistered Authority review canonical phase')
+        return super().advance(meter)
+
     def require_for_v3(self,raw):
         self._actual_v3()
         from ..runtime.dispatch_current_inventory_v3 import _freeze_value_v3
         if not self.complete or _freeze_value_v3(raw)!=self.column._frozen_value:
             raise AuthorityUnavailable('Authority review canonical proof requires complete actual roundtrip')
         return self.result
+
 
 
 def begin_authority_review_canonical_read_v3(work,column,*,generation):
@@ -888,10 +903,14 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
         self.habit_metadata_column=None
         self.artifact_model_metadata_column=None
         self.d13_metadata_column=None
+    def _source_from_inspection_v3(self,original):
+        return VerifiedAuthoritySourceMetadataV3(_ISSUER,self,original.key,original.revision,original.valid,
+            original.cell_id,original.header,original.payload_sha256,original.metadata,original.semantic_digest)
     def _next(self,meter):
+        if self.source_inspection_task is not None:
+            return self._advance_source_inspection_v3(meter)
         from ..graph_types import AtomKey
         from ..runtime_storage_v3 import begin_runtime_cell_read_v3
-        from ..runtime.dispatch_current_inventory_v3 import _DispatchSourceStreamV3
         from ..runtime.c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
         row=meter.read_fixed_row(self.db,'graph_atoms',('token','revision','valid','type_name','value_cell_id'),
             'bot=? AND persona=? AND token>? ORDER BY token',(*self.namespace.as_tuple,self.cursor))
@@ -945,36 +964,22 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
             self.pending=None
             self.habit_metadata_column=habit_namespace_metadata_column_v3(self.work,key,revision,valid,cell)
             return
+        if type_name=='memory.source':
+            self._start_source_inspection_v3(self.work,meter)
+            return
         self.cell=begin_runtime_cell_read_v3(self.db,cell,erasure_owner_ref=token)
         codec=self.cell.header[0]
         if codec not in('canonical-json.ascii.v1','canonical-json.utf8.v1'):
             raise AuthorityUnavailable('Authority graph value has an unregistered canonical codec')
-        self.parser=(_DispatchSourceStreamV3(self,key,valid,ensure_ascii=codec=='canonical-json.ascii.v1')
-            if type_name=='memory.source'else C09CanonicalJSONStreamV2(ensure_ascii=codec=='canonical-json.ascii.v1'))
+        self.parser=C09CanonicalJSONStreamV2(ensure_ascii=codec=='canonical-json.ascii.v1')
         self.body=None
-        self.semantic_decoder=self.semantic_hash=None
-        if type_name=='memory.source'and codec=='canonical-json.utf8.v1':
-            import codecs
-            from hashlib import sha256
-            self.semantic_decoder=codecs.getincrementaldecoder('utf-8')('strict');self.semantic_hash=sha256()
-    def _semantic_source_fragment_v3(self,fragment,meter,*,final=False):
-        if self.semantic_decoder is None:return
-        text=self.semantic_decoder.decode(fragment,final=final)
-        parts=[]
-        for char in text:
-            point=ord(char)
-            if point<127:parts.append(char)
-            elif point<=65535:parts.append('\\u'+format(point,'04x'))
-            else:
-                point-=65536;parts.append('\\u'+format(55296+(point>>10),'04x')+'\\u'+format(56320+(point&1023),'04x'))
-        encoded=''.join(parts).encode('ascii');meter.charge_encode(len(encoded));self.semantic_hash.update(encoded)
     def _cell(self,meter):
         from ..runtime_contracts import canonical_digest
         from .life_numeric_source_read_v3 import numeric_authority_source_reader_v3
         if self.offset<len(self.fragment):
             end=min(self.offset+1024,len(self.fragment));self._reserve(65536)
             fragment=self.fragment[self.offset:end]
-            self.parser.feed(fragment,lambda event:None);self._semantic_source_fragment_v3(fragment,meter)
+            self.parser.feed(fragment,lambda event:None)
             self.offset=end;return
         fragment=self.cell.read_fragment(meter=meter)
         if fragment is not None:self.fragment,self.offset=fragment,0;return
@@ -984,16 +989,7 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
         key,revision,valid,type_name,cell=self.pending
         self.root=canonical_digest((self.leaf_schema,self.root,key.token,revision,valid,type_name,digest,cell,tuple(self.cell.header)))
         self.count+=1
-        if type_name=='memory.source'and not self.parser.erased:
-            metadata=self.parser._source_metadata
-            if metadata['source_id']!=key.owner.subject or key.name!='record':
-                raise AuthorityUnavailable('Authority Source identity differs from actual canonical full EOF')
-            self._reserve(65536)
-            self._semantic_source_fragment_v3(b'',meter,final=True)
-            semantic=digest if self.semantic_hash is None else self.semantic_hash.hexdigest()
-            self.sources[key.token]=VerifiedAuthoritySourceMetadataV3(_ISSUER,self,key,revision,bool(valid),cell,
-                self.cell.header,digest,metadata,semantic)
-        elif type_name in self.projection_types and numeric_authority_source_reader_v3(self.work) is None:
+        if type_name in self.projection_types and numeric_authority_source_reader_v3(self.work) is None:
             from ..runtime.natural_producer_qualification_v1 import _HostProducerAttachmentV3
             request=('graph_atoms',('revision','value','valid'),('token','bot','persona'),(key.token,*self.namespace.as_tuple))
             self.attachment=_HostProducerAttachmentV3(self.work,request)
@@ -1004,6 +1000,9 @@ class _AuthorityNamespaceReadV3(_CurrentNamespaceInventoryKernelV3):
         self.work.heads=dict(self.heads)
     def advance_v3(self,meter):
         self.work.require_current(meter=meter)
+        if self.source_inspection_task is not None:
+            self._advance_source_inspection_v3(meter)
+            return
         if self.d13_metadata_column is not None:
             from ..runtime_contracts import canonical_digest
             column=self.d13_metadata_column
@@ -1440,13 +1439,26 @@ def require_authority_source_material_preparation_v3(work,*,source_ref,audiences
         audiences=audiences,purpose=purpose)
 
 
+def require_current_authority_character_labor_call_work_v1(service,work):
+    """Return only the actual installed call's Source-qualified Prepared and A/B/C originals."""
+    require_actual_authority_graph_attachment_owner_v3(work,db=work.db)
+    if work.controller.kind!='character_labor' or work.service is not service or work.phase!='validate':
+        raise AuthorityUnavailable('Life consumer has no actual completed execution Source Work')
+    from .character_labor_source_read_v1 import require_character_labor_source_result_v1
+    return require_character_labor_source_result_v1(service,work)
+
+
 def begin_authority_graph_read_work_v3(verifier,*,credential,subject,permit,namespace,request,
         parent_original_id,now_utc,deadline_utc):
     """Borrow the original call permit; this producer never claims or finishes it."""
     controller=require_authority_graph_read_controller_v3(verifier)
+    from .character_labor_source_read_v1 import CharacterLaborAckMetadataRequestV1
     if (type(parent_original_id)is not str or not parent_original_id
             or type(now_utc)not in(int,float)or not math.isfinite(now_utc)
-            or(deadline_utc is None and controller.kind not in('generation','review'))
+            or(deadline_utc is None and controller.kind not in('generation','review','character_labor_census')
+                and not(controller.kind=='character_labor'and(request.phase=='adoption'
+                    or(type(request)is CharacterLaborAckMetadataRequestV1
+                        and request.phase=='adoption_ack_metadata'))))
             or(deadline_utc is not None and(type(deadline_utc)not in(int,float)or not math.isfinite(deadline_utc)
                 or now_utc>=deadline_utc))):
         raise AuthorityUnavailable('Authority read needs its original parent/clock/finite deadline')
@@ -1454,11 +1466,22 @@ def begin_authority_graph_read_work_v3(verifier,*,credential,subject,permit,name
         permit=permit,namespace=namespace,request=request,deadline_utc=deadline_utc)
     work.parent_original_id=parent_original_id;work.now_utc=float(now_utc)
     work.catalogue_reader=_AuthorityCatalogueReadV3(work)
-    work.phase='bootstrap_generation'if deadline_utc is None else'catalogue'
+    work.phase='bootstrap_generation'if deadline_utc is None and controller.kind in('generation','review')else'catalogue'
     return work
 
 
 def _prepare_authority_attachment_v3(work,request):
+    if work.controller.kind=='character_labor_census':
+        from .character_labor_census_v1 import require_character_labor_census_body_request_v1
+        require_character_labor_census_body_request_v1(work,request)
+    if work.controller.kind=='character_labor':
+        from .character_labor_source_read_v1 import require_character_labor_body_request_v1
+        require_character_labor_body_request_v1(work,request)
+        if request[0] in ('graph_atoms','graph_history'):
+            from .life_model_original_family_read_v3 import prepare_life_model_graph_body_attachment_v3
+            return prepare_life_model_graph_body_attachment_v3(work,request)
+        from ..runtime.natural_producer_qualification_v1 import _HostProducerAttachmentV3
+        return _HostProducerAttachmentV3(work,request)
     from .d13_authority_model_source_v3 import d13_authority_source_reader_v3,require_d13_body_request_v3
     if d13_authority_source_reader_v3(work)is not None:
         require_d13_body_request_v3(work,request)
@@ -1549,6 +1572,12 @@ def _advance_authority_local_materials_v3(work,meter):
             from .foreground_mesh_source_read_v3 import advance_foreground_mesh_materials_v3
             advance_foreground_mesh_materials_v3(work,meter)
         return
+    if work.phase=='character_labor_census':
+        from .character_labor_census_v1 import advance_character_labor_census_v1
+        advance_character_labor_census_v1(work,meter);return
+    if work.phase=='character_labor_source':
+        from .character_labor_source_read_v1 import advance_character_labor_source_v1
+        advance_character_labor_source_v1(work,meter);return
     if work.phase=='d13_paid_source':
         from .d13_authority_model_source_v3 import d13_authority_source_reader_v3
         reader=d13_authority_source_reader_v3(work)
@@ -1639,18 +1668,33 @@ def _advance_authority_local_materials_v3(work,meter):
     if work.phase=='catalogue':
         work.catalogue_reader.advance_v3(meter)
         if work.catalogue_reader.complete:
-            work.namespace_reader=_AuthorityNamespaceReadV3(work,catalogue=work.catalogue_reader.rows,
-                catalogue_hash=work.catalogue_reader.catalogue_hash)
+            if work.controller.kind=='character_labor_census':
+                from .character_labor_census_v1 import character_labor_census_namespace_reader_v1
+                work.namespace_reader=character_labor_census_namespace_reader_v1(work,
+                    catalogue=work.catalogue_reader.rows,catalogue_hash=work.catalogue_reader.catalogue_hash)
+            elif work.controller.kind=='character_labor':
+                from .character_labor_source_read_v1 import character_labor_namespace_reader_v1
+                work.namespace_reader=character_labor_namespace_reader_v1(work,
+                    catalogue=work.catalogue_reader.rows,catalogue_hash=work.catalogue_reader.catalogue_hash)
+            else:
+                work.namespace_reader=_AuthorityNamespaceReadV3(work,catalogue=work.catalogue_reader.rows,
+                    catalogue_hash=work.catalogue_reader.catalogue_hash)
             work.phase='namespace'
         return
     if work.phase=='namespace':
         work.namespace_reader.advance_v3(meter)
         if work.namespace_reader.graph_eof:
             work.projection=AuthorityGraphProjectionV3(_ISSUER,work)
-            if getattr(work,'contact_prepared_locator',None) is not None:
+            if work.controller.kind=='character_labor_census':
+                work.phase='character_labor_census'
+            elif work.controller.kind=='character_labor':
+                work.phase='character_labor_source'
+            elif getattr(work,'contact_prepared_locator',None) is not None:
                 work.phase='contact_policy_metadata'
             elif work.controller.kind=='contact':
                 work.phase='contact_source'
+            elif work.controller.kind=='d04_result' and work.owner_model_work_kind=='d04.appraisal':
+                work.phase='validate'
             elif work.controller.kind=='model'and not work.model_natural:
                 work.phase = ('artifact_model_source' if work.owner_model_work_kind == 'artifact_draft_v1'
                     else 'internal_life_source' if work.owner_model_work_kind == 'd06.encode_internal_life_content'
@@ -1772,7 +1816,16 @@ def advance_authority_graph_read_work_v3(work):
     require_actual_authority_graph_attachment_owner_v3(work)
     if work.failure is not None:raise work.failure
     if work.complete:return work.prepared
+    from ..runtime.d13_cache_use_admission_v2 import (D13CacheUseAdmissionRequiredV2,
+        resolve_authority_d13_cache_use_v2)
     try:
+        from ..runtime.source_inspection_metadata_read_v3 import resolve_pending_inspection_metadata_core_v3
+        if resolve_pending_inspection_metadata_core_v3(work):
+            return work
+        resolve_authority_d13_cache_use_v2(work)
+        if work.controller.kind=='character_labor':
+            from .character_labor_source_read_v1 import resolve_character_labor_source_census_v1
+            if resolve_character_labor_source_census_v1(work):return work
         if work.phase == 'contact_owner_observation':
             from .contact_model_work_v3 import observe_contact_current_policy_v3
             observe_contact_current_policy_v3(work)
@@ -1792,6 +1845,10 @@ def advance_authority_graph_read_work_v3(work):
                     except AuthorityCollectionSourceRequiredV6 as required:
                         required.selection.require_v3(work)
                         work.collection_source_reader=_AuthoritySourceMaterialReadV3(work,required.selection)
+                    except D13CacheUseAdmissionRequiredV2 as required:
+                        if required.work is not work:
+                            raise AuthorityUnavailable('D13 pin continuation crossed its original Authority Work')
+            resolve_authority_d13_cache_use_v2(work)
         return work
     except BaseException as error:
         if work.failure is None:work.failure=error
@@ -2104,35 +2161,66 @@ class _AuthorityDerivedBlobOriginalV6:
                 or(table,column,tuple(key_columns),tuple(key))!=('graph_d11_derived_cache_payloads_v1','payload_bytes',
                     ('bot','persona','block_ref'),self.key)):
             raise AuthorityUnavailable('Authority BLOB original crossed actual fixed table/column/PK/candidate')
-        self.reader.require_current_v6(owner);return self
+        self.reader.require_current_v6(owner)
+        from ..runtime.d13_cache_use_admission_v2 import require_authority_d13_payload_pin_v2
+        require_authority_d13_payload_pin_v2(owner,metadata=self.metadata,metadata_ref=self.metadata_ref,meter=None)
+        return self
 
 
 def begin_authority_derived_payload_read_v6(work,*,selection,metadata,metadata_ref):
     from ..runtime.dispatch_initial_source_read_v3 import DispatchOriginalJSONReadV3
+    from ..runtime.d13_cache_use_admission_v2 import prepare_authority_d13_cache_use_v2
+    with runtime_storage_quantum_v3(work.db) as meter:
+        prepare_authority_d13_cache_use_v2(work,metadata=metadata,metadata_ref=metadata_ref,meter=meter)
     original=_AuthorityDerivedBlobOriginalV6(_ISSUER,work,selection,metadata,metadata_ref)
     return DispatchOriginalJSONReadV3(work,table='graph_d11_derived_cache_payloads_v1',column='payload_bytes',
         key_columns=('bot','persona','block_ref'),key=original.key,authority_blob_original=original)
+
+
+def _advance_authority_role_manifest_preservation_v1(work,task):
+    from ..runtime.role_manifest_logical_preservation_v1 import RoleManifestLogicalPreservationTaskV1
+    from ..runtime.d06_ordinary_readout_v3 import _AUTHORITY
+    owner=_AUTHORITY.get(work)
+    if (type(task)is not RoleManifestLogicalPreservationTaskV1 or owner is None
+            or task.owner is not owner or owner.work is not work or work.db.in_transaction):
+        raise AuthorityUnavailable('role preservation continuation crossed its actual Authority Work')
+    while not task.complete:
+        with work.quantum_v3()as meter:task.advance(meter)
 
 
 def read_authority_graph_current_v3(work,read):
     """Drive material EOF on the original RPC thread, then repeat the original pure read."""
     require_actual_authority_graph_attachment_owner_v3(work,db=work.db)
     if work.failure is not None:raise work.failure
+    from ..runtime.role_manifest_logical_preservation_v1 import RoleManifestLogicalPreservationNeededV1
     try:
         while work.phase!='validate':advance_authority_graph_read_work_v3(work)
+        while True:
+            try:
+                if work.owner_model_work_kind=='d04.appraisal':
+                    from .d04_ordinary_source_v3 import prepare_authority_d04_ordinary_readout_v3
+                    prepare_authority_d04_ordinary_readout_v3(work)
+                from ..runtime.d06_ordinary_readout_v3 import prepare_authority_life_ordinary_readout_v3
+                prepare_authority_life_ordinary_readout_v3(work)
+                break
+            except RoleManifestLogicalPreservationNeededV1 as needed:
+                _advance_authority_role_manifest_preservation_v1(work,needed.task)
         if work.complete and work.producer_inputs is not None:_observe_authority_producer_context_v3(work)
         while True:
-            with work.quantum_v3()as meter:
-                if work.complete:
-                    with bind_prepared_authority_graph_read_v3(work.prepared,service=work.service,db=work.db,meter=meter):
-                        return read(work.db)
-                with bind_authority_graph_original_preparation_v3(work):
-                    try:result=read(work.db)
-                    except AuthorityGraphAttachmentRequiredV3 as required:
-                        work.pending=_prepare_authority_attachment_v3(work,required.request)
-                    else:
-                        work.complete=True;work.prepared=PreparedAuthorityGraphReadV3(_ISSUER,work)
-                        return result
+            try:
+                with work.quantum_v3()as meter:
+                    if work.complete:
+                        with bind_prepared_authority_graph_read_v3(work.prepared,service=work.service,db=work.db,meter=meter):
+                            return read(work.db)
+                    with bind_authority_graph_original_preparation_v3(work):
+                        try:result=read(work.db)
+                        except AuthorityGraphAttachmentRequiredV3 as required:
+                            work.pending=_prepare_authority_attachment_v3(work,required.request)
+                        else:
+                            work.complete=True;work.prepared=PreparedAuthorityGraphReadV3(_ISSUER,work)
+                            return result
+            except RoleManifestLogicalPreservationNeededV1 as needed:
+                _advance_authority_role_manifest_preservation_v1(work,needed.task)
             while work.pending is not None:advance_authority_graph_read_work_v3(work)
     except BaseException as error:
         if work.failure is None:work.failure=error
@@ -2142,9 +2230,18 @@ def read_authority_graph_current_v3(work,read):
 def finish_authority_graph_read_work_v3(work):
     if type(work)is not AuthorityGraphReadWorkV3:return
     first=work.failure
-    try:work.release_v3()
-    except BaseException:
-        if first is None:raise
+    try:
+        work.release_v3()
+        if (actual_authority_graph_release_v3(work) is work.operation
+                and work.operation is not None and work.operation.closed
+                and not work.borrowed_counter_operation):
+            from ..runtime.d13_cache_use_admission_v2 import release_authority_d13_cache_use_v2
+            release_authority_d13_cache_use_v2(work)
+    except BaseException as error:
+        if first is None:
+            work.failure=error
+            raise
+        first.add_note('Authority final release also failed: '+type(error).__name__)
 
 
 def require_authority_same_batch_hints_v7(work,*,parent_original_id,frozen):
@@ -2608,14 +2705,16 @@ def authority_reply_attention_versions_v3(snapshot):
 def require_authority_outbound_collection_source_v6(work,*,slot,completion,batch,outbox,source_ref,original,receipt):
     """Context use derives only from this record's actual adopted delivered observation."""
     from ..authority_service.v2_contract import MutationReceiptV2,PlatformObservationV2
+    from .observation_refinement_contract_v3 import (
+        PlatformObservationRefinementReceiptV3,observation_platform_observation_v3)
     from ..domains.d09.turn_order import _outbound_segment
     from ..graph_types import AtomKey
     if (type(original)is not PreparedAuthorityJSONColumnV3 or original.owner is not work
             or original.attachment.table!='graph_d13_outbound_observations_v1'
-            or type(receipt)is not MutationReceiptV2):
+            or type(receipt)not in (MutationReceiptV2,PlatformObservationRefinementReceiptV3)):
         raise AuthorityUnavailable('Authority outbound context lacks its actual adopted original column')
-    adopted=original.require_v3(work);pending=receipt.pending
-    observation=None if pending is None else pending.platform_observation
+    adopted=original.require_v3(work)
+    observation=observation_platform_observation_v3(receipt)
     for atom in(slot,completion,batch,outbox):
         if work.projection.get(atom.key)is not atom or not atom.valid:
             raise AuthorityUnavailable('Authority outbound record changed its actual current Graph atoms')
@@ -2627,7 +2726,7 @@ def require_authority_outbound_collection_source_v6(work,*,slot,completion,batch
             or slot.value['direction']!='outbound' or slot.value['origin_ref']!=outbox.key.token
             or outbox.key.type_name!='runtime.outbox'or outbox.value['phase']!='delivered'
             or outbox.value['payload_ref']!=payload_ref or type(segment)is not dict
-            or type(observation)is not PlatformObservationV2 or pending.phase!='observed'
+            or type(observation)is not PlatformObservationV2
             or receipt.durable_state!='committed'or observation.outcome!='delivered'
             or outbox.value['effect_id']!=observation.binding.origin.effect_id
             or outbox.value['operation_id']!=observation.binding.origin.operation_id
@@ -3041,3 +3140,18 @@ def require_authority_c02_bundle_envelope_v3(db,namespace,operation_id):
     if work.namespace!=namespace or work.c02_bundle_original is None:
         raise AuthorityUnavailable('Authority C02 consumer lacks its actual full typed-semantic original EOF')
     return work.c02_bundle_original.require_current_v3(work,operation_id)
+
+
+def begin_authority_d04_result_graph_read_work_v3(service,*,credential,subject,permit,intent,now_utc):
+    controller=require_authority_graph_read_controller_v3(service)
+    if controller.kind!='d04_result' or controller.service is not service or permit.operation!='read':
+        raise AuthorityUnavailable('D04 result Source requires its actual installed independent READ')
+    work=AuthorityGraphReadWorkV3(_ISSUER,controller,credential=credential,subject=subject,permit=permit,
+        namespace=controller.location.namespace_id,request=intent,deadline_utc=None)
+    if work.owner_model_work_kind!='d04.appraisal':
+        work.release_v3()
+        raise AuthorityUnavailable('D04 result Source cannot borrow another paid model job')
+    work.now_utc=float(now_utc);work.catalogue_reader=_AuthorityCatalogueReadV3(work)
+    work.model_natural=work.model_reply=work.model_context=False
+    work.phase='catalogue'
+    return work

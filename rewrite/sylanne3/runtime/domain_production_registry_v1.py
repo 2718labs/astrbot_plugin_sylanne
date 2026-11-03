@@ -37,6 +37,8 @@ _OPERATIONS = {
     "focus_life_project": ("d07", "FocusLifeProjectRequestV1", "stage_focus_life_project_in_transaction_v1", "workbench.create"),
     "prepare_life_project_context": ("d03", "PrepareLifeProjectContextRequestV1", "stage_prepare_life_project_context_in_transaction_v1", "workbench.create"),
     "prepare_source_note_action": ("d08", "PrepareSourceNoteActionRequestV1", "stage_prepare_source_note_action_in_transaction_v1", "workbench.create"),
+    "prepare_character_labor_body": ("d02", "PrepareCharacterLaborBodyRequestV1", "stage_prepare_character_labor_body_in_transaction_v1", "workbench.create"),
+    "rebuild_character_labor_body": ("d02", "RebuildCharacterLaborBodyRequestV1", "stage_rebuild_character_labor_body_in_transaction_v1", "workbench.create"),
     "prepare_source_note_body": ("d02", "PrepareSourceNoteBodyRequestV1", "stage_prepare_source_note_body_in_transaction_v1", "workbench.create"),
     "prepare_artifact_draft_body": ("d02", "PrepareArtifactDraftBodyRequestV1", "stage_prepare_artifact_draft_body_in_transaction_v1", "workbench.create"),
     "record_host_lifecycle": ("d11", "HostLifecycleRequestV1", "stage_current_host_lifecycle_in_transaction_v1", "workbench.create"),
@@ -57,8 +59,11 @@ _OPERATIONS = {
     "serve_concern": ("d07", "ServeCurrentConcernRequestV1", "stage_serve_current_concern_in_transaction_v1", "workbench.create"),
     "advance_reflection": ("d07", "AdvanceCurrentReflectionRequestV1", "stage_advance_current_reflection_in_transaction_v1", "workbench.activate"),
     "run_simulation": ("d07", "RunCurrentSimulationRequestV1", "stage_run_current_simulation_in_transaction_v1", "workbench.create"),
+    "cancel_action": ("d08", "CancelCurrentActionRequestV1", "stage_cancel_current_action_in_transaction_v1", "workbench.control"),
     "recheck_action": ("d08", "RecheckCurrentActionRequestV1", "stage_recheck_current_action_in_transaction_v1", "workbench.read"),
     "settle_observed_action": ("d08", "SettleCurrentObservedActionRequestV1", "stage_settle_current_observed_action_in_transaction_v1", "workbench.activate"),
+    "acknowledge_commitment_terms": ("d08", "AcknowledgeCurrentCommitmentTermsRequestV1", "stage_acknowledge_current_commitment_terms_in_transaction_v1", "workbench.activate"),
+    "settle_current_commitment_fulfillment": ("d08", "SettleCurrentCommitmentFulfillmentRequestV1", "stage_settle_current_commitment_fulfillment_in_transaction_v1", "workbench.activate"),
     "acknowledge_bilateral": ("d08", "AcknowledgeCurrentBilateralRequestV1", "stage_acknowledge_current_bilateral_in_transaction_v1", "workbench.activate"),
     "adopt_joint_plan": ("d08", "AdoptCurrentJointPlanRequestV1", "stage_adopt_current_joint_plan_in_transaction_v1", "workbench.activate"),
     "advance_life": ("d10", "AdvanceCurrentLifeRequestV1", "stage_current_life_effect_experience_bundle_in_transaction_v1", "workbench.activate"),
@@ -68,6 +73,20 @@ _OPERATIONS = {
 
 
 _PERSONAL_OPERATIONS = {
+    "register_ordinary_cumulative_growth_policy_v1": ("d01", ".d01_ordinary_cumulative_growth_v1", "RegisterOrdinaryCumulativeGrowthPolicyRequestV1", "stage_ordinary_cumulative_growth_v1", "verify_ordinary_cumulative_stage_v1", "workbench.activate"),
+    "assess_ordinary_continuity_v1": ("d01", ".d01_ordinary_cumulative_growth_v1", "AssessOrdinaryContinuityRequestV1", "stage_ordinary_cumulative_growth_v1", "verify_ordinary_cumulative_stage_v1", "workbench.activate"),
+    "adopt_ordinary_deep_growth_v1": ("d01", ".d01_ordinary_cumulative_growth_v1", "AdoptOrdinaryDeepGrowthRequestV1", "stage_ordinary_cumulative_growth_v1", "verify_ordinary_cumulative_stage_v1", "workbench.activate"),
+    "register_single_event_review_attention_v1": ("d07", ".d07_single_event_review_v1", "RegisterSingleEventReviewAttentionRequestV1", "stage_register_single_event_review_attention_v1", "", "workbench.activate"),
+    "register_ordinary_continuity_attention_v1": ("d07", ".d07_ordinary_continuity_cognition_v1", "RegisterOrdinaryContinuityAttentionRequestV1", "stage_register_ordinary_continuity_attention_v1", "", "workbench.activate"),
+    "register_single_event_growth_policy_v1": ("d01", ".d01_single_event_growth_v1", "RegisterSingleEventGrowthPolicyRequestV1", "stage_single_event_growth_v1", "verify_single_event_stage_v1", "workbench.activate"),
+    "prepare_single_event_growth_v1": ("d01", ".d01_single_event_growth_v1", "PrepareSingleEventGrowthRequestV1", "stage_single_event_growth_v1", "verify_single_event_stage_v1", "workbench.activate"),
+    "adopt_single_event_growth_v1": ("d01", ".d01_single_event_growth_v1", "AdoptSingleEventGrowthRequestV1", "stage_single_event_growth_v1", "verify_single_event_stage_v1", "workbench.activate"),
+    "review_single_event_growth_v1": ("d01", ".d01_single_event_growth_v1", "ReviewSingleEventGrowthRequestV1", "stage_single_event_growth_v1", "verify_single_event_stage_v1", "workbench.activate"),
+    "read_single_event_growth_v1": ("d01", ".d01_single_event_growth_v1", "ReadSingleEventGrowthRequestV1", "stage_single_event_growth_v1", "verify_single_event_stage_v1", "workbench.read"),
+    "mark_goal_growth_review_v1": ("d08", ".persona_growth_review_v1", "MarkCurrentGrowthReviewRequestV1", "stage_mark_growth_review_v1", "", "workbench.control"),
+    "mark_life_growth_review_v1": ("d10", ".persona_growth_review_v1", "MarkCurrentGrowthReviewRequestV1", "stage_mark_growth_review_v1", "", "workbench.control"),
+    "confirm_goal_growth_review_v1": ("d08", ".persona_growth_review_v1", "ConfirmCurrentGrowthReviewRequestV1", "stage_confirm_growth_review_v1", "", "workbench.control"),
+    "confirm_life_growth_review_v1": ("d10", ".persona_growth_review_v1", "ConfirmCurrentGrowthReviewRequestV1", "stage_confirm_growth_review_v1", "", "workbench.control"),
     "freeze_general_growth_intent_v1": ("d01", ".d01_general_growth_v1", "FreezeCurrentGeneralGrowthRequestV1", "stage_freeze_current_general_growth_in_transaction_v1", "", "workbench.activate"),
     "register_general_growth_trial_start_v1": ("d01", ".d01_general_growth_v1", "RegisterCurrentGeneralGrowthTrialStartRequestV1", "stage_register_current_general_growth_trial_start_in_transaction_v1", "", "workbench.activate"),
     "derive_general_growth_trial_v1": ("d01", ".d01_general_growth_v1", "DeriveCurrentGeneralGrowthTrialRequestV1", "stage_derive_current_general_growth_trial_in_transaction_v1", "", "workbench.activate"),
@@ -169,6 +188,11 @@ _POSTCONDITION_OPERATIONS = {
 
 
 def installed_operation_v1(operation_kind):
+    from .d06_retention_v1 import OPERATIONS as RETENTION_OPERATIONS
+    if operation_kind in RETENTION_OPERATIONS:
+        return InstalledDomainOperationV1('d06',operation_kind,RETENTION_OPERATIONS[operation_kind],
+            'stage_memory_retention_v1','verify_retention_stage_v1',
+            'workbench.activate' if operation_kind=='register_memory_retention_policy_v1' else 'workbench.create')
     from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS,_REQUESTS as LONG_TERM_REQUESTS
     from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,_REQUESTS as HABIT_REQUESTS
     if operation_kind in LONG_TERM_OPERATIONS:
@@ -298,6 +322,8 @@ def installed_operation_v1(operation_kind):
         ".d07_life_project_focus_v1" if operation_kind == "focus_life_project" else
         ".d03_life_project_context_v1" if operation_kind == "prepare_life_project_context" else
         ".d08_source_note_action_v1" if operation_kind == "prepare_source_note_action" else
+        ".d02_character_labor_rebuild_v1" if operation_kind == "rebuild_character_labor_body" else
+        ".d11_character_work_segment_v1" if operation_kind == "prepare_character_labor_body" else
         ".d02_life_body_preparation_v1" if operation_kind in {"prepare_source_note_body", "prepare_artifact_draft_body"} else
         ".d11_host_lifecycle_v1" if operation_kind == "record_host_lifecycle" else
         ".d11_life_preparation_v1" if operation_kind == "prepare_life" else
@@ -353,6 +379,17 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
                 or task_evidence.request.operation_kind != operation.operation_kind):
             raise ValueError("Owner task readers changed their actual paired current Core issuance")
     issuer = graph._GraphCoordinator__d11_issuer
+    from .d06_retention_v1 import OPERATIONS as RETENTION_OPERATIONS
+    if operation.operation_kind in RETENTION_OPERATIONS:
+        if foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError('retention maintenance requires its actual current Owner Source Work')
+        from .d06_retention_v1 import InstalledD06RetentionReadersV1
+        assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+        if assembly is None:
+            from .d01_production_operations_v1 import MissingProductionOriginalV1
+            raise MissingProductionOriginalV1('actual_installed_D06_retention_bundle')
+        return InstalledD06RetentionReadersV1(issuer=issuer,owner_guard=owner_guard,
+            installed_bundle=assembly.admin_bundle)
     from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS
     from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,SOURCE_NOTE_OPERATIONS,InstalledHabitSourceNoteReadersV1
     if operation.operation_kind in LONG_TERM_OPERATIONS:
@@ -594,11 +631,45 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
     if operation.operation_kind == "observe_method_comparison_v1":
         from .d11_method_observation_v1 import install_method_observation_readers_v1
         return install_method_observation_readers_v1(graph, scope=scope, owner_guard=owner_guard, owner_binding=owner_binding)
+    from .persona_growth_review_contract_v1 import REVIEW_OPERATIONS_V1
+    if operation.operation_kind in REVIEW_OPERATIONS_V1:
+        if foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError("growth review requires its independent fresh Owner control channel")
+        from .persona_growth_review_v1 import install_growth_review_readers_v1
+        return install_growth_review_readers_v1(graph, scope=scope, owner_guard=owner_guard,
+            owner_binding=owner_binding, operation=operation)
     if operation.operation_kind in {"pause_project_v1", "resume_project_v1"}:
         if foreground_issuance is not None:
             raise ValueError("project controls require the actual Owner channel, never Self foreground issuance")
         from .d08_project_control_v1 import install_project_control_readers_v1
         return install_project_control_readers_v1(graph, scope=scope, owner_guard=owner_guard, owner_binding=owner_binding)
+    from .d01_ordinary_cumulative_growth_v1 import OPERATION_KINDS as ORDINARY_CUMULATIVE_OPERATIONS
+    if operation.operation_kind in ORDINARY_CUMULATIVE_OPERATIONS:
+        if foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError('ordinary cumulative policy/assessment/deep adoption requires its exact current Owner Work')
+        from .d01_production_operations_v1 import InstalledD01ProductionReadersV1
+        return InstalledD01ProductionReadersV1(issuer=issuer,owner_guard=owner_guard,
+            role_clock_reader=graph._GraphCoordinator__d04_semantic_mapping_reader)
+    if operation.operation_kind=='register_single_event_review_attention_v1':
+        from .d07_single_event_review_v1 import InstalledD07SingleEventReviewReadersV1
+        assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+        if assembly is None or foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError('single-event review attention needs its actual installed independent Owner Source Work')
+        return InstalledD07SingleEventReviewReadersV1(graph=graph,issuer=issuer,bundle=assembly.admin_bundle)
+    if operation.operation_kind == 'register_ordinary_continuity_attention_v1':
+        from .d07_ordinary_continuity_cognition_v1 import InstalledD07OrdinaryContinuityReadersV1
+        assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+        if assembly is None or foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError('ordinary continuity attention requires its actual installed Owner assembly')
+        return InstalledD07OrdinaryContinuityReadersV1(graph=graph,issuer=issuer,bundle=assembly.admin_bundle,
+            owner_guard=owner_guard,role_clock_reader=graph._GraphCoordinator__d04_semantic_mapping_reader)
+    from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1
+    if operation.operation_kind in SINGLE_EVENT_OPERATION_KINDS_V1:
+        if foreground_issuance is not None or owner_task_issuance is not None:
+            raise ValueError('single-event growth requires its independent exact Owner or review Source Work')
+        from .d01_production_operations_v1 import InstalledD01ProductionReadersV1
+        return InstalledD01ProductionReadersV1(issuer=issuer,owner_guard=owner_guard,
+            role_clock_reader=graph._GraphCoordinator__d04_semantic_mapping_reader)
     if operation.operation_kind in _PERSONAL_OPERATIONS:
         if operation.domain == "d05":
             from .d05_production_operations_v1 import InstalledD05ProductionReadersV1
@@ -686,10 +757,24 @@ def installed_readers_for_operation_v1(graph, operation, *, scope, owner_guard, 
     if operation.domain in {"d02", "d10"} or contact:
         from .d02_production_operations_v1 import InstalledD02ProductionReadersV1
         clock = graph._GraphCoordinator__d04_semantic_mapping_reader
+        runtime=graph._GraphCoordinator__domain_production_runtime_v1
+        labor_pair=runtime._active_character_labor_census_v1 if operation.operation_kind in {
+            'prepare_character_labor_body','rebuild_character_labor_body','prepare_life'} else None
+        labor_bundle=None
+        if labor_pair is not None:
+            actual_assembly=graph._GraphCoordinator__d04_installed_joint_assembly
+            if actual_assembly is None:
+                raise ValueError("labor census has no actual installed package bundle")
+            labor_bundle=actual_assembly.admin_bundle
         body = InstalledD02ProductionReadersV1(issuer=issuer,
-            body_quote_authority=graph._GraphCoordinator__body_quote_authority, role_clock_reader=clock)
+            body_quote_authority=graph._GraphCoordinator__body_quote_authority, role_clock_reader=clock,
+            installed_bundle=labor_bundle,
+            labor_census=None if labor_pair is None else labor_pair[0],
+            labor_scope=None if labor_pair is None else labor_pair[1],
+            labor_pages=runtime._active_character_labor_segment_pages_v1
+                if operation.operation_kind=="rebuild_character_labor_body" else None)
         if operation.domain == "d02":
-            if operation.operation_kind == "prepare_source_note_body":
+            if operation.operation_kind in {"prepare_source_note_body","prepare_character_labor_body","rebuild_character_labor_body"}:
                 assembly = graph._GraphCoordinator__d04_installed_joint_assembly
                 if assembly is None:
                     raise ValueError("SourceNote Body requires the actual installed package bundle")
@@ -712,6 +797,19 @@ def stage_installed_domain_operation_v1(db, *, operation, frame, request, instal
             or installed_operation_v1(operation.operation_kind) != operation
             or type(request) is not operation.request_type or not db.in_transaction):
         raise ValueError("exact registered domain request and current transaction required")
+    from .persona_growth_review_v1 import require_growth_review_new_work_v1
+    from .d01_production_operations_v1 import MissingProductionOriginalV1, waiting_stage_v1
+    try:
+        require_growth_review_new_work_v1(db, frame=frame, operation_kind=operation.operation_kind, request=request)
+    except MissingProductionOriginalV1 as missing:
+        return waiting_stage_v1(frame, operation.domain, operation.operation_kind, request, missing)
+    from .d06_retention_v1 import (OPERATIONS as RETENTION_OPERATIONS,
+        InstalledD06RetentionReadersV1,stage_memory_retention_v1,verify_retention_stage_v1)
+    if operation.operation_kind in RETENTION_OPERATIONS:
+        if type(installed_readers) is not InstalledD06RetentionReadersV1:
+            raise TypeError('retention stage requires its actual installed typed readers')
+        return verify_retention_stage_v1(stage_memory_retention_v1(
+            db,frame=frame,request=request,installed_readers=installed_readers))
     from .d08_long_term_plan_v1 import OPERATIONS as LONG_TERM_OPERATIONS,stage_current_long_term_operation_v1
     from .d10_habit_v1 import OPERATIONS as HABIT_OPERATIONS,stage_current_habit_operation_v1
     if operation.operation_kind in LONG_TERM_OPERATIONS:
@@ -779,8 +877,10 @@ def stage_installed_domain_operation_v1(db, *, operation, frame, request, instal
             producer_kind=operation.operation_kind[len("input:"):], request=request, installed_readers=installed_readers)
     if operation.operation_kind in _PERSONAL_OPERATIONS:
         module = import_module(_PERSONAL_OPERATIONS[operation.operation_kind][1], package=__package__)
-        return getattr(module, operation.stage_name)(
+        stage=getattr(module, operation.stage_name)(
             db, frame=frame, request=request, installed_readers=installed_readers)
+        from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1
+        return module.verify_single_event_stage_v1(stage)if operation.operation_kind in SINGLE_EVENT_OPERATION_KINDS_V1 else stage
     module = import_module(".d06_life_numeric_drive_v1" if operation.operation_kind == "prepare_internal_life_numeric_drive" else
         ".d06_life_numeric_joint_v1" if operation.operation_kind == "prepare_internal_life_numeric_joint" else
         ".d04_life_encoding_baseline_v1" if operation.operation_kind == "prepare_internal_life_interval_baseline" else
@@ -802,6 +902,8 @@ def stage_installed_domain_operation_v1(db, *, operation, frame, request, instal
         ".d07_life_project_focus_v1" if operation.operation_kind == "focus_life_project" else
         ".d03_life_project_context_v1" if operation.operation_kind == "prepare_life_project_context" else
         ".d08_source_note_action_v1" if operation.operation_kind == "prepare_source_note_action" else
+        ".d02_character_labor_rebuild_v1" if operation.operation_kind == "rebuild_character_labor_body" else
+        ".d11_character_work_segment_v1" if operation.operation_kind == "prepare_character_labor_body" else
         ".d02_life_body_preparation_v1" if operation.operation_kind in {"prepare_source_note_body", "prepare_artifact_draft_body"} else
         ".d10_offline_tick_execution_v1" if operation.operation_kind == "prepare_offline_tick" else
         ".d11_life_product_adapter_v1" if operation.operation_kind == "prepare_life" else

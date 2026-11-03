@@ -10,7 +10,6 @@ from dataclasses import asdict, dataclass
 import ctypes
 import hashlib
 import json
-import logging
 import os
 from pathlib import Path
 import select
@@ -25,6 +24,7 @@ from uuid import uuid4
 from weakref import WeakSet,WeakKeyDictionary
 import threading
 
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from .contract import AuthorityUnavailable
 from .c09_process_identity_v1 import read_process_identity_v1
 from .linux_installation_security_v1 import read_installed_bytes_v1, read_installed_json_v1
@@ -45,7 +45,7 @@ def _supervisor_stage_event_v1(stage, event, *, sequence=None, role=None, cohort
         metadata["peer_pid"] = peer_pid
     if exception_type is not None:
         metadata["exception_type"] = exception_type
-    logging.getLogger(__name__).warning("Sylanne D12 root supervisor stage metadata: " +
+    diagnostic_channel_v1(__name__).warning("Sylanne D12 root supervisor stage metadata: " +
         json.dumps(metadata, separators=(",", ":")))
     return observed
 
@@ -330,11 +330,43 @@ def _host_credentials(spec):
 
 _ROOT_GENESIS_HOLDS_V3 = WeakSet()
 _ROOT_GENESIS_HOLD_ISSUER_V3 = object()
+_ROOT_GENESIS_AUTHORITY_BINDINGS_V4 = WeakKeyDictionary()
+
+
+def _require_actual_authority_observation_v4(*,host_spec,authority_spec,host_observation,authority_observation,
+        authority_binding,authority_original,launcher_original):
+    spec,observed,expected=authority_spec,authority_observation,authority_binding
+    if (type(spec)is not InstalledProcessSupervisorSpecV2 or spec.service_role!='authority'
+            or type(observed)is not D12SupervisorObservationV2 or type(expected)is not dict
+            or spec.authority_id!=host_spec.authority_id
+            or spec.installation_id!=host_spec.installation_id
+            or spec.namespace_cohort!=host_spec.namespace_cohort
+            or spec.profile_id!=host_spec.profile_id
+            or any(getattr(spec,name)!=getattr(host_spec,name)for name in
+                ('launcher_code_ref','launcher_build_digest','protected_state_directory',
+                 'bootstrap_package_ref','selection_control_directory','control_socket_path'))
+            or (observed.selection_revision,observed.selected_cohort_digest,observed.selected_release_ref,observed.selected_manifest_digest)!=
+                (host_observation.selection_revision,host_observation.selected_cohort_digest,
+                 host_observation.selected_release_ref,host_observation.selected_manifest_digest)
+            or observed.service_role!='authority'or observed.state!='active'
+            or observed.supervisor_id!=spec.supervisor_id or observed.spec_digest!=spec.spec_digest
+            or observed.main_process_original!=authority_original
+            or observed.main_pid!=authority_original['pid']
+            or observed.launcher_process_original!=launcher_original
+            or not observed.invocation_id or len(observed.process_ids)>spec.maximum_processes
+            or observed.pid_namespace_identity!=_namespace_identity(os.getpid(),'pid')
+            or observed.mount_namespace_identity!=_namespace_identity(os.getpid(),'mnt')
+            or any(getattr(observed,name)!=value for name,value in expected.items())
+            or observed.installed_code_digest!=digest((spec.launcher_build_digest,spec.executable_sha256,
+                spec.entry_sha256,expected['expected_final_entry_sha256'],expected['selected_manifest_digest']))
+            or digest(observed.main_process_details)!=digest(_process_details(os.getpid()))):
+        raise AuthorityUnavailable('actual held Authority-role observation differs from its protected fixed invocation')
+    return observed
 
 
 class RootPeerRegistryGenesisHoldV3:
     """Actual root channel keeps installed Host starts excluded until release."""
-    def __init__(self, issuer, adapter, channel, response, launcher, authority):
+    def __init__(self, issuer, adapter, channel, response, launcher, authority, *, authority_spec=None,authority_binding=None):
         if issuer is not _ROOT_GENESIS_HOLD_ISSUER_V3:
             raise AuthorityUnavailable("actual installed Root genesis channel issuer required")
         self.adapter, self.channel = adapter, channel
@@ -348,6 +380,17 @@ class RootPeerRegistryGenesisHoldV3:
                 or response['authority_process_original']!=authority
                 or not response['root_channel_nonce']):
             raise AuthorityUnavailable("actual complete Root Host genesis census differs")
+        self.authority_spec,self.authority_binding=authority_spec,authority_binding
+        self.authority_observation=None
+        if authority_spec is not None:
+            if (set(response)!={'schema','status','observation','root_channel_nonce','root_process_original',
+                    'authority_process_original','registry_scope','authority_observation'}
+                    or response['schema']!='sylanne3.root-peer-registry-genesis-held.v4'):
+                raise AuthorityUnavailable('explicit V4 Authority birth requires its exact actual Root held wire')
+            self.authority_observation=decode_process_supervisor_observation_v2(response['authority_observation'])
+            self._require_authority_observation_v4()
+            _ROOT_GENESIS_AUTHORITY_BINDINGS_V4[self]=(adapter,channel,authority_spec,
+                digest(authority_binding),digest(response),self.authority_observation.observation_digest)
         _ROOT_GENESIS_HOLDS_V3.add(self)
 
     def require_current(self):
@@ -357,6 +400,22 @@ class RootPeerRegistryGenesisHoldV3:
                 or read_process_identity_v1(os.getpid())!=self.authority_original
                 or select.select([self.channel],[],[],0)[0]):
             raise AuthorityUnavailable("continuous installed Root genesis channel exclusion ended")
+
+    def _require_authority_observation_v4(self):
+        return _require_actual_authority_observation_v4(host_spec=self.adapter.config,authority_spec=self.authority_spec,
+            host_observation=self.observation,authority_observation=self.authority_observation,authority_binding=self.authority_binding,
+            authority_original=self.authority_original,launcher_original=self.launcher_original)
+
+    def require_authority_birth_observation_v4(self):
+        self.require_current()
+        expected=(self.adapter,self.channel,self.authority_spec,digest(self.authority_binding),
+            digest(self.original),None if self.authority_observation is None else self.authority_observation.observation_digest)
+        if _ROOT_GENESIS_AUTHORITY_BINDINGS_V4.get(self)!=expected:
+            raise AuthorityUnavailable('old Host-only genesis hold has no actual Authority-role birth witness')
+        verify_process_supervisor_spec_v1(self.authority_spec)
+        if _read_selected_invocation(self.authority_spec)!=self.authority_binding:
+            raise AuthorityUnavailable('held Authority selected invocation changed before actual Core birth')
+        return self._require_authority_observation_v4()
 
     def close(self):
         if not self.released:
@@ -369,6 +428,7 @@ class RootPeerRegistryGenesisHoldV3:
 
 
 _ROOT_PEER_BASELINES_V3=WeakSet()
+_ROOT_COVERAGE_AUTHORITY_BINDINGS_V4=WeakKeyDictionary()
 _ROOT_PEER_OBSERVATIONS_V3=WeakSet()
 _ROOT_PEER_OBSERVATION_BINDINGS_V3=WeakKeyDictionary()
 _ROOT_PEER_START_ISSUER_V3=object()
@@ -459,6 +519,33 @@ class RootPeerStartBaselineV3:
 
 
 class RootPeerStartCoverageHoldV3(RootPeerStartBaselineV3):
+    def __init__(self,issuer,*,supervisor,channel,response,peer,root,authority,authority_spec=None,authority_binding=None):
+        super().__init__(issuer,supervisor=supervisor,channel=channel,response=response,peer=peer,root=root,authority=authority)
+        self.authority_spec,self.authority_binding=authority_spec,authority_binding
+        self.authority_observation=None;self.authority_held_original=response
+        if authority_spec is not None:
+            if (set(response)!={'schema','status','observation','root_channel_nonce','root_process_original',
+                    'authority_process_original','authority_observation'}
+                    or response['schema']!='sylanne3.root-peer-start-coverage-held.v4'):
+                raise AuthorityUnavailable('current Core birth requires its exact V4 actual Root pending hold wire')
+            self.authority_observation=decode_process_supervisor_observation_v2(response['authority_observation'])
+            _require_actual_authority_observation_v4(host_spec=supervisor.config,authority_spec=authority_spec,
+                host_observation=self.observation,authority_observation=self.authority_observation,
+                authority_binding=authority_binding,authority_original=authority,launcher_original=root)
+            _ROOT_COVERAGE_AUTHORITY_BINDINGS_V4[self]=(supervisor,channel,self.control,self.gate,authority_spec,
+                digest(authority_binding),digest(response))
+    def require_authority_birth_observation_v4(self):
+        self.require_current(control=self.control,gate=self.gate,meter=None)
+        if _ROOT_COVERAGE_AUTHORITY_BINDINGS_V4.get(self)!=(self.supervisor,self.channel,self.control,self.gate,
+                self.authority_spec,digest(self.authority_binding),digest(self.authority_held_original)):
+            raise AuthorityUnavailable('current Core birth has no actual private Authority-role coverage qualification')
+        verify_process_supervisor_spec_v1(self.authority_spec)
+        if _read_selected_invocation(self.authority_spec)!=self.authority_binding:
+            raise AuthorityUnavailable('current Authority selected invocation changed under its original pending hold')
+        return _require_actual_authority_observation_v4(host_spec=self.supervisor.config,authority_spec=self.authority_spec,
+            host_observation=self.observation,authority_observation=self.authority_observation,
+            authority_binding=self.authority_binding,authority_original=self.authority_process_original,
+            launcher_original=self.root_process_original)
     def resolve_pending_v3(self,pending):
         self.require_current(control=self.control,gate=self.gate,meter=None)
         self.channel.sendall(json.dumps(dict(action='resolve_pending_peer',root_channel_nonce=self.channel_nonce,
@@ -713,9 +800,11 @@ class RootProcessLauncherV1:
                 installation_id=spec.installation_id,namespace=spec.namespace_cohort[0],
                 supervisor_spec_digest=spec.spec_digest,root_process_original=self.launcher_original,
                 key_id=c09['key_id'],key_bytes=key)
-        channel.sendall(json.dumps(dict(status='peer_start_held',observation=asdict(before),root_channel_nonce=nonce,
-            root_process_original=self.launcher_original,authority_process_original=authority.main_process_original),
-            separators=(',',':')).encode()+b'\n')
+        held=dict(status='peer_start_held',observation=asdict(before),root_channel_nonce=nonce,
+            root_process_original=self.launcher_original,authority_process_original=authority.main_process_original)
+        if covering and 'authority_birth_contract'in request:
+            held.update(schema='sylanne3.root-peer-start-coverage-held.v4',authority_observation=asdict(authority))
+        channel.sendall(json.dumps(held,separators=(',',':')).encode()+b'\n')
         if covering:
             while True:
                 packet=_read_peer_start_packet_v3(channel)
@@ -855,6 +944,65 @@ class RootProcessLauncherV1:
             time.sleep(0.02)
         raise AuthorityUnavailable("original stop outcome unknown: Host role not drained")
 
+    def _initial_storage_hold_v4(self,channel,request,authority):
+        from .d12_package_files_v2 import InstalledPackageSelectionFilesV2
+        from .linux_installation_security_v1 import read_installed_json_v1
+        from .installed_root_lifetime_observer_v3 import read_installed_root_lifetime_spec_v3,read_root_lifetime_resource_approval_v3
+        from .c09_initial_segmented_genesis_v4 import (initial_fixed_bindings_from_protected_assets_v4,
+            require_published_initial_genesis_for_root_v4)
+        from ..runtime_contracts import canonical_digest
+        if (request!={'verb':'initial_storage_hold_v4','service_role':'host','expected_invocation_id':'',
+                'spec_digest':self.specs['host'].spec_digest}or self.registry.get('host')is not None):
+            raise AuthorityUnavailable('initial segmented genesis requires actual never-started Host Root admission')
+        files=InstalledPackageSelectionFilesV2(control_directory=self.specs['host'].selection_control_directory)
+        selected,cohort,configuration=files.read_selected_configuration_cohort_v2()
+        if selected.cohort_digest!=authority.selected_cohort_digest:
+            raise AuthorityUnavailable('initial storage actual Authority invocation changed selected configuration')
+        assets=configuration['assets'];launch=configuration['deployment']
+        inventory=read_installed_json_v1(launch['inventory_path'],limit=1048576)
+        from hashlib import sha256
+        if sha256(read_installed_bytes_v1(launch['inventory_path'],limit=1048576)).hexdigest()!=launch['inventory_sha256']:
+            raise AuthorityUnavailable('Root initial storage actual inventory pin changed')
+        bindings=initial_fixed_bindings_from_protected_assets_v4(assets,inventory_manifest_digest=inventory['manifest_digest'])
+        if ((bindings['authority_id'],bindings['installation_id'],bindings['namespace'])!=
+                (self.specs['host'].authority_id,self.specs['host'].installation_id,self.specs['host'].namespace_cohort[0])
+                or any(Path(path).exists()for path in (*bindings['role_paths'].values(),bindings['control_path']))):
+            raise AuthorityUnavailable('initial storage refuses any preexisting role/Control file or different installation')
+        observed=self._observe('host')
+        if not observed.stopped_and_drained:raise AuthorityUnavailable('initial storage actual whole Host cohort is not empty')
+        resource=read_root_lifetime_resource_approval_v3(read_installed_root_lifetime_spec_v3())
+        original=dict(schema='sylanne3.c09.initial-storage-startup-held.v4',command='initial_storage_held_v4',
+            consumer_mode='production_root',bindings=bindings,root_process_original=self.launcher_original,
+            authority_process_original=authority.main_process_original,resource_original=resource,
+            selection_configuration_digest=selected.cohort_digest,startup_nonce=str(uuid4()),
+            authority_observation=asdict(authority),host_observation=asdict(observed))
+        channel.sendall(json.dumps(original,separators=(',',':')).encode()+b'\n')
+        packet=_read_peer_start_packet_v3(channel,limit=65536)
+        if packet==dict(command='release_initial_storage_v4',startup_nonce=original['startup_nonce']):
+            channel.sendall(b'{"status":"initial_storage_released_v4"}\n');return
+        if (type(packet)is not dict or set(packet)!={'command','startup_nonce','registry_scope'}
+                or packet['command']!='bind_initial_genesis_v4'or packet['startup_nonce']!=original['startup_nonce']):
+            raise AuthorityUnavailable('Root initial storage accepts only its same-channel exact bind/release')
+        after,_,_=files.read_selected_configuration_cohort_v2()
+        if after!=selected:raise AuthorityUnavailable('Root initial storage selected configuration changed before publication bind')
+        bind=require_published_initial_genesis_for_root_v4(bindings=bindings,startup_original=original)
+        peers=[item for item in assets['installations_v2']if item['installation_id']==bindings['installation_id']
+            and item['profile_id']==self.specs['host'].profile_id]
+        if len(peers)!=1:raise AuthorityUnavailable('Root initial registry has no unique actual installed peer')
+        peer=(peers[0]['certificate_sha256'],self.specs['host'].profile_id)
+        scope=dict(authority_id=bindings['authority_id'],installation_id=bindings['installation_id'],namespace=bindings['namespace'],
+            manifest_digest=bind['manifest_digest'],pointer_version=0,storage_generation=0,
+            peer_cohort_digest=canonical_digest(dict(peer=peer,supervisor_spec_digest=self.specs['host'].spec_digest,
+                inventory_manifest_digest=bindings['inventory_manifest_digest'])))
+        if packet['registry_scope']!=scope:raise AuthorityUnavailable('Root initial registry requested another final genesis scope')
+        held=dict(schema='sylanne3.root-peer-registry-genesis-held.v4',status='registry_genesis_held',observation=asdict(observed),
+            root_channel_nonce=uuid4().hex,root_process_original=self.launcher_original,
+            authority_process_original=authority.main_process_original,registry_scope=scope,authority_observation=asdict(authority))
+        channel.sendall(json.dumps(dict(initial_bind_original=bind,registry_genesis_original=held),separators=(',',':')).encode()+b'\n')
+        release=_read_peer_start_packet_v3(channel,limit=1024)
+        if release!=dict(root_channel_nonce=held['root_channel_nonce'],action='release_registry_genesis'):
+            raise AuthorityUnavailable('initial Root registry exclusion did not end on its exact original channel')
+
     def serve_forever_v1(self):
         endpoint = Path(self.specs["host"].control_socket_path)
         if endpoint.exists():
@@ -915,14 +1063,26 @@ class RootProcessLauncherV1:
                                 sequence=self._active_control_diagnostic_sequence):
                             request=_read_peer_start_packet_v3(channel,limit=65536)
                         expected_fields={"verb", "service_role", "expected_invocation_id", "spec_digest"}
-                        if request.get('verb')=='registry_genesis_hold':expected_fields.add('registry_scope')
+                        if request.get('verb')=='registry_genesis_hold':
+                            expected_fields.add('registry_scope')
+                            if 'authority_birth_contract' in request:
+                                expected_fields.add('authority_birth_contract')
+                                if request['authority_birth_contract']!='sylanne3.d13.core-incarnation-authority-observation.v4':
+                                    raise AuthorityUnavailable('unknown explicit Authority birth wire contract')
                         elif request.get('verb')=='peer_start_resolve_hold':expected_fields.add('pending_start_original')
+                        if request.get('verb')=='peer_start_coverage_hold' and 'authority_birth_contract'in request:
+                            expected_fields.add('authority_birth_contract')
+                            if request['authority_birth_contract']!='sylanne3.d13.core-incarnation-authority-observation.v4':
+                                raise AuthorityUnavailable('unknown current Authority birth wire contract')
                         if set(request) != expected_fields:
                             raise AuthorityUnavailable("closed fixed control request required")
                         role = request["service_role"]
                         if role not in self.specs or request["spec_digest"] != self.specs[role].spec_digest:
                             raise AuthorityUnavailable("control installed service binding differs")
                         verb = request["verb"]
+                        if role=='host'and verb=='initial_storage_hold_v4':
+                            self._initial_storage_hold_v4(channel,request,authority)
+                            continue
                         if role=='host' and verb=='registry_genesis_hold':
                             scope=request['registry_scope']
                             if (set(scope)!={'authority_id','installation_id','namespace','manifest_digest',
@@ -940,6 +1100,9 @@ class RootProcessLauncherV1:
                             held={'status':'registry_genesis_held','observation':asdict(observed),
                                 'root_channel_nonce':nonce,'root_process_original':self.launcher_original,
                                 'authority_process_original':authority.main_process_original,'registry_scope':scope}
+                            if 'authority_birth_contract' in request:
+                                held.update(schema='sylanne3.root-peer-registry-genesis-held.v4',
+                                    authority_observation=asdict(authority))
                             channel.sendall(json.dumps(held,separators=(',',':')).encode()+b'\n')
                             # This actual single control loop cannot dispatch a start while this channel is held.
                             with channel.makefile('rb') as stream:
@@ -971,7 +1134,7 @@ class RootProcessLauncherV1:
                                 for frame in diagnostic.stack]})
                             diagnostic = diagnostic.__cause__ or (
                                 None if diagnostic.__suppress_context__ else diagnostic.__context__)
-                        logging.getLogger(__name__).error(
+                        diagnostic_channel_v1(__name__).error(
                             "Sylanne D12 root launcher cause metadata: " +
                             json.dumps(chain, separators=(",", ":")))
                         result = {"status": "unavailable", "reason": str(exc)}
@@ -1061,10 +1224,16 @@ class InstalledRootProcessSupervisorV1:
         return observed
 
     @contextmanager
-    def hold_peer_registry_genesis_v3(self, *, registry_scope):
+    def hold_peer_registry_genesis_v3(self, *, registry_scope,authority_spec=None):
         verify_process_supervisor_spec_v1(self.config)
         if self.config.service_role!='host':
             raise AuthorityUnavailable('installed Host Root genesis provider required')
+        authority_binding=None
+        if authority_spec is not None:
+            verify_process_supervisor_spec_v1(authority_spec)
+            if authority_spec.service_role!='authority':
+                raise AuthorityUnavailable('explicit actual Authority-role fixed spec required')
+            authority_binding=_read_selected_invocation(authority_spec)
         channel=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
         hold=None
         try:
@@ -1079,16 +1248,19 @@ class InstalledRootProcessSupervisorV1:
                     or _namespace_identity(pid,'mnt')!=_namespace_identity(os.getpid(),'mnt')):
                 raise AuthorityUnavailable('actual Root PID1 genesis channel namespace differs')
             launcher=read_process_identity_v1(pid);authority=read_process_identity_v1(os.getpid())
-            channel.sendall(json.dumps({'verb':'registry_genesis_hold','service_role':'host',
-                'expected_invocation_id':'','spec_digest':self.config.spec_digest,
-                'registry_scope':registry_scope},separators=(',',':')).encode()+b'\n')
+            request={'verb':'registry_genesis_hold','service_role':'host','expected_invocation_id':'',
+                'spec_digest':self.config.spec_digest,'registry_scope':registry_scope}
+            if authority_spec is not None:
+                request['authority_birth_contract']='sylanne3.d13.core-incarnation-authority-observation.v4'
+            channel.sendall(json.dumps(request,separators=(',',':')).encode()+b'\n')
             with channel.makefile('rb') as stream:raw=stream.readline(262145)
             if len(raw)>262144 or not raw.endswith(b'\n'):
                 raise AuthorityUnavailable('bounded complete Root genesis census original required')
             response=json.loads(raw)
             if response.get('status')!='registry_genesis_held' or response.get('registry_scope')!=registry_scope:
                 raise AuthorityUnavailable(response.get('reason','Root genesis census scope unavailable'))
-            hold=RootPeerRegistryGenesisHoldV3(_ROOT_GENESIS_HOLD_ISSUER_V3,self,channel,response,launcher,authority)
+            hold=RootPeerRegistryGenesisHoldV3(_ROOT_GENESIS_HOLD_ISSUER_V3,self,channel,response,launcher,authority,
+                authority_spec=authority_spec,authority_binding=authority_binding)
             hold.require_current()
             yield hold
         finally:
@@ -1138,13 +1310,19 @@ class InstalledRootProcessSupervisorV1:
             process_incarnation='linux-host:'+observed.main_process_original['birth'],
             pointer_version=context.pointer_version,storage_generation=context.storage_generation)
 
-    def _open_peer_start_baseline_v3(self,*,expected_prior_invocation_id,pending=None,coverage=False):
+    def _open_peer_start_baseline_v3(self,*,expected_prior_invocation_id,pending=None,coverage=False,authority_spec=None):
         gate=self._peer_registry_gate_v3
         if gate is None:raise AuthorityUnavailable('actual Root peer-start Gate is not installed')
         peers=tuple(peer for peer,item in gate._installed_config_v3.installations_v2.items()
             if peer[1]==self.config.profile_id and item.installation_id==self.config.installation_id)
         if len(peers)!=1:raise AuthorityUnavailable('actual Root installed peer binding is ambiguous')
         verify_process_supervisor_spec_v1(self.config)
+        authority_binding=None
+        if authority_spec is not None:
+            if not coverage or pending is not None:
+                raise AuthorityUnavailable('current Core Authority observation belongs only to the exact coverage hold')
+            verify_process_supervisor_spec_v1(authority_spec)
+            authority_binding=_read_selected_invocation(authority_spec)
         endpoint=Path(self.config.control_socket_path);st=endpoint.lstat()
         if not endpoint.is_socket() or st.st_uid!=0 or st.st_mode&0o077:
             raise AuthorityUnavailable('actual Root-only pending start endpoint required')
@@ -1159,11 +1337,17 @@ class InstalledRootProcessSupervisorV1:
             request=dict(verb='peer_start_coverage_hold' if coverage else 'peer_start_hold' if pending is None else 'peer_start_resolve_hold',service_role='host',
                 expected_invocation_id=expected_prior_invocation_id,spec_digest=self.config.spec_digest)
             if pending is not None:request['pending_start_original']=pending
+            if authority_spec is not None:
+                request['authority_birth_contract']='sylanne3.d13.core-incarnation-authority-observation.v4'
             channel.sendall(json.dumps(request,separators=(',',':')).encode()+b'\n')
             response=_read_peer_start_packet_v3(channel)
-            cls=RootPeerStartCoverageHoldV3 if coverage else RootPeerStartBaselineV3
-            baseline=cls(_ROOT_PEER_START_ISSUER_V3,supervisor=self,channel=channel,
-                response=response,peer=peers[0],root=root,authority=authority)
+            if coverage:
+                baseline=RootPeerStartCoverageHoldV3(_ROOT_PEER_START_ISSUER_V3,supervisor=self,channel=channel,
+                    response=response,peer=peers[0],root=root,authority=authority,
+                    authority_spec=authority_spec,authority_binding=authority_binding)
+            else:
+                baseline=RootPeerStartBaselineV3(_ROOT_PEER_START_ISSUER_V3,supervisor=self,channel=channel,
+                    response=response,peer=peers[0],root=root,authority=authority)
             if pending is None and not coverage and (not baseline.observation.stopped_and_drained
                     or baseline.observation.invocation_id!=expected_prior_invocation_id):
                 raise AuthorityUnavailable('Root pending start baseline differs from its original expected invocation')
@@ -1171,8 +1355,8 @@ class InstalledRootProcessSupervisorV1:
         except BaseException:
             _close_peer_start_channel_v3(channel);raise
 
-    def hold_pending_peer_start_coverage_v3(self):
-        return self._open_peer_start_baseline_v3(expected_prior_invocation_id='',coverage=True)
+    def hold_pending_peer_start_coverage_v3(self,*,authority_spec=None):
+        return self._open_peer_start_baseline_v3(expected_prior_invocation_id='',coverage=True,authority_spec=authority_spec)
 
     def require_pending_peer_start_baseline_v3(self,expected_prior_invocation_id):
         return self._open_peer_start_baseline_v3(expected_prior_invocation_id=expected_prior_invocation_id)

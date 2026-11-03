@@ -371,6 +371,16 @@ def _source_family_current_sql_v1(db, *, namespace, roots, purpose, audiences,
                                   streaming_qualified=None, streaming_scope=None,
                                   streaming_graph_stamp=None):
     """Shared exact source/access/correction closure for activity and Owner setup."""
+    from .character_labor_source_read_v1 import character_labor_source_family_v1
+    labor_sources = character_labor_source_family_v1(db, namespace=namespace,
+        roots=roots, purpose=purpose, audiences=audiences)
+    if labor_sources is not None:
+        return labor_sources
+    from ..runtime.source_correction_commit_read_v3 import current_source_correction_family_v3
+    correction_sources = current_source_correction_family_v3(db, namespace=namespace,
+        roots=roots, purpose=purpose, audiences=audiences)
+    if correction_sources is not None:
+        return correction_sources
     from ..runtime.domain_background_read_v3 import background_json_loads_v3
     from ..runtime.artifact_receipt_original_read_v1 import artifact_receipt_sql_v1 as _artifact_receipt_sql_v1
     from .artifact_model_source_read_v3 import artifact_model_source_family_v3

@@ -105,11 +105,11 @@ def installed(tmp_path):
 
 def paired(server, peer=PEER_A):
     channel = b"channel-" + peer.certificate_sha256.encode()
-    response = server._dispatch_for_test("handshake", REQUEST, peer, channel)
+    response = server.dispatch("handshake", REQUEST, peer, channel)
     binding = response["channel_binding_sha256"]
 
     def call(method, command):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, REQUEST, peer, channel, handshake_binding=binding,
             command=command,
         )

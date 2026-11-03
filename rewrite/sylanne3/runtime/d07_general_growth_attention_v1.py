@@ -101,14 +101,18 @@ def actual_general_growth_outcome_parent_metadata_v1(db,*,frame,plan,prepared,te
         context_source_refs,outcome_original_ref,outcome_original_digest,issuer):
     """Called only where actual D10 _actual_outcome already returned these values."""
     from .d11_life_contract_v1 import D11LifeTerminalV1,D11DraftTerminalV1
-    from .d11_life_preparation_v1 import D11LifePreparedV1,D11DraftPreparedV1
+    from .d11_life_preparation_v1 import D11LifePreparedV1,D11DraftPreparedV1,D11CharacterLaborLifePreparedV1
     from .d11_artifact_draft_contract_v1 import RegisteredDraftFilePlanV3
-    from .d11_life_contract_v1 import RegisteredLifePlanV2
+    from .d11_life_contract_v1 import RegisteredLifePlanV2,RegisteredCharacterLaborLifePlanV1
     from .issuers import D11BudgetJobIssuer
+    family={
+        RegisteredLifePlanV2:(D11LifePreparedV1,"d11.life_plan"),
+        RegisteredDraftFilePlanV3:(D11DraftPreparedV1,"d11.life_plan"),
+        RegisteredCharacterLaborLifePlanV1:(D11CharacterLaborLifePreparedV1,"d11.life_character_labor_plan_v1"),
+    }.get(type(plan))
     if (not db.in_transaction or type(issuer)is not D11BudgetJobIssuer
             or type(terminal)not in{D11LifeTerminalV1,D11DraftTerminalV1}
-            or type(plan)not in{RegisteredLifePlanV2,RegisteredDraftFilePlanV3}
-            or type(prepared)not in{D11LifePreparedV1,D11DraftPreparedV1} or terminal.binding!=prepared.binding
+            or family is None or type(prepared)is not family[0] or terminal.binding!=prepared.binding
             or prepared.plan!=plan):
         raise ValueError("General metadata must derive from actual installed paid Life originals")
     binding=terminal.binding;namespace=frame.envelope.authority.namespace
@@ -123,7 +127,7 @@ def actual_general_growth_outcome_parent_metadata_v1(db,*,frame,plan,prepared,te
     if (lease.state!="active"or(lease.bot_id,lease.persona_id)!=namespace.as_tuple
             or(grant.bot_id,grant.persona_id,grant.lease_id)!=(*namespace.as_tuple,lease.lease_id)):
         raise ValueError("General Life actual current parent grant/lease differs")
-    plan_original=ProductionOriginalRefV1("d11.life_plan",binding.plan_original_ref,binding.plan_digest)
+    plan_original=ProductionOriginalRefV1(family[1],binding.plan_original_ref,binding.plan_digest)
     terminal_original=ProductionOriginalRefV1("d11.life_terminal",terminal.original_ref,canonical_digest(terminal))
     return D10GeneralGrowthOutcomeParentMetadataV1(namespace,binding.activity_id,binding.effect_id,
         plan_original,terminal_original,binding.digest,ProductionOriginalRefV1("d11.life_outcome",outcome_original_ref,outcome_original_digest),
@@ -859,9 +863,11 @@ def resolve_general_growth_service_followup_v1(db,read,event,trigger,*,issuer):
         if not atom.valid:continue
         raw={name:value for name,value in atom.value.items()if name!="schema"}
         ticket=AttentionTicket(**{**raw,"source_refs":tuple(raw["source_refs"]),"cancel_refs":tuple(raw["cancel_refs"])})
-        if ticket.ticket_id.startswith("attention:general-growth:"):
-            read_general_growth_ticket_original_v1(db,read=read,ticket=ticket,issuer=issuer)
-        else:
+        original=read_general_growth_ticket_original_v1(db,read=read,ticket=ticket,issuer=issuer)
+        if original is None:
+            from .artifact_phase_observation_v1 import read_artifact_observation_ticket_original_v1
+            original=read_artifact_observation_ticket_original_v1(db,read=read,ticket=ticket,issuer=issuer)
+        if original is None:
             from ..host.post_c02_attention_driver import post_c02_attention_operation_id
             from .domain_background_read_v3 import background_rows_v3,background_point_v3
             rows=background_rows_v3(db,table="graph_d07_attention_issuance_v1",columns=("operation_id","c02_operation_id","bundle_digest"),
@@ -1004,106 +1010,35 @@ _GENERAL_SOURCE_TASKS=WeakKeyDictionary()
 _GENERAL_SOURCE_PROOFS=WeakKeyDictionary()
 _GENERAL_SOURCE_ISSUER=object()
 
-def _general_growth_source_heap_v1(reader,extra=0):
-    from .domain_background_read_v3 import _heap
-    total=extra
-    for task in _GENERAL_SOURCE_TASKS.get(reader,{}).values():
-        total+=_heap((task.key,task.header,task.fragment,task.metadata),set())
-        if task.parser is not None:
-            parser=task.parser
-            total+=parser._source_heap_bytes()+_heap((parser._stack,parser._string,parser._literal,
-                parser._number,parser._active_scalar),set())
-    reader.reserve_heap_v3(extra=total)
-    return total
-
-def _new_general_growth_source_parser_v1(reader,*,ensure_ascii):
-    from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3
-    from weakref import ref as weak_ref
-    reader_ref=weak_ref(reader)
-    class _ActualGeneralSourceParser(C09MemorySourceJSONStreamV3):
-        def _source_require_arena(self,extra=0):
-            _general_growth_source_heap_v1(reader_ref(),extra)
-            return super()._source_require_arena(extra)
-    return _ActualGeneralSourceParser(ensure_ascii=ensure_ascii)
-
 class _GeneralGrowthSourceMetadataEOFV1:
     def __init__(self,issuer,reader,ref):
-        if issuer is not _GENERAL_SOURCE_ISSUER:raise TypeError("actual General Source metadata leaf issuer required")
+        if issuer is not _GENERAL_SOURCE_ISSUER:raise TypeError('actual General Source metadata leaf issuer required')
         from .domain_background_read_v3 import require_actual_background_attachment_owner_v3
         require_actual_background_attachment_owner_v3(reader,db=reader.db)
         from weakref import ref as weak_ref
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
         self.reader=weak_ref(reader);self.key=AtomKey.from_token(ref)
-        if self.key.type_name!="memory.source"or NamespaceId.from_key(self.key)!=reader.namespace:
-            raise ValueError("General Source metadata leaf crossed actual Source namespace")
-        self.header=None;self.cell=None;self.parser=None;self.fragment=b"";self.offset=0;self.total=None
-        self.phase="header";self.metadata=None;self.sha256=None;self.complete=False
-    def advance(self,meter):
-        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3,begin_runtime_cell_read_v3
-        from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2,legacy_cell_read_transaction_v2
-        reader=self.reader();reader.require_data_current_v3(meter)
-        if self.complete:return True
-        if self.phase=="header":
-            self.header=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",
-                ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",
-                (self.key.token,*reader.namespace.as_tuple))
-            if self.header is None or self.header[0]<1 or self.header[1]!=1:
-                raise ValueError("General Source metadata lost its actual positive current head")
-            self.cell=begin_runtime_cell_read_v3(reader.db,self.header[2],erasure_owner_ref=self.key.token)if self.header[2]is not None else None
-            codec=None if self.cell is None else self.cell.header[0]
-            if codec not in(None,"canonical-json.ascii.v1","canonical-json.utf8.v1"):
-                raise ValueError("General Source metadata has another actual cell codec")
-            self.parser=_new_general_growth_source_parser_v1(reader,ensure_ascii=codec!="canonical-json.utf8.v1")
-            self.phase="source";return False
-        if self.fragment:
-            part=self.fragment[:1024]
-            _general_growth_source_heap_v1(reader,len(part)*4+65536)
-            self.parser.feed(part,lambda event:None)
-            self.fragment=self.fragment[len(part):]
-            return False
-        if self.cell is not None:chunk=self.cell.read_fragment(meter=meter)
-        else:
-            with legacy_cell_read_transaction_v2(reader.db):
-                if self.total is None:
-                    meter.require_available(1024)
-                    row=reader.db.execute("SELECT typeof(value),length(CAST(value AS BLOB)) FROM graph_atoms "
-                        "WHERE token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple)).fetchone()
-                    meter.charge_read(16)
-                    if row is None or row[0]!="text":raise ValueError("General Source original byte length/kind disappeared")
-                    self.total=row[1]
-                if self.offset<self.total:
-                    chunk,total,kind=read_legacy_sql_cell_fragment_v2(reader.db,table="graph_atoms",column="value",
-                        where="token=? AND bot=? AND persona=?",parameters=(self.key.token,*reader.namespace.as_tuple),
-                        start=self.offset,length=min(16384,self.total-self.offset),meter=meter)
-                    if(total,kind)!=(self.total,"text"):raise ValueError("General Source original byte count/kind changed")
-                    self.offset+=len(chunk)
-                else:chunk=None
-        if chunk is not None:
-            _general_growth_source_heap_v1(reader,len(chunk)+65536);self.fragment=chunk;return False
-        result=self.parser.finish()
-        if self.cell is not None:
-            if(result.sha256,result.byte_count)!=(self.cell.finish(meter=meter),self.cell.header[3]):
-                raise ValueError("General Source actual raw EOF/cell digest differs")
-        elif result.byte_count!=self.total:raise ValueError("General Source legacy original EOF differs")
-        _general_growth_source_heap_v1(reader,_general_metadata_copy_size_v1(self.parser._source_metadata))
-        metadata=dict(self.parser._source_metadata)
-        for name in("audiences","purposes","parent_source_ids"):metadata[name]=tuple(metadata[name])
-        if metadata["source_id"]!=self.key.owner.subject:
-            raise ValueError("General Source metadata identity differs from actual key")
-        _general_growth_source_heap_v1(reader,_general_metadata_copy_size_v1(metadata))
-        self.metadata=metadata;self.sha256=result.sha256;self.complete=True;return True
-    def require_v1(self,reader,meter):
-        from ..runtime_storage_v3 import _runtime_bounded_fixed_row_v3
-        if self.reader()is not reader or _GENERAL_SOURCE_TASKS.get(reader,{}).get(self.key.token)is not self or not self.complete:
-            raise ValueError("General Source metadata is not this actual Work's complete original leaf")
-        reader.require_data_current_v3(meter)
-        current=_runtime_bounded_fixed_row_v3(reader.db,meter,"graph_atoms",
-            ("revision","valid","value_cell_id"),"token=? AND bot=? AND persona=?",(self.key.token,*reader.namespace.as_tuple))
-        if current!=self.header:raise ValueError("General Source metadata changed its physical head after actual EOF")
-        return self
+        if self.key.type_name!='memory.source'or NamespaceId.from_key(self.key)!=reader.namespace:
+            raise ValueError('General Source metadata leaf crossed actual Source namespace')
+        self.inspection=InspectionMetadataReadV3(reader,self.key)
+        self.header=self.metadata=self.sha256=None;self.complete=False
 
-def _general_metadata_copy_size_v1(value):
-    from .domain_background_read_v3 import _heap
-    return _heap(value,set())+65536
+    def advance(self,meter):
+        reader=self.reader();reader.require_data_current_v3(meter)
+        if self.complete:self.require_v1(reader,meter);return True
+        self.inspection.advance(meter)
+        if not self.inspection.complete:return False
+        original=self.inspection.result.require_v3(reader,meter)
+        self.header=(original.revision,int(original.valid),original.cell_id)
+        self.metadata=original.metadata;self.sha256=original.semantic_digest;self.complete=True
+        return True
+
+    def require_v1(self,reader,meter):
+        if self.reader()is not reader or _GENERAL_SOURCE_TASKS.get(reader,{}).get(self.key.token)is not self or not self.complete:
+            raise ValueError('General Source metadata is not this actual Work complete original leaf')
+        reader.require_data_current_v3(meter)
+        self.inspection.result.require_v3(reader,meter)
+        return self
 
 def start_general_growth_source_metadata_task_v1(reader,ref):
     if general_growth_background_parent_v1(reader)is None:
@@ -1182,4 +1117,6 @@ def read_general_growth_background_source_metadata_v1(reader,ref):
     return task.require_v1(reader,current_c09_sql_meter_v2()).metadata
 
 def release_general_growth_source_metadata_v1(reader):
-    _GENERAL_SOURCE_PROOFS.pop(reader,None);_GENERAL_SOURCE_TASKS.pop(reader,None)
+    _GENERAL_SOURCE_PROOFS.pop(reader,None)
+    tasks=_GENERAL_SOURCE_TASKS.pop(reader,{})
+    for task in tasks.values():task.inspection.release_v3()

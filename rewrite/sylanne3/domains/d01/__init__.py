@@ -257,6 +257,18 @@ class PersonaActivation:
 
 
 @dataclass(frozen=True)
+class ActiveRoleHeadControlV3:
+    """Control identity only; no claim readout, lineage or Source permission."""
+    namespace: NamespaceId
+    head_id: str
+    plan_key: AtomKey
+    plan_version: int
+    read_versions: tuple[GraphVersion, ...]
+    graph_epoch: int
+    authorization_revision: int
+
+
+@dataclass(frozen=True)
 class ActiveRoleQualification:
     namespace: NamespaceId
     head_id: str
@@ -264,6 +276,14 @@ class ActiveRoleQualification:
     read_versions: tuple[GraphVersion, ...]
     graph_epoch: int
     authorization_revision: int
+
+
+class OrdinaryPersonaReadoutUnavailableV3(ValueError):
+    """Selected ordinary claims have no actual current consumer Source readout."""
+    def __init__(self,block_ids):
+        self.block_ids=tuple(block_ids)
+        self.missing_inputs=tuple('current_ordinary_persona_readout:'+name for name in self.block_ids)
+        super().__init__(', '.join(self.missing_inputs))
 
 
 @dataclass(frozen=True)
@@ -274,6 +294,21 @@ class PersonaView:
     values: tuple[ValueRule, ...]
     context_tags: tuple[str, ...]
     social_strategy_known: bool
+
+
+@dataclass(frozen=True)
+class PersonaValuesProjectionV1:
+    """Current value rules only; no ordinary, semantic or conditioned claim."""
+    head_id: str
+    namespace: NamespaceId
+    values: tuple[ValueRule, ...]
+    context_tags: tuple[str, ...]
+    social_strategy_known: bool
+    schema: str = "d01.persona-values-projection.v1"
+
+    def __post_init__(self) -> None:
+        if self.schema != "d01.persona-values-projection.v1":
+            raise ValueError("unknown persona values projection schema")
 
 
 @dataclass(frozen=True)
@@ -426,6 +461,8 @@ class PersonaDomain:
     def type_specs(self) -> tuple[TypeSpec, ...]:
         from .method_learning_v1 import method_learning_type_specs_v1
         from .conditioned_self_v1 import conditioned_self_type_specs_v1
+        from .single_event_growth_v1 import single_event_type_specs_v1,single_event_review_type_specs_v2
+        from .ordinary_cumulative_growth_v1 import ordinary_cumulative_type_specs_v1
         layouts = (
             ("d01.persona_plan.v1", _validate_persona_plan, PersonaPlan),
             ("d01.persona_activation.v1", _validate_persona_activation, PersonaActivation),
@@ -445,7 +482,7 @@ class PersonaDomain:
                 "storage_role": "state",
                 "fields": [field.name for field in fields(value_type)],
             }),
-        ) for name, validator, value_type in layouts) + method_learning_type_specs_v1() + conditioned_self_type_specs_v1()
+        ) for name, validator, value_type in layouts) + method_learning_type_specs_v1() + conditioned_self_type_specs_v1() + single_event_type_specs_v1() + single_event_review_type_specs_v2() + ordinary_cumulative_type_specs_v1()
 
     def register_types(self) -> tuple[str, ...]:
         return tuple(spec.name for spec in self.type_specs())
@@ -531,11 +568,11 @@ class PersonaDomain:
         )
 
     @staticmethod
-    def resolve_active_role(
+    def resolve_active_role_control_v3(
         snapshot: GraphSnapshot, *, namespace: NamespaceId,
         current_guard: OwnerAuthorizationGuardV1,
-    ) -> ActiveRoleQualification:
-        """Qualify a graph head against a freshly read trusted Authority guard."""
+    ) -> ActiveRoleHeadControlV3:
+        """Validate actual activation/Owner control without decoding a plan claim."""
         if not isinstance(snapshot, GraphSnapshot) or not isinstance(namespace, NamespaceId):
             raise TypeError("graph snapshot and namespace are required")
         if not isinstance(current_guard, OwnerAuthorizationGuardV1):
@@ -565,28 +602,39 @@ class PersonaDomain:
             raise ValueError("role activation differs from current Owner authorization")
         plan_key = AtomKey(Owner("persona", *namespace.as_tuple),
                            "d01.persona_plan.v1", activation["plan_id"])
-        plan_atom = snapshot.get(plan_key)
+        epochs = [item.revision for item in snapshot.epochs
+                  if (item.bot, item.persona) == namespace.as_tuple]
+        if len(epochs) != 1:
+            raise ValueError("complete role graph epoch is required")
+        return ActiveRoleHeadControlV3(namespace, activation["head_id"], plan_key,
+            activation["plan_version"], tuple(GraphVersion(atom.key, atom.revision)
+                for atom in (activation_atom, grant_atom)), epochs[0], current_guard.authorization_revision)
+
+    @staticmethod
+    def resolve_active_role(
+        snapshot: GraphSnapshot, *, namespace: NamespaceId,
+        current_guard: OwnerAuthorizationGuardV1,
+    ) -> ActiveRoleQualification:
+        """Resolve the complete protected plan after current control qualification."""
+        control = PersonaDomain.resolve_active_role_control_v3(
+            snapshot, namespace=namespace, current_guard=current_guard)
+        plan_atom = snapshot.get(control.plan_key)
         if plan_atom is None or not plan_atom.valid:
             raise ValueError("active persona plan is missing")
         _validate_persona_plan(plan_atom.value)
         raw = plan_atom.value
         if (raw["namespace"] != _json_value(asdict(namespace))
-                or raw["version"] != activation["plan_version"]
-                or f"{raw['plan_id']}@{raw['version']}" != activation["head_id"]):
+                or raw["version"] != control.plan_version
+                or f"{raw['plan_id']}@{raw['version']}" != control.head_id):
             raise ValueError("active persona head is stale")
-        epochs = [item.revision for item in snapshot.epochs
-                  if (item.bot, item.persona) == namespace.as_tuple]
-        if len(epochs) != 1:
-            raise ValueError("complete role graph epoch is required")
         plan_data = dict(raw)
         plan_data["namespace"] = namespace
         plan_data["blocks"] = tuple(_persona_block(item) for item in raw["blocks"])
         plan_data["values"] = tuple(_value_rule(item) for item in raw["values"])
         return ActiveRoleQualification(
-            namespace, activation["head_id"], PersonaPlan(**plan_data),
-            tuple(GraphVersion(atom.key, atom.revision)
-                  for atom in (activation_atom, plan_atom, grant_atom)),
-            epochs[0], current_guard.authorization_revision,
+            namespace, control.head_id, PersonaPlan(**plan_data),
+            (control.read_versions[0], GraphVersion(plan_atom.key, plan_atom.revision), control.read_versions[1]),
+            control.graph_epoch, control.authorization_revision,
         )
 
     @staticmethod
@@ -656,7 +704,7 @@ class PersonaDomain:
 
     def project(
         self, plan: PersonaPlan, snapshot: object = None, *, context_tags: tuple[str, ...] = (),
-        role_binding_complete: bool = False, semantic_projection=None,
+        role_binding_complete: bool = False, semantic_projection=None, ordinary_readout=None,
     ) -> PersonaView:
         if not isinstance(plan, PersonaPlan):
             raise TypeError("plan must be PersonaPlan")
@@ -667,12 +715,24 @@ class PersonaDomain:
         if semantic_projection is not None and (type(semantic_projection) is not SelfModelProjectionV3
                 or semantic_projection.runtime_identity.namespace!=plan.namespace or semantic_projection.persona_head!=plan.head_id):
             raise ValueError("persona readout requires the exact current qualified self model")
+        ordinary_ids=frozenset()
+        if ordinary_readout is not None:
+            from ...runtime.d04_ordinary_readout_v3 import PreparedD04OrdinaryReadoutV3,require_d04_ordinary_projection_v3
+            if type(ordinary_readout)is PreparedD04OrdinaryReadoutV3:
+                ordinary_ids=require_d04_ordinary_projection_v3(ordinary_readout,plan)
+            else:
+                from ...runtime.d06_ordinary_readout_v3 import require_life_ordinary_projection_v3
+                ordinary_ids=require_life_ordinary_projection_v3(ordinary_readout,plan)
         blocks=[]
+        unavailable=[]
         from .conditioned_self_v1 import decode_conditioned_self_claim_v1
         for block in plan.blocks:
             if block.kind in {'self_knowledge','strategy'} and decode_conditioned_self_claim_v1(block.claim)is not None:
                 continue
-            if block.kind!="semantic_identity":blocks.append(block);continue
+            if block.kind!="semantic_identity":
+                if block.block_id in ordinary_ids:blocks.append(block)
+                elif method_policy_state_v1(block.claim) is None:unavailable.append(block.block_id)
+                continue
             semantic=decode_semantic_identity_v3(block.claim)
             if semantic is None:blocks.append(block);continue
             if semantic.runtime_identity.namespace!=plan.namespace:raise ValueError("semantic projection crossed namespace")
@@ -685,11 +745,43 @@ class PersonaDomain:
                     or rows[0].plasticity_policy_ref!=semantic.plasticity_policy_ref or rows[0].scope_refs!=semantic.scope_refs):
                 raise ValueError("persona readout semantic payload/ref/runtime/claim/policy/scope differs from qualified source")
             blocks.append(replace(block,claim=rows[0].claim,plasticity="read_only"))
+        if unavailable:raise OrdinaryPersonaReadoutUnavailableV3(tuple(unavailable))
         return PersonaView(plan.head_id, plan.namespace, tuple(blocks), plan.values, tags, role_binding_complete)
 
-    def evaluate_values(self, view: PersonaView, candidates: Mapping[str, tuple[str, ...]]) -> ValueEvaluation:
-        if not isinstance(view, PersonaView):
-            raise TypeError("view must be PersonaView")
+    def project_selected_v4(self, value, *, context_tags=(),
+            role_binding_complete=False, semantic_projection=None) -> PersonaView:
+        from ...runtime.selected_persona_readout_v4 import require_projectable_selected_persona_readout_v4
+        selected = require_projectable_selected_persona_readout_v4(value)
+        if selected.values is None:
+            raise OrdinaryPersonaReadoutUnavailableV3(('actual_complete_values',))
+        if semantic_projection is not None:
+            raise ValueError('dedicated semantic readout needs its exact selected-Body issuer adapter')
+        return PersonaView(selected.control.head_id, selected.control.namespace,
+            selected.selected_blocks, selected.values,
+            _unique_strings(context_tags, 'context_tags'), role_binding_complete)
+
+    def project_selected_values_v4(self, value, *, context_tags=(),
+            role_binding_complete=False) -> PersonaValuesProjectionV1:
+        from ...runtime.selected_persona_readout_v4 import require_projectable_selected_persona_readout_v4
+        selected = require_projectable_selected_persona_readout_v4(value)
+        if selected.values is None:
+            raise OrdinaryPersonaReadoutUnavailableV3(('actual_complete_values',))
+        return PersonaValuesProjectionV1(selected.control.head_id, selected.control.namespace,
+            selected.values, _unique_strings(context_tags, 'context_tags'), role_binding_complete)
+
+    def project_values_v1(
+        self, plan: PersonaPlan, *, context_tags: tuple[str, ...] = (),
+        role_binding_complete: bool = False,
+    ) -> PersonaValuesProjectionV1:
+        """Project exactly the data used by value ordering, without claim readout."""
+        if not isinstance(plan, PersonaPlan):
+            raise TypeError("plan must be PersonaPlan")
+        return PersonaValuesProjectionV1(plan.head_id, plan.namespace, plan.values,
+            _unique_strings(context_tags, "context_tags"), role_binding_complete)
+
+    def evaluate_values(self, view: PersonaView | PersonaValuesProjectionV1, candidates: Mapping[str, tuple[str, ...]]) -> ValueEvaluation:
+        if not isinstance(view, (PersonaView, PersonaValuesProjectionV1)):
+            raise TypeError("view must be a persona or values-only projection")
         reasons: dict[str, tuple[str, ...]] = {}
         preferred: list[str] = []
         rejected: list[str] = []
@@ -709,7 +801,7 @@ class PersonaDomain:
                 unresolved.append(candidate_id)
         return ValueEvaluation(tuple(preferred), tuple(rejected), tuple(unresolved), reasons)
 
-    def validate_growth(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None) -> None:
+    def validate_growth(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None, single_event_qualification=None) -> None:
         if not isinstance(plan, PersonaPlan) or not isinstance(proposal, GrowthProposal):
             raise TypeError("plan and proposal must be D01 values")
         if proposal.base_head != plan.head_id:
@@ -735,13 +827,19 @@ class PersonaDomain:
             raise ValueError("target block cannot be changed by natural growth")
         if proposal.evidence_reality != "external":
             raise ValueError("simulated or self-asserted evidence cannot settle growth")
-        if proposal.change_kind == "core" and len(proposal.source_families) < 2:
+        if single_event_qualification is not None:
+            from ...runtime.d01_single_event_growth_v1 import require_single_event_qualification_v1
+            require_single_event_qualification_v1(single_event_qualification, plan=plan, proposal=proposal)
+        elif proposal.change_kind == "core" and len(proposal.source_families) < 2:
             raise ValueError("core growth needs two independent evidence families")
         if not proposal.counterevidence_checked:
             raise ValueError("growth needs a completed counterevidence check")
 
-    def activate_revision(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None) -> PersonaRevision:
-        self.validate_growth(plan, proposal, semantic_qualification=semantic_qualification)
+    def activate_revision(self, plan: PersonaPlan, proposal: GrowthProposal, *, semantic_qualification=None, single_event_qualification=None) -> PersonaRevision:
+        self.validate_growth(plan, proposal, semantic_qualification=semantic_qualification, single_event_qualification=single_event_qualification)
+        return self._mechanical_growth_revision_v1(plan,proposal)
+
+    def _mechanical_growth_revision_v1(self,plan,proposal):
         blocks = tuple(
             PersonaBlock(block.block_id, block.kind, proposal.replacement_claim, block.plasticity)
             if block.block_id == proposal.target_block else block
@@ -758,7 +856,7 @@ class PersonaDomain:
     def issue_growth_candidate(
         self, snapshot: GraphSnapshot, *, namespace: NamespaceId,
         current_guard: OwnerAuthorizationGuardV1, proposal: GrowthProposal,
-        source_ids: tuple[str, ...], semantic_qualification=None,
+        source_ids: tuple[str, ...], semantic_qualification=None, single_event_qualification=None,
     ) -> GrowthAdoptionCandidate:
         """Prepare a natural-growth write set from one current shared-graph read.
 
@@ -766,7 +864,16 @@ class PersonaDomain:
         deletion authority at commit. This method grants no write authority.
         """
         active = self.resolve_active_role(snapshot, namespace=namespace, current_guard=current_guard)
-        self.validate_growth(active.plan, proposal, semantic_qualification=semantic_qualification)
+        self.validate_growth(active.plan, proposal, semantic_qualification=semantic_qualification, single_event_qualification=single_event_qualification)
+        return self.mechanical_growth_candidate_v1(snapshot,namespace=namespace,current_guard=current_guard,
+            proposal=proposal,source_ids=source_ids)
+
+    def mechanical_growth_candidate_v1(
+        self,snapshot:GraphSnapshot,*,namespace:NamespaceId,current_guard:OwnerAuthorizationGuardV1,
+        proposal:GrowthProposal,source_ids:tuple[str,...],
+    )->GrowthAdoptionCandidate:
+        """Reproduce candidate data; policy qualification and commit authority remain separate."""
+        active=self.resolve_active_role(snapshot,namespace=namespace,current_guard=current_guard)
         source_ids = _unique_strings(source_ids, "source_ids", minimum=1)
         if len(source_ids) != len(proposal.source_families):
             raise ValueError("each evidence family needs one independent source")
@@ -797,7 +904,7 @@ class PersonaDomain:
                          GraphVersion(head_key, 0)))
         if set(roots) != set(proposal.source_families) or len(set(roots)) != len(roots):
             raise ValueError("evidence provenance differs from independent families")
-        revision = self.activate_revision(active.plan, proposal, semantic_qualification=semantic_qualification)
+        revision = self._mechanical_growth_revision_v1(active.plan,proposal)
         next_plan = replace(active.plan, version=active.plan.version + 1,
                             blocks=revision.blocks, authored=False)
         grant_atom = snapshot.get(owner_grant_key(*namespace.as_tuple))
@@ -821,7 +928,7 @@ class PersonaDomain:
     def validate_growth_candidate(
         self, candidate: GrowthAdoptionCandidate, snapshot: GraphSnapshot, *,
         namespace: NamespaceId, current_guard: OwnerAuthorizationGuardV1,
-        proposal: GrowthProposal, source_ids: tuple[str, ...], semantic_qualification=None,
+        proposal: GrowthProposal, source_ids: tuple[str, ...], semantic_qualification=None, single_event_qualification=None,
     ) -> GrowthAdoptionCandidate:
         """Reject modified or stale D01 write sets before D11's atomic commit."""
         if not isinstance(candidate, GrowthAdoptionCandidate):
@@ -829,6 +936,7 @@ class PersonaDomain:
         expected = self.issue_growth_candidate(
             snapshot, namespace=namespace, current_guard=current_guard,
             proposal=proposal, source_ids=source_ids, semantic_qualification=semantic_qualification,
+            single_event_qualification=single_event_qualification,
         )
         if candidate != expected:
             raise ValueError("growth candidate differs from current evidence and head")

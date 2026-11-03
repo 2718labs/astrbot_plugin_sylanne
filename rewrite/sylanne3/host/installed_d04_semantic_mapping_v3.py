@@ -250,14 +250,17 @@ class InstalledD04SemanticMappingReaderV3:
                 if actual is None or self._selection_owner.get() is not None:continue
                 raw,_original_digest=actual
             else:
-                with graph._GraphCoordinator__store._lock:
-                    row = db.execute(f"SELECT original_json,original_digest,signature FROM {table} "
-                        "WHERE bot=? AND persona=? ORDER BY revision DESC LIMIT 1", scope.namespace.as_tuple).fetchone()
-                if row is None or self._selection_owner.get() is not None:continue
-                graph._GraphCoordinator__d11_issuer._signer.verify(kind,row[0],row[2])
-                raw=json.loads(row[0])
-                if canonical_digest(raw)!=row[1] or raw.get('namespace')!=asdict(scope.namespace):
-                    raise ValueError('D04 accepting Owner original identity differs')
+                if self._selection_owner.get() is not None:continue
+                from ..runtime.role_control_signed_metadata_v4 import (
+                    role_original_metadata_scope_v4,read_role_original_metadata_v4)
+                with role_original_metadata_scope_v4(self,scope,current), graph._GraphCoordinator__store._lock:
+                    if db.in_transaction:raise ValueError('accepting original metadata retained SQL')
+                    db.execute('BEGIN')
+                    try:
+                        saved=read_role_original_metadata_v4(db,graph._GraphCoordinator__d11_issuer,table,scope.namespace)
+                    finally:db.rollback()
+                if saved is None:continue
+                raw,_original_digest=saved
             original_manifest = self._qualified_original_manifest(scope.namespace, raw)
             source_ref = (None if target is None else "d04-semantic-installation:" + canonical_digest(
                 (scope.namespace, target.source_installation_id, original_manifest)))

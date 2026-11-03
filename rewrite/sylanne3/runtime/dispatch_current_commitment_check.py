@@ -52,7 +52,7 @@ class CurrentD08CriteriaEvidenceV1:
 
 def evaluate_commitment_conflict_criteria_v1(
     intent: ActionIntent, goal: Goal, facts: CurrentD08ConflictFactsV1,
-    authority_snapshot: AuthorityDispatchSnapshotV1,
+    authority_snapshot: AuthorityDispatchSnapshotV1, *, approved_first_communication=None,
 ) -> tuple[str, ...]:
     """Return blockers from the full inventories; no free-text compatibility.
 
@@ -77,8 +77,19 @@ def evaluate_commitment_conflict_criteria_v1(
     if len(own) != len(intent.commitment_refs):
         missing.append("own_pinned_commitment_missing")
     for item in own.values():
+        from ..domains.d08.commitment_communication_v1 import CommitmentCommunicationIntentV1, CommitmentTermsCommunicationIntentV2, scope_terms_match_v1
+        first = (type(approved_first_communication) in (CommitmentCommunicationIntentV1,CommitmentTermsCommunicationIntentV2)
+            and approved_first_communication.commitment.key.name == item.commitment_id
+            and approved_first_communication.commitment.revision == item.revision
+            and approved_first_communication.commitment_digest == canonical_digest(item)
+            and scope_terms_match_v1(approved_first_communication,item)
+            and approved_first_communication.subject_ref == item.subject_ref
+            and approved_first_communication.target_ref == intent.target_ref
+            and approved_first_communication.source_refs == intent.source_refs
+            and intent.identity.phase == "commitment_literal_v1")
+        allowed = {"communicated", "acknowledged"} | ({"private_intention", "offered"} if first else set())
         if (item.subject_ref != f"persona:{facts.namespace.persona_id}"
-                or item.establishment_state not in {"communicated", "acknowledged"}
+                or item.establishment_state not in allowed
                 or item.fulfillment_state not in {"pending", "partially_fulfilled"}):
             missing.append("own_commitment_state_unqualified")
     for item in facts.commitments:
@@ -251,6 +262,9 @@ def read_current_commitment_criteria_v1(
         f"cancellation-epoch:{intent.action_id}":
             observed.cancellation_graph_version.revision,
     }
+    from .d08_commitment_communication_v1 import current_named_commitment_check_refs_v1
+    named_versions = current_named_commitment_check_refs_v1(db, namespace, intent, now_utc=now_utc)
+    observed_versions.update((ref.ref, ref.version) for ref in named_versions)
     frozen_versions = {item.ref: item.version for item in spec.required_input_versions}
     if (len(observed_versions) != len(spec.required_input_versions)
             or observed_versions != frozen_versions
@@ -262,8 +276,10 @@ def read_current_commitment_criteria_v1(
             or receipt.result != "pass" or receipt.coverage != "full"
             or receipt.valid_until < now_utc):
         raise ValueError("D08 frozen check versions or receipt changed")
+    from .d08_commitment_communication_v1 import current_named_commitment_for_action_v1
+    approved = current_named_commitment_for_action_v1(db, namespace, intent, now_utc=now_utc)
     blockers = evaluate_commitment_conflict_criteria_v1(
-        intent, goal, facts, authority_snapshot)
+        intent, goal, facts, authority_snapshot, approved_first_communication=approved)
     if blockers:
         raise ValueError("D08 semantic conflict remains: " + ",".join(blockers))
     return CurrentD08CriteriaEvidenceV1(

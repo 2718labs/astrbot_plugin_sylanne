@@ -17,7 +17,8 @@ from ..authority_service.v2_owner_session import (
 )
 from ..workbench_api.http_transport import (
     ASSET_ROUTE, COMMAND_ROUTE, PLUGIN_ROUTE_PREFIX, SCENE_CANDIDATES_ROUTE, SESSION_ROUTE,
-    REPLY_CONTROL_SESSION_ROUTE,
+    REPLY_CONTROL_SESSION_ROUTE, OWNER_SESSION_IDENTITY_ROUTE,
+    INSPECTION_MAINTENANCE_SESSION_ROUTE,
     SYLANNE_OWNER_SESSION_COOKIE, WorkbenchHttpTransport, command_json_response_v1, OwnedWorkbenchJSONV3,
 )
 from ..workbench_api.owner_session_resolver import BoundOwnerSessions
@@ -345,6 +346,16 @@ class WorkbenchHostMount:
                 if type(result) is OwnedWorkbenchJSONV3:
                     result.release_v3()
 
+        async def owner_session_identity():
+            if self._closed:
+                return json_response(_unavailable('host_stopped'),status_code=503,headers=_STATIC_HEADERS)
+            transport=self._transport
+            if transport is None:
+                return json_response(_unavailable('authority_unavailable'),status_code=503,headers=_STATIC_HEADERS)
+            result=await transport.owner_session_identity(request)
+            status_code=result.pop('http_status',200)
+            return json_response(result,status_code=status_code,headers=_STATIC_HEADERS)
+
         async def session():
             if self._closed:
                 return json_response(_unavailable("host_stopped"), status_code=503,
@@ -360,6 +371,16 @@ class WorkbenchHostMount:
             result = await transport.open_session(request)
             status_code = result.pop("http_status", 200)
             return json_response(result, status_code=status_code, headers=_STATIC_HEADERS)
+
+        async def inspection_maintenance_session():
+            if self._closed:
+                return json_response(_unavailable("host_stopped"),status_code=503,headers=_STATIC_HEADERS)
+            transport=self._transport
+            if transport is None:
+                return json_response(_unavailable("inspection_maintenance_unavailable"),status_code=503,headers=_STATIC_HEADERS)
+            result=await transport.open_inspection_maintenance_session(request)
+            status_code=result.pop("http_status",200)
+            return json_response(result,status_code=status_code,headers=_STATIC_HEADERS)
 
         async def reply_control_session():
             if self._closed:
@@ -527,6 +548,9 @@ class WorkbenchHostMount:
             SESSION_ROUTE, session, ["GET"], "Sylanne current Owner session",
         )
         context.register_web_api(
+            OWNER_SESSION_IDENTITY_ROUTE,owner_session_identity,["GET"],"Sylanne current Owner identity correlation",
+        )
+        context.register_web_api(
             SCENE_CANDIDATES_ROUTE, scene_candidates, ["GET"],
             "Sylanne current Owner scene observations",
         )
@@ -539,6 +563,9 @@ class WorkbenchHostMount:
         context.register_web_api(
             CONFIGURATION_ROUTE, configuration, ["GET", "POST"],
             "Sylanne Dashboard-only current SDK configuration",
+        )
+        context.register_web_api(
+            INSPECTION_MAINTENANCE_SESSION_ROUTE,inspection_maintenance_session,["GET"],"Sylanne Owner inspection maintenance session",
         )
         context.register_web_api(
             REPLY_CONTROL_SESSION_ROUTE, reply_control_session, ["GET"], "Sylanne Owner reply metadata session",

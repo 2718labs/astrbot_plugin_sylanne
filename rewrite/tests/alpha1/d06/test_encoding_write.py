@@ -62,8 +62,8 @@ class EncodingWriteTests(unittest.TestCase):
         self.perspective = AtomKey(Owner("scene", "bot", "persona", "scene-1"), "d03.role_binding", "current")
         self.feeling = AtomKey(Owner("persona", "bot", "persona"), "d04.feeling_state.v1", "current")
         self.interpretation = AtomKey(Owner("persona", "bot", "persona"), "d07.belief_revision.v1", "current")
-        self.baseline = AtomKey(Owner("event", "bot", "persona", "world-1"),
-                                "d04.encoding_baseline.v1", "record")
+        self.baseline = AtomKey(self.source.owner,
+                                "d04.encoding_baseline.v1", "baseline-1")
         self.self_event = AtomKey(Owner("event", "bot", "persona", "world:1"),
                                   "d03.world_event", "current")
         self.self_mapping = self_mapping_key(self.namespace)
@@ -137,6 +137,47 @@ class EncodingWriteTests(unittest.TestCase):
         return self.pipeline.prepare_encoding(
             "source-1", context, audience="owner", purpose="context")
 
+    def seed_baseline(self, prepared, *, perspective_ref=None):
+        """Commit a typed unit baseline against the graph's actual fixture facts."""
+        perspective_ref = perspective_ref or prepared.proposal.trace.perspective_ref
+        value = {
+            "baseline_id": self.baseline.name,
+            "source_refs": [self.source.token],
+            "perspective_ref": perspective_ref,
+            "then_feeling_versions": [{"ref": self.feeling.token, "revision": 1}],
+            "interpretation_versions": [{"ref": self.interpretation.token, "revision": 1}],
+            "as_known_at": 2.0,
+            "projection_policy_ref": "projection-policy:unit-fixture",
+            "projection_policy_version": "v1",
+            "basis_version": "scheme-1",
+            "parameter_version": "params-1",
+            "salience_interval": None,
+            "tone_interval": None,
+            "unknown_reasons": [
+                "salience_interval:numeric_projection_uncertified",
+                "tone_interval:numeric_projection_uncertified",
+            ],
+        }
+        baseline = decode_encoding_baseline(value)
+        perspective_key = AtomKey.from_token(perspective_ref)
+        refs = [self.source, perspective_key, self.feeling, self.interpretation]
+        if perspective_key == self.self_perspective:
+            refs.extend((self.self_mapping, self.self_event))
+        baseline.verify_committed_refs(self.store.graph_snapshot(tuple(refs)))
+        current = self.store.graph_snapshot((self.baseline,)).get(self.baseline)
+        if current is None or not current.valid:
+            self.store.graph_commit(GraphCandidate(
+                self.event("baseline"), (GraphVersion(self.baseline, 0),),
+                (GraphWrite(self.baseline, value),),
+            ))
+        elif current.value != value:
+            raise AssertionError("unit encoding baseline changed")
+        proposal = prepared.proposal
+        baseline_version = (self.baseline.token, 1)
+        reads = (proposal.read_versions if baseline_version in proposal.read_versions
+                 else (*proposal.read_versions, baseline_version))
+        return replace(prepared, proposal=replace(proposal, read_versions=reads))
+
     def envelope(self, prepared, *, missing=(), baseline=False):
         episode = prepared.proposal.episode.episode_id
         trace = prepared.proposal.trace.trace_id
@@ -172,13 +213,15 @@ class EncodingWriteTests(unittest.TestCase):
         )
 
     def test_committed_proofs_compile_separate_episode_and_subjective_trace(self):
-        prepared = self.seed()
-        envelope = self.envelope(prepared)
-        proposal = self.adapter.compile_encoding(envelope, prepared)
+        prepared = self.seed_baseline(self.seed_self())
+        envelope = self.envelope(prepared, baseline=True)
+        proposal = self.adapter.compile_encoding_v2(
+            envelope, prepared, encoding_baseline_ref=self.baseline.token,
+        )
         D06DomainProvider().validate(proposal)
         episode, trace = proposal.typed_writes
         self.assertEqual(episode.value["source_refs"], [self.source.token])
-        self.assertEqual(episode.value["event_ref"], self.event_ref.token)
+        self.assertEqual(episode.value["event_ref"], self.self_event.token)
         self.assertEqual(trace.value["episode_ref"], episode.key.token)
         self.assertEqual(trace.value["then_feeling_refs"], [self.feeling.token])
         self.assertEqual(trace.value["interpretation_refs"], [self.interpretation.token])
@@ -191,26 +234,33 @@ class EncodingWriteTests(unittest.TestCase):
         self.assertEqual(receipt.status, "committed")
 
     def test_missing_committed_context_or_access_proof_is_rejected(self):
-        prepared = self.seed()
+        prepared = self.seed_baseline(self.seed_self())
         with self.assertRaisesRegex(ValueError, "committed read proof"):
-            self.adapter.compile_encoding(
-                self.envelope(prepared, missing=(self.feeling,)), prepared,
+            self.adapter.compile_encoding_v2(
+                self.envelope(prepared, missing=(self.feeling,), baseline=True), prepared,
+                encoding_baseline_ref=self.baseline.token,
             )
         with self.assertRaisesRegex(ValueError, "source proof differs"):
-            self.adapter.compile_encoding(
-                self.envelope(prepared, missing=(self.access,)), prepared,
+            self.adapter.compile_encoding_v2(
+                self.envelope(prepared, missing=(self.access,), baseline=True), prepared,
+                encoding_baseline_ref=self.baseline.token,
             )
 
     def test_candidate_is_not_written_by_preparation_or_compilation(self):
-        prepared = self.seed()
-        proposal = self.adapter.compile_encoding(self.envelope(prepared), prepared)
+        prepared = self.seed_baseline(self.seed_self())
+        proposal = self.adapter.compile_encoding_v2(
+            self.envelope(prepared, baseline=True), prepared,
+            encoding_baseline_ref=self.baseline.token,
+        )
         snapshot = self.store.graph_snapshot(tuple(write.key for write in proposal.typed_writes))
         self.assertTrue(all(atom.revision == 0 and not atom.valid for atom in snapshot.atoms))
 
     def test_access_withdrawal_after_preparation_stales_the_write(self):
-        prepared = self.seed()
-        envelope = self.envelope(prepared)
-        proposal = self.adapter.compile_encoding(envelope, prepared)
+        prepared = self.seed_baseline(self.seed_self())
+        envelope = self.envelope(prepared, baseline=True)
+        proposal = self.adapter.compile_encoding_v2(
+            envelope, prepared, encoding_baseline_ref=self.baseline.token,
+        )
         self.pipeline.repository.set_access(
             self.event("withdraw"), "source-1", audiences=("owner",),
             purposes=("context",), status="withdrawn", recorded_at=3.0,
@@ -222,8 +272,11 @@ class EncodingWriteTests(unittest.TestCase):
             ))
 
     def test_provider_rejects_a_trace_detached_from_its_episode(self):
-        prepared = self.seed()
-        proposal = self.adapter.compile_encoding(self.envelope(prepared), prepared)
+        prepared = self.seed_baseline(self.seed_self())
+        proposal = self.adapter.compile_encoding_v2(
+            self.envelope(prepared, baseline=True), prepared,
+            encoding_baseline_ref=self.baseline.token,
+        )
         episode, trace = proposal.typed_writes
         detached = GraphWrite(
             trace.key, {**trace.value, "episode_ref": episode.value["event_ref"]},
@@ -232,11 +285,7 @@ class EncodingWriteTests(unittest.TestCase):
             D06DomainProvider().validate(replace(proposal, typed_writes=(episode, detached)))
 
     def test_v2_baseline_is_typed_and_bound_to_read_and_historical_proofs(self):
-        prepared = self.seed_self()
-        with_baseline = replace(prepared, proposal=replace(
-            prepared.proposal,
-            read_versions=(*prepared.proposal.read_versions, (self.baseline.token, 1)),
-        ))
+        with_baseline = self.seed_baseline(self.seed_self())
         envelope = self.envelope(with_baseline, baseline=True)
         proposal = self.adapter.compile_encoding_v2(
             envelope, with_baseline, encoding_baseline_ref=self.baseline.token,
@@ -255,7 +304,7 @@ class EncodingWriteTests(unittest.TestCase):
             D06DomainProvider().validate(without_history)
         with self.assertRaisesRegex(ValueError, "committed read proof"):
             self.adapter.compile_encoding_v2(
-                self.envelope(prepared, baseline=False), prepared,
+                self.envelope(with_baseline, baseline=False), with_baseline,
                 encoding_baseline_ref=self.baseline.token,
             )
         wrong_namespace = AtomKey(Owner("event", "other", "persona", "world-1"),
@@ -267,16 +316,13 @@ class EncodingWriteTests(unittest.TestCase):
 
     def test_v2_rejects_sender_scene_and_missing_self_mapping_proof(self):
         legacy = self.seed()
-        legacy = replace(legacy, proposal=replace(
-            legacy.proposal,
-            read_versions=(*legacy.proposal.read_versions, (self.baseline.token, 1)),
-        ))
+        self.seed_self_graph()
+        legacy = self.seed_baseline(legacy, perspective_ref=self.self_perspective.token)
         with self.assertRaisesRegex(ValueError, "perspective_ref"):
             self.adapter.compile_encoding_v2(
                 self.envelope(legacy, baseline=True), legacy,
                 encoding_baseline_ref=self.baseline.token,
             )
-        self.seed_self_graph()
         context = EncodingContext(
             self.self_event.token, self.self_perspective.token,
             (self.feeling.token,), (self.interpretation.token,), (),
@@ -286,8 +332,8 @@ class EncodingWriteTests(unittest.TestCase):
                 self.baseline,
             )),
         )
-        self_prepared = self.pipeline.prepare_encoding(
-            "source-1", context, audience="owner", purpose="context")
+        self_prepared = self.seed_baseline(self.pipeline.prepare_encoding(
+            "source-1", context, audience="owner", purpose="context"))
         guarded = self.envelope(self_prepared, baseline=True)
         missing_mapping = replace(guarded.version_guard, read_versions=tuple(
             version for version in guarded.version_guard.read_versions
@@ -496,7 +542,9 @@ class EncodingWriteTests(unittest.TestCase):
         from sylanne3.authority_service.v2_worker_model_result_contract import (
             WorkerModelResultReadRequestV1, WorkerModelResultReadV1,
         )
-        from sylanne3.model_broker.first_ingress_encoding import build_first_ingress_encoding_payload
+        from sylanne3.model_broker.first_ingress_encoding import (
+            FIRST_INGRESS_ENCODING_TEMPLATE_VERSION, build_first_ingress_encoding_payload,
+        )
         from sylanne3.runtime.encoding_call_binding import EncodingCallBinding
         from sylanne3.runtime_contracts import canonical_serialize, DomainProposal
 
@@ -533,7 +581,9 @@ class EncodingWriteTests(unittest.TestCase):
                    self.feeling,
                    self.interpretation, self.baseline)),
         )
-        payload, template = build_first_ingress_encoding_payload(original)
+        payload, template = build_first_ingress_encoding_payload(
+            original, template_version=FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+        )
         frozen = {
             "schema": "sylanne.first-ingress-encoding-call.v2",
             "namespace": ["bot", "persona"], "job_id": "job-1",
@@ -548,7 +598,9 @@ class EncodingWriteTests(unittest.TestCase):
             },
             "provider_id": "provider-1", "model_id": "model-1",
             "required_capabilities": [], "privacy_tier": "private",
-            "prompt_template_digest": template, "payload": payload,
+            "prompt_template_digest": template,
+            "prompt_template_version": FIRST_INGRESS_ENCODING_TEMPLATE_VERSION,
+            "payload": payload,
             "timeout_seconds": 10.0, "max_output_tokens": 100,
             "acquire_operation_id": "acquire-1", "original_operation_id": "ingress-1",
             "work_kind": "d06.encode_source", "worker_fence": 1,

@@ -43,3 +43,42 @@ The active full-implementation goal continues through phase 5b and the redesigne
 ## Errors
 - Initial Git clone using OpenSSL failed with SSL_ERROR_SYSCALL; retry with per-command Schannel succeeded. No TLS validation disabled.
 - Python launcher listed a missing D:\WLDA runtime; use verified uv CPython at C:\Users\pidan\AppData\Roaming\uv\python\cpython-3.13.14-windows-x86_64-none\python.exe.
+
+
+## 2026-10-20 当前任务：全部 283 项生产源码链
+
+用户明确要求继续逐项查全部283需求，修完代码缺口；服务器实测由用户负责。旧交付 production-closure-r1 与 codex/beta1 982e4c9 是本轮固定基线，不能当本次全部需求通过。
+
+1. 已完成审查覆盖（不等于实现闭合）：原283行分母全部逐行实际链审查；台账 docs/plans/complete-agent-20261006/beta1-283-source-chain-audit.json。
+2. 进行中：逐项修复并复核真实授权、producer、consumer、失效/删除、cold/replay。审查归类134项含代码缺口，保留总任务HOLD；新增修改随独立应用收据记录，不因局部修复自动改整行通过。
+3. 随修改执行必要的有限验证：保留首次失败，已绿部分不无故重复。全部283行已有具体源码结论；最终统一快照尚未冻结，旧证据不能转移。
+4. 待执行：独立新快照和不含测试的运行ZIP<=16,000,000字节，沿用未变native真实hash；服务器/HOLD资格单列。
+
+主对话唯一G写者；全分母审查已完成，Sol按限定实际修改复核ABI；仅必要共享架构契约复用一名Astra high，其余不自动恢复。无真实模型/sender，不SQL修账，不改TTL/预算。
+
+当前共享 Natural 修复：最终原件 canonical 准备已接真实 inventory Work，有限 codec/清理验证已保存；独立首次 Source READ Work、最终同步原上限及其他283领域缺口继续实施。审查覆盖283/283不是代码闭合283/283。
+
+
+2026-10-20 r18（实际源码继续，非冻结/交付）：Owner承诺首建→明确Scope→具名确定性Prepare→PromiseUse→真实outbound采纳→communicated/ACK的已有协议接线落入产品；共享commit fresh返回临时11字段正文摘要，实际持久receipt剔除正文，只保存真实stage与同CommitReceipt导出的4字段Scope元数据。已提交Scope恢复先只查固定nullness元数据，再沿原操作/请求与当前Owner fence恢复，不新建授权、预算或发送。Host实际outbound结果现在消费Owned lease并最终释放。单次同源Vue typecheck/build130模块，双运行资源1,841,965 bytes，SHA adf37c2eccd4552f30e91f88d95052d458b16799c2cd5dd5a8cb5757671d4bb1；浏览器/服务器未验。
+D13已采用后的独立fact READ与distinct metadata-only duplicate replay为真实Work kind；ordinary FULL/initial/P2 roster官方RPC在SQL外、每实际事务完整currentness核验，跨后续调用只用私issued prepared+原retained operation，最终真实closed callback释放元数据。C09 actor已接退休receiver清理：continuous drain后、Graph checkpoint/关闭及capture前，PREPARED切换前、SWITCHED显式旧→新恢复分开；首HOLD保留失败，不循环同失败，不用进程退出代替durable owner terminal。READ/remote范围已落，WRITE/model formal terminal、fresh完整consumer安装和controlledSDK-ready仍在编码。
+283全分母记录继续保持原134/98/50/1，不按编译/import/build提升。只读重核发现11,054条旧源码证据中3,950条哈希已变化，123/134 confirmed-gap行含变化文件，属于需重新核当前源码，不能视作PASS或已闭合。D05真实prior/boundary SourceWork和其输入producer继续补。POSIX TLS加载已移除纯schema-test开关；测试源不进运行ZIP成员，尚未构新ZIP。保留全部旧失败数据库、日志、快照；无DB/full节点/付费/sender/WSL/native/服务器运行，无新冻结/推送/发布。
+
+
+### r19 continuation — IN PROGRESS / HOLD
+
+Continue D13 generation/Counter first-writer obligations, real Core birth/retirement, Source metadata remaining actual consumers/producers and authorized legacy capture; then remaining 283 code gaps. Keep first-failure evidence; do not rebuild/retest unchanged green nodes or treat frontend build as closure. Final artifact remains runtime-only <=16,000,000 bytes, not yet produced.
+
+
+### 2026-10-21 r29 — actual D13 / Source / R09 continuation, IN PROGRESS / HOLD
+
+Actual V4 parent cleanup drain, installed metadata-only Life census controller and explicit Body-profile mTLS census/segment interfaces are applied and compiled. R09 native Method routing, original absolute deadline and same-W01 preparation facts are wired; scheduler lifetime and real terminal adoption remain in progress. D04 per-producer FullPersonaWriter/role lineage, R03 actual Case C3 Source groups, and labor chronological B/C/adoption producers are being integrated by disjoint writers. First source-review profile/ABI errors were preserved and corrected before DB execution. No full-node rerun, database, provider, sender, new snapshot, package, push or server acceptance. Full 283 row statuses remain unpromoted. Exact hashes and open points are in audit ongoing_source_work_20261021_r29.
+
+
+### 2026-10-21 r30 — actual source interfaces / FIRST IMPORT FAILURE PRESERVED / HOLD
+
+Applied actual R09 retained same-ticket child handoff, original/parent deadline cap, explicit labor B Source/metadata/dual-purpose/quote/CAS/census consumption, independent policy/plan producers, and R03 Case attention/signature/Review V2 compatibility seams. Source candidates compiled before guarded writes. The one new shared-module import/API check FAILED before any Work/DB: ProductionOriginalRefV1 is missing from the R09 command annotation module. First log is D:/bun/tmp/sylanne-r30-census-r09-source-interface-20261021.log; sole writer is repairing the formal import, without repeating installed nodes. New labor C Source classification, chronological rebuild, Host WRITE adoption/settlement/cold, retained accounting basis/C09 and D04 FullWriter remain actively in progress. No new frozen snapshot/package/push or server/native/model/sender execution. All 283 row statuses remain unpromoted; exact changing-source hashes and limits are audit r30.
+
+
+### 2026-10-21 r32 — actual consumers / cold ACK / shared lifetime, IN PROGRESS / HOLD
+
+Public D13 adoption/execution now enters actual metadata Work, same-ticket handoff and original Core/Source gates; Owner async continuation consumes actual Progress before ordered checkpoints. Initial Body install signs its true GraphReceipt checkpoint in the installation transaction; no old missing checkpoint is invented. Shared handoff outer lifetime now survives inherited final mappers and is released on abort; one necessary existing scheduler regression run passed 11 cases in 1.81s, including updated lifetime ordering and first-error cleanup. This is not D13 business/Numeric/native/installation/server acceptance. Selector/Owner WebUI rebuild factory, exact new C09 retirement consumers, R03 experience causality and remaining whole283 production gaps stay open. No new package/freeze/push; whole283 row statuses unchanged. Exact hashes and first-checker limits are audit r32.

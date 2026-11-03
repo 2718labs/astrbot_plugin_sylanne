@@ -229,3 +229,108 @@ def test_owned_storage_payload_cleanup_keeps_same_lease(mode):
     lease.release()
     owned.release_v3()
     assert len(released) == 1 and pool.used == baseline
+
+
+@pytest.mark.parametrize("error", (None, RuntimeError, asyncio.CancelledError))
+def test_background_consumer_keeps_actual_payload_until_await_finishes(error):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from sylanne3.graph_worker import OwnedGraphStorageResultV3, _RESULT_ISSUER_V3
+    from sylanne3.runtime_context import RuntimeContext
+    from sylanne3.runtime_storage_v3 import RuntimeStorageOperationV3, _RuntimeResourcePoolV3, _INSTALLED
+
+    async def scenario():
+        pool = _RuntimeResourcePoolV3()
+        baseline = pool.used
+        handle = SimpleNamespace(pool=pool, selection_digest="background-consumer")
+        lease = RuntimeStorageOperationV3(_INSTALLED, handle, "background-consumer", None)
+        lease.retain(1024)
+        payload = {"status": "progressed", "receipt": {"source_payload": "not-a-status"}}
+        released = []
+
+        def cleanup():
+            released.append(True)
+            payload.clear()
+
+        owned = OwnedGraphStorageResultV3(_RESULT_ISSUER_V3, payload, lease, cleanup)
+        summary = None
+        with pytest.raises(error) if error is not None else nullcontext():
+            with RuntimeContext._background_graph_result_v3(owned) as current:
+                try:
+                    assert current is payload and not lease.closed
+                    await asyncio.sleep(0)
+                    assert pool.used == baseline + 1024 and released == []
+                    summary = RuntimeContext._background_status_v3(current)
+                    if error is not None:
+                        raise error()
+                finally:
+                    current = None
+        assert summary == {"status": "progressed"}
+        assert released == [True] and payload == {}
+        assert lease.closed and pool.used == baseline
+
+    asyncio.run(scenario())
+
+
+def test_d07_reflection_consumer_unwraps_owned_before_waking(monkeypatch):
+    """Consume a real owned result at the worker boundary, without issuing execution rights."""
+    import sqlite3
+    from threading import RLock
+    from types import SimpleNamespace
+    from sylanne3.graph_worker import OwnedGraphStorageResultV3, _RESULT_ISSUER_V3
+    from sylanne3.runtime.d07_execution_v1 import TABLE
+    from sylanne3.runtime.d07_installed_execution_v1 import InstalledD07ExecutionServiceV1
+    from sylanne3.runtime import d07_graph_stages_v1
+    from sylanne3.runtime_contracts import NamespaceId
+    from sylanne3.runtime_storage_v3 import RuntimeStorageOperationV3, _RuntimeResourcePoolV3, _INSTALLED
+
+    async def scenario():
+        pool = _RuntimeResourcePoolV3()
+        baseline = pool.used
+        lease = RuntimeStorageOperationV3(_INSTALLED,
+            SimpleNamespace(pool=pool, selection_digest="reflection-consumer"),
+            "reflection-consumer", None)
+        lease.retain(1024)
+        payload = {"status": "prepared", "job_id": "actual-job",
+                   "prepared_digest": "1" * 64, "source_payload": ["excluded"]}
+        owned = OwnedGraphStorageResultV3(_RESULT_ISSUER_V3, payload, lease, payload.clear)
+        monkeypatch.setattr(d07_graph_stages_v1,
+            "prepare_current_d07_reflection_continuation_v3", lambda *a, **kw: owned)
+
+        class WorkerBoundary:
+            async def call(self, callback):
+                return callback(None)
+
+        db = sqlite3.connect(":memory:")
+        try:
+            db.execute("CREATE TABLE " + TABLE +
+                       " (bot TEXT,persona TEXT,kind TEXT,original_ref TEXT)")
+            db.execute("INSERT INTO " + TABLE + " VALUES(?,?,?,?)",
+                       ("bot", "persona", "reflection_continuation", "reflection"))
+            service = object.__new__(InstalledD07ExecutionServiceV1)
+            service.worker = WorkerBoundary()
+            service._closed = service._reflection_discovery_active = False
+            service._reflection_rescan_requested = False
+            service.owner_loop = asyncio.get_running_loop()
+            service._db = db
+            service._store = SimpleNamespace(_lock=RLock())
+            service.bundle = SimpleNamespace(installation_policy=SimpleNamespace(
+                namespace=NamespaceId("bot", "persona")))
+            service.bootstrap = None
+            service._wake_seen = set()
+            wakes = []
+
+            def wake(job_id):
+                assert lease.closed and pool.used == baseline and payload == {}
+                wakes.append(job_id)
+
+            service.wake_committed_job_v1 = wake
+            result = await service.resume_pending_reflections_v3()
+            assert result == ({"status": "prepared", "job_id": "actual-job",
+                               "prepared_digest": "1" * 64},)
+            assert wakes == ["actual-job"]
+            assert service._reflection_discovery_active is False
+        finally:
+            db.close()
+
+    asyncio.run(scenario())

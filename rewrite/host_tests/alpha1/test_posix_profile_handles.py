@@ -57,7 +57,7 @@ class PosixProfileHandleTests(unittest.TestCase):
             f"h.__path__=[{str(source / 'sylanne3' / 'host')!r}]; "
             "sys.modules['sylanne3.host']=h; "
             "from sylanne3.host.authority_profile import _load_profile_from_root; "
-            f"p=_load_profile_from_root('safe',Path({str(self.root)!r}),prepare_tls=True); "
+            f"p=_load_profile_from_root('safe',Path({str(self.root)!r})); "
             "assert p.prepared_ssl_context is not None"
         )
         result = subprocess.run(
@@ -70,18 +70,18 @@ class PosixProfileHandleTests(unittest.TestCase):
     def test_symlink_and_writable_ancestor_are_rejected(self) -> None:
         self.profile.chmod(0o777)
         with self.assertRaises(PermissionError):
-            authority_profile._load_profile_from_root("safe", self.root, prepare_tls=True)
+            authority_profile._load_profile_from_root("safe", self.root)
         self.profile.chmod(0o755)
         cert = self.profile / "client-cert.pem"
         cert.rename(self.profile / "original-cert.pem")
         cert.symlink_to("original-cert.pem")
         with self.assertRaises(OSError):
-            authority_profile._load_profile_from_root("safe", self.root, prepare_tls=True)
+            authority_profile._load_profile_from_root("safe", self.root)
 
     def test_descriptor_acl_presence_is_rejected(self) -> None:
         with patch.object(authority_profile.os, "getxattr", return_value=b"acl") as read_acl:
             with self.assertRaisesRegex(PermissionError, "ACL"):
-                authority_profile._load_profile_from_root("safe", self.root, prepare_tls=True)
+                authority_profile._load_profile_from_root("safe", self.root)
         self.assertIsInstance(read_acl.call_args.args[0], int)
 
     def test_replaced_path_after_open_does_not_change_tls_material(self) -> None:
@@ -100,7 +100,7 @@ class PosixProfileHandleTests(unittest.TestCase):
         with patch.object(authority_profile, "_tls_fd_path", side_effect=replace_after_open), \
              patch.object(authority_profile.os, "getegid", return_value=65534):
             loaded = authority_profile._load_profile_from_root(
-                "safe", self.root, prepare_tls=True)
+                "safe", self.root)
         self.assertTrue(swapped)
         self.assertIsNotNone(loaded.prepared_ssl_context)
 

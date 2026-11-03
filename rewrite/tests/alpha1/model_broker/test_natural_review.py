@@ -173,3 +173,41 @@ def test_promise_speech_act_is_forced_to_hold_without_typed_grant_scope():
     )
     assert candidate.verdict == "hold"
     assert candidate.issues == (("commitment_out_of_scope", "/units"),)
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_shared_review_canonical_steps_match_real_frozen_original(corrupt):
+    """Pure canonical algorithm: no Authority/Host proof is issued by this test."""
+    from dataclasses import asdict
+    from hashlib import sha256
+    from sylanne3.authority_service.contract import AuthorityUnavailable
+    from sylanne3.runtime.natural_frozen_original_read_v3 import _NaturalReviewCanonicalStateV3
+    from sylanne3.runtime.c09_paged_sql_v2 import C09BatchBudgetV2,C09SqlByteMeterV2
+    from sylanne3.runtime_contracts import canonical_serialize,meter_canonical_outputs
+    generation,frozen,_=_frozen_and_seals()
+    raw=asdict(frozen)
+    if corrupt:
+        raw['canonical_wire']=raw['canonical_wire'].replace('review-model','other-model')
+    wire=canonical_serialize(raw).encode('utf-8')
+    class Retention:
+        retained=0
+        def retain(self,size):
+            self.retained+=size
+            assert self.retained<=8388608
+    state=_NaturalReviewCanonicalStateV3(raw,generation,Retention(),sha256(wire).hexdigest(),len(wire))
+    budget=C09BatchBudgetV2(100,262144,25000000,250000000,8388608)
+    try:
+        for _ in range(1000):
+            meter=C09SqlByteMeterV2(budget)
+            with meter_canonical_outputs(meter):
+                complete=state.advance(meter)
+            assert meter.consumed_bytes<=262144
+            if complete:break
+        else:pytest.fail('finite actual canonical original did not complete')
+    except (AuthorityUnavailable,ValueError)as exc:
+        assert corrupt and 'canonical fragment differs' in str(exc)
+        return
+    assert not corrupt
+    assert state.result==frozen
+    assert state.wire_digest==frozen.wire_digest
+    assert state.expected_payload_digest==frozen.wire_digest

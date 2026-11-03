@@ -782,7 +782,11 @@ def artifact_model_current_type_versions_v3(db,namespace,type_id,*,limit):
 
 def artifact_model_source_family_v3(db,*,namespace,roots,purpose,audiences):
     from .current_authority_graph_read_v3 import _authority_attachment_owner_v3
-    work=_authority_attachment_owner_v3(db);r=_READERS.get(work)
+    work=_authority_attachment_owner_v3(db)
+    # No artifact attachment means this db owns no artifact-model Source family;
+    # a WeakKeyDictionary lookup with None would raise instead of answering.
+    if work is None:return None
+    r=_READERS.get(work)
     if r is None:return None
     r.capability.require_v3()
     if namespace!=work.namespace:raise AuthorityUnavailable("Artifact Source family crossed actual namespace")

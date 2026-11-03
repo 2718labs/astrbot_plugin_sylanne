@@ -434,7 +434,7 @@ def validate_current_general_growth_freeze_v1(readers,db,frame,request):
         "growth_counterevidence":counter,"semantic_interpretation":semantic_original}
 
 
-def read_current_general_growth_v1(readers,db,frame,request):
+def read_current_general_growth_facts_v1(readers,db,frame,request,*,single_event_qualification=None):
     from .d01_production_operations_v1 import CurrentGrowthInputsV1,MissingProductionOriginalV1
     from .domain_production_erasure_v1 import decode_typed_production_value_v1
     from ..domains.d01 import PersonaDomain,GrowthProposal
@@ -480,8 +480,12 @@ def read_current_general_growth_v1(readers,db,frame,request):
     if (counter["growth_proposal_ref"]!=request.growth_proposal_ref or counter["query_scope_ref"]!="d07.current_interpretation.v1"
             or tuple(counter["evidence_source_refs"])!=wrapper.support_source_refs or counter["coverage_complete"]is not True):
         raise ValueError("General birth counter original differs from its fixed proposal/support scope")
-    complete,conflict,current_originals=_read_current_general_counter_scope_v1(db,read,
-        "d01.growth:"+raw["target_block"]+":"+raw["change_kind"])
+    if single_event_qualification is None:
+        complete,conflict,current_originals=_read_current_general_counter_scope_v1(db,read,
+            "d01.growth:"+raw["target_block"]+":"+raw["change_kind"])
+    else:
+        from .d01_single_event_growth_v1 import single_event_current_counter_scope_v1
+        complete,conflict,current_originals=single_event_current_counter_scope_v1(db,read,raw,single_event_qualification,semantic=False)
     originals.extend((counter_original,*current_originals))
     proposal=GrowthProposal(raw["proposal_id"],raw["base_head"],raw["target_block"],raw["replacement_claim"],families,
         complete,raw["change_kind"],"external")
@@ -972,7 +976,12 @@ def stage_adopt_current_general_growth_in_transaction_v1(db,*,frame,request,inst
         return waiting_stage_v1(frame,"d01","adopt_general_growth_v1",request,missing)
     old_request=AdoptCurrentGrowthRequestV1(request.growth_proposal_ref,request.trigger_original_ref,
         request.trial_original_refs,request.counterevidence_query_ref)
-    stage=compile_adopt_current_growth_v1(frame,old_request,inputs)
+    from .current_full_persona_writer_v1 import (
+        require_bound_current_full_persona_writer_v1, require_full_persona_writer_stage_v1)
+    writer,_=require_bound_current_full_persona_writer_v1(db,frame=frame,request=request)
+    stage=compile_adopt_current_growth_v1(frame,old_request,inputs,
+        writer_qualification=writer,writer_request=request)
+    stage=require_full_persona_writer_stage_v1(db,frame=frame,request=request,stage=stage)
     general_provenance["growth"]=json.loads(stage.original_payload_json)["provenance"]
     writes=tuple(write for proposal in stage.proposals for write in proposal.typed_writes)
     return stage_result_v1(frame,"d01","adopt_general_growth_v1",request,writes=writes,provenance=general_provenance,
@@ -987,9 +996,14 @@ from ..graph_types import AtomKey,owner_grant_key
 
 _GENERAL_OWNER_OPERATIONS_V1=frozenset({"freeze_general_growth_intent_v1","register_general_growth_trial_start_v1",
     "derive_general_growth_trial_v1","adopt_general_growth_v1"})
+from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_OPERATION_KINDS_V1 as _SINGLE_EVENT_OPERATIONS_V1
+_GENERAL_OWNER_OPERATIONS_V1 = _GENERAL_OWNER_OPERATIONS_V1 | frozenset(_SINGLE_EVENT_OPERATIONS_V1)
 
 def general_growth_owner_metadata_retains_path_v1(table,kind,path):
     """Fixed metadata projection used only by the registered General Owner task."""
+    from .d01_single_event_growth_v1 import single_event_metadata_paths_v1
+    selected=single_event_metadata_paths_v1(table,kind,path)
+    if selected is not None:return selected
     if not path:return True
     if table=="graph_d01_production_inputs_v1":
         if kind=="growth_proposal":return path[0]!="replacement_claim"
@@ -1010,6 +1024,7 @@ def general_growth_owner_metadata_retains_path_v1(table,kind,path):
     fields={
         "interpretation":{"schema","interpretation_id","question_key","source_refs","stance","evidence_status","current","observed_at","valid_until"},
         "goal":{"goal_id","revision","state","reason_refs"},
+        "personal_plan":{"plan_id","revision","goal_ref","state","source_refs"},
         "cancellation":{"action_id","action_revision","action_digest","activity_id","attempt_id","effect_id","cancel_epoch","state","actor","source_refs","operation_id"},
         "action":{"action_id","revision","goal_ref","commitment_refs","target_ref","action_kind","purpose","identity","source_refs"},
         "outcome":{"action_id","activity_id","effect_id","attempt_id","observation_refs","cost_refs","source_refs","result_level"},
@@ -1026,6 +1041,12 @@ def validate_general_growth_owner_metadata_fields_v1(table,kind,projection,field
     from .d01_production_operations_v1 import GrowthIntentOriginalV1,GrowthCounterevidenceOriginalV1
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
     from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+    from .d01_single_event_growth_v1 import single_event_metadata_type_v1
+    single_type=single_event_metadata_type_v1(table,kind)
+    if single_type is not None:
+        if set(fields_seen)!={field.name for field in fields(single_type)}:
+            raise ValueError("single-event metadata original differs from its exact registered fields")
+        return projection
     types={
         ("graph_d01_production_inputs_v1","growth_proposal"):GrowthIntentOriginalV1,
         ("graph_d01_production_inputs_v1","growth_counterevidence"):GrowthCounterevidenceOriginalV1,
@@ -1081,8 +1102,14 @@ def _general_plan_head_metadata_v1(db,namespace,key,kind,keys):
 def _general_plan_counter_metadata_v1(db,namespace,scope,roots,keys,originals):
     from .current_method_learning_read_v3 import read_bound_current_general_owner_type_metadata_v1
     from .d01_production_operations_v1 import MissingProductionOriginalV1
-    rows,complete=read_bound_current_general_owner_type_metadata_v1(db,namespace=namespace,
-        type_id="d07.current_interpretation.v1",limit=129)
+    from .domain_background_read_v3 import _active_v3
+    from .d01_single_event_growth_v1 import single_event_metadata_work_v1,_single_type_metadata_v1
+    owner=_active_v3(db)
+    if owner is not None and single_event_metadata_work_v1(owner):
+        rows,complete=_single_type_metadata_v1(db,namespace,"d07.current_interpretation.v1")
+    else:
+        rows,complete=read_bound_current_general_owner_type_metadata_v1(db,namespace=namespace,
+            type_id="d07.current_interpretation.v1",limit=129)
     if not complete or len(rows)>128:raise MissingProductionOriginalV1("complete_current_general_growth_counter_inventory")
     for atom in rows:
         if atom.valid and atom.value["question_key"]==scope and atom.value["current"]is True:
@@ -1268,6 +1295,20 @@ def validate_current_general_owner_metadata_profile_v1(table,column,key_columns,
     if type(profile)is not tuple or len(profile)!=2 or profile[0]!=table:
         raise ValueError("General metadata uses its fixed table/kind profile")
     kind=profile[1]
+    from .d01_single_event_growth_v1 import single_event_metadata_type_v1
+    single_type=single_event_metadata_type_v1(table,kind)
+    if single_type is not None:
+        if table=="graph_d01_production_inputs_v1":
+            if column!="payload_json"or tuple(key_columns)!=("bot","persona","original_ref")or tuple(key)[:2]!=namespace.as_tuple:
+                raise ValueError("single-event signed metadata full PK differs")
+        else:
+            from ..domains.d01.single_event_growth_v1 import ADOPTION_TYPE,REVIEW_TYPE,REVIEW_TYPE_V2
+            expected={"single_event_adoption":ADOPTION_TYPE,"single_event_review":REVIEW_TYPE,
+                "single_event_review_v2":REVIEW_TYPE_V2}[kind]
+            if (column!="value"or tuple(key_columns)!=("token","bot","persona")or tuple(key)[1:]!=namespace.as_tuple
+                    or AtomKey.from_token(key[0]).type_name!=expected):
+                raise ValueError("single-event graph metadata full PK/type differs")
+        return profile
     if table=="graph_d01_production_inputs_v1":
         if (column!="payload_json"or tuple(key_columns)!=("bot","persona","original_ref")
                 or tuple(key)[:2]!=namespace.as_tuple or kind not in {"growth_proposal","growth_counterevidence",
@@ -1279,7 +1320,7 @@ def validate_current_general_owner_metadata_profile_v1(table,column,key_columns,
             raise ValueError("General D07 metadata full PK/kind differs")
     elif table=="graph_atoms":
         types={"activation":"d01.persona_activation.v1","persona_plan":"d01.persona_plan.v1",
-            "interpretation":"d07.current_interpretation.v1","goal":"d08.goal.v1","cancellation":"d08.action_cancellation.v1","action":"d08.action_intent.v1","outcome":"d08.action_outcome.v1",
+            "interpretation":"d07.current_interpretation.v1","goal":"d08.goal.v1","personal_plan":"d08.personal_plan.v1","cancellation":"d08.action_cancellation.v1","action":"d08.action_intent.v1","outcome":"d08.action_outcome.v1",
             "life_progress":"d10.life_progress.v1","life_progress_provenance":"d10.life_progress_provenance.v1",
             "cost":"runtime.cost_settlement","job":"runtime.job"}
         if column!="value"or tuple(key_columns)!=("token","bot","persona")or tuple(key)[1:]!=namespace.as_tuple:
@@ -1346,14 +1387,19 @@ class _GeneralOwnerMetadataTaskV1:
             allowed={("graph_d01_production_inputs_v1",kind)for kind in("growth_proposal","growth_counterevidence",
                 "general_growth_intent_v1","general_growth_trial_start_v1","general_growth_trial_v1")}|{
                 ("graph_d07_execution_originals_v1",kind)for kind in("prepared","adopted","semantic_question")}
-            if(self.table,self.kind)not in allowed:raise ValueError("General signed metadata escaped the closed input families")
+            from .d01_single_event_growth_v1 import single_event_metadata_type_v1
+            if(self.table,self.kind)not in allowed and single_event_metadata_type_v1(self.table,self.kind)is None:
+                raise ValueError("General signed metadata escaped the closed input families")
         elif identity[0]=="graph":
             if len(identity)!=3:raise ValueError("General graph metadata selector differs")
             _,self.kind,token=identity;self.key=AtomKey.from_token(token)
             kinds={"activation":"d01.persona_activation.v1","persona_plan":"d01.persona_plan.v1",
-                "interpretation":"d07.current_interpretation.v1","goal":"d08.goal.v1","cancellation":"d08.action_cancellation.v1","action":"d08.action_intent.v1",
+                "interpretation":"d07.current_interpretation.v1","goal":"d08.goal.v1","personal_plan":"d08.personal_plan.v1","cancellation":"d08.action_cancellation.v1","action":"d08.action_intent.v1",
                 "outcome":"d08.action_outcome.v1","life_progress":"d10.life_progress.v1",
                 "life_progress_provenance":"d10.life_progress_provenance.v1","cost":"runtime.cost_settlement","job":"runtime.job"}
+            from ..domains.d01.single_event_growth_v1 import ADOPTION_TYPE,REVIEW_TYPE,REVIEW_TYPE_V2
+            kinds.update({"single_event_adoption":ADOPTION_TYPE,"single_event_review":REVIEW_TYPE,
+                "single_event_review_v2":REVIEW_TYPE_V2})
             if self.kind not in kinds or self.key.type_name!=kinds[self.kind]or NamespaceId.from_key(self.key)!=reader.namespace:
                 raise ValueError("General graph metadata type/namespace differs")
         elif identity[0]=="type":
@@ -1361,6 +1407,9 @@ class _GeneralOwnerMetadataTaskV1:
             _,self.type_id,_=identity
             kinds={"d07.current_interpretation.v1":"interpretation","d08.action_outcome.v1":"outcome",
                 "d10.life_progress.v1":"life_progress","runtime.job":"job","runtime.cost_settlement":"cost"}
+            from .d01_single_event_growth_v1 import single_event_metadata_work_v1
+            if single_event_metadata_work_v1(reader):
+                kinds.update({"d08.goal.v1":"goal","d08.personal_plan.v1":"personal_plan","d08.action_intent.v1":"action"})
             if self.type_id not in kinds:raise ValueError("unregistered General type metadata inventory")
             self.kind=kinds[self.type_id]
         elif identity[0]=="starts":
@@ -1369,9 +1418,8 @@ class _GeneralOwnerMetadataTaskV1:
             if len(identity)!=2 or len(identity[1])!=64:raise ValueError("General adopted cognition requires its actual prepared digest")
         else:raise ValueError("unregistered General metadata selector")
     def require_reader_v1(self,meter=None):
-        from .current_method_learning_read_v3 import _MethodLearningReadV3
-        if type(self.reader)is not _MethodLearningReadV3 or self.reader.operation_kind not in _GENERAL_OWNER_OPERATIONS_V1:
-            raise ValueError("General metadata only uses its actual registered Owner Method Work")
+        from .current_method_learning_read_v3 import require_actual_general_owner_metadata_work_v1
+        require_actual_general_owner_metadata_work_v1(self.reader,operation_kind=self.reader.operation_kind,namespace=self.reader.namespace)
         self.reader.require_current(meter=meter)
         return self.reader
     def require_signature_v1(self,column,signer,kind):
@@ -1537,5 +1585,32 @@ class _GeneralBackgroundMetadataTaskV1(_GeneralOwnerMetadataTaskV1):
         return finish_current_general_growth_trial_metadata_column_v1(column,reader=reader,kind=kind)
 
 def create_current_general_background_metadata_task_v1(reader,identity):
-    if identity[0]=="prepared_for_adoption"or identity[0]=="type"and identity!=("type","runtime.cost_settlement",129):raise ValueError("General derive-child cannot borrow D07/fair/Owner producer metadata")
+    from .d01_single_event_growth_v1 import single_event_metadata_work_v1
+    if identity[0]=="prepared_for_adoption" or (identity[0]=="type" and identity!=("type","runtime.cost_settlement",129)
+            and not single_event_metadata_work_v1(reader)):
+        raise ValueError("General derive-child cannot borrow D07/fair/Owner producer metadata")
     return _GeneralBackgroundMetadataTaskV1(reader,identity)
+
+
+
+def read_current_general_growth_v1(readers,db,frame,request,*,single_event_qualification=None):
+    from dataclasses import replace
+    from ..domains.d01 import PersonaDomain
+    from ..graph_types import GraphSnapshot
+    from .d01_production_operations_v1 import CurrentDomainReadV1
+    from .d01_ordinary_cumulative_growth_v1 import qualify_current_ordinary_continuity_v1
+    inputs,provenance=read_current_general_growth_facts_v1(readers,db,frame,request,
+        single_event_qualification=single_event_qualification)
+    snapshot=GraphSnapshot(tuple(atom for atom in frame.snapshot.atoms
+        if not(atom.key.type_name=='d01.growth_contribution.v1' and atom.revision==0)),
+        frame.snapshot.epochs,frame.snapshot.ingress_receipts,frame.snapshot.scene_proofs)
+    candidate=PersonaDomain().mechanical_growth_candidate_v1(snapshot,
+        namespace=frame.envelope.authority.namespace,current_guard=inputs.owner_guard,
+        proposal=inputs.proposal,source_ids=inputs.source_ids)
+    from .current_full_persona_writer_v1 import (
+        require_bound_current_full_persona_writer_v1, preserve_full_persona_writer_candidate_v1)
+    writer,_=require_bound_current_full_persona_writer_v1(db,frame=frame,request=request)
+    candidate=preserve_full_persona_writer_candidate_v1(writer,candidate,frame=frame,request=request)
+    qualification=qualify_current_ordinary_continuity_v1(readers,db,CurrentDomainReadV1(frame),
+        request,candidate,mode='ordinary')
+    return replace(inputs,ordinary_continuity_qualification=qualification),provenance

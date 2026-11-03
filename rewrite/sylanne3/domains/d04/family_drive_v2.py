@@ -13,7 +13,7 @@ import math
 from ...graph_types import AtomKey, GraphSnapshot, GraphVersion
 from ...memory_types import SourceRecord, access_key, source_key, validate_access
 from ...runtime_contracts import NamespaceId, canonical_digest
-from ..d01 import ActiveRoleQualification
+from ..d01 import ActiveRoleQualification, ActiveRoleHeadControlV3
 from ..d06 import source_correction_head_key
 from .affect import _decode_appraisal
 from .drive_allocation import CompiledDrivePolicy, RoleCondition
@@ -144,10 +144,10 @@ class FamilyIntervalDriveCandidateV2:
 
 def compile_family_interval_drive_candidate(
     *, snapshot: GraphSnapshot, namespace: NamespaceId,
-    role: ActiveRoleQualification, condition: RoleCondition,
+    role: ActiveRoleQualification | ActiveRoleHeadControlV3, condition: RoleCondition,
     policy: CompiledDrivePolicy, time_map: AffineTimeMapV1,
     portions: tuple[FamilyDosePortionV2 | FamilyDoseShareV3, ...],
-    audience: tuple[str, ...], purpose: str,
+    audience: tuple[str, ...], purpose: str, selected_readout=None,
 ) -> FamilyIntervalDriveCandidateV2:
     """Bind explicit 24D doses to graph facts and divide by role duration.
 
@@ -156,7 +156,7 @@ def compile_family_interval_drive_candidate(
     even a structurally valid result is HOLD and is not a product drive row.
     """
     if (type(snapshot) is not GraphSnapshot or type(namespace) is not NamespaceId
-            or type(role) is not ActiveRoleQualification
+            or type(role) not in (ActiveRoleQualification, ActiveRoleHeadControlV3)
             or type(condition) is not RoleCondition or type(policy) is not CompiledDrivePolicy
             or type(time_map) is not AffineTimeMapV1
             or type(portions) is not tuple or not portions
@@ -164,6 +164,14 @@ def compile_family_interval_drive_candidate(
             or any(type(x) is not str or not x or x == "*" for x in audience)
             or purpose not in {"context", "expression", "consolidation", "audit"}):
         raise FamilyDriveHold("typed graph, role, mapping, time and portions are required")
+    if type(role)is ActiveRoleHeadControlV3:
+        from ...runtime.selected_persona_readout_v4 import (
+            require_projectable_selected_persona_readout_v4,require_selected_persona_control_header_v4)
+        selected=require_projectable_selected_persona_readout_v4(selected_readout)
+        if selected.control is not role:
+            raise FamilyDriveHold('D04 control requires its actual private selected readout')
+        persona_version=role.plan_version
+    else:persona_version=role.plan.version
     # The installed block operator and FixedBlockStep both use role time. A
     # scaled/offset solver clock would also require mapping K/R/J and step
     # length; a rate conversion alone would silently change the dynamics.
@@ -176,13 +184,16 @@ def compile_family_interval_drive_candidate(
             or role.head_id != condition.role_ref
             or policy.condition_version != condition.condition_version
             or policy.policy_version != condition.policy_version
-            or condition.persona_version != str(role.plan.version)):
+            or condition.persona_version != str(persona_version)):
         raise FamilyDriveHold("D01 role, mapping or graph epoch is stale")
     versions = list(role.read_versions)
     for version in versions:
-        atom = snapshot.get(version.key)
-        if atom is None or not atom.valid or atom.revision != version.revision:
-            raise FamilyDriveHold("D01 installed role read is absent or stale")
+        if type(role)is ActiveRoleHeadControlV3:
+            require_selected_persona_control_header_v4(selected,version.key,version.revision)
+        else:
+            atom = snapshot.get(version.key)
+            if atom is None or not atom.valid or atom.revision != version.revision:
+                raise FamilyDriveHold("D01 installed role read is absent or stale")
 
     source_rows: dict[str, SourceRecord] = {}
     source_evidence: set[tuple[str, int, str, bool]] = set()
@@ -351,7 +362,7 @@ def compile_family_interval_drive_candidate(
     schema = SHARED_SCHEMA if any(type(p) is FamilyDoseShareV3 for p in portions) else SCHEMA
     digest = canonical_digest({
         "schema": schema, "family": family_root, "time_map": asdict(time_map),
-        "role": (role.head_id, role.plan.version, condition.condition_version),
+        "role": (role.head_id, persona_version, condition.condition_version),
         "mapping": (policy.mapping_version, policy.compiler_ref, policy.policy_version),
         "graph_epoch": role.graph_epoch, "source_closure": source_digest,
         "read_versions": tuple(sorted((v.key.token, v.revision) for v in read_versions)),
@@ -359,7 +370,7 @@ def compile_family_interval_drive_candidate(
         "contribution_allocations": tuple(asdict(a) for a in allocations),
     })
     return FamilyIntervalDriveCandidateV2(
-        family_root, time_map, role.head_id, role.plan.version,
+        family_root, time_map, role.head_id, persona_version,
         condition.condition_version, policy.mapping_version, policy.compiler_ref,
         policy.policy_version, role.graph_epoch, ordered, total_l1,
         read_versions, source_digest, digest, tuple(allocations), schema,

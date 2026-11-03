@@ -38,6 +38,8 @@ def read_c09_domain_row_v2(table,columns,row,*,authority_namespace,issuer):
     from . import c09_contact_originals_v2 as contact2
     from . import domain_production_erasure_v1 as domain
     from .contact_plan_adoption_v3 import TABLE as PLAN3_TABLE,COLUMNS as PLAN3_COLUMNS,SIGN_KIND as PLAN3_SIGN,validate_contact_plan_original_payload_v3
+    from .source_inspection_migration_v1 import OPERATIONS as INSPECTION_OPS, MEMBERS as INSPECTION_MEMBERS, validate_source_inspection_migration_row_v1
+    from ..authority_service.d13_outbound_observation_v1 import TABLE as D13_OUTBOUND_TABLE
     from .c09_contact_effect_accounting_v1 import GRAPH_TABLES, validate_graph_financial_row_v1
     if table=="graph_world_revision_erasure_barriers_v1":
         from .d03_world_history_v1 import decode_world_erasure_barrier_row_v1,ERASURE_SIGN_KIND
@@ -77,6 +79,19 @@ def read_c09_domain_row_v2(table,columns,row,*,authority_namespace,issuer):
             raise C09PagedCaptureHold('Contact Plan3 physical original namespace differs')
         issuer._signer.verify(PLAN3_SIGN,canonical_serialize(raw),row[13])
         kind,ref,digest,body = 'plan_physical',row[2],row[8],True
+    elif table in {INSPECTION_OPS,INSPECTION_MEMBERS}:
+        from ..runtime_contracts import NamespaceId,namespace_ref
+        own_namespace=namespace_ref(NamespaceId(row[0],row[1]))
+        value=validate_source_inspection_migration_row_v1(table,columns,row,authority_namespace=own_namespace)
+        if table==INSPECTION_OPS:
+            kind,ref,raw,digest='source_inspection_migration_operation',value['operation_id'],value,value['accepted_digest']
+        else:
+            kind,ref,raw,digest='source_inspection_migration_member',value['producer_operation_id'],value,row[10]
+        body=False
+    elif table==D13_OUTBOUND_TABLE:
+        from ..authority_service.c09_platform_observation_lineage_v3 import read_d13_outbound_lineage_v3
+        value=read_d13_outbound_lineage_v3(columns,row,authority_namespace=authority_namespace)
+        kind,ref,raw,digest,body='d13_outbound_observation_v1',value['operation_id'],value,value['original_digest'],False
     elif table==d04.TABLE:
         kind,ref,raw,digest=d04.read_d04_inventory_row_v3(columns,row,authority_namespace=authority_namespace)
         body=kind in d04.BODY_KINDS
@@ -92,6 +107,19 @@ def read_c09_domain_row_v2(table,columns,row,*,authority_namespace,issuer):
     elif table in domain.DERIVED_STORE_TABLES_V6:
         kind,ref,raw,digest=domain._validate_derived_store_row_v6(table,columns,row,authority_namespace=authority_namespace)
         body=table=='graph_d11_derived_cache_payloads_v1'
+    elif table=="graph_d11_life_originals_v1" and row[columns.index("kind")] in {
+            "character_labor_plan_v1","character_labor_prepared_v1","character_labor_body_preparation_v1",
+            "character_labor_admission_v1","character_labor_prepared_metadata_v1",
+            "character_work_segment_v1","character_labor_accounting_basis_v1",
+            "character_labor_adoption_metadata_v1","body_policy_checkpoint_v1",
+            "character_labor_rebuild_selection_binding_v1"}:
+        from .c09_character_labor_originals_v1 import read_character_labor_inventory_row_v1
+        from .c09_life_originals_v1 import FACT_KINDS
+        kind,ref,raw,digest=read_character_labor_inventory_row_v1(columns,row,
+            authority_namespace=authority_namespace,issuer=issuer)
+        body=kind not in FACT_KINDS
+        if not body and domain.domain_production_source_closure_v1(table,kind,row[columns.index("payload_json")]):
+            raise C09PagedCaptureHold("independent labor accounting fact contains Source body references")
     elif table in domain.TABLE_COLUMNS and table not in domain.DERIVED_STORE_TABLES_V6:
         kind,ref,raw,digest=domain.validate_domain_production_row_v1(table,columns,row,authority_namespace=authority_namespace)
         body=table not in domain.SOURCE_INDEPENDENT_POLICY_TABLES
@@ -127,6 +155,21 @@ def c09_domain_nested_payload_v2(original):
 
 
 def iter_c09_domain_identity_links_v2(original):
+    if original.family in {'graph_d04_originals_v3','graph_d11_life_originals_v1'}:
+        manifest=original.payload.get('role_support_manifest')
+        if type(manifest)is dict and manifest.get('schema')in {
+                'd06.ordinary-role-support-manifest.v3','d06.ordinary-role-support-manifest.v4'}:
+            from .c09_d04_originals_v3 import iter_c09_life_role_manifest_links_v4
+            from ..runtime_contracts import NamespaceId
+            yield from iter_c09_life_role_manifest_links_v4(manifest,NamespaceId(**manifest['namespace']))
+    if original.family in {"graph_source_inspection_migrations_v1","graph_source_inspection_migration_members_v1"}:
+        yield from original.payload["graph_refs"]
+        return
+    if original.family=='graph_d13_outbound_observations_v1':
+        from ..graph_types import AtomKey
+        yield original.payload['source_ref']
+        yield from original.payload['source_refs']
+        return
     from .c09_d04_originals_v3 import TABLE as d04
     from .c09_d07_execution_v1 import TABLE as d07
     from .c09_contact_originals_v1 import TABLE as contact
@@ -322,6 +365,31 @@ def classify_c09_domain_row_v2(original,columns,row,*,closure,nested_hit,origin,
     if type(nested_hit) is not bool or type(original) is not C09DomainRowV2:
         raise C09PagedCaptureHold('complete actual domain-row reference sweep required')
     verify_original_joins(original)
+    if original.family in {"graph_source_inspection_migrations_v1","graph_source_inspection_migration_members_v1"}:
+        from ..graph_types import AtomKey
+        values=dict(zip(columns,row,strict=True));payload=original.payload
+        if (values["bot"],values["persona"])!=closure.namespace.as_tuple:return 'preserved_exact'
+        direct=any(closure.contains_atom(ref) or
+            (AtomKey.from_token(ref).type_name=="memory.source" and
+             closure.contains_source_id(AtomKey.from_token(ref).owner.subject))
+            for ref in payload["graph_refs"])
+        marker=(original.family=="graph_source_inspection_migrations_v1"
+            and closure.contains_domain_link("source_inspection_member_retirement_parent_v1",payload["operation_id"]))
+        if not (direct or nested_hit or marker):return 'preserved_exact'
+        if original.family=="graph_source_inspection_migration_members_v1" and closure._state()[3]!="sealed":
+            closure.add_domain_link("source_inspection_member_retirement_parent_v1",payload["operation_id"],**origin)
+        return 'derived_removed'
+    if original.family=='graph_d13_outbound_observations_v1':
+        from ..graph_types import AtomKey
+        values=dict(zip(columns,row,strict=True))
+        if (values['bot'],values['persona'])!=closure.namespace.as_tuple:return 'preserved_exact'
+        if not (closure.contains_atom(original.payload['source_ref'])
+                or any(closure.contains_atom(ref) or closure.contains_source_id(
+                    AtomKey.from_token(ref).owner.subject) for ref in original.payload['source_refs'])):
+            return 'preserved_exact'
+        if closure._state()[3]=='sealed':raise C09PagedCaptureHold('outbound effect lineage discovered after closure seal')
+        closure.add_domain_link('platform_observation_effect_v3',original.payload['effect_id'],**origin)
+        return 'derived_removed'
     if not original.body_bearing:return 'preserved_exact'
     from .domain_production_erasure_v1 import domain_production_source_closure_v1,TABLE_COLUMNS
     values=dict(zip(columns,row,strict=True))
@@ -359,7 +427,7 @@ def verify_c09_life_domain_join_v2(db,original,columns,row,*,index,read_d07_orig
     else:validate_life_original_join_row_v2(db,**args,read_d07_original=read_d07_original)
 
 
-def classify_c09_shared_original_row_v2(db,row,*,registry,closure,nested_hit):
+def classify_c09_shared_original_row_v2(db,row,*,registry,closure,nested_hit,build):
     """Validate one W01 original/receipt and its completed reference sweep."""
     import json
     from ..runtime_contracts import NamespaceId
@@ -371,7 +439,10 @@ def classify_c09_shared_original_row_v2(db,row,*,registry,closure,nested_hit):
     bundle=db.execute('SELECT digest,activity_id,effect_id,commit_seq FROM graph_bundle_operations WHERE bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,op)).fetchone()
     if bundle!=(receipt.operation_digest,receipt.activity_id,receipt.effect_id,receipt.commit_seq):
         raise C09PagedCaptureHold('shared original lacks actual Graph bundle receipt')
-    payload=json.loads(row[7]);contact=row[3]=='d08' and row[4] in {'prepare_contact_dispatch','prepare_contact_dispatch_v3'}
+    payload=json.loads(row[7])
+    if row[3]=='d05' and row[4]=='adopt_relationship_contribution':
+        require_d05_simulation_parent_join_v3(build,payload,registry=registry,namespace=ns)
+    contact=row[3]=='d08' and row[4] in {'prepare_contact_dispatch','prepare_contact_dispatch_v3'}
     if contact:
         from .c09_contact_final_v1 import validate_contact_final_original_joins_v1
         validate_contact_final_original_joins_v1(db,namespace=ns,operation_id=op,payload=payload,receipt=receipt,original_digest=row[6],registry=registry)
@@ -382,8 +453,9 @@ def classify_c09_shared_original_row_v2(db,row,*,registry,closure,nested_hit):
     return 'derived_removed' if removed else 'preserved_exact'
 
 
-def classify_c09_shared_outbox_row_v2(db,row,*,closure,read_causal_disposition):
-    """Actual causal/child originals; callback must independently verify each."""
+def classify_c09_shared_outbox_row_v2(db,row,*,closure,read_causal_disposition,
+        read_native_causal=None,read_native_command=None,read_native_job=None):
+    """Verify causal originals and each registered native command/job dependency."""
     import json
     from ..runtime_contracts import NamespaceId
     from .domain_production_original_codec_v1 import decode_domain_production_outbox_row_v1
@@ -395,7 +467,15 @@ def classify_c09_shared_outbox_row_v2(db,row,*,closure,read_causal_disposition):
     linked=meter.read_fixed_row(db,'graph_domain_production_originals_v1',ORIGINAL_COLUMNS,
         'bot=? AND persona=? AND operation_id=?',(*ns.as_tuple,actual['causal_operation_id']))
     if linked is None:raise C09PagedCaptureHold('active shared outbox lacks its exact causal original')
-    if row[5]=='actual_internal_experience_requires_encoding':
+    native=actual['native_causal_dependencies']
+    native_removed=False
+    if native:
+        if read_native_causal is None:raise C09PagedCaptureHold('native outbox requires its registered frozen-source verifier')
+        for dependency in native:
+            result=read_native_causal(ns,dependency,linked)
+            if result not in {'preserved_exact','derived_removed'}:raise C09PagedCaptureHold('native causal disposition is incomplete')
+            native_removed=native_removed or result=='derived_removed'
+    elif row[5]=='actual_internal_experience_requires_encoding':
         from .domain_production_originals_v1 import read_adopted_domain_operation_v1
         from .domain_production_contracts_v1 import ProductionOutboxStageV1,ProductionOriginalRefV1
         from .domain_production_followups_v1 import verify_current_followup_trigger_v1
@@ -403,17 +483,45 @@ def classify_c09_shared_outbox_row_v2(db,row,*,closure,read_causal_disposition):
         verify_current_followup_trigger_v1(db,ns,event,read_adopted_domain_operation_v1(db,ns,actual['causal_operation_id']),None)
     elif row[10] is None and row[5]=='actual_offline_simulation_experiences_require_encoding':
         raise C09PagedCaptureHold('offline outbox trigger requires its actual installed original reader')
-    elif row[5]!='actual_internal_experience_requires_encoding' and (row[7]!=linked[6] or row[6]!=linked[3]+'-current:'+linked[6][:48]):
+    elif row[7]!=linked[6] or row[6]!=linked[3]+'-current:'+linked[6][:48]:
         raise C09PagedCaptureHold('shared outbox trigger differs from its exact causal original')
     causal=read_causal_disposition(ns,actual['causal_operation_id'])
     if causal is None:raise C09PagedCaptureHold('active shared outbox lacks its actual causal original')
-    removed=causal=='derived_removed' or closure.contains_atom(actual['original_ref']) or closure.contains_operation(actual['causal_operation_id'])
-    if row[10] is not None:
-        for command in json.loads(row[10])['completed_commands']:
-            child=read_causal_disposition(ns,command['operation_id'])
-            if child is None:raise C09PagedCaptureHold('shared outbox lost its actual completed child')
-            removed=removed or child=='derived_removed'
+    removed=native_removed or causal=='derived_removed' or closure.contains_atom(actual['original_ref']) or closure.contains_operation(actual['causal_operation_id'])
+    if row[10] is None:
+        commands=()
+    else:
+        disposition=json.loads(row[10])
+        if disposition['schema'] in {'d11.artifact-draft-wake-disposition.v1',
+                'd11.artifact-task-wait-consumed.v1','d11.owner-source-note-submit-consumed.v1'}:
+            commands=()
+        else:
+            commands=tuple(disposition['completed_commands'])
+    preparation_operations=actual['native_preparation_operations']
+    operations=frozenset((*preparation_operations,*(command['operation_id'] for command in commands)))
+    covered=set()
+    for dependency in actual['native_command_dependencies']:
+        if read_native_command is None:raise C09PagedCaptureHold('native command requires its actual frozen original verifier')
+        disposition,operation=read_native_command(ns,dependency,operations)
+        if operation not in operations or disposition not in {'preserved_exact','derived_removed'}:
+            raise C09PagedCaptureHold('native command original has no exact completed command disposition')
+        covered.add(operation);removed=removed or disposition=='derived_removed'
+    job_operations=set()
+    for token in actual['native_job_graph_refs']:
+        if read_native_job is None:raise C09PagedCaptureHold('native command requires its actual job history verifier')
+        disposition,operation=read_native_job(ns,token,frozenset(covered))
+        if operation not in covered or operation in job_operations or disposition not in {'preserved_exact','derived_removed'}:
+            raise C09PagedCaptureHold('native command job has no unique actual command identity')
+        job_operations.add(operation);removed=removed or disposition=='derived_removed'
+    if job_operations!=covered or not set(preparation_operations)<=covered:
+        raise C09PagedCaptureHold('native preparation lacks its complete actual original/job membership')
+    for command in commands:
+        if command['operation_id'] in covered:continue
+        child=read_causal_disposition(ns,command['operation_id'])
+        if child is None:raise C09PagedCaptureHold('shared outbox lost its actual completed child')
+        removed=removed or child=='derived_removed'
     return 'derived_removed' if removed else 'preserved_exact'
+
 
 
 def classify_c09_derived_store_row_v2(db,table,columns,row,*,closure,authority_namespace,require_erased_fact,meter):
@@ -949,3 +1057,118 @@ class C09MappedGraphRowCaptureV3:
         hit=_nested_pattern_hit(small_sql,self.pattern_ref,source_id=source_id)
         hit|=_nested_pattern_hit(semantic,self.pattern_ref,source_id=source_id)
         return hit or (self.source_metadata and not source_id and self.value.parser._source_atom_hit)
+
+def require_d05_simulation_parent_join_v3(build,payload,*,registry,namespace):
+    """Historical immutable producer -> exact branch -> D05 consumer join."""
+    import hashlib
+    import json
+    from ..runtime_contracts import canonical_digest,canonical_serialize,NamespaceId
+    from ..graph_types import AtomKey,GraphVersion
+    from .c09_paged_sql_v2 import (current_c09_sql_meter_v2,read_c09_table_shape_v2,
+        read_c09_materialized_row_v2,read_legacy_sql_cell_fragment_v2,legacy_cell_read_transaction_v2,
+        _sql_scalar_size_v2,_quote)
+    from .domain_production_original_codec_v1 import ORIGINAL_COLUMNS,decode_domain_production_original_row_v1
+    from .domain_production_originals_v1 import _receipt
+    from .d07_behavior_stage_codec_v1 import validate_d07_behavior_provenance_v1
+    if payload['request'].get('semantics')!='simulation':return
+    build.require_current();meter=current_c09_sql_meter_v2();db=build.pair.source
+    parent_refs=tuple(value for value in payload['observed_originals']if value['kind']=='d07.current-run_simulation')
+    triggers=tuple(value for value in payload['observed_originals']if value['kind']=='d07.adopted_simulation')
+    if len(parent_refs)!=1 or len(triggers)!=1:
+        raise C09PagedCaptureHold('D05 simulation requires its unique producer and branch originals')
+    parent_ref,trigger=parent_refs[0],triggers[0]
+    digest=parent_ref['original_digest']
+    if parent_ref['original_ref']!='d07-current:'+digest[:48] or parent_ref['read_versions']:
+        raise C09PagedCaptureHold('D05 simulation immutable producer locator differs')
+    token=trigger['original_ref'];key=AtomKey.from_token(token)
+    if NamespaceId.from_key(key)!=namespace or key.type_name!='d07.simulation_branch.v1':
+        raise C09PagedCaptureHold('D05 simulation branch namespace/type differs')
+    table='graph_domain_production_originals_v1'
+    parents=tuple(db.execute('SELECT operation_id FROM '+table+
+        " WHERE bot=? AND persona=? AND domain='d07' AND operation_kind='run_simulation' AND original_digest=? ORDER BY operation_id LIMIT 2",
+        (*namespace.as_tuple,digest)))
+    meter.charge_read(sum(_sql_scalar_size_v2(value)for row in parents for value in row))
+    if len(parents)!=1:raise C09PagedCaptureHold('D05 simulation producer is absent or ambiguous in actual frozen Graph')
+    op=parents[0][0];pk=(*namespace.as_tuple,op)
+    shape=read_c09_table_shape_v2(db,table,meter=meter)
+    if shape.columns!=ORIGINAL_COLUMNS or shape.primary_key_columns!=('bot','persona','operation_id'):
+        raise C09PagedCaptureHold('D05 simulation parent has another registered physical original schema')
+    columns=','.join('typeof('+_quote(name)+'),length(CAST('+_quote(name)+' AS BLOB))'for name in ORIGINAL_COLUMNS)
+    metadata=db.execute('SELECT '+columns+' FROM '+table+' WHERE bot=? AND persona=? AND operation_id=?',pk).fetchone()
+    if metadata is None:raise C09PagedCaptureHold('actual D05 simulation parent disappeared')
+    meter.charge_read(sum(_sql_scalar_size_v2(value)for value in metadata))
+    metadata=tuple((metadata[i],metadata[i+1])for i in range(0,len(metadata),2))
+    row=read_c09_materialized_row_v2(db,shape,pk,metadata,meter.budget)
+    actual=decode_domain_production_original_row_v1(row,namespace,registry=registry)
+    if (actual['domain'],actual['operation_kind'],actual['operation_id'],actual['original_digest'])!=('d07','run_simulation',op,digest):
+        raise C09PagedCaptureHold('D05 canonical locator differs from its fully authenticated producer')
+    original=json.loads(row[7]);receipt=_receipt(json.loads(row[10]))
+    behavior=original['provenance'];validate_d07_behavior_provenance_v1('run_simulation',behavior)
+    if (behavior['status']!='staged' or behavior['work_kind']!='simulation' or behavior['execution']is None
+            or original['schema']!='d07.current-run_simulation.v1'):
+        raise C09PagedCaptureHold('D05 simulation parent lacks its actual completed execution provenance')
+    result=behavior['behavior']['simulation_result'];execution=behavior['execution'];request=behavior['behavior']['request']
+    branches=tuple(part for part in result['branches']if part['branch_id']==key.name)
+    writes=tuple(part for part in original['writes']if part['key']==key.token)
+    if len(branches)!=1 or len(writes)!=1:
+        raise C09PagedCaptureHold('D05 simulation parent lacks exactly its complete branch result/write')
+    branch={'schema':key.type_name,**branches[0]}
+    if (writes[0]['value']!=branch or canonical_digest(branch)!=trigger['original_digest']
+            or branch['content_reality']!='simulated' or branch['evidence_eligibility']!='none'
+            or result['activity_id']!=key.owner.subject or request['activity_id']!=key.owner.subject
+            or execution['source_refs']!=request['snapshot_refs'] or execution['input_digest']!=behavior['input_digest']
+            or receipt.activity_id!=key.owner.subject or receipt.operation_id!=op
+            or receipt.effect_id!=original['identity']['effect_id']):
+        raise C09PagedCaptureHold('D05 simulation actual branch/result/request/execution differs')
+    versions=tuple((item.key.token,item.revision)for item in receipt.write_versions if item.key==key)
+    if len(versions)!=1 or versions[0][1]!=1 or trigger['read_versions']!=[{'key':token,'revision':1}]:
+        raise C09PagedCaptureHold('D05 simulation branch is absent from its exact immutable producer receipt')
+    bundle=meter.read_fixed_row(db,'graph_bundle_operations',('digest','activity_id','effect_id','commit_seq'),
+        'bot=? AND persona=? AND operation_id=?',pk)
+    if bundle!=(receipt.operation_digest,receipt.activity_id,receipt.effect_id,receipt.commit_seq):
+        raise C09PagedCaptureHold('D05 simulation parent actual bundle receipt differs')
+    event=meter.read_fixed_row(db,'graph_events',('reads','revisions'),'bot=? AND persona=? AND session=? AND event_id=?',
+        (*namespace.as_tuple,key.owner.subject,op))
+    reads=tuple(tuple(part)for part in json.loads(row[8]))
+    if (event is None or set(tuple(part)for part in json.loads(event[0]))!=set(reads)
+            or len(json.loads(event[0]))!=len(reads) or set((v.key.token,v.revision)for v in receipt.read_versions)!=set(reads)
+            or set(tuple(part)for part in json.loads(event[1]))!=set((v.key.token,v.revision)for v in receipt.write_versions)
+            or [token,1]not in json.loads(event[1])):
+        raise C09PagedCaptureHold('D05 simulation parent lost its complete event/readset')
+    hs=read_c09_table_shape_v2(db,'graph_history',meter=meter)
+    history=meter.read_fixed_row(db,'graph_history',('valid','event_bot','event_persona','event_session','event_id'),
+        'token=? AND revision=?',(token,1))
+    head=meter.read_fixed_row(db,'graph_atoms',('revision','valid'),'token=?',(token,))
+    if history!=(1,*namespace.as_tuple,key.owner.subject,op) or head!=(1,1):
+        raise C09PagedCaptureHold('D05 simulation branch current head/history producer differs')
+    # Compare complete source bytes, retaining only one bounded fragment.
+    expected=canonical_digest(branch);hasher=hashlib.sha256()
+    if 'value_cell_id'in hs.columns:
+        scope=build.session.begin_source_physical_read_v3(build.pair,meter=meter)
+        cell=meter.read_fixed_row(db,'graph_history',('value_cell_id',),'token=? AND revision=?',(token,1))
+        h=scope.read_cell_header_v3(cell[0],meter=meter)
+        if h[1]!='canonical-json.ascii.v1' or h[2]!=token or h[6]!=expected:
+            raise C09PagedCaptureHold('D05 simulation branch physical commitment differs')
+        meter.require_available(h[4]*2+h[5]*1024+32768)
+        root=canonical_digest(('sylanne3.segmented-cell-genesis.v1',cell[0]));offset=ordinal=0
+        while ordinal<h[5]:
+            seg=scope.read_cell_segment_v3(cell[0],ordinal,meter=meter)
+            if seg is None or seg[0]!=offset or hashlib.sha256(seg[1]).hexdigest()!=seg[2]:
+                raise C09PagedCaptureHold('D05 simulation branch physical Source order/SHA differs')
+            hasher.update(seg[1]);root=canonical_digest(('sylanne3.segmented-cell-link.v1',root,cell[0],ordinal,offset,len(seg[1]),seg[2]))
+            offset+=len(seg[1]);ordinal+=1
+        scope.require_cell_eof_v3(cell[0],ordinal,meter=meter)
+        if (offset,root)!=(h[4],h[7]):raise C09PagedCaptureHold('D05 simulation branch complete physical EOF differs')
+    else:
+        with legacy_cell_read_transaction_v2(db):
+            _,total,kind=read_legacy_sql_cell_fragment_v2(db,table='graph_history',column='value',
+                where='token=? AND revision=?',parameters=(token,1),start=0,length=0,meter=meter)
+            if kind!='text':raise C09PagedCaptureHold('D05 simulation native branch has another actual codec')
+            meter.require_available(total*2+32768);offset=0
+            while offset<total:
+                raw,size,kind=read_legacy_sql_cell_fragment_v2(db,table='graph_history',column='value',
+                    where='token=? AND revision=?',parameters=(token,1),start=offset,length=min(4096,total-offset),meter=meter)
+                if kind!='text' or size!=total or not raw:raise C09PagedCaptureHold('D05 simulation native complete EOF changed')
+                hasher.update(raw);offset+=len(raw)
+    if hasher.hexdigest()!=expected:raise C09PagedCaptureHold('D05 simulation branch full Source SHA differs from its real producer')
+    build.require_current()

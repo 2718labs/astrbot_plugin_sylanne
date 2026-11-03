@@ -83,6 +83,7 @@ class C04PrepareStageV3:
     read_versions: tuple[GraphVersion, ...]
     replayed: bool = False
     prepared: C04InternalWorkPreparedV1 | None = None
+    resource_inputs: object | None = None
 
     @property
     def reservation_write(self) -> GraphWrite:
@@ -219,7 +220,7 @@ def stage_current_c04_prepare_v3(
     d02_issuer: D02ResourceIssuer, d11_issuer: D11BudgetGrantIssuer,
     body_authority: D02BodyQuoteAuthority,
     cpu_authority: C04InternalCpuQuotePolicyAuthorityV1,
-    installation_id: str, now_utc: float,
+    installation_id: str, now_utc: float, resource_inputs=None,
 ) -> C04PrepareStageV3:
     """Collect and authenticate inputs; price but do not execute or graph-write.
 
@@ -373,6 +374,15 @@ def stage_current_c04_prepare_v3(
             or owner_value["grant_id"] != owner.grant_id
             or owner_value["activation_generation"] != authority.activation_generation):
         raise C04PrepareHold("C04 current Owner graph original differs")
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_resource_inputs_v3 import bound_c04_body_resource_v3,C04BodyResourceInputsV3
+        if resource_inputs is None:
+            capsule=bound_c04_body_resource_v3()
+            if capsule is not None:resource_inputs=capsule.packet
+        if type(resource_inputs)is not C04BodyResourceInputsV3:
+            raise C04PrepareHold("current C04 pricing requires its actual complete resource Source inputs")
+        resource_inputs.require_v3(db,envelope=envelope,policy_id=body_policy_id,policy_version=body_policy_version)
     cpu_policy = cpu_authority.read_policy(db, namespace, cpu_policy_id, cpu_policy_version)
     if cpu_policy.installation_id != installation_id or cpu_policy.algorithm_ref != ALGORITHM_ID_V3:
         raise C04PrepareHold("installed CPU policy or algorithm differs")
@@ -388,11 +398,11 @@ def stage_current_c04_prepare_v3(
         body_policy_id=body_policy_id, body_policy_version=body_policy_version,
         reservation_id=reservation_id, d02_issuer=d02_issuer, body_authority=body_authority,
         now_utc=now_utc, original_reads=tuple(GraphVersion(AtomKey.from_token(ref), revision)
-            for ref, revision in sorted(versions.items())))
+            for ref, revision in sorted(versions.items())),resource_inputs=resource_inputs)
     return C04PrepareStageV3(resources.envelope, resource, resources.body, work, execution_id,
         owner_key.token, owner_revision, canonical_digest(owner_value),
         resources.body_profile_ref, resources.body_profile_revision,
-        resources.body_state_ref, resources.body_state_revision, resources.read_versions)
+        resources.body_state_ref, resources.body_state_revision, resources.read_versions,resource_inputs=resource_inputs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,43 +414,55 @@ class C04BodyResourcesV3:
     body_state_ref: str
     body_state_revision: int
     read_versions: tuple[GraphVersion, ...]
+    resource_inputs: object | None = None
 
 
 def _prepare_c04_body_resources_v3(db, *, envelope, resource, body_policy_id, body_policy_version,
-        reservation_id, d02_issuer, body_authority, now_utc, original_reads):
+        reservation_id, d02_issuer, body_authority, now_utc, original_reads, resource_inputs=None):
     """Common fixed Body/CPU materialization; only qualified Owner/Self wrappers call."""
     _transaction(db)
     namespace, identity = envelope.authority.namespace, envelope.identity
     body_policy = body_authority.policy(db, namespace, body_policy_id, body_policy_version)
     if body_policy.work_kind != C04_INTERNAL_CPU_WORK_KIND or body_policy.valid_until < envelope.deadline_utc:
         raise C04PrepareHold("installed C04 fixed Body policy differs or expires")
+    from ..runtime_storage_v3 import runtime_storage_v3
     profile_write = BodyDomain.profile_write(body_policy.profile)
-    profile_revision, profile_value = _head(db, namespace, profile_write.key)
-    if profile_value != profile_write.value:
-        raise C04PrepareHold("current body profile differs from installed policy")
-    state_key = AtomKey(Owner("persona", *namespace.as_tuple),
-                        "d02.body_state.v1", body_policy.profile.profile_id)
-    state_revision, state_value = _head(db, namespace, state_key)
-    state = BodyState(**state_value)
-    if state.version != state_revision:
-        raise C04PrepareHold("current body state version differs")
-    inventory = db.execute(
-        "SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-        "AND owner_kind='activity' AND type_name='d02.reservation.v1' "
-        "ORDER BY token LIMIT 1025", namespace.as_tuple).fetchall()
-    if len(inventory) > 1024:
-        raise C04PrepareHold("current body reservation inventory exceeds bound")
-    reservations = []
+    state_key = AtomKey(Owner("persona", *namespace.as_tuple),"d02.body_state.v1",body_policy.profile.profile_id)
     versions = {version.key.token: version.revision for version in original_reads}
-    for ref, revision, value, valid in inventory:
-        key = AtomKey.from_token(ref)
-        if valid != 1:
-            raise C04PrepareHold("current body inventory contains invalid original")
-        reservation = BodyReservation(**json.loads(value))
-        if key != BodyDomain.reservation_write(namespace, key.owner.subject, reservation).key:
-            raise C04PrepareHold("body reservation inventory identity differs")
-        reservations.append(reservation)
-        versions[ref] = revision
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_resource_inputs_v3 import C04BodyResourceInputsV3
+        if type(resource_inputs)is not C04BodyResourceInputsV3:
+            raise C04PrepareHold("actual resource Source EOF required before any C04 quote")
+        resource_inputs.require_v3(db,envelope=envelope,policy_id=body_policy_id,policy_version=body_policy_version)
+        profile_key,profile_revision,profile=resource_inputs.profile
+        actual_state_key,state_revision,state=resource_inputs.state
+        if profile_key!=profile_write.key or profile!=body_policy.profile or actual_state_key!=state_key:
+            raise C04PrepareHold("current Body resources differ from the actual signed fixed policy")
+        reservations=[]
+        for key,revision,reservation in resource_inputs.reservations:
+            if key!=BodyDomain.reservation_write(namespace,key.owner.subject,reservation).key:
+                raise C04PrepareHold("actual resource reservation identity differs")
+            reservations.append(reservation);versions[key.token]=revision
+        versions.update((v.key.token,v.revision)for v in resource_inputs.versions)
+    else:
+        profile_revision,profile_value=_head(db,namespace,profile_write.key)
+        if profile_value!=profile_write.value:
+            raise C04PrepareHold("current Body profile differs from installed policy")
+        state_revision,state_value=_head(db,namespace,state_key)
+        state=BodyState(**state_value)
+        inventory=db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
+            "AND owner_kind='activity' AND type_name='d02.reservation.v1' ORDER BY token LIMIT 1025",namespace.as_tuple).fetchall()
+        if len(inventory)>1024:raise C04PrepareHold("current Body reservation inventory exceeds bound")
+        reservations=[]
+        for ref,revision,value,valid in inventory:
+            key=AtomKey.from_token(ref)
+            if valid!=1:raise C04PrepareHold("current Body inventory contains invalid original")
+            reservation=BodyReservation(**json.loads(value))
+            if key!=BodyDomain.reservation_write(namespace,key.owner.subject,reservation).key:
+                raise C04PrepareHold("Body reservation inventory identity differs")
+            reservations.append(reservation);versions[ref]=revision
+    if state.version!=state_revision:
+        raise C04PrepareHold("current Body state version differs")
     if (len({item.reservation_id for item in reservations}) != len(reservations)
             or len({item.effect_id for item in reservations}) != len(reservations)):
         raise C04PrepareHold("body reservation inventory is ambiguous")
@@ -451,7 +473,7 @@ def _prepare_c04_body_resources_v3(db, *, envelope, resource, body_policy_id, bo
         raise C04PrepareHold("C04 original signed CPU quote differs")
     body = body_authority.issue_fixed_quote_and_reservation(
         db, d02_issuer, post_quote, resource, body_policy_id, body_policy_version,
-        state, tuple(reservations), reservation_id, identity.effect_id)
+        state, tuple(reservations), reservation_id, identity.effect_id, now_utc=now_utc)
     if body.replayed:
         raise C04PrepareHold("body quote exists without complete C04 prepared original")
     for ref in (body.reservation_write.key.token, *resource.d02_settlement_refs):
@@ -459,15 +481,17 @@ def _prepare_c04_body_resources_v3(db, *, envelope, resource, body_policy_id, bo
             raise C04PrepareHold("new C04 body graph key already exists")
         versions[ref] = 0
     versions.update({profile_write.key.token: profile_revision, state_key.token: state_revision})
-    return C04BodyResourcesV3(post_quote, body, profile_write.key.token, profile_revision,
+    result=C04BodyResourcesV3(post_quote, body, profile_write.key.token, profile_revision,
         state_key.token, state_revision, tuple(GraphVersion(AtomKey.from_token(ref), revision)
-            for ref, revision in sorted(versions.items())))
+            for ref, revision in sorted(versions.items())),resource_inputs)
+    if resource_inputs is not None:resource_inputs.consume_v3(result)
+    return result
 
 
 def record_committed_current_c04_prepare_v3(
     db: sqlite3.Connection, stage: C04PrepareStageV3, *, graph_revision: int,
     asset: D04LoadedTanhReadoutAsset,
-    projection_policy: D04IntervalProjectionPolicyV2, running_job=None,
+    projection_policy: D04IntervalProjectionPolicyV2, running_job=None, resource_receipt=None,
 ) -> C04InternalWorkPreparedV1:
     """CAS receipt hook: reserve CPU and freeze both originals exactly once.
 
@@ -491,9 +515,15 @@ def record_committed_current_c04_prepare_v3(
                        namespace.as_tuple).fetchone()
     if epoch != (stage.work.graph_epoch + (2 if running_job is not None else 1),):
         raise C04PrepareHold("prepare must commit its exact actual reservation/job Graph CAS")
-    reservation_revision, reservation_value = _head(db, namespace, stage.reservation_write.key)
-    if reservation_revision != 1 or reservation_value != stage.reservation_write.value:
-        raise C04PrepareHold("staged body reservation was not committed exactly")
+    if stage.resource_inputs is not None:
+        from .c04_body_resource_inputs_v3 import require_c04_resource_reservation_after_cas_v3
+        if require_c04_resource_reservation_after_cas_v3(db,stage.resource_inputs,resource_receipt)!=stage.reservation_write:
+            raise C04PrepareHold("actual resource Source stage differs from committed reservation")
+        reservation_revision=1
+    else:
+        reservation_revision,reservation_value=_head(db,namespace,stage.reservation_write.key)
+        if reservation_revision!=1 or reservation_value!=stage.reservation_write.value:
+            raise C04PrepareHold("staged body reservation was not committed exactly")
     for version in stage.read_versions:
         if version.key == stage.reservation_write.key:
             continue

@@ -47,7 +47,16 @@ def read_d04_series_root_v1(db, namespace, root_ref):
         return None
     payload, digest = original
     prepared = read_d04_numeric_prepared_v3(db, namespace, payload["numeric_operation_id"])
+    return _series_root_from_original_v1(payload,digest,prepared,root_ref=root_ref)
+
+
+def _series_root_from_original_v1(payload,digest,prepared,*,root_ref=None):
+    expected_ref=(None if prepared is None else "d04-series-root:"+canonical_digest(
+        (prepared.binding.namespace,prepared.binding.operation_id))[:48])
+    root_ref=expected_ref if root_ref is None else root_ref
     if (prepared is None or prepared.digest != payload["numeric_prepared_digest"]
+            or payload["numeric_operation_id"]!=prepared.binding.operation_id
+            or canonical_digest(payload)!=digest or expected_ref!=root_ref
             or payload["schema"] != "d04.series-root.v1" or payload["root_ref"] != root_ref):
         raise ValueError("series frozen original/identity changed")
     frozen = decode_series_dto_v1(D04JointCompiledInputsV1, payload["frozen_model"])
@@ -68,39 +77,65 @@ def freeze_post_c02_d04_series_v1(graph, bootstrap, bundle, *, c02_operation_id,
     identity = numeric_ids_v3(namespace, c02_operation_id)
     root_ref = "d04-series-root:" + canonical_digest((namespace, identity["operation"]))[:48]
     store = graph._GraphCoordinator__store
+    from ..runtime_storage_v3 import runtime_storage_v3
     with store._lock:
-        root = read_d04_series_root_v1(store._db, namespace, root_ref)
-        prepared = read_d04_numeric_prepared_v3(store._db, namespace, identity["operation"])
-    if root is not None:
-        return root
-    ready = (_ready_from_original_v3(prepared) if prepared is not None else
-        prepare_post_c02_joint_numeric_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref))
-    current = ready.preparation.current
-    installation = graph._GraphCoordinator__d04_installed_joint_assembly
-    from ..native_runtime.loader import load_production_native
-    from ..host.affect_scheme_asset import load_verified_affect_scheme
-    policy = bundle.d04_joint_numeric
-    handle = load_production_native(installation.package_root,
-        trusted_manifest_sha256=installation.installation_policy.manifest_digest)
-    scheme = load_verified_affect_scheme(installation.package_root,
-        installation.installation_policy.manifest_digest, available_cpu_features=installation.available_cpu_features).scheme
-    frozen = compile_d04_joint_product_inputs_v1(handle, installation.package_root, scheme, current.component,
-        checkpoints=current.checkpoints, drives=current.drives, families=current.families,
-        readout_id=graph._GraphCoordinator__d04_installed_joint_output_policy.policy.readout_id,
-        max_iterations=policy.max_iterations, tolerance=policy.tolerance)
-    with store._lock:
-        db = store._db
-        db.execute("BEGIN IMMEDIATE")
+        segmented=runtime_storage_v3(store._db)is not None
+        if segmented:
+            retained=store._db.execute("SELECT 1 FROM graph_d04_originals_v3 WHERE bot=? AND persona=? "
+                "AND ((kind='series_root' AND original_ref=?) OR (kind='numeric_prepared' AND original_ref=?)) LIMIT 1",
+                (*namespace.as_tuple,root_ref,identity["operation"])).fetchone()
+            root=prepared=None
+        else:
+            retained=None
+            root=read_d04_series_root_v1(store._db,namespace,root_ref)
+            prepared=read_d04_numeric_prepared_v3(store._db,namespace,identity["operation"])
+    if root is not None:return root
+    if retained is not None:
+        from .d04_source_work_v3 import prepare_current_d04_series_freeze_source_v3
+        ready=prepare_current_d04_series_freeze_source_v3(graph,bootstrap,bundle,
+            c02_operation_id=c02_operation_id,source_ref=source_ref)
+    else:
+        ready=(_ready_from_original_v3(prepared)if prepared is not None else
+            prepare_post_c02_joint_numeric_v3(graph,bootstrap,bundle,c02_operation_id=c02_operation_id,source_ref=source_ref))
+    def freeze(ready):
+        if type(ready)is D04SeriesRootV1:
+            return ready
         try:
-            metadata, epoch = graph._v2_graph_stamp(namespace)
+            return freeze_current(ready)
+        finally:
+            if segmented:
+                from .d04_source_work_v3 import finish_installed_d04_series_freeze_v3
+                finish_installed_d04_series_freeze_v3(graph,ready)
+    def freeze_current(ready):
+        current = ready.preparation.current
+        installation = graph._GraphCoordinator__d04_installed_joint_assembly
+        from ..native_runtime.loader import load_production_native
+        from ..host.affect_scheme_asset import load_verified_affect_scheme
+        policy = bundle.d04_joint_numeric
+        handle = load_production_native(installation.package_root,
+            trusted_manifest_sha256=installation.installation_policy.manifest_digest)
+        scheme = load_verified_affect_scheme(installation.package_root,
+            installation.installation_policy.manifest_digest, available_cpu_features=installation.available_cpu_features).scheme
+        frozen = compile_d04_joint_product_inputs_v1(handle, installation.package_root, scheme, current.component,
+            checkpoints=current.checkpoints, drives=current.drives, families=current.families,
+            readout_id=graph._GraphCoordinator__d04_installed_joint_output_policy.policy.readout_id,
+            max_iterations=policy.max_iterations, tolerance=policy.tolerance)
+        roots=[]
+        def append(db,metadata,epoch,now,guard,role,_stage_current):
             if (metadata.graph_revision != current.component.graph_revision
                     or epoch.revision != current.component.query_epoch.revision):
                 raise ValueError("series model freeze lost its current original Graph stamp")
-            require_current_read_rows_v3(db, ready.evidence_inputs.read_rows, namespace)
+            from ..runtime_storage_v3 import runtime_storage_v3
+            if runtime_storage_v3(db)is None:
+                require_current_read_rows_v3(db,ready.evidence_inputs.read_rows,namespace)
+            else:
+                from .d04_source_work_v3 import require_installed_d04_series_rows_seal_v3
+                require_installed_d04_series_rows_seal_v3(graph,db,ready,root_ref)
             # A previously consumed v3 identity cannot be reinterpreted as a
             # series. The service independently enforces this before claiming.
-            if any(read_d04_original_v3(db, namespace, kind, identity["operation"]) is not None
-                    for kind in ("numeric_claim", "numeric_measurement", "numeric_artifact", "numeric_adoption")):
+            if db.execute("SELECT 1 FROM graph_d04_originals_v3 WHERE bot=? AND persona=? AND original_ref=? "
+                    "AND kind IN ('numeric_claim','numeric_measurement','numeric_artifact','numeric_adoption') LIMIT 1",
+                    (*namespace.as_tuple,identity['operation'])).fetchone()is not None:
                 raise ValueError("series cannot take over an already consumed numeric-v3 execution")
             payload = {"schema": "d04.series-root.v1", "root_ref": root_ref,
                 "numeric_operation_id": ready.prepared.binding.operation_id,
@@ -112,14 +147,36 @@ def freeze_post_c02_d04_series_v1(graph, bootstrap, bundle, *, c02_operation_id,
                 "output_policy_sha256": graph._GraphCoordinator__d04_installed_joint_output_policy.policy_sha256,
                 "graph_revision": metadata.graph_revision, "graph_epoch": epoch.revision,
                 "requirements": asdict(metadata.requirements)}
-            record_d04_original_in_transaction_v3(db, namespace, "series_root", root_ref, payload)
+            digest=record_d04_original_in_transaction_v3(db,namespace,"series_root",root_ref,payload)
+            root=_series_root_from_original_v1(payload,digest,ready.prepared,root_ref=root_ref)
             from .d04_series_initial_original_v1 import require_d04_series_initial_original_v1
-            require_d04_series_initial_original_v1(db, read_d04_series_root_v1(db, namespace, root_ref))
-            db.commit()
-        except BaseException:
-            db.rollback()
-            raise
-        return read_d04_series_root_v1(db, namespace, root_ref)
+            require_d04_series_initial_original_v1(db,root)
+
+            roots.append(root)
+            return {'status':'series_frozen','root_ref':root.root_ref,'root_digest':root.digest,
+                'numeric_prepared_digest':ready.prepared.digest}
+        if segmented:
+            from .d04_source_work_v3 import run_installed_d04_series_freeze_v3
+            run_installed_d04_series_freeze_v3(graph,ready,root_ref,commit=append)
+        else:
+            with store._lock:
+                db=store._db
+                db.execute('BEGIN IMMEDIATE')
+                try:
+                    metadata,epoch=graph._v2_graph_stamp(namespace)
+                    append(db,metadata,epoch,None,None,None,None)
+                    db.commit()
+                except BaseException:
+                    db.rollback()
+                    raise
+        if len(roots)!=1:raise ValueError('series metadata WRITE has no actual fixed root result')
+        return roots[0]
+    from ..graph_worker import GraphStorageWorkV3
+    if type(ready) is GraphStorageWorkV3:
+        def failed(error):
+            raise error
+        return ready.map_terminal_v3("service", freeze, failed)
+    return freeze(ready)
 
 
 def read_d04_series_chunk_prepared_v1(db, namespace, operation_id):

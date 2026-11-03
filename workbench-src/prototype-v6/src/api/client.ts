@@ -1,7 +1,14 @@
+import {validateLaborOptionsInput,validateLaborOptions,validateLaborRebuildInput,validateLaborPreview,validateLaborRebuildReceipt,type LaborOptionsInput,type LaborRebuildInput} from './character-labor-rebuild.ts'
+import { validateOwnerSourcePage, validateOwnerSourceDetail, validateSourceInspectionWorkflowInput, validateSourceInspectionWorkflowResponse, type SourceInspectionWorkflowInput, type OwnerSourceMetadata } from './source-owner-read.ts'
+import {FULFILLMENT_ACTIONS,validateCurrentActionProjection,validateFulfillmentInput,validateFulfillmentReceipt,type FulfillmentAttempt} from './commitment-fulfillment.ts'
+import {COMMITMENT_PREPARE_ACTION,validateCommitmentCommandInput,validateCommitmentCommandReceipt,type CommitmentCommandAttempt} from './commitment-communication.ts'
+import {validateGrowthReviewInput,validateGrowthReviewReceipt,validateGrowthReviewState,type GrowthReviewKind,type GrowthReviewInput} from './growth-review.ts'
+import { sourceErasureRequest, validateSourceErasureResponse, type SourceErasureAttempt, type SourceErasureReceipt } from './source-erasure.ts'
 import {operationIdV1} from './browser-crypto.ts'
 import {validateSelfViewProjection,type SelfViewProjection} from './conditioned-self.ts'
 import {BETA1_OPERATIONS,validateBeta1Input,validateBeta1Receipt,validateBeta1State,type Beta1Kind,type Beta1Input,type Beta1Domain} from './beta1-owner.ts'
 import { validateGeneralGrowthInput, validateGeneralGrowthReceipt, type GeneralGrowthKind, type GeneralGrowthInput, type GeneralGrowthReceipt } from './general-growth.ts'
+import { validateSingleEventGrowthInput, validateSingleEventGrowthReceipt, type SingleEventKind, type SingleEventGrowthInput, type SingleEventGrowthReceipt } from './single-event-growth.ts'
 import { OWNER_TASK_ACTION, OWNER_MATERIAL_ACTION, ownerMaterialInputDigest, validateOwnerMaterialText, validateOwnerMaterialStatus, validateOwnerMaterialReceipt, type OwnerMaterialStatus, OwnerTaskContractError, validateOwnerTaskOptions, validateOwnerTaskRequest, validateOwnerTaskStatus, validateOwnerTaskReceipt, type OwnerTaskOptions, type OwnerTaskRequest, type OwnerTaskStatus, type OwnerTaskReceipt } from './owner-source-note-task.ts'
 import { MANAGEMENT_PREFIX, LOG_LIMIT, MANAGEMENT_RESPONSE_MAX_BYTES, ManagementContractError, managementRequest, binding, validateCapabilities, validateManagementProblem, validateLogFilter, validateLogPage, validateSettings, validateReceipt, type ManagementCapabilities, type LogFilter, type LogPage, type SettingsSnapshot, type SettingsReceipt } from './management.ts'
 import { SETUP_PREFIX, SETUP_RESPONSE_MAX_BYTES, validateSetupStatus, type SetupStatus } from './setup.ts'
@@ -13,6 +20,18 @@ import { SourceCorrectionContractError, validateSourceCorrectionContext, validat
 import { ProjectControlContractError, validateProjectControlContext, validateProjectControlContextV2, type ProjectControlContextV2, validateProjectControlReceipt, type ProjectControlContext, type ProjectControlAction, type ProjectControlInput, type ProjectControlReceipt } from './project-control.ts'
 import { OwnerArtifactContractError, validateOwnerArtifactOptions, validateOwnerArtifactBody, ownerArtifactReadInput, type OwnerArtifactOptions, type OwnerArtifactItem, type OwnerArtifactBody } from './owner-artifact.ts'
 import { RelationsContractError, validateRelationsProjection, type RelationsProjection } from './relations.ts'
+
+export interface OnboardingChoice { blueprint: string; label: string; description: string; model_capability_ref: string; budget_ref: string }
+export interface OnboardingChoices { schema: 'd12.onboarding-choices.v1'; namespace: { bot: string; persona: string }; creation: { choices: OnboardingChoice[]; reason_code: string | null }; binding_route_available: boolean }
+export interface ObservedSceneChoice { platform_ref: string; conversation_ref: string; visibility: 'private' | 'group'; scene_ref: string }
+export interface CreateCharacterInput { display_name: string; blueprint: string; model_capability_ref: string; budget_ref: string }
+export interface BindSceneInput { scene_ref: string; visibility: 'private' | 'group'; acknowledgement: true }
+export type PendingOnboardingAttempt = Readonly<{scope:string;operationId:string;ownerBindingDigest:string} & (
+  {action:'create_character';input:Readonly<CreateCharacterInput>} | {action:'bind_scene';input:Readonly<BindSceneInput>})>
+export interface OwnerSessionIdentity {schema:'d12.owner-session-identity.v1';owner_binding_digest:string}
+export interface RoleInitializationReceipt { operation_id: string; phase: 'role_initialized'; namespace: { bot: string; persona: string }; role_ref: string; plan_id: string; head_id: string; owner_grant_id: string; owner_grant_revision: number; graph_revision: number }
+export interface SceneBindingReceipt { operation_id: string; phase: 'scene_bound'; namespace: { bot: string; persona: string }; scene_ref: string; binding_id: string; binding_revision: number; role_head_id: string; graph_revision: number }
+
 export interface FetchResponse { ok: boolean; status: number; body?: ReadableStream<Uint8Array> | null; json(): Promise<unknown> }
 export type FetchLike = (input: string, init: RequestInit) => Promise<FetchResponse>
 export type ApiErrorCode = 'offline' | 'unauthorized' | 'timeout' | 'network_unavailable' | 'invalid_response' | 'session_changed' | 'action_pending' | 'contact_hold' | string
@@ -93,9 +112,9 @@ export function validateWorkspace(body: unknown, scope: string): ProjectionResul
   if (base.status !== 'ready') return base
   const p = base.projection
   if (!hasFields(p, ['namespace', 'access_generation', 'views', 'view_diagnostics', 'unavailable_domains', 'command_routes']) || !namespace(p.namespace, scope) || !isInteger(p.access_generation, 1) || !Array.isArray(p.views) || !Array.isArray(p.view_diagnostics) || !isRecord(p.unavailable_domains) || !Array.isArray(p.command_routes)) invalid()
-  if (p.views.some(v => !hasFields(v, ['view_type', 'status'], ['snapshot_epoch']) || !isViewType(v.view_type) || typeof v.status !== 'string' || !['available', 'unavailable'].includes(v.status) || (v.snapshot_epoch !== undefined && !isInteger(v.snapshot_epoch))) ||
+  if (p.views.some(v => !hasFields(v, ['view_type', 'status', 'reason_code']) || !isViewType(v.view_type) || typeof v.status !== 'string' || !['readable_not_loaded', 'unsupported', 'unavailable'].includes(v.status) || !isText(v.reason_code)) ||
       new Set(p.views.map(v => v.view_type)).size !== p.views.length ||
-      p.view_diagnostics.some(v => !hasFields(v, ['view_type', 'read_status'], ['coverage', 'problem_code', 'snapshot_epoch']) || !isViewType(v.view_type) || !projectionStates.includes(v.read_status as ProjectionStatus) || (v.coverage !== undefined && (typeof v.coverage !== 'string' || !['partial', 'complete', 'not_disclosed'].includes(v.coverage))) || (v.problem_code !== undefined && !isText(v.problem_code)) || (v.snapshot_epoch !== undefined && !isInteger(v.snapshot_epoch))) ||
+      p.view_diagnostics.some(v => !hasFields(v, ['view_type', 'read_status', 'reason_code']) || !isViewType(v.view_type) || !['readable_not_loaded', 'unsupported', 'unavailable'].includes(String(v.read_status)) || !isText(v.reason_code)) ||
       Object.values(p.unavailable_domains).some(v => !isText(v)) || p.command_routes.some(v => !hasFields(v, ['action', 'status']) || !isText(v.action) || typeof v.status !== 'string' || !['route_installed', 'partial_route_installed', 'unavailable'].includes(v.status))) invalid()
   return base
 }
@@ -187,12 +206,12 @@ export class WorkbenchApi {
       throw new WorkbenchApiError('无法连接本地后端。没有显示缓存或示例角色。', { code: 'network_unavailable', retryable: true })
     } finally { if (timer) clearTimeout(timer); if (abortListener) abort.signal.removeEventListener('abort', abortListener); this.#requests.delete(abort); this.#managementRequests.delete(abort); this.#setupRequests.delete(abort); this.#creatorRequests.delete(abort) }
   }
-  #creatorPayload(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'|'consolidation'|'context'|'expression'){
+  #creatorPayload(action:string,scope:string,input:object,operationId:string,purpose:string){
     const payload={schema_version:'d12.contract.v1',action,scope,purpose,audience:'owner',operation_id:operationId,input}
     if(new TextEncoder().encode(JSON.stringify(payload)).byteLength>64*1024)throw new WorkbenchApiError('完整请求超过当前64KiB命令上限，未发送；不会截断原文。',{code:'invalid_input'})
     return payload
   }
-  async #creatorCommand(action:string,scope:string,input:object,operationId:string,purpose:'workbench_user_action'|'workbench_view'|'consolidation'|'context'|'expression'='workbench_user_action'){
+  async #creatorCommand(action:string,scope:string,input:object,operationId:string,purpose:string='workbench_user_action'){
     if(!UUID4.test(operationId))invalid()
     makeReadCommand('open_workspace',scope)
     const generation=this.#creatorGeneration
@@ -208,6 +227,120 @@ export class WorkbenchApi {
       throw new WorkbenchApiError((body.problem.code==='local_module_disabled'||body.problem.code==='joint_node_input_hold')&&typeof body.problem.message==='string'?body.problem.message:'当前领域操作未完成。请按实际状态重新读取；不会自动重放。',{code:body.status==='stale'&&body.problem.code==='draft_current_basis_changed'?'creator_conflict':body.problem.code,status:0,retryable:body.problem.retryable===true})
     }
     return body
+  }
+
+  async #inspectionMaintenanceCommand(scope: string, action: 'accept_source_inspection_migration_v1' | 'read_source_inspection_migration_v1',
+      operationId: string, input: object, originalId: string, expected?: SourceInspectionWorkflowInput) {
+    validateScope(scope)
+    if (!UUID4.test(operationId) || !UUID4.test(originalId)) invalid()
+    const generation = this.#generation
+    const session = await this.#json('/inspection-maintenance-session', 'GET', undefined, undefined, false, false, true)
+    if (!hasFields(session, ['status', 'dashboard_session', 'owner_session', 'csrf_token']) || session.status !== 'ready'
+        || session.dashboard_session !== 'authenticated' || session.owner_session !== 'unlocked' || !isText(session.csrf_token)) invalid()
+    if (generation !== this.#generation) throw new WorkbenchApiError('维护会话已切换。', { code: 'session_changed' })
+    const payload = this.#creatorPayload(action, scope, input, operationId, action === 'accept_source_inspection_migration_v1' ? 'workbench_user_action' : 'workbench_view')
+    const body = await this.#json('/commands', 'POST', payload, session.csrf_token, false, false, true)
+    if (isRecord(body) && !['ready', 'accepted', 'pending_confirmation'].includes(String(body.status))) {
+      if (!hasFields(body, ['status', 'problem']) || !hasFields(body.problem, ['code'], ['message', 'retryable']) || !isText(body.problem.code)) invalid()
+      throw new WorkbenchApiError('来源维护受理或查询尚未确认，请保留原操作。', { code: body.problem.code, status: body.status === 'unauthorized' ? 403 : 0 })
+    }
+    try { return validateSourceInspectionWorkflowResponse(body, scope, originalId, action === 'accept_source_inspection_migration_v1' ? 'accept' : 'read', expected) }
+    catch { invalid() }
+  }
+  async acceptSourceInspectionMigration(scope: string, operationId: string, input: SourceInspectionWorkflowInput) {
+    validateSourceInspectionWorkflowInput(input, scope, operationId)
+    return this.#inspectionMaintenanceCommand(scope, 'accept_source_inspection_migration_v1', operationId, input, operationId, input)
+  }
+  async readSourceInspectionMigration(scope: string, originalId: string) {
+    return this.#inspectionMaintenanceCommand(scope, 'read_source_inspection_migration_v1', operationIdV1(), { operation_id: originalId }, originalId)
+  }
+
+  async readOnboardingChoices(scope: string): Promise<OnboardingChoices> {
+    const body = await this.#creatorCommand('read_onboarding_choices', scope, {}, operationIdV1())
+    if (!hasFields(body, ['status', 'projection'])) invalid()
+    const p = body.projection
+    if (!hasFields(p, ['schema', 'namespace', 'creation', 'binding_route_available'])
+        || p.schema !== 'd12.onboarding-choices.v1' || !namespace(p.namespace, scope)
+        || typeof p.binding_route_available !== 'boolean'
+        || !hasFields(p.creation, ['choices', 'reason_code']) || !Array.isArray(p.creation.choices)
+        || p.creation.choices.length > 16
+        || (p.creation.reason_code !== null && (typeof p.creation.reason_code !== 'string' || !/^[A-Za-z0-9_.:-]{1,128}$/.test(p.creation.reason_code)))
+        || (p.creation.choices.length === 0) !== (p.creation.reason_code !== null)) invalid()
+    const seen = new Set<string>()
+    for (const item of p.creation.choices) {
+      if (!hasFields(item, ['blueprint', 'label', 'description', 'model_capability_ref', 'budget_ref'])
+          || !isText(item.blueprint) || seen.has(item.blueprint)
+          || !isText(item.label) || item.label.length > 80
+          || typeof item.description !== 'string' || item.description.length > 1024
+          || !isText(item.model_capability_ref) || !isText(item.budget_ref)) invalid()
+      seen.add(item.blueprint)
+    }
+    return p as unknown as OnboardingChoices
+  }
+  async readObservedSceneChoices(scope: string): Promise<ObservedSceneChoice[]> {
+    validateScope(scope)
+    await this.openSession()
+    const body = await this.#json('/scene-candidates', 'GET', undefined, undefined, false, false, true)
+    if (!hasFields(body, ['schema_version', 'status', 'candidates'])
+        || body.schema_version !== 'sylanne.scene-candidates.v1'
+        || !['ready', 'empty'].includes(String(body.status)) || !Array.isArray(body.candidates)
+        || body.candidates.length > 64 || (body.status === 'empty') !== (body.candidates.length === 0)) invalid()
+    const seen = new Set<string>()
+    for (const item of body.candidates) {
+      if (!hasFields(item, ['platform_ref', 'conversation_ref', 'visibility', 'scene_ref'])
+          || !isText(item.platform_ref) || !isText(item.conversation_ref) || !isText(item.scene_ref)
+          || !item.scene_ref.startsWith('scene:') || seen.has(item.scene_ref)
+          || !['private', 'group'].includes(String(item.visibility))) invalid()
+      seen.add(item.scene_ref)
+    }
+    return body.candidates as ObservedSceneChoice[]
+  }
+  async createCharacter(scope: string, input: CreateCharacterInput, operationId: string): Promise<RoleInitializationReceipt> {
+    if (!hasFields(input, ['display_name', 'blueprint', 'model_capability_ref', 'budget_ref'])
+        || !isText(input.display_name) || input.display_name.trim().length === 0 || input.display_name.trim().length > 80
+        || !isText(input.blueprint) || !isText(input.model_capability_ref) || !isText(input.budget_ref)) invalid()
+    const body = await this.#creatorCommand('create_character', scope, input, operationId)
+    if (!hasFields(body, ['status', 'receipt'])) invalid()
+    const r = body.receipt
+    if (!hasFields(r, ['operation_id', 'phase', 'namespace', 'role_ref', 'plan_id', 'head_id', 'owner_grant_id', 'owner_grant_revision', 'graph_revision'])
+        || r.operation_id !== operationId || r.phase !== 'role_initialized' || !namespace(r.namespace, scope)
+        || !isText(r.role_ref) || !isText(r.plan_id) || !isText(r.head_id) || !isText(r.owner_grant_id)
+        || !isInteger(r.owner_grant_revision, 1) || !isInteger(r.graph_revision, 1)) invalid()
+    return r as unknown as RoleInitializationReceipt
+  }
+  async bindObservedScene(scope: string, input: BindSceneInput, operationId: string): Promise<SceneBindingReceipt> {
+    if (!hasFields(input, ['scene_ref', 'visibility', 'acknowledgement']) || !isText(input.scene_ref)
+        || !input.scene_ref.startsWith('scene:') || !['private', 'group'].includes(input.visibility) || input.acknowledgement !== true) invalid()
+    const body = await this.#creatorCommand('bind_scene', scope, input, operationId)
+    if (!hasFields(body, ['status', 'receipt'])) invalid()
+    const r = body.receipt
+    if (!hasFields(r, ['operation_id', 'phase', 'namespace', 'scene_ref', 'binding_id', 'binding_revision', 'role_head_id', 'graph_revision'])
+        || r.operation_id !== operationId || r.phase !== 'scene_bound' || !namespace(r.namespace, scope)
+        || r.scene_ref !== input.scene_ref || !isText(r.binding_id) || !isInteger(r.binding_revision, 1)
+        || !isText(r.role_head_id) || !isInteger(r.graph_revision, 1)) invalid()
+    return r as unknown as SceneBindingReceipt
+  }
+
+  async readCurrentCommitmentAction(scope:string,refs:string[]){
+    if(refs.length<1||refs.length>16||new Set(refs).size!==refs.length||!refs.every(isText))invalid()
+    const operationId=operationIdV1()
+    const body=await this.#creatorCommand('read_beta1_owner_state_v1',scope,{domain:'action',refs},operationId,'context')
+    if(!hasFields(body,['status','projection']))invalid()
+    return validateCurrentActionProjection(body.projection,scope,refs,operationId)
+  }
+  async runCommitmentFulfillment(attempt:FulfillmentAttempt){
+    validateFulfillmentInput(attempt)
+    const body=await this.#creatorCommand(FULFILLMENT_ACTIONS[attempt.kind],attempt.scope,attempt.input,attempt.operationId,attempt.kind==='cancel_action'?attempt.purpose!:['create_terms','approve_terms'].includes(attempt.kind)?'expression':'context')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateFulfillmentReceipt(body.receipt,attempt)
+  }
+  async runCommitmentCommand(attempt:CommitmentCommandAttempt){
+    const {scope,kind,input,operationId}=attempt
+    validateCommitmentCommandInput(kind,scope,input)
+    const action=kind==='submit'?COMMITMENT_PREPARE_ACTION:kind==='create'?'domain_input_create_commitment':'domain_input_register_commitment_communication'
+    const body=await this.#creatorCommand(action,scope,input,operationId,kind==='submit'?'context':'expression')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateCommitmentCommandReceipt(body.receipt,scope,kind,input,operationId)
   }
   async submitBeta1Owner(scope:string,kind:Beta1Kind,input:Beta1Input,operationId:string){
     const request=validateBeta1Input(kind,input)
@@ -241,6 +374,39 @@ export class WorkbenchApi {
     if(receipt.schema!=='d12.named-joint-node-receipt.v1'||receipt.operation_id!==operationId||receipt.window_ref!==windowRef||receipt.node_id!==nodeId||!isText(receipt.actual_operation_id)||!isText(receipt.command_original_ref)||!isText(receipt.command_original_digest)||!isText(receipt.original_digest)||!/^[0-9a-f]{64}$/.test(receipt.original_digest)||!/^[0-9a-f]{64}$/.test(receipt.command_original_digest)||!isRecord(receipt.original))invalid()
     return {operationId,actualOperationId:receipt.actual_operation_id,originalDigest:receipt.original_digest,commandOriginalRef:receipt.command_original_ref}
   }
+  async readCharacterLaborRebuildOptions(scope:string,input:LaborOptionsInput){
+    validateLaborOptionsInput(scope,input)
+    const body=await this.#creatorCommand('read_character_labor_rebuild_options_v1',scope,input,operationIdV1(),'context')
+    if(!hasFields(body,['status','projection']))invalid()
+    return validateLaborOptions(body.projection,scope,input)
+  }
+  async previewCharacterLaborRebuild(scope:string,input:LaborRebuildInput){
+    validateLaborRebuildInput(scope,input)
+    if(input.request.expected_choice_digest!==null)invalid()
+    const body=await this.#creatorCommand('domain_rebuild_character_labor_body',scope,input,operationIdV1(),'context')
+    if(!hasFields(body,['status','projection']))invalid()
+    return validateLaborPreview(body.projection,scope,input)
+  }
+  async submitCharacterLaborRebuild(scope:string,input:LaborRebuildInput,operationId:string){
+    validateLaborRebuildInput(scope,input)
+    if(input.request.expected_choice_digest===null)invalid()
+    const body=await this.#creatorCommand('domain_rebuild_character_labor_body',scope,input,operationId,'context')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateLaborRebuildReceipt(body.receipt,scope,operationId,input)
+  }
+  async readGrowthReviewState(scope:string,refs:string[]){
+    if(refs.length<1||refs.length>16||new Set(refs).size!==refs.length||!refs.every(isText))throw new WorkbenchApiError('请选择1至16个不重复的真实对象引用。',{code:'invalid_input'})
+    const operationId=operationIdV1()
+    const body=await this.#creatorCommand('read_beta1_owner_state_v1',scope,{domain:'growth_review',refs},operationId,'context')
+    if(!hasFields(body,['status','projection']))invalid()
+    return validateGrowthReviewState(body.projection,scope,refs,operationId)
+  }
+  async submitGrowthReview(scope:string,kind:GrowthReviewKind,input:GrowthReviewInput,operationId:string){
+    const request=validateGrowthReviewInput(kind,input)
+    const body=await this.#creatorCommand('domain_'+kind,scope,request,operationId,'consolidation')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateGrowthReviewReceipt(body.receipt,kind,operationId)
+  }
   async readBeta1OwnerState(scope:string,domain:Exclude<Beta1Domain,'self'>,refs:string[]){
     if(!['world','habit','long_window'].includes(domain)||refs.length<1||refs.length>16||new Set(refs).size!==refs.length||!refs.every(isText))throw new WorkbenchApiError('请选择1至16个当前对象引用。',{code:'invalid_input'})
     const operationId=operationIdV1()
@@ -263,6 +429,12 @@ export class WorkbenchApi {
     const body=await this.#creatorCommand('domain_'+kind,scope,request,operationId,'consolidation')
     if(!hasFields(body,['status','receipt']))invalid()
     return validateGeneralGrowthReceipt(body.receipt,kind,operationId)
+  }
+  async submitSingleEventGrowth(scope:string,kind:SingleEventKind,input:SingleEventGrowthInput,operationId:string):Promise<SingleEventGrowthReceipt>{
+    const request=validateSingleEventGrowthInput(kind,input)
+    const body=await this.#creatorCommand('domain_'+kind,scope,request,operationId,'consolidation')
+    if(!hasFields(body,['status','receipt']))invalid()
+    return validateSingleEventGrowthReceipt(body.receipt,kind,operationId)
   }
   #creatorValidate<T>(validate:()=>T):T{try{return validate()}catch(error){if(error instanceof CreatorContractError)invalid();throw error}}
   readConfigurationDraft(scope:string):Promise<CreatorConfiguration>{
@@ -375,6 +547,29 @@ export class WorkbenchApi {
     try { return validateOwnerTaskStatus(body.projection, scope, operationId, inputDigest) }
     catch (error) { if (error instanceof OwnerTaskContractError) invalid(); throw error }
   }
+  async eraseSource(attempt: SourceErasureAttempt): Promise<SourceErasureReceipt> {
+    const input = sourceErasureRequest(attempt), generation = this.#creatorGeneration
+    await this.openSession()
+    if (generation !== this.#creatorGeneration || !this.#csrf) throw new WorkbenchApiError('当前 Owner 会话已变化。',{code:'session_changed'})
+    const body = await this.#json('/commands','POST',this.#creatorPayload('erase_or_retire',attempt.scope,input,attempt.operationId,'audit'),this.#csrf,false,false,true)
+    if (isRecord(body) && ['unavailable','unauthorized','stale'].includes(String(body.status))) {
+      if (body.status === 'unauthorized') { this.clearSession(); throw responseError(403,body) }
+      throw new WorkbenchApiError('来源删除尚未取得原件；请保留原操作ID核验。',{code:problem(body.problem)?.code ?? 'erasure_unresolved'})
+    }
+    try { return validateSourceErasureResponse(body, attempt) } catch { invalid() }
+  }
+  async readOwnerSourcePage(scope: string, cursor: string | null = null, pageSize = 32) {
+    const operationId = operationIdV1()
+    const body = await this.#creatorCommand('read_current_source_page_v1', scope, { cursor, page_size: pageSize }, operationId, 'context')
+    if (!hasFields(body, ['status', 'projection'])) invalid()
+    return this.#creatorValidate(() => validateOwnerSourcePage(body.projection, scope, operationId, pageSize))
+  }
+  async readOwnerSourceDetail(scope: string, selected: OwnerSourceMetadata) {
+    const operationId = operationIdV1()
+    const body = await this.#creatorCommand('read_current_source_detail_v1', scope, { source_id: selected.source_id, expected_revision: selected.revision }, operationId, 'context')
+    if (!hasFields(body, ['status', 'projection'])) invalid()
+    return this.#creatorValidate(() => validateOwnerSourceDetail(body.projection, scope, operationId, selected))
+  }
   async readSourceCorrectionContext(scope: string, sourceId: string): Promise<SourceCorrectionContext> {
     if (!isText(sourceId) || sourceId.length > 256) throw new WorkbenchApiError('请选择当前来源记录。', { code: 'invalid_input' })
     const body = await this.#creatorCommand('read_source_correction_context_v1', scope, { source_id: sourceId }, operationIdV1())
@@ -428,6 +623,17 @@ export class WorkbenchApi {
       try { return validateSetupStatus(body) } catch { invalid() }
     })
   }
+  async readOwnerSessionIdentity():Promise<OwnerSessionIdentity>{
+    this.clearSession()
+    await this.openSession()
+    const generation=this.#generation
+    const body=await this.#json('/owner-session-identity','GET')
+    if(generation!==this.#generation)throw new WorkbenchApiError('Owner 会话在身份核验期间已切换。',{code:'session_changed'})
+    if(!hasFields(body,['status','projection'])||body.status!=='ready'
+      ||!hasFields(body.projection,['schema','owner_binding_digest'])||body.projection.schema!=='d12.owner-session-identity.v1'
+      ||typeof body.projection.owner_binding_digest!=='string'||!/^[0-9a-f]{64}$/.test(body.projection.owner_binding_digest))invalid()
+    return body.projection as unknown as OwnerSessionIdentity
+  }
   openSession(): Promise<void> {
     if (this.#csrf) return Promise.resolve()
     if (this.#sessionRequest) return this.#sessionRequest
@@ -461,7 +667,7 @@ export class WorkbenchApi {
   }
   readView(scope: string, viewType: ViewType, cursor: string | null = null): Promise<ProjectionResult<CharacterProjection>> {
     // Config/control, paid operations and contact sends are deliberately not exposed.
-    if (viewType !== 'creation' && viewType !== 'd06.memory_sources.v1') return Promise.reject(new WorkbenchApiError('此界面尚未实现该视图的字段合同。', { code: 'view_unsupported' }))
+    if (viewType !== 'creation') return Promise.reject(new WorkbenchApiError('此界面尚未实现该视图的字段合同。', { code: 'view_unsupported' }))
     return this.#one(`view:${scope}:${viewType}:${cursor ?? ''}`, async () => validateCharacterView(await this.#read('read_character_view', scope, viewType, cursor), scope, viewType))
   }
   async #replyControlSession() {

@@ -152,3 +152,100 @@ def test_canonical_astrbot_route_refs_are_accepted_without_other_id_widening(tmp
     finally:
         core.close()
         journal.close()
+
+
+def test_historical_observation_keeps_accepted_after_delivered_without_mutation(tmp_path):
+    from sylanne3.runtime_contracts import canonical_digest as receipt_digest
+    core, journal, bridge, claimed, start, binding = _ready(tmp_path)
+    try:
+        bridge._observation_verifier = lambda namespace, receipt, value: value
+        accepted, _ = bridge.execution_observe_v2(credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=_report(start, binding))
+        delivered_report = replace(_report(start, binding), observation_id="observation-delivered",
+            outcome="delivered", observed_at_utc="2026-09-27T01:00:01Z")
+        original_dispatch = core._db.execute(
+            "SELECT * FROM authority_v2_fences WHERE namespace=? AND operation_id=?",
+            (bridge.namespace, claimed.pending.permit.operation_id)).fetchone()
+        delivered = bridge.execution_refine_observation_v3(credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=delivered_report)
+        assert core._db.execute(
+            "SELECT * FROM authority_v2_fences WHERE namespace=? AND operation_id=?",
+            (bridge.namespace, claimed.pending.permit.operation_id)).fetchone() == original_dispatch
+        assert bridge.execution_refine_observation_v3(credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=delivered_report) == delivered
+        with pytest.raises(AuthorityUnavailable):
+            bridge.execution_observe_v2(credential="ok", subject="subject-a",
+                claimed_receipt=claimed, observation=delivered_report)
+        latest = bridge.read_current_observation_receipt_v1(
+            credential="ok", subject="subject-a", effect_id="effect-a")
+        assert latest == delivered and latest != accepted
+        before_head, before_writes = journal.verified_head(), core._db.total_changes
+        request = dict(credential="ok", subject="subject-a", effect_id="effect-a",
+            mutation_id=accepted.pending.mutation_id, expected_receipt_digest=receipt_digest(accepted))
+        assert bridge.read_historical_observation_receipt_v3(**request) == accepted
+        for changed in (dict(expected_receipt_digest="0" * 64),
+                        dict(mutation_id="observation-not-in-chain"),
+                        dict(subject="another-subject")):
+            with pytest.raises(AuthorityUnavailable):
+                bridge.read_historical_observation_receipt_v3(**(request | changed))
+        assert journal.verified_head() == before_head
+        assert core._db.total_changes == before_writes
+    finally:
+        core.close()
+        journal.close()
+
+
+@pytest.mark.parametrize("has_append", [False, True])
+def test_observation_fact_cold_recovery_adopts_only_an_existing_append(tmp_path, has_append):
+    from sylanne3.authority_service.observation_refinement_contract_v3 import (
+        PlatformObservationRefinementPendingV3, PlatformObservationRefinementReceiptV3)
+    from sylanne3.authority_service.observation_refinement_v3 import (
+        prepare_observation_refinement_v3, append_observation_refinement_v3)
+    core, journal, bridge, claimed, start, binding = _ready(tmp_path)
+    try:
+        bridge._observation_verifier = lambda namespace, receipt, value: value
+        bridge.execution_observe_v2(credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=_report(start, binding))
+        old_dispatch = core._db.execute(
+            "SELECT * FROM authority_v2_fences WHERE namespace=? AND operation_id=?",
+            (bridge.namespace, claimed.pending.permit.operation_id)).fetchone()
+        report = replace(_report(start, binding), observation_id="cold-delivered",
+            outcome="delivered", observed_at_utc="2026-09-27T01:00:01Z")
+        pending = prepare_observation_refinement_v3(bridge, credential="ok", subject="subject-a",
+            claimed_receipt=claimed, observation=report)
+        assert type(pending) is PlatformObservationRefinementPendingV3
+        if has_append:
+            append_observation_refinement_v3(bridge, credential="ok", subject="subject-a", pending=pending)
+        head = journal.verified_head()
+    finally:
+        core.close()
+        journal.close()
+    core, _, journal, bridge = _service(tmp_path, create=False, with_owner=True,
+        final_authorizer=lambda *_: None, final_issuer="graph-issuer-a")
+    try:
+        fact_id = pending.fact_write_permit.operation_id
+        assert bridge.current_observation_refinement_operation_v3(
+            credential="ok", subject="subject-a") == fact_id
+        result = bridge.recover_observation_refinement_v3(
+            credential="ok", subject="subject-a", fact_operation_id=fact_id)
+        assert journal.verified_head() == head
+        assert core._db.execute(
+            "SELECT * FROM authority_v2_fences WHERE namespace=? AND operation_id=?",
+            (bridge.namespace, claimed.pending.permit.operation_id)).fetchone() == old_dispatch
+        if has_append:
+            assert type(result) is PlatformObservationRefinementReceiptV3
+            assert result.pending == pending
+            assert bridge.current_observation_refinement_operation_v3(
+                credential="ok", subject="subject-a") is None
+            assert bridge.recover_observation_refinement_v3(credential="ok", subject="subject-a",
+                fact_operation_id=fact_id) == result
+        else:
+            assert result == pending
+            assert bridge.current_observation_refinement_operation_v3(
+                credential="ok", subject="subject-a") == fact_id
+            assert core._db.execute(
+                "SELECT state,receipt FROM authority_platform_observation_facts_v3 WHERE fact_operation_id=?",
+                (fact_id,)).fetchone() == ("pending", None)
+    finally:
+        core.close()
+        journal.close()

@@ -203,6 +203,7 @@ from ..host.model_workflows_v6 import AdminModelWorkflowsV6
 from ..host.model_workflows_v7 import AdminModelWorkflowsV7
 from ..host.model_workflows_v8 import AdminModelWorkflowsV8
 from ..host.model_workflows_v9 import AdminModelWorkflowsV9
+from ..host.model_workflows_v10 import AdminModelWorkflowsV10
 from .d12_owner_storage_admission_v1 import InstalledD12OwnerStorageAdmissionServiceV1
 from .v2_model_egress_contract import ModelEgressIntentV1
 
@@ -364,7 +365,7 @@ class InstalledLifeNumericModelGraphReaderV1:
                 or type(owner_storage) is not InstalledD12OwnerStorageAdmissionServiceV1
                 or type(structured_readers) is not InstalledD06StructuredExperienceReadersV1
                 or type(workflows) not in (AdminModelWorkflowsV3, AdminModelWorkflowsV4,
-                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9) or workflows.life_numeric is None
+                    AdminModelWorkflowsV5, AdminModelWorkflowsV6, AdminModelWorkflowsV7, AdminModelWorkflowsV8, AdminModelWorkflowsV9, AdminModelWorkflowsV10) or workflows.life_numeric is None
                 or structured_readers.resource_issuer is not structured_readers.issuer.resource_issuer):
             raise TypeError('actual installed Life Owner/original readers and workflow required')
         policy=bundle.installation_policy
@@ -416,6 +417,8 @@ class InstalledLifeNumericModelGraphReaderV1:
             raise ValueError('Life model selected installation/namespace differs')
         prepared, binding, request, adopted = _read_committed_life_numeric_request_originals_v1(db,
             namespace=ns, issuer=self.readers.issuer, job_id=job.job_id)
+        from ..runtime.d06_ordinary_readout_v3 import require_authority_life_ordinary_readout_v3
+        require_authority_life_ordinary_readout_v3(db,self,intent,prepared)
         # Refuse an already canceled/retired worker before constructing its
         # complete Source frame. The same signed acquisition was verified above;
         # all Source/Owner/deadline checks still apply to every live worker.

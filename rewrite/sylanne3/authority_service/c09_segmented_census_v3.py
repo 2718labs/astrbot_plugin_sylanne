@@ -143,8 +143,14 @@ class InstalledSegmentedCensusV3:
                 if actual!=(ddl,):raise AuthorityUnavailable('registered sealed logical family physical DDL differs')
                 refs.extend((table,column)for column in columns)
             return tuple(refs)
-        if self.role=='core':return (('authority_d13_counter_originals_v1','payload_cell_id'),
-            ('authority_d13_provider_http_bindings_v1','payload_cell_id'))
+        if self.role=='core':
+            from .c09_platform_observation_fact_storage_v3 import TABLE,PHYSICAL_DDL,CELL_COLUMNS
+            actual=meter.read_fixed_row(self.target,'sqlite_master',('sql',),'type=? AND name=?',('table',TABLE))
+            refs=(('authority_d13_counter_originals_v1','payload_cell_id'),('authority_d13_provider_http_bindings_v1','payload_cell_id'))
+            if actual is not None:
+                if actual!=(PHYSICAL_DDL,):raise AuthorityUnavailable('Fact target physical profile differs')
+                refs+=tuple((TABLE,column)for column in CELL_COLUMNS)
+            return refs
         return ()
 
     def _plan_owner(self,namespace,producing_operation_id,header,meter):
@@ -182,7 +188,11 @@ class InstalledSegmentedCensusV3:
         if table==OUTPUT_TABLE:
             output=decode_owner_source_output_mapping_row_v3(row)
             if data['outcome']!='complete':return None
-        cell_id=data[column];header=self._header(cell_id,meter)
+        cell_id=data[column]
+        if table=='authority_platform_observation_facts_v3' and cell_id is None and column in ('receipt_cell_id','updated_fact_permit_cell_id'):
+            if data['state']!='pending':raise AuthorityUnavailable('committed Fact lacks its exact cell references')
+            return None
+        header=self._header(cell_id,meter)
         if self.role=='graph':
             from ..graph_types import AtomKey
             from ..runtime.domain_production_originals_v1 import PHYSICAL_TABLE
@@ -234,18 +244,28 @@ class InstalledSegmentedCensusV3:
                         or(header[4],header[6])!=(expected['total_bytes'],expected['payload_sha256'])):
                     raise AuthorityUnavailable('Owner output complete mapping lost its real source owner/header/bytes')
             else:raise AuthorityUnavailable('unknown registered segmented Graph family')
+        elif table=='authority_platform_observation_facts_v3':
+            from .c09_platform_observation_fact_storage_v3 import require_fact_cell_binding_v3
+            if (shape.primary_key_columns!=('fact_operation_id',) or data['namespace']!=self.scope.authority_namespace
+                    or data['fact_operation_id']!=key[0] or data['mutation_id']!=key[0]):
+                raise AuthorityUnavailable('Fact target exact PK/namespace differs')
+            require_fact_cell_binding_v3(namespace=data['namespace'],operation_id=key[0],column=column[:-8],header=header)
+            owner=header[2]
         else:
             if key[0]!=self.scope.authority_namespace:raise AuthorityUnavailable('actual Core cell crossed authority namespace')
             if table=='authority_d13_counter_originals_v1':
-                if key[2]not in {'draft','header','evidence'}:raise AuthorityUnavailable('unknown actual D13 counter phase')
+                if key[2]not in {'draft','header','evidence','pressure_mapping_v1'}:raise AuthorityUnavailable('unknown actual D13 counter phase')
                 family='d13-counter-source'if key[2]=='draft'else'd13-counter-history'
             elif table=='authority_d13_provider_http_bindings_v1':
-                if key[2]not in {'expected','observed_before_send'}:raise AuthorityUnavailable('unknown actual provider HTTP phase')
+                from .d13_accounting_metadata_v3 import D13_ACCOUNTING_PHASES_V3
+                if key[2]not in {'expected','observed_before_send'} | D13_ACCOUNTING_PHASES_V3:
+                    raise AuthorityUnavailable('unknown actual provider HTTP/accounting phase')
                 family='d13-provider-http-history'
             else:raise AuthorityUnavailable('unknown registered segmented Core family')
             owner=canonical_serialize((family,key[0],key[1]))
             if header[2]!=owner:raise AuthorityUnavailable('actual Core cell crossed its counter/call erasure owner')
-        if header[1]!='canonical-json.ascii.v1':raise AuthorityUnavailable('registered logical family has another actual codec')
+        if header[1]!=('canonical-json.utf8.v1' if table=='authority_platform_observation_facts_v3' else 'canonical-json.ascii.v1'):
+            raise AuthorityUnavailable('registered logical family has another actual codec')
         return(self.scope.scope_digest,self.role,table,canonical_digest(key),column,canonical_serialize(key),
             cell_id,owner,header[1],c09_row_commitment_v2(row))
     def advance(self):
@@ -440,6 +460,8 @@ class InstalledSegmentedCensusV3:
             ('graph_contact_expression_plan_originals_v3','source_selection_json'):'source_selection_cell_id',
             ('authority_d13_counter_originals_v1','payload_json'):'payload_cell_id',
             ('authority_d13_provider_http_bindings_v1','payload_json'):'payload_cell_id'}
+        from .c09_platform_observation_fact_storage_v3 import TABLE as FACT_TABLE,BLOB_COLUMNS
+        if family==FACT_TABLE and logical_column in BLOB_COLUMNS:mapped[(family,logical_column)]=logical_column+'_cell_id'
         column=mapped.get((family,logical_column))
         if column is None or(family,column)not in self._refs(meter):
             raise AuthorityUnavailable('actual closed cursor names an unregistered logical family/column')

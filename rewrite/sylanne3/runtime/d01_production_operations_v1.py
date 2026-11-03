@@ -93,6 +93,9 @@ class CurrentDomainReadV1:
             from .domain_background_read_v3 import read_bound_background_graph_atom_v3
             handled, atom = read_bound_background_graph_atom_v3(db, ns, key)
         if not handled:
+            from .current_character_labor_adoption_v1 import read_bound_character_labor_adoption_head_v1
+            handled, atom = read_bound_character_labor_adoption_head_v1(db, ns, key)
+        if not handled:
             row = read_graph_row_v3(db, ('revision', 'value', 'valid'), where='token=? AND bot=? AND persona=?', parameters=(key.token, *ns.as_tuple), history=False)
             atom = GraphAtom(key, row[0], json.loads(row[1]), bool(row[2])) if row else GraphAtom(key, 0, {}, False)
         if self.frame.snapshot.get(key) != atom:
@@ -115,6 +118,9 @@ class CurrentDomainReadV1:
         return found
 
     def complete_inventory(self, db, type_name):
+        from .current_character_labor_adoption_v1 import read_bound_character_labor_adoption_inventory_v1
+        labor, values = read_bound_character_labor_adoption_inventory_v1(self.frame, db, type_name)
+        if labor:return values
         from ..authority_service.artifact_model_graph_v3 import read_bound_artifact_model_frame_inventory_v3
         artifact,values=read_bound_artifact_model_frame_inventory_v3(self.frame,db,type_name)
         if artifact:return values
@@ -145,6 +151,11 @@ class CurrentDomainReadV1:
             raise MissingProductionOriginalV1("bounded_source_roots")
         purpose = purpose or frame.envelope.authority.purpose
         audiences = (audience,) if audience is not None else frame.envelope.authority.audience
+        from ..authority_service.character_labor_source_read_v1 import character_labor_source_family_v1
+        labor_sources = character_labor_source_family_v1(db, namespace=ns, roots=roots,
+            purpose=purpose, audiences=audiences, records=True)
+        if labor_sources is not None:
+            return labor_sources
         active, done, records = set(), set(), {}
 
         def visit(ref):
@@ -483,6 +494,9 @@ class InstalledD01ProductionReadersV1:
         return read_current_general_growth_v1(self,db,frame,request)
 
     def _read(self, db, read, ref, kind):
+        from .d01_ordinary_cumulative_growth_v1 import read_bound_ordinary_signed_input_v1
+        handled,result=read_bound_ordinary_signed_input_v1(db,read,ref,kind,self.issuer)
+        if handled:return result
         from .current_conditioned_self_read_v3 import read_bound_conditioned_d01_input_v3
         handled,result=read_bound_conditioned_d01_input_v3(db,read=read,ref=ref,kind=kind,issuer=self.issuer)
         if handled:return result
@@ -601,16 +615,12 @@ class InstalledD01ProductionReadersV1:
                 persona_head=next(v for v in active.read_versions if v.key.type_name == "d01.persona_plan.v1"),
                 plan_head=plan_head, candidate_refs=tuple(item[0] for item in candidates["candidates"]),
                 condition_heads=heads, condition_query_epoch=epoch)
-        from ..domains.d01.identity_v3 import decode_semantic_identity_v3
-        semantic_projection=None
-        if any(block.kind=="semantic_identity" and decode_semantic_identity_v3(block.claim) is not None for block in active.plan.blocks):
-            semantic_projection=self.read_self_model_v3(db,frame,ProjectSelfModelRequestV3())
         return CurrentValuesInputsV1(active.plan, self.owner_guard,
             tuple((item[0], tuple(item[1])) for item in candidates["candidates"]),
             tuple(context["context_tags"]), context["role_binding_complete"], candidate_original, context_original,
-            method_strategy,semantic_projection)
+            method_strategy)
 
-    def read_growth(self, db, frame, request):
+    def read_growth(self, db, frame, request, *, single_event_qualification=None):
         read = CurrentDomainReadV1(frame)
         read.check(db)
         raw, original = self._read(db, read, request.growth_proposal_ref, "growth_proposal")
@@ -676,13 +686,14 @@ class InstalledD01ProductionReadersV1:
             namespace=frame.envelope.authority.namespace, current_guard=self.owner_guard)
         target = next((block for block in active.plan.blocks if block.block_id == proposal.target_block), None)
         if target is not None and target.kind == "semantic_identity":
-            current_counter = self.current_semantic_counter_scope_v3(db,read,raw) if raw.get("schema")=="d01.growth-intent.v2" else None
+            current_counter = self.current_semantic_counter_scope_v3(db,read,raw,single_event_qualification=single_event_qualification) if raw.get("schema")=="d01.growth-intent.v2" else None
             if current_counter is not None:
                 complete=current_counter.complete
                 conflict=current_counter.qualification=="opposition"
                 proposal=replace(proposal,counterevidence_checked=current_counter.complete)
             proposal, semantic, deep_originals = self.qualify_semantic_growth_v3(db, read, request, raw,
-                proposal, active, trials_complete=trials_complete, counter_complete=complete, counter_conflict=conflict,counter_scope=current_counter)
+                proposal, active, trials_complete=trials_complete, counter_complete=complete, counter_conflict=conflict,counter_scope=current_counter,
+                single_event_qualification=single_event_qualification)
             originals.extend(deep_originals)
         return CurrentGrowthInputsV1(proposal, tuple(source.source_id for source in sources), self.owner_guard,
             tuple(originals), trials_complete, complete, conflict, semantic_qualification=semantic)
@@ -864,7 +875,7 @@ class InstalledD01ProductionReadersV1:
         return a, b, semantic_original
 
     def derive_current_growth_trial_from_adopted_progress_v1(self, db, *, frame, producing_operation_id,
-            original_ref, growth_proposal_ref, settled_progress_ref, validate_only=False, adopted_at_utc=None):
+            original_ref, growth_proposal_ref, settled_progress_ref, validate_only=False, adopted_at_utc=None, single_event_qualification=None):
         """Derive completion from actual adopted progress, never a caller flag."""
         read = CurrentDomainReadV1(frame)
         read.check(db)
@@ -902,16 +913,24 @@ class InstalledD01ProductionReadersV1:
             if (outcome.result_level != "completed_verified" or outcome.unknown_effects
                     or outcome.effect_id not in outcome.completed_effects or not outcome.observation_refs):
                 raise MissingProductionOriginalV1("actual_completed_verified_growth_trial_action")
-            actions = tuple(candidate for candidate in read.complete_inventory(db, "d08.action_intent.v1")
-                if candidate.valid and candidate.value["action_id"] == outcome.action_id
-                and candidate.value["identity"]["effect_id"] == outcome.effect_id
-                and candidate.value["identity"]["attempt_id"] == outcome.attempt_id)
+            if single_event_qualification is None:
+                actions = tuple(candidate for candidate in read.complete_inventory(db, "d08.action_intent.v1")
+                    if candidate.valid and candidate.value["action_id"] == outcome.action_id
+                    and candidate.value["identity"]["effect_id"] == outcome.effect_id
+                    and candidate.value["identity"]["attempt_id"] == outcome.attempt_id)
+            else:
+                from .d01_single_event_growth_v1 import single_event_trial_actions_v1
+                actions = single_event_trial_actions_v1(db,read,outcome,single_event_qualification)
             if len(actions) != 1:
                 raise MissingProductionOriginalV1("exact_actual_growth_trial_action_identity")
             action = _decode("d08.action_intent.v1", actions[0].value)
-            costs = tuple(candidate for candidate in read.complete_inventory(db, "runtime.cost_settlement")
-                if candidate.valid and candidate.value["activity_id"] == action.identity.activity_id
-                and candidate.value["effect_id"] == outcome.effect_id)
+            if single_event_qualification is None:
+                costs = tuple(candidate for candidate in read.complete_inventory(db, "runtime.cost_settlement")
+                    if candidate.valid and candidate.value["activity_id"] == action.identity.activity_id
+                    and candidate.value["effect_id"] == outcome.effect_id)
+            else:
+                from .d01_single_event_growth_v1 import single_event_trial_costs_v1
+                costs = single_event_trial_costs_v1(db,read,action,outcome,single_event_qualification)
             if not costs:
                 raise MissingProductionOriginalV1("actual_known_paid_growth_trial_action_cost")
             for cost in costs:
@@ -928,7 +947,11 @@ class InstalledD01ProductionReadersV1:
         kind = "growth_trial"
         value = GrowthTrialOriginalV1(growth_proposal_ref, outcomes, tuple(roots), True)
         if intent.get("schema") == "d01.growth-intent.v2":
-            start_ref, start, _ = self.current_semantic_trial_start_v3(db, read, growth_proposal_ref, original_ref)
+            if single_event_qualification is None:
+                start_ref, start, _ = self.current_semantic_trial_start_v3(db, read, growth_proposal_ref, original_ref)
+            else:
+                from .d01_single_event_growth_v1 import single_event_semantic_trial_start_v1
+                start_ref, start, _ = single_event_semantic_trial_start_v1(self,db,read,growth_proposal_ref,original_ref,single_event_qualification)
             if adopted_at_utc is not None:
                 if not validate_only:raise ValueError("historical adoption time is read-only evidence, never new trial issuance")
                 mapping,digest,now_role=self._historical_identity_clock_v3(db,read,start,adopted_at_utc)
@@ -1001,7 +1024,7 @@ class InstalledD01ProductionReadersV1:
         return self.record_input(db,frame=frame,original_ref=policy.policy_ref,
             producing_operation_id=producing_operation_id,kind=("identity_plasticity_policy_v3" if type(policy) is IdentityPlasticityPolicyV3 else "identity_trial_observation_policy_v3"),value=policy)
 
-    def _identity_clock_v3(self, db, read):
+    def _identity_clock_v3(self, db, read, *, qualification_at_utc=None):
         from .d11_role_clock_installation_v1 import read_current_role_clock_installation_v1, TABLE as CLOCK_TABLE
         from ..host.installed_d04_semantic_mapping_v3 import InstalledD04SemanticMappingReaderV3
         if type(self.role_clock_reader) is not InstalledD04SemanticMappingReaderV3:
@@ -1011,7 +1034,7 @@ class InstalledD01ProductionReadersV1:
             (*read.frame.envelope.authority.namespace.as_tuple,mapping.version)).fetchone()
         if row is None:raise MissingProductionOriginalV1("signed_deep_identity_role_clock_original")
         from datetime import datetime, timezone
-        wall=datetime.fromtimestamp(read.frame.now_utc,timezone.utc).isoformat().replace("+00:00","Z")
+        wall=datetime.fromtimestamp(read.frame.now_utc if qualification_at_utc is None else qualification_at_utc,timezone.utc).isoformat().replace("+00:00","Z")
         return mapping, row[0], mapping.character_at(wall)
 
     def _historical_identity_clock_v3(self, db, read, start, adopted_at_utc):
@@ -1036,7 +1059,10 @@ class InstalledD01ProductionReadersV1:
         wall=datetime.fromtimestamp(adopted_at_utc,timezone.utc).isoformat().replace("+00:00","Z")
         return mapping,row[1],mapping.character_at(wall)
 
-    def current_semantic_counter_scope_v3(self, db, read, intent):
+    def current_semantic_counter_scope_v3(self, db, read, intent, *, single_event_qualification=None):
+        if single_event_qualification is not None:
+            from .d01_single_event_growth_v1 import single_event_current_counter_scope_v1
+            return single_event_current_counter_scope_v1(db,read,intent,single_event_qualification,semantic=True)
         from ..domains.d01.production_operations_v1 import SemanticCounterScopeV3
         from ..domains.d07 import D07DomainProvider
         scope="d01.growth:"+intent["target_block"]+":core"
@@ -1068,7 +1094,10 @@ class InstalledD01ProductionReadersV1:
         read.committed_operation(db,history[0])
         return head
 
-    def validate_semantic_trial_scope_v3(self, db, read, planned, policy):
+    def validate_semantic_trial_scope_v3(self, db, read, planned, policy, *, single_event_qualification=None):
+        if single_event_qualification is not None:
+            from .d01_single_event_growth_v1 import single_event_trial_scope_v1
+            return single_event_trial_scope_v1(db,read,planned,policy,single_event_qualification)
         lineage={planned.key.token}
         if planned.key.type_name=="d08.action_intent.v1":
             goals=tuple(atom for atom in read.complete_inventory(db,"d08.goal.v1") if atom.valid and atom.key.name==planned.value["goal_ref"])
@@ -1196,7 +1225,7 @@ class InstalledD01ProductionReadersV1:
             producing_operation_id=producing_operation_id,kind="growth_counterevidence",value=counter),semantic_original)
 
     def qualify_semantic_growth_v3(self, db, read, request, raw, proposal, active,
-            *, trials_complete, counter_complete, counter_conflict,counter_scope):
+            *, trials_complete, counter_complete, counter_conflict,counter_scope, single_event_qualification=None):
         from ..domains.d01.identity_v3 import (SemanticIdentityRevision, SemanticIdentityRevisionRefV3,
             RuntimeIdentityRef, decode_semantic_identity_v3, encode_semantic_identity_v3)
         from ..domains.d01.production_operations_v1 import SemanticGrowthQualificationV3
@@ -1212,18 +1241,26 @@ class InstalledD01ProductionReadersV1:
         if (raw["base_head"]!=active.head_id or raw["semantic_base_revision_ref"]!=plain_v1(base_ref)
                 or raw["continuity_anchor"]!=plain_v1(base.continuity_anchor)):
             raise ValueError("deep identity exact semantic base/continuity anchor changed")
-        policy,policy_original=self._identity_policy_v3(db,read,raw["plasticity_policy_ref"],require_growth=True)
+        at = read.frame.now_utc
+        if single_event_qualification is not None:
+            from .d01_single_event_growth_v1 import single_event_qualification_now_v1
+            at = single_event_qualification_now_v1(single_event_qualification, db=db, frame=read.frame)
+        policy,policy_original=self._identity_policy_v3(db,read,raw["plasticity_policy_ref"],require_growth=True,
+            qualification_at_utc=at)
+        if single_event_qualification is not None:
+            from .d01_single_event_growth_v1 import require_single_event_qualification_v1
+            require_single_event_qualification_v1(single_event_qualification, plan=active.plan, proposal=proposal, completed=False)
         if (target.plasticity!="growth" or target.block_id not in policy.target_block_ids
                 or (base.plasticity_policy_ref,base.plasticity_policy_digest)!=(policy.policy_ref,policy_original.original_digest)
                 or raw["plasticity_policy_digest"]!=policy_original.original_digest
                 or (raw["observer_policy_ref"],raw["observer_policy_digest"])!=(policy.observer_policy_ref,policy.observer_policy_digest)
                 or tuple(raw["scope_refs"])!=policy.scope_refs or tuple(raw["exclusion_refs"])!=policy.exclusion_refs
-                or not policy.valid_from_utc<=raw["valid_from"]<=read.frame.now_utc<raw["valid_until"]<=policy.valid_until_utc
-                or len(proposal.source_families)<policy.required_independent_families
+                or not policy.valid_from_utc<=raw["valid_from"]<=at<raw["valid_until"]<=policy.valid_until_utc
+                or single_event_qualification is None and len(proposal.source_families)<policy.required_independent_families
                 or not policy.required_completed_trials<=len(request.trial_original_refs)<=policy.maximum_trials
                 or not trials_complete or not counter_complete or counter_conflict):
             raise MissingProductionOriginalV1("complete_current_deep_policy_support_counter_and_real_trials")
-        mapping,clock_digest,now_role=self._identity_clock_v3(db,read)
+        mapping,clock_digest,now_role=self._identity_clock_v3(db,read,qualification_at_utc=at)
         originals=[policy_original];trial_pairs=[];support_pairs=[]
         for ref in request.trial_original_refs:
             trial,trial_original=self._read(db,read,ref,"growth_trial")
@@ -1241,12 +1278,14 @@ class InstalledD01ProductionReadersV1:
             for outcome_ref in trial["settled_outcome_refs"]:
                 current_trial=self.derive_current_growth_trial_from_adopted_progress_v1(db,
                     frame=read.frame,producing_operation_id=None,original_ref=ref,
-                    growth_proposal_ref=request.growth_proposal_ref,settled_progress_ref=outcome_ref,validate_only=True)
+                    growth_proposal_ref=request.growth_proposal_ref,settled_progress_ref=outcome_ref,validate_only=True,
+                    single_event_qualification=single_event_qualification)
                 if plain_v1(current_trial)!=trial:
                     raise MissingProductionOriginalV1("current_actual_deep_trial_effect_source_cost_changed")
             self.validate_semantic_trial_plan_history_v3(db,read,start)
             planned=read.head(db,start["planned_progress_ref"],required=True)
-            self.validate_semantic_trial_scope_v3(db,read,planned,policy)
+            self.validate_semantic_trial_scope_v3(db,read,planned,policy,
+                single_event_qualification=single_event_qualification)
             originals.extend((start_original,trial_original));trial_pairs.append((ref,trial_original.original_digest))
         for ref in raw["evidence_source_refs"]:
             source=read.head(db,ref,required=True);support_pairs.append((ref,canonical_digest(source.value)))
@@ -1272,7 +1311,7 @@ class InstalledD01ProductionReadersV1:
             target.block_id,base.revision+1,proposal.replacement_claim,base_ref,base.legacy_origin,base.continuity_anchor,
             canonical_digest(base.claim),diff,policy.policy_ref,policy_original.original_digest,
             tuple(raw["evidence_source_refs"]),request.counterevidence_query_ref,raw["continuity_interpretation_ref"],
-            request.trial_original_refs,policy.scope_refs,policy.exclusion_refs,read.frame.now_utc,
+            request.trial_original_refs,policy.scope_refs,policy.exclusion_refs,at,
             policy.readout_valid_until_utc,"growth",adopt_before=raw["valid_until"])
         encoded=encode_semantic_identity_v3(semantic)
         qualification=SemanticGrowthQualificationV3(active.head_id,target.block_id,encoded,tuple(originals))
@@ -1410,7 +1449,13 @@ def stage_adopt_current_growth_in_transaction_v1(db, *, frame, request, installe
     if type(installed_readers) is not InstalledD01ProductionReadersV1:
         raise TypeError("installed D01 current readers required")
     try:
-        stage = compile_adopt_current_growth_v1(frame, request, installed_readers.read_growth(db, frame, request))
+        inputs=installed_readers.read_growth(db, frame, request)
+        from .current_full_persona_writer_v1 import (
+            require_bound_current_full_persona_writer_v1, require_full_persona_writer_stage_v1)
+        writer,_=require_bound_current_full_persona_writer_v1(db,frame=frame,request=request)
+        stage=compile_adopt_current_growth_v1(frame,request,inputs,
+            writer_qualification=writer,writer_request=request)
+        stage=require_full_persona_writer_stage_v1(db,frame=frame,request=request,stage=stage)
     except MissingProductionOriginalV1 as missing:
         return waiting_stage_v1(frame, "d01", "adopt_growth", request, missing)
     return verify_d01_production_stage_v1(stage)
@@ -1496,7 +1541,9 @@ def read_plan_current_d01_operation_v1(db, *, namespace, activity_id, operation_
         raise ValueError("D01 fixed read planning requires current W01 transaction")
     from ..graph_types import Owner
     keys, roots, originals = [owner_grant_key(*namespace.as_tuple)], [], []
-    types = ["d01.persona_activation.v1", "d01.persona_plan.v1", "d01.persona_revision.v1", "d01.growth_contribution.v1"]
+    types = ["d01.persona_activation.v1", "d01.persona_plan.v1"]
+    if operation_kind != "evaluate_values":
+        types.extend(("d01.persona_revision.v1", "d01.growth_contribution.v1"))
     if operation_kind == "evaluate_values" and type(request) is EvaluateCurrentValuesRequestV1:
         originals.extend((request.candidate_set_ref, request.context_ref))
         for ref, table in ((request.candidate_set_ref, TABLE), (request.context_ref, TABLE)):
@@ -1661,17 +1708,6 @@ def read_plan_current_d01_operation_v1(db, *, namespace, activity_id, operation_
                                 producer_kind="derive_growth_trial",request=DeriveCurrentGrowthTrialInputRequestV1(ref,request.growth_proposal_ref,outcome_ref))
                             types.extend(actual_plan.fixed_type_ids);keys.extend(actual_plan.exact_keys)
                             roots.extend(actual_plan.source_roots);originals.extend(actual_plan.required_original_refs)
-    if operation_kind=="evaluate_values":
-        from ..domains.d01.identity_v3 import decode_semantic_identity_v3
-        plans=db.execute("SELECT value FROM graph_atoms WHERE bot=? AND persona=? AND type_name='d01.persona_plan.v1' "
-            "AND valid=1 ORDER BY token LIMIT 129",namespace.as_tuple).fetchall()
-        if len(plans)>128:raise MissingProductionOriginalV1("bounded_current_persona_projection_inventory")
-        if any(block["kind"]=="semantic_identity" and decode_semantic_identity_v3(block["claim"]) is not None
-                for row in plans for block in json.loads(row[0])["blocks"]):
-            qualified=read_plan_current_d01_operation_v1(db,namespace=namespace,activity_id=activity_id,
-                operation_kind="project_self_model_v3",request=ProjectSelfModelRequestV3())
-            types.extend(qualified.fixed_type_ids);keys.extend(qualified.exact_keys)
-            roots.extend(qualified.source_roots);originals.extend(qualified.required_original_refs)
     return production_read_plan_v1(types, keys, roots, originals)
 
 
@@ -1805,6 +1841,8 @@ class StartSemanticGrowthTrialRequestV3:
 
 _ORIGINAL_TYPES.update({"growth_proposal_v2":GrowthIntentOriginalV2,"growth_trial_v2":GrowthTrialOriginalV2,
     "identity_plasticity_policy_v3":IdentityPlasticityPolicyV3,"identity_trial_start_v3":IdentityTrialStartV3})
+from ..domains.d01.single_event_review_case_v1 import CASE_KIND,RegisteredSingleEventReviewCaseV1
+_ORIGINAL_TYPES[CASE_KIND]=RegisteredSingleEventReviewCaseV1
 KINDS=frozenset(_ORIGINAL_TYPES)
 
 
@@ -1960,3 +1998,11 @@ _GENERAL_ORIGINAL_TYPES_V1={"general_growth_intent_v1":GeneralGrowthIntentOrigin
     "general_growth_trial_start_v1":GeneralGrowthTrialStartV1,"general_growth_trial_v1":GeneralGrowthTrialOriginalV1}
 KINDS=frozenset((*KINDS,*_GENERAL_ORIGINAL_TYPES_V1))
 _ORIGINAL_TYPES.update(_GENERAL_ORIGINAL_TYPES_V1)
+
+from ..domains.d01.single_event_growth_v1 import SINGLE_EVENT_ORIGINAL_TYPES_V1 as _SINGLE_EVENT_ORIGINAL_TYPES_V1
+KINDS = frozenset((*KINDS, *_SINGLE_EVENT_ORIGINAL_TYPES_V1))
+_ORIGINAL_TYPES.update(_SINGLE_EVENT_ORIGINAL_TYPES_V1)
+
+from ..domains.d01.ordinary_cumulative_growth_v1 import ORDINARY_CUMULATIVE_ORIGINAL_TYPES_V1 as _ORDINARY_CUMULATIVE_ORIGINAL_TYPES_V1
+KINDS = frozenset((*KINDS,*_ORDINARY_CUMULATIVE_ORIGINAL_TYPES_V1))
+_ORIGINAL_TYPES.update(_ORDINARY_CUMULATIVE_ORIGINAL_TYPES_V1)

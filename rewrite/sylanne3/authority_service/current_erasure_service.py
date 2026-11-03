@@ -91,76 +91,6 @@ class GraphBarrierAttestationV2:
             raise ValueError('complete paged Source barrier differs from actual pending')
 
 
-@dataclass(frozen=True, slots=True)
-class CleanupSurfaceReceiptV1:
-    """One non-content surface claim; its issuer still needs live verification."""
-
-    surface: str
-    operation_id: str
-    scope_digest: str
-    status: str
-    receipt_digest: str
-
-    def __post_init__(self) -> None:
-        if self.surface not in REQUIRED_CLEANUP_SURFACES:
-            raise ValueError("unknown cleanup surface")
-        identifier(self.operation_id, "operation_id")
-        if (self.status not in {"purged", "sanitized", "reset", "not_applicable"}
-                or type(self.scope_digest) is not str
-                or _DIGEST.fullmatch(self.scope_digest) is None
-                or type(self.receipt_digest) is not str
-                or _DIGEST.fullmatch(self.receipt_digest) is None):
-            raise ValueError("invalid cleanup surface claim")
-
-
-@dataclass(frozen=True, slots=True)
-class CleanupAttestationV1:
-    """Complete claim set for future verification; not a closure receipt."""
-
-    accepted_receipt: DeletionMutationReceiptV1
-    surface_receipts: tuple[CleanupSurfaceReceiptV1, ...]
-    evidence: DeletionEvidenceV1
-
-    def __post_init__(self) -> None:
-        if type(self.accepted_receipt) is not DeletionMutationReceiptV1:
-            raise TypeError("durable accepted receipt required")
-        pending = self.accepted_receipt.pending
-        if (pending.source_phase, pending.target_phase) != ("pending", "accepted"):
-            raise ValueError("cleanup requires accepted phase original")
-        if (type(self.surface_receipts) is not tuple
-                or any(type(item) is not CleanupSurfaceReceiptV1
-                       for item in self.surface_receipts)
-                or {item.surface for item in self.surface_receipts}
-                   != REQUIRED_CLEANUP_SURFACES
-                or len(self.surface_receipts) != len(REQUIRED_CLEANUP_SURFACES)):
-            raise ValueError("all unique cleanup surfaces need receipts")
-        scope = deletion_scope_digest(
-            pending.closure_roots, pending.deletion_epoch, pending.policy_ref)
-        if any((item.operation_id, item.scope_digest)
-               != (pending.deletion_operation_id, scope)
-               for item in self.surface_receipts):
-            raise ValueError("cleanup surface differs from deletion original")
-        evidence = self.evidence
-        if (type(evidence) is not DeletionEvidenceV1
-                or evidence.kind != "cleanup_complete"
-                or evidence.bound_anchor != self.accepted_receipt.after_anchor
-                or evidence.authority_id != pending.permit.authority_id
-                or evidence.namespace != pending.permit.namespace
-                or evidence.deletion_operation_id != pending.deletion_operation_id
-                or evidence.request_digest != pending.request_digest
-                or evidence.scope_digest != scope
-                or evidence.deletion_epoch != pending.deletion_epoch):
-            raise ValueError("cleanup claim differs from accepted original")
-
-
-MISSING_PORTS = (
-    "product D12 admission for the pinned Owner erasure plan",
-    "pinned cumulative C09 Graph application verifier and product admission",
-    "issuer-owned inventory and independently verified receipts for every cleanup surface",
-    "ScopedErasureV2 content readiness and historical migration qualification",
-)
-
-
 class CurrentErasureAuthority:
     """Internal consumer of an original pending recovery, never a success facade."""
 
@@ -438,10 +368,6 @@ class CurrentErasureAuthority:
         return "c09-" + kind + "-" + uuid.uuid5(
             uuid.NAMESPACE_URL, namespace + ":" + operation_id + ":" + kind).hex
 
-    def _prepare_unbound_for_storage_test(self, **kwargs):
-        """Controlled storage mechanics only; this is never product admission."""
-        return self._prepare_bound_request(
-            **kwargs, plan=None, replay_issuer="authority-owner-session-v1")
 
     def _prepare_bound_request(self, *, credential, subject: str, holder: str,
                                installation_id: str, owner_actor_id: str,
@@ -746,6 +672,5 @@ class CurrentErasureAuthority:
 
 __all__ = [
     "CurrentErasureAuthority", "GraphBarrierAttestationV1",
-    "CleanupSurfaceReceiptV1", "CleanupAttestationV1",
-    "REQUIRED_CLEANUP_SURFACES", "MISSING_PORTS",
+    "REQUIRED_CLEANUP_SURFACES",
 ]

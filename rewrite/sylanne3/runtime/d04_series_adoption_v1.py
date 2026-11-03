@@ -2,9 +2,9 @@
 from dataclasses import asdict, replace
 from contextlib import contextmanager
 import json
-import logging
 import time
 
+from ..diagnostic_channel_v1 import diagnostic_channel_v1
 from ..runtime_contracts import canonical_digest, canonical_serialize
 from ..graph_types import AtomKey, GraphWrite, GraphVersion
 from ..native_runtime.d04_series_math_v1 import D04SeriesChunkMathV1, verify_d04_series_chunk_math_v1
@@ -22,7 +22,7 @@ from .d04_joint_advance_v2 import (ProductAdvanceEvidenceV2, ProductAdvanceMembe
     preflight_joint_advance_v2, preflight_joint_numeric_original_v1, record_joint_advance_v2, record_joint_numeric_original_v1)
 from .d04_joint_output_original_store_v1 import record_d04_joint_output_original_v1, record_d04_joint_output_closure_v1
 
-_LOG = logging.getLogger(__name__)
+_LOG = diagnostic_channel_v1(__name__)
 
 
 class _AdoptionTimings:

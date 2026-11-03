@@ -140,8 +140,10 @@ def validate_catalogue_upgrade_core_row_v1(columns, row):
         raise AuthorityUnavailable('catalogue Core original cannot be classified') from exc
 
 
-def require_selected_catalogue_target_in_tx_v1(db, lifecycle):
+def require_selected_catalogue_target_in_tx_v1(db, lifecycle, *, inspection_workflow_phase=None):
     """A completed conversion does not permit restarting its old source package."""
+    from .source_inspection_migration_v1 import require_no_pending_source_inspection_migration_in_tx_v1
+    require_no_pending_source_inspection_migration_in_tx_v1(db, lifecycle.namespace,lifecycle=lifecycle,inspection_workflow_phase=inspection_workflow_phase)
     require_no_pending_catalogue_upgrade_in_tx_v1(db, lifecycle.namespace)
     if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (TABLE,)).fetchone():
         return
@@ -310,7 +312,9 @@ class InstalledGraphCatalogueUpgradeV1:
             return self._reply(receipt, selected, cohort)
 
     def _admit(self, db, context, storage, pause_id, actor, token, request):
+        from .source_inspection_migration_v1 import require_no_pending_source_inspection_migration_in_tx_v1
         lifecycle = self.lifecycle
+        require_no_pending_source_inspection_migration_in_tx_v1(db, lifecycle.namespace,lifecycle=lifecycle)
         pause = lifecycle._operation(db, pause_id)
         head = read_lifecycle_head_in_tx_v1(db, lifecycle.namespace)
         guard = lifecycle._owner_still_current(db, pause)

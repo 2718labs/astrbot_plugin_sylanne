@@ -76,7 +76,7 @@ def _body_lineage(db, token, start_revision, current_revision, kind):
     return values
 
 
-def stage_historical_c04_cost_in_transaction_v1(db, namespace, evidence, *, resource_issuer, body_authority):
+def stage_historical_c04_cost_in_transaction_v1(db, namespace, evidence, *, resource_issuer, body_authority, accounting_inputs=None):
     if (not db.in_transaction or type(namespace) is not NamespaceId
             or type(evidence) is not HistoricalInternalCostEvidenceV1):
         raise C04CostHold("installed historical accounting transaction required")
@@ -84,6 +84,16 @@ def stage_historical_c04_cost_in_transaction_v1(db, namespace, evidence, *, reso
     prepared = read_c04_internal_work_prepared_v1(db, namespace, operation_id)
     if prepared is None or prepared.binding != binding:
         raise C04CostHold("original C04 preparation differs")
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_accounting_inputs_v3 import C04BodyAccountingInputsV3
+        if type(accounting_inputs)is not C04BodyAccountingInputsV3:
+            raise C04CostHold("historical Body accounting needs its actual independent two-token EOF packet")
+        accounting_inputs.require_v3(db,namespace=namespace,evidence=evidence,prepared=prepared).consume_v3()
+    def completed(stage):
+        if accounting_inputs is None:return stage
+        from .c04_body_accounting_inputs_v3 import register_c04_body_accounting_stage_v3
+        return register_c04_body_accounting_stage_v3(accounting_inputs,stage)
     quote = resource_issuer.original_signed_quote(db, binding.resource_quote_ref, binding.resource_quote_version)
     if (canonical_digest(quote) != binding.resource_quote_digest
             or quote.work_kind != "d06.c04_internal_cpu.v1"
@@ -133,18 +143,27 @@ def stage_historical_c04_cost_in_transaction_v1(db, namespace, evidence, *, reso
     if body_original is not None:
         if body_original.binding_digest != binding.binding_digest or body_original.proof_digest != evidence.proof_digest:
             raise C04CostHold("historical body original conflicts")
-        return HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), body_original, None)
-    state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                          (prepared.body_state_ref, *namespace.as_tuple)).fetchone()
-    reservation_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                          (binding.body_reservation_ref, *namespace.as_tuple)).fetchone()
+        return completed(HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), body_original, None))
+    if accounting_inputs is None:
+        state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                              (prepared.body_state_ref, *namespace.as_tuple)).fetchone()
+        reservation_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                              (binding.body_reservation_ref, *namespace.as_tuple)).fetchone()
+    else:
+        state_member,reservation_member=accounting_inputs.current_rows_v3()
+        state_row=None if state_member is None else(state_member[1],state_member[3],state_member[2])
+        reservation_row=None if reservation_member is None else(reservation_member[1],reservation_member[3],reservation_member[2])
     if state_row is None or reservation_row is None or state_row[2] != 1 or reservation_row[2] != 1:
-        return HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), None, "target_erased")
+        return completed(HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), None, "target_erased"))
     try:
-        state = BodyState(**json.loads(state_row[1]))
-        reserved = BodyReservation(**json.loads(reservation_row[1]))
-        _body_lineage(db, prepared.body_state_ref, prepared.body_state_revision, state_row[0], BodyState)
-        _body_lineage(db, binding.body_reservation_ref, prepared.body_reservation_revision, reservation_row[0], BodyReservation)
+        state = state_row[1] if accounting_inputs is not None else BodyState(**json.loads(state_row[1]))
+        reserved = reservation_row[1] if accounting_inputs is not None else BodyReservation(**json.loads(reservation_row[1]))
+        if accounting_inputs is None:
+            _body_lineage(db, prepared.body_state_ref, prepared.body_state_revision, state_row[0], BodyState)
+            _body_lineage(db, binding.body_reservation_ref, prepared.body_reservation_revision, reservation_row[0], BodyReservation)
+        else:
+            accounting_inputs.require_lineages_v3()
+
         body_quote = body_authority.original_body_quote(db, binding.body_quote_ref,
             binding.body_quote_version, quote, operation_id)
         if (canonical_digest(body_quote) != binding.body_quote_digest
@@ -178,13 +197,13 @@ def stage_historical_c04_cost_in_transaction_v1(db, namespace, evidence, *, reso
             row = db.execute("SELECT revision FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
             reads.append(GraphVersion(write.key, row[0] if row else 0))
         writes.extend(body_writes)
-        return HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), body_original, None)
+        return completed(HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), body_original, None))
     except (C04CostHold, TypeError, ValueError) as exc:
-        return HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), None,
-                                       "unpaid_requires_reconciliation:" + type(exc).__name__)
+        return completed(HistoricalC04CostStageV1(cpu, tuple(writes), tuple(reads), None,
+                                       "unpaid_requires_reconciliation:" + type(exc).__name__))
 
 
-def record_historical_c04_body_after_cas_v1(db, stage):
+def record_historical_c04_body_after_cas_v1(db, stage, *, receipt=None):
     if not db.in_transaction:
         raise C04CostHold("historical body original requires same graph CAS")
     original = stage.body_original
@@ -195,10 +214,15 @@ def record_historical_c04_body_after_cas_v1(db, stage):
         if prior != original:
             raise C04CostHold("historical body original replay conflicts")
         return prior
-    for write in stage.writes:
-        row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
-        if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
-            raise C04CostHold("historical body graph CAS missing")
+    from ..runtime_storage_v3 import runtime_storage_v3
+    if runtime_storage_v3(db)is not None:
+        from .c04_body_accounting_inputs_v3 import require_c04_body_accounting_after_cas_v3
+        require_c04_body_accounting_after_cas_v3(db,stage,receipt)
+    else:
+        for write in stage.writes:
+            row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (write.key.token,)).fetchone()
+            if row is None or row[1] != 1 or json.loads(row[0]) != write.value:
+                raise C04CostHold("historical body graph CAS missing")
     db.execute("INSERT INTO d02_c04_body_cost_originals_v1 VALUES(?,?,?,?,?)",
         (*original.namespace.as_tuple, original.operation_id, canonical_serialize(asdict(original)), canonical_digest(asdict(original))))
     return original

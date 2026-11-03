@@ -46,7 +46,8 @@ TABLE = "graph_d07_execution_originals_v1"
 SIGN_KIND = "d07.execution-original.v1"
 KINDS = frozenset({"prepared", "prepare_commit", "request", "call", "result_attempt", "result", "paid_cost",
     "partial_cost", "body_cost", "execution", "adopted", "simulation_request", "simulation_budget", "reflection_request", "reflection_continuation", "general_growth_attention_v1", "accounting_prepared", "semantic_question", "budget_allocation", "budget_closed"})
-KINDS = KINDS | frozenset({'joint_external_semantic_basis_v1'})
+KINDS = KINDS | frozenset({'joint_external_semantic_basis_v1','ordinary_continuity_attention_v1',
+    'ordinary_continuity_adoption_v1','single_event_review_attention_v1','single_event_review_adoption_v1','single_event_review_cardinality_rejected_v1'})
 
 
 def install_d07_execution_schema_v1(db):
@@ -86,6 +87,9 @@ def record_d07_original_in_transaction_v1(db, issuer, namespace, kind, ref, payl
 
 
 def read_d07_original_v1(db, issuer, namespace, kind, ref):
+    from .d07_single_event_review_v1 import read_bound_single_event_review_interpretation_original_v1
+    review,original=read_bound_single_event_review_interpretation_original_v1(db,issuer,namespace,kind,ref)
+    if review:return original
     from .d07_source_preparation_members_v3 import read_bound_d07_source_preparation_original_v3
     handled,original=read_bound_d07_source_preparation_original_v3(db,issuer,namespace,kind,ref)
     if handled:return original
@@ -605,7 +609,7 @@ class D07SemanticTargetOriginalV1:
     read_versions: tuple[GraphVersion, ...]
 
     def __post_init__(self):
-        if (self.kind not in {"graph_head", "d08_joint_plan_intent"} or type(self.original_ref) is not str
+        if (self.kind not in {"graph_head", "d08_joint_plan_intent", "single_event_review_case_v1"} or type(self.original_ref) is not str
                 or not self.original_ref or type(self.revision) is not int or self.revision < 1
                 or canonical_digest(background_json_loads_v3(self.value_json)) != self.original_digest
                 or canonical_serialize(background_json_loads_v3(self.value_json)) != self.value_json
@@ -616,7 +620,7 @@ class D07SemanticTargetOriginalV1:
         for ref in self.source_refs:
             if AtomKey.from_token(ref).type_name != "memory.source":
                 raise ValueError("D07 semantic target requires actual D06 sources")
-        if any(type(v) is not GraphVersion or v.revision < 1 for v in self.read_versions):
+        if any(type(v) is not GraphVersion or v.revision < (0 if self.kind=="single_event_review_case_v1"else 1) for v in self.read_versions):
             raise ValueError("D07 semantic target current read versions differ")
 
 
@@ -653,6 +657,9 @@ def read_d07_joint_plan_semantic_target_v1(db, issuer, namespace, target_ref):
 
 
 def resolve_current_d07_semantic_target_v1(db, issuer, frame, question):
+    from .d07_single_event_review_v1 import resolve_current_single_event_review_target_v1
+    if question.target_ref.ref.startswith("single-event-review-case:"):
+        return resolve_current_single_event_review_target_v1(db,frame=frame,question=question,issuer=issuer)
     try:
         key = AtomKey.from_token(question.target_ref.ref)
     except (ValueError, TypeError):
@@ -681,6 +688,10 @@ def read_current_d07_semantic_question_v1(db, issuer, namespace, ref):
     if row is None:
         return None
     raw = row[0]
+    if raw.get("schema")=="d07.ordinary-continuity-question.v1":
+        from .d07_ordinary_continuity_attention_v1 import D07OrdinaryContinuityQuestionV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        return decode_typed_production_value_v1(raw,D07OrdinaryContinuityQuestionV1)
     if raw.get("schema")=="d07.artifact-phase-observation-question.v1":
         from .artifact_phase_observation_v1 import ArtifactPhaseObservationQuestionV1
         from .domain_production_erasure_v1 import decode_typed_production_value_v1
@@ -733,6 +744,14 @@ def read_prepared_d07_execution_v1(db, issuer, namespace, job_id):
         from .artifact_phase_observation_execution_v1 import artifact_observation_prepared_from_wire_v3
         value=artifact_observation_prepared_from_wire_v3(row[0])
         thaw_d07_cognition_request_v1(background_json_loads_v3(value.frozen_json))
+    elif raw.get("schema") == "d07.single-event-review-prepared.v1":
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        value=decode_typed_production_value_v1(row[0],D07SingleEventReviewPreparedV1)
+    elif raw.get("schema") == "d07.ordinary-continuity-prepared.v1":
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        value=decode_typed_production_value_v1(row[0],D07OrdinaryContinuityPreparedV1)
     elif raw.get("schema") == "d07.general-growth-prepared.v1":
         from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1
         from ..model_broker.general_growth_cognition_v1 import thaw_general_growth_cognition_request_v1
@@ -841,6 +860,18 @@ def _source_input(frame, roots):
 
 def freeze_current_d07_stage_v1(frame, stage, workflow, installation_id):
     """Derive the model's question and sources from actual installed stage data."""
+    target=stage.provenance.get("semantic_target")
+    if type(target)is D07SemanticTargetOriginalV1 and target.kind=="single_event_review_case_v1":
+        from .d07_single_event_review_v1 import freeze_current_single_event_review_stage_v1
+        return freeze_current_single_event_review_stage_v1(frame,stage,workflow,installation_id)
+    from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityQuestionV1,
+        freeze_current_ordinary_continuity_stage_v1)
+    if type(stage.provenance.get("semantic_question"))is D07OrdinaryContinuityQuestionV1:
+        return freeze_current_ordinary_continuity_stage_v1(frame,stage,workflow,installation_id)
+    from .d07_general_growth_attention_v1 import D07GeneralGrowthQuestionV1
+    if type(stage.provenance.get("semantic_question"))is D07GeneralGrowthQuestionV1:
+        from .d07_general_growth_execution_v1 import freeze_current_general_growth_stage_v1
+        return freeze_current_general_growth_stage_v1(frame,stage,workflow,installation_id)
     if stage.status != "queued" or stage.envelope != frame.envelope or workflow.work_kind != WORK_KIND:
         raise ValueError("D07 actual queued current stage/workflow required")
     if stage.work_kind == "concern":
@@ -984,7 +1015,7 @@ def _prepare_d07_resources_in_transaction_v1(db, *, frame, ids, work_kind, froze
     quoted_envelope = replace(envelope, version_guard=replace(envelope.version_guard,
         resource_lease_versions=(VersionedRef(quote.quote_id, quote.version),)))
     body = body_authority.issue_fixed_quote_and_reservation(db, resource_issuer, quoted_envelope, quote,
-        body_policy_id, body_policy_version, state, tuple(reservations), ids["reservation"], identity.effect_id)
+        body_policy_id, body_policy_version, state, tuple(reservations), ids["reservation"], identity.effect_id, now_utc=frame.now_utc)
     if body.replayed:
         raise ValueError("D07 orphan prior body quote cannot authorize a new execution")
     reservation_digest = canonical_digest({"schema": "d07.execution-reservation.v1", "frozen": frozen,
@@ -1190,7 +1221,11 @@ def verify_current_d07_preparation_stage_v1(db, preparation, service):
             raise ValueError('observation preparation changed its actual current basis before CAS')
     workflow = service._configured(prepared)
     frozen = freeze_current_d07_stage_v1(frame, stage, workflow, service.bundle.installation_policy.installation_id)
-    if canonical_serialize(asdict(frozen)) != prepared.frozen_json or stage.input_digest != prepared.stage_input_digest:
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1
+    from ..domains.d01.production_operations_v1 import plain_v1
+    from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1
+    frozen_wire=plain_v1(frozen)if type(prepared)in {D07OrdinaryContinuityPreparedV1,D07SingleEventReviewPreparedV1} else asdict(frozen)
+    if canonical_serialize(frozen_wire) != prepared.frozen_json or stage.input_digest != prepared.stage_input_digest:
         raise ValueError("D07 exact current source/choice/model wire changed before preparation CAS")
     if stage.work_kind == "concern":
         from .d07_current_behavior_v1 import advance_current_concerns_v1, D07ConcernInputsV1
@@ -1199,10 +1234,15 @@ def verify_current_d07_preparation_stage_v1(db, preparation, service):
             D07ConcernInputsV1(frame.snapshot, provenance["tickets"], provenance["policy"],
                 provenance["issuance_originals"], provenance["trigger"], frame.now_utc, provenance["focus_epoch"]))
         if (checked.proposal.typed_writes != stage.proposal.typed_writes or checked.input_digest != stage.input_digest
-                or checked.provenance != {k: v for k, v in stage.provenance.items() if k not in {"semantic_question", "semantic_target", "artifact_observation_basis"}}
+                or checked.provenance != {k: v for k, v in stage.provenance.items() if k not in {"semantic_question", "semantic_target", "artifact_observation_basis", "ordinary_continuity_basis"}}
                 or checked.status != "queued"):
             raise ValueError("D07 installed pure fair choice differs from actual preparation")
-        if "semantic_question" in stage.provenance and resolve_current_d07_semantic_target_v1(db, service.d11_issuer,
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1,current_ordinary_continuity_basis_for_d07_v1
+        if type(prepared)is D07OrdinaryContinuityPreparedV1:
+            actual=current_ordinary_continuity_basis_for_d07_v1(service,db,frame,stage.provenance["semantic_question"])
+            if actual.basis!=stage.provenance["ordinary_continuity_basis"].basis:
+                raise ValueError("ordinary continuity current basis changed before actual preparation CAS")
+        elif "semantic_question" in stage.provenance and resolve_current_d07_semantic_target_v1(db, service.d11_issuer,
                 frame, stage.provenance["semantic_question"]) != stage.provenance["semantic_target"]:
             raise ValueError("D07 signed semantic target differs before exact preparation CAS")
     elif stage.work_kind == "reflection":
@@ -1293,7 +1333,12 @@ def read_registered_simulation_request_v1(db, issuer, namespace, ref):
 
 def seal_d07_request_in_transaction_v1(db, issuer, prepared, request):
     from .d07_general_growth_execution_v1 import D07GeneralGrowthPreparedV1,thaw_current_general_growth_prepared_request_v1
-    if type(prepared)is D07GeneralGrowthPreparedV1:
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityPreparedV1,thaw_current_ordinary_continuity_prepared_request_v1
+    if type(prepared)is D07OrdinaryContinuityPreparedV1:
+        from ..model_broker.ordinary_continuity_cognition_v1 import ordinary_continuity_template_digest_v1
+        frozen=thaw_current_ordinary_continuity_prepared_request_v1(prepared)
+        template_digest=ordinary_continuity_template_digest_v1(prepared.phase)
+    elif type(prepared)is D07GeneralGrowthPreparedV1:
         from ..model_broker.general_growth_cognition_v1 import TEMPLATE_DIGEST as GENERAL_TEMPLATE_DIGEST
         frozen=thaw_current_general_growth_prepared_request_v1(prepared)
         template_digest=GENERAL_TEMPLATE_DIGEST
@@ -1385,8 +1430,14 @@ def stage_actual_d07_interpretation_writes_v1(db, *, prepared, issuer, envelope)
     require_current_d07_content_reads_v1(db, prepared, issuer=issuer)
     from .d07_general_growth_execution_v1 import (D07GeneralGrowthPreparedV1,
         thaw_current_general_growth_prepared_request_v1,parse_current_general_growth_output_v1)
+    from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityPreparedV1,
+        thaw_current_ordinary_continuity_prepared_request_v1,parse_current_ordinary_continuity_output_v1)
+    from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1,parse_current_single_event_review_output_v1
+    case_review=type(prepared)is D07SingleEventReviewPreparedV1
+    ordinary=type(prepared)is D07OrdinaryContinuityPreparedV1
     general=type(prepared)is D07GeneralGrowthPreparedV1
-    frozen=(thaw_current_general_growth_prepared_request_v1(prepared)if general
+    frozen=(thaw_current_ordinary_continuity_prepared_request_v1(prepared)if ordinary else
+        thaw_current_general_growth_prepared_request_v1(prepared)if general
         else thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json)))
     if frozen.input.work_kind == "simulation":
         return (), ()  # Branches already preserve hypothetical eligibility.
@@ -1399,9 +1450,11 @@ def stage_actual_d07_interpretation_writes_v1(db, *, prepared, issuer, envelope)
     text = background_json_loads_v3(result.observation.result_json)
     if set(text) != {"text"}:
         raise ValueError("D07 semantic candidate result is not original model text")
-    suggestion=(parse_current_general_growth_output_v1(prepared,text["text"],frozen)if general
+    suggestion=(parse_current_ordinary_continuity_output_v1(prepared,text["text"],frozen)if ordinary else
+        parse_current_single_event_review_output_v1(prepared,text["text"],frozen)if case_review else
+        parse_current_general_growth_output_v1(prepared,text["text"],frozen)if general
         else parse_d07_cognition_output_v1(text["text"], frozen))
-    source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general else frozen.input.sources
+    source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general or ordinary else frozen.input.sources
     sources={source.source_ref.ref:source.record for source in source_inputs}
     writes, reads = [], []
     for index, finding in enumerate(suggestion.findings):
@@ -1625,11 +1678,31 @@ def record_d07_body_cost_after_cas_v1(db, *, prepared, issuer, writes, original)
     return record_d07_original_in_transaction_v1(db, issuer, prepared.namespace, "body_cost", prepared.job_id, original)
 
 
+def require_actual_d07_execution_wall_deadline_v1(prepared, result_read, job, *, deadline_utc=None):
+    """Compare the authenticated model wall timing with its original UTC deadline."""
+    from ..authority_service.d07_current_execution_v1 import D07CognitionResultReadV1
+    if type(result_read) is not D07CognitionResultReadV1:
+        raise TypeError("D07 wall deadline requires the actual signed scoped result")
+    request = result_read.request
+    if ((request.namespace, request.job_id, request.call_id, request.original_operation_id, request.binding_digest)
+            != (prepared.namespace, prepared.job_id, prepared.call_id, prepared.operation_id, prepared.digest)
+            or (job.bot_id, job.persona_id, job.job_id, job.operation_id, job.activity_id, job.effect_id)
+            != (*prepared.namespace.as_tuple, prepared.job_id, prepared.operation_id, prepared.activity_id, prepared.effect_id)):
+        raise ValueError("D07 wall timing lost its exact original prepared execution/job")
+    original_deadline = datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp()
+    limit = original_deadline if deadline_utc is None else min(original_deadline, deadline_utc)
+    if result_read.timing.ended_at > limit:
+        raise ValueError("D07 actual model wall end exceeded its original UTC deadline")
+    return result_read
+
+
 def build_actual_ingress_recall_execution_v1(db, *, prepared, result_read, paid, issuer):
     """Pure terminal projection from the genuine scoped read, paid cost and role clock."""
     from ..model_broker.d07_cognition_v1 import parse_d07_ingress_recall_output_v1
     if type(prepared) is not D07IngressRecallPreparedV1 or not db.in_transaction:
         raise ValueError("Self C3 terminal projection requires its current exact prepared original")
+    actual_job = get_job(db, prepared.job_id)
+    require_actual_d07_execution_wall_deadline_v1(prepared, result_read, actual_job)
     frozen = thaw_d07_ingress_recall_request_v1(background_json_loads_v3(prepared.frozen_json))
     response = background_json_loads_v3(result_read.observation.result_json)
     if set(response) != {"text"} or type(response["text"]) is not str:
@@ -1649,7 +1722,7 @@ def build_actual_ingress_recall_execution_v1(db, *, prepared, result_read, paid,
         prepared.operation_id, prepared.activity_id, prepared.effect_id, prepared.attempt_id,
         prepared.execution_id, prepared.digest, prepared.stage_input_digest, suggestion.output_digest,
         prepared.need_ref, prepared.need_digest, prepared.c02_operation_id, prepared.cycle_job_ref,
-        start, end, mapping.mapping_id, str(mapping.version), get_job(db, prepared.job_id).budget_ref,
+        start, end, mapping.mapping_id, str(mapping.version), actual_job.budget_ref,
         (paid["cost_ref"],), sources, prepared.activation_generation)
     return execution, suggestion
 
@@ -1661,11 +1734,13 @@ def stage_d07_execution_original_in_transaction_v1(db, *, prepared, issuer, hold
     body = read_d07_original_v1(db, issuer, prepared.namespace, "body_cost", prepared.job_id)
     if paid is None or body is None or not paid[0]["paid"] or body[0]["unpaid_cost"]:
         raise ValueError("D07 result cannot be adopted before actual computation/body settlement")
+    result = read_d07_original_v1(db, issuer, prepared.namespace, "result", paid[0]["result_ref"])
+    read = from_wire(result[0], D07CognitionResultReadV1)
+    actual_job = get_job(db, prepared.job_id)
+    require_actual_d07_execution_wall_deadline_v1(prepared, read, actual_job)
     prior = read_d07_original_v1(db, issuer, prepared.namespace, "execution", "d07-terminal:" + prepared.call_id)
     if prior is not None:
         return decode_d07_execution_original_v1(prior[0]), ()
-    result = read_d07_original_v1(db, issuer, prepared.namespace, "result", paid[0]["result_ref"])
-    read = from_wire(result[0], D07CognitionResultReadV1)
     terminal_ref = "d07-terminal:" + prepared.call_id
     if type(prepared) is D07IngressRecallPreparedV1:
         execution, _ = build_actual_ingress_recall_execution_v1(db, prepared=prepared,
@@ -1673,15 +1748,23 @@ def stage_d07_execution_original_in_transaction_v1(db, *, prepared, issuer, hold
     else:
         from .d07_general_growth_execution_v1 import (D07GeneralGrowthPreparedV1,
             thaw_current_general_growth_prepared_request_v1,parse_current_general_growth_output_v1)
+        from .d07_ordinary_continuity_cognition_v1 import (D07OrdinaryContinuityPreparedV1,
+            thaw_current_ordinary_continuity_prepared_request_v1,parse_current_ordinary_continuity_output_v1)
+        from .d07_single_event_review_v1 import D07SingleEventReviewPreparedV1,parse_current_single_event_review_output_v1
+        case_review=type(prepared)is D07SingleEventReviewPreparedV1
+        ordinary=type(prepared)is D07OrdinaryContinuityPreparedV1
         general=type(prepared)is D07GeneralGrowthPreparedV1
-        frozen=(thaw_current_general_growth_prepared_request_v1(prepared)if general
+        frozen=(thaw_current_ordinary_continuity_prepared_request_v1(prepared)if ordinary else
+            thaw_current_general_growth_prepared_request_v1(prepared)if general
             else thaw_d07_cognition_request_v1(background_json_loads_v3(prepared.frozen_json)))
         response = background_json_loads_v3(read.observation.result_json)
         if set(response) != {"text"} or type(response["text"]) is not str:
             raise ValueError("D07 provider exact text response required")
-        suggestion=(parse_current_general_growth_output_v1(prepared,response["text"],frozen)if general
+        suggestion=(parse_current_ordinary_continuity_output_v1(prepared,response["text"],frozen)if ordinary else
+            parse_current_single_event_review_output_v1(prepared,response["text"],frozen)if case_review else
+            parse_current_general_growth_output_v1(prepared,response["text"],frozen)if general
             else parse_d07_cognition_output_v1(response["text"], frozen))
-        source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general else frozen.input.sources
+        source_inputs=(*frozen.input.context_sources,*frozen.input.support_sources)if general or ordinary else frozen.input.sources
         causal_depth=prepared.stage_causal_depth if general else frozen.input.causal_depth
         mapping = _clock_from_json(prepared.clock_mapping_json)
         if _clock_original(db, issuer, prepared.namespace, mapping) != prepared.clock_original_digest:
@@ -1689,19 +1772,34 @@ def stage_d07_execution_original_in_transaction_v1(db, *, prepared, issuer, hold
         start_wall, end_wall = read.timing.started_at, read.timing.ended_at
         start = float(mapping.character_at(datetime.fromtimestamp(start_wall, timezone.utc).isoformat().replace("+00:00", "Z")))
         end = float(mapping.character_at(datetime.fromtimestamp(end_wall, timezone.utc).isoformat().replace("+00:00", "Z")))
-        execution = D07ExecutionOriginalV1(terminal_ref, prepared.operation_id, prepared.activity_id,
+        if ordinary:
+            from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityExecutionOriginalV1
+            execution_type=D07OrdinaryContinuityExecutionOriginalV1
+            phase_fields={"phase":prepared.phase,"basis_original":prepared.basis_original,
+                "question_original":frozen.input.question_original,"trigger_assessment_original":prepared.trigger_assessment_original,
+                "causal_parent_executions":prepared.causal_parent_executions,"review_step":prepared.review_step}
+        else:
+            execution_type=D07ExecutionOriginalV1;phase_fields={}
+        execution = execution_type(terminal_ref, prepared.operation_id, prepared.activity_id,
             prepared.effect_id, prepared.attempt_id, prepared.execution_id, prepared.stage_input_digest,
             suggestion.output_digest, prepared.work_kind, start, end, mapping.mapping_id, str(mapping.version),
-            get_job(db, prepared.job_id).budget_ref, (paid[0]["cost_ref"],),
+            actual_job.budget_ref, (paid[0]["cost_ref"],),
             tuple(s.source_ref.ref for s in source_inputs), prepared.activation_generation,
-            suggestion.resolved_slots, suggestion.discriminating_refs, suggestion.predictions, causal_depth)
-    record_d07_original_in_transaction_v1(db, issuer, prepared.namespace, "execution", terminal_ref, asdict(execution))
+            suggestion.resolved_slots, suggestion.discriminating_refs, suggestion.predictions, causal_depth,**phase_fields)
+    from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityExecutionOriginalV1
+    from ..domains.d01.production_operations_v1 import plain_v1
+    execution_wire=plain_v1(execution)if type(execution)is D07OrdinaryContinuityExecutionOriginalV1 else asdict(execution)
+    record_d07_original_in_transaction_v1(db, issuer, prepared.namespace, "execution", terminal_ref, execution_wire)
     job = transition_job(db, prepared.job_id, holder, fence, target_phase="completed", result_ref=terminal_ref)
     return execution, (job_graph_write(job),)
 
 
 def decode_d07_execution_original_v1(raw):
     data = dict(raw)
+    if data.get("schema")=="d07.ordinary-continuity-execution.v1":
+        from .d07_ordinary_continuity_cognition_v1 import D07OrdinaryContinuityExecutionOriginalV1
+        from .domain_production_erasure_v1 import decode_typed_production_value_v1
+        return decode_typed_production_value_v1(data,D07OrdinaryContinuityExecutionOriginalV1)
     if data.get("schema") == "d07.ingress-recall-execution.v1":
         from dataclasses import fields
         if set(data) != {field.name for field in fields(D07IngressRecallExecutionOriginalV1)}:
@@ -1890,3 +1988,44 @@ def decode_native_named_d07_head_v2(raw, *, namespace, c02_operation_id, head_ki
     else:
         raise ValueError("unregistered named D07 native head field")
     return GraphVersion(key,raw["revision"])
+
+
+def verify_d07_adoption_receipt_metadata_v1(db,*,prepared,interpretation,adopted,point):
+    """Pure validation of already authenticated exact metadata; does not issue a read capability."""
+    from .domain_production_originals_v1 import TABLE,_receipt,reconstruct_graph_bundle_commit_receipt_v1
+    from .domain_background_read_v3 import background_json_loads_v3,background_typed_original_digest_v3
+    from ..graph_store import GraphStore
+    from ..graph_types import GraphReceipt,NamespaceEpoch
+    ns=prepared.namespace;op=prepared.operation_id
+    business=point(TABLE,("domain","operation_kind","original_digest","bundle_digest","receipt_json","receipt_digest"),
+        ("bot","persona","operation_id"),(*ns.as_tuple,op))
+    if business is None or business[:2]!=("d07","serve_concern"):
+        raise MissingProductionOriginalV1("single_event_review_actual_business_commit_receipt")
+    committed=_receipt(background_json_loads_v3(business[4]))
+    bundle=point("graph_bundle_operations",("digest","activity_id","effect_id","commit_seq","receipt_json"),
+        ("bot","persona","operation_id"),(*ns.as_tuple,op))
+    event=point("graph_events",("reads","revisions","invalidated","epoch_revision"),
+        ("bot","persona","session","event_id"),(*ns.as_tuple,prepared.activity_id,op))
+    history=point("graph_history",("event_bot","event_persona","event_session","event_id","valid"),
+        ("token","revision"),(interpretation.key.token,interpretation.revision))
+    if bundle is None or event is None:
+        raise MissingProductionOriginalV1("single_event_review_actual_bundle_event_receipt")
+    graph_receipt=GraphReceipt("committed",GraphStore._version_rows(event[1]),GraphStore._version_rows(event[2]),
+        NamespaceEpoch(*ns.as_tuple,event[3]))
+    raw=background_json_loads_v3(bundle[4])
+    version=GraphVersion(interpretation.key,interpretation.revision)
+    if(set(raw)!={"schema","status","commit_seq","phase","prepared_digest","graph_receipt_digest"}
+            or raw["schema"]!="d07.actual-graph-stage.v1"or raw["status"]!="committed"
+            or raw["phase"]!="behavior_adopted"or raw["prepared_digest"]!=prepared.digest
+            or raw["commit_seq"]!=bundle[3]or raw["graph_receipt_digest"]!=adopted["graph_receipt_digest"]
+            or canonical_digest(graph_receipt)!=adopted["graph_receipt_digest"]or version not in graph_receipt.revisions
+            or history!=(*ns.as_tuple,prepared.activity_id,op,1)
+            or (committed.status,committed.operation_id,committed.activity_id,committed.effect_id)!=
+                ("committed",op,prepared.activity_id,prepared.effect_id)
+            or bundle[:4]!=(committed.operation_digest,committed.activity_id,committed.effect_id,committed.commit_seq)
+            or business[3]!=committed.operation_digest
+            or background_typed_original_digest_v3(db,business[4],committed)!=business[5]
+            or reconstruct_graph_bundle_commit_receipt_v1(ns,op,(*bundle[:4],business[4]),
+                (event[0],event[1],event[3]))!=committed):
+        raise ValueError("review adoption lost its exact Graph receipt and distinct formal business receipt")
+    return graph_receipt,committed

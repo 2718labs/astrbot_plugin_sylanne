@@ -78,15 +78,21 @@ def recover_natural_dispatch_candidate_in_transaction_v2(
             or data.get("status") != "natural_paid_review_current_hold"
             or type(data.get("refs")) is not list or len(data["refs"]) != 4):
         raise NaturalDispatchCurrentHold("durable natural dispatch candidate is invalid")
-    event = db.execute(
-        "SELECT revisions,epoch_revision,reads FROM graph_events WHERE bot=? "
-        "AND persona=? AND session=? AND event_id=?",
-        namespace.as_tuple + (row[0], operation_id),
-    ).fetchone()
-    if event is None or event[1] != data.get("graph_epoch"):
+    if prepared_history is None:
+        event = db.execute(
+            "SELECT revisions,epoch_revision,reads FROM graph_events WHERE bot=? "
+            "AND persona=? AND session=? AND event_id=?",
+            namespace.as_tuple + (row[0], operation_id),
+        ).fetchone()
+        if event is None:
+            raise NaturalDispatchCurrentHold("natural dispatch graph event is absent")
+        event_reads, event_revisions, event_epoch = (
+            GraphStore._version_rows(event[2]), GraphStore._version_rows(event[0]), event[1])
+    else:
+        event_reads, event_revisions, event_epoch = prepared_history.event_v3(db,namespace,row[0],operation_id)
+    if event_epoch != data.get("graph_epoch"):
         raise NaturalDispatchCurrentHold("natural dispatch graph event is absent")
-    revisions = {item.key.token: item.revision
-                 for item in GraphStore._version_rows(event[0])}
+    revisions = {item.key.token: item.revision for item in event_revisions}
     types = ("d08.action_intent.v1", "d08.action_schema.v1",
              "d08.communication_intent_grant.v1", NATURAL_BATCH_SCHEMA_V2)
     writes = []
@@ -122,7 +128,7 @@ def recover_natural_dispatch_candidate_in_transaction_v2(
         raise NaturalDispatchCurrentHold("natural dispatch operation differs")
     evidence = validate_dispatch_candidate_writes(
         tuple(writes), namespace=namespace, identity=action.identity,
-        read_versions=GraphStore._version_rows(event[2]),
+        read_versions=event_reads,
         source_refs=tuple(data.get("source_refs", ())),
         access_epoch=data.get("access_epoch"),
         delete_epoch=data.get("delete_epoch"),
@@ -164,7 +170,8 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
     ).fetchone() else None
     if row is None:
         return None
-    receipt = load_admission(db, namespace, row[0])
+    receipt = load_admission(db, namespace, row[0], prepared_admission=(
+        None if prepared_inventory is None else prepared_inventory.admission_originals))
     recovered = recover_natural_dispatch_candidate_in_transaction_v2(
         db, namespace, request.operation_id,
         prepared_history=None if prepared_inventory is None else prepared_inventory.natural_history)
@@ -205,7 +212,7 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
         NaturalDispatchClaimHold, require_natural_action_uncancelled_v3,
     )
     try:
-        require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch)
+        require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch,prepared_inventory=prepared_inventory)
     except NaturalDispatchClaimHold as exc:
         raise NaturalDispatchCurrentHold(str(exc)) from exc
     segment = batch["segment"]
@@ -259,7 +266,8 @@ def read_current_natural_dispatch_segment_in_transaction_v2(
                evidence.generation_original_operation_id):
         raise NaturalDispatchCurrentHold("natural paid generation original differs")
     try:
-        proof = read_original_scoped_query_proof_v2(db, original)
+        proof = read_original_scoped_query_proof_v2(db, original,prepared_scope=(
+                None if prepared_inventory is None else prepared_inventory.natural_scope_original))
         assert_natural_scoped_query_current_v2(
             db, proof, now_utc=now_utc,prepared_inventory=prepared_inventory)
     except (NaturalScopedQueryHold, ValueError) as exc:

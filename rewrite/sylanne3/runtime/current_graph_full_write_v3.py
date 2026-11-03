@@ -98,12 +98,16 @@ class _FullReadWriteCaptureV3:
         self.outer_transaction=object();self._savepoint_name=None;self._staged_candidate=None
         self._writer_active=False;self._facts=None;self._before_heads=None;self._before_stamp=None
         self._prepared=None;self._active_candidate=None;self.closed=False;self._used=False
-        _CAPTURES[self]=(base,graph,self.store,self.db,self.namespace,self.work,self.operation,scope,capability,candidate,phase,self.outer_transaction)
+        from .d08_commitment_communication_v1 import named_promise_use_metadata_key_v1
+        self.named_promise_use_key=named_promise_use_metadata_key_v1(self.db,self.namespace,candidate)
+        self.auxiliary_types=(_AUXILIARY_METADATA_ONLY_TYPES_V3 if self.named_promise_use_key is None else
+            _AUXILIARY_METADATA_ONLY_TYPES_V3|frozenset({self.named_promise_use_key.type_name}))
+        _CAPTURES[self]=(base,graph,self.store,self.db,self.namespace,self.work,self.operation,scope,capability,candidate,phase,self.outer_transaction,self.named_promise_use_key,self.auxiliary_types)
     @property
     def provisional_proof(self):return self._facts if self.phase=='provisional' else None
     def _actual_v3(self):
         if self.closed or _CAPTURES.get(self)!=(self.base,self.graph,self.store,self.db,self.namespace,self.work,self.operation,
-                self.writer_scope,self.capability,self.candidate,self.phase,self.outer_transaction):
+                self.writer_scope,self.capability,self.candidate,self.phase,self.outer_transaction,self.named_promise_use_key,self.auxiliary_types):
             raise AuthorityUnavailable('actual originating FULL writer capture changed or ended')
         self.base._actual()
         self.store._require_recovery_capability(self.capability)
@@ -123,8 +127,11 @@ class _FullReadWriteCaptureV3:
         if key.owner.bot!=self.namespace.bot_id or key.owner.persona!=self.namespace.persona_id:
             raise AuthorityUnavailable('FULL writer delta crosses its original namespace')
         if (key.type_name in _SOURCE_AUTHORITY_TYPES_V3 or key.type_name not in
-                self.base.projection._types|_AUXILIARY_METADATA_ONLY_TYPES_V3):
+                self.base.projection._types|self.auxiliary_types):
             raise AuthorityUnavailable('FULL delta affects Source/Owner or an unprepared graph type')
+        from ..domains.d08.commitment_communication_v1 import USE_TYPES
+        if key.type_name in USE_TYPES and key!=self.named_promise_use_key:
+            raise AuthorityUnavailable('FULL named metadata delta names another PromiseUse key')
     def _begin_savepoint_v3(self,store,business_candidate,staged,name,capability):
         self._actual_v3()
         if (store is not self.store or business_candidate is not self.candidate or capability is not self.capability
@@ -187,10 +194,11 @@ class _FullReadWriteCaptureV3:
                         or valid and header[0]!='canonical-json.ascii.v1' or not valid and header[0] not in CODECS):
                     raise AuthorityUnavailable('actual FULL writer cell seal/codec is absent or differs')
                 origin=meter.read_fixed_row(db,'runtime_cell_origins_v3',_ORIGIN_COLUMNS,'origin_digest=?',(header[7],))
-                metadata_only=key.type_name in _AUXILIARY_METADATA_ONLY_TYPES_V3 and key.type_name not in self.base.projection._types
+                metadata_only=key.type_name in self.auxiliary_types and key.type_name not in self.base.projection._types
                 payload=None
                 if valid:
-                    authority=self.operation.handle.selected.basis.control
+                    from ..runtime_storage_v3 import runtime_source_identity_v4
+                    authority=runtime_source_identity_v4(self.operation.handle,meter=meter).control
                     if (origin is None or origin[:3]!=(header[7],self.operation.selection_digest,'graph')
                             or origin[3:5]!=(authority.authority_id,authority.installation_id)
                             or origin[8]!=canonical_serialize(dict(table='graph_atoms',token=key.token,revision=version.revision))
@@ -212,7 +220,7 @@ class _FullReadWriteCaptureV3:
         event=self._active_candidate.event
         facts=_ActualFullWriteFactsV3(self.base,self.graph,self.store,db,self.namespace,self.work,self.operation,self.writer_scope,
             self.phase,self._savepoint_name,self.outer_transaction,event.scope,event.event_id,prepared[5],self._before_stamp,after,
-            receipt,tuple(rows),authority_heads[0],authority_heads[1],self)
+            receipt,tuple(rows),authority_heads[0],authority_heads[1],self,auxiliary_metadata_only_types=self.auxiliary_types)
         _FACTS[facts]=facts._identity_v3()
         self._facts=facts
         if self.phase=='applied_transaction':
@@ -260,9 +268,14 @@ def begin_full_read_write_capture_v3(base_proof,*,graph,actual_write_scope,capab
             or phase=='provisional' and candidate.epochs!=(base_proof.graph_stamp[1],)
             or phase=='applied_transaction' and candidate.epochs not in((),(base_proof.graph_stamp[1],))):
         raise AuthorityUnavailable('actual FULL capture scope/candidate belongs to another write transaction')
-    if phase=='provisional' and (len(candidate.writes)!=4 or {write.key.type_name for write in candidate.writes}!=_PROVISIONAL_TYPES_V3
-            or any(write.key.owner.kind!='activity' or write.key.owner.subject!=candidate.event.scope.session for write in candidate.writes)):
-        raise AuthorityUnavailable('provisional FULL capture requires the actual fixed four D08 activity writes')
+    if phase=='provisional':
+        from .d08_commitment_communication_v1 import named_promise_use_metadata_key_v1
+        named_key=named_promise_use_metadata_key_v1(store._db,base_proof.namespace,candidate)
+        ordinary=tuple(write for write in candidate.writes if write.key!=named_key)
+        if (len(ordinary)!=4 or {write.key.type_name for write in ordinary}!=_PROVISIONAL_TYPES_V3
+                or len(candidate.writes)!=(4 if named_key is None else 5)
+                or any(write.key.owner.kind!='activity' or write.key.owner.subject!=candidate.event.scope.session for write in ordinary)):
+            raise AuthorityUnavailable('provisional FULL requires exact D08 activity writes and its independently bound named Use')
     capture=_FullReadWriteCaptureV3(_ISSUER,base_proof,graph,scope,capability,candidate,phase)
     for write in candidate.writes:capture._supported_key_v3(write.key)
     return capture

@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 
 from ..contracts import EventConflict, StaleRead
+from ..authority_service.contract import AuthorityUnavailable
 from ..authority_service.v2_execution_bridge import CurrentEffectReadV2
 from ..dispatch_runtime import DispatchBlocked, DispatchRequest, HandoffUncertain
 from ..graph_coordinator import UnavailableGuard
@@ -52,10 +53,30 @@ class OriginalNaturalReplyDispatchV2:
 
 
 @dataclass(frozen=True, slots=True)
-class NaturalReplyDispatchResultV2:
+class NaturalReplyDispatchOriginalSummaryV3:
+    namespace: NamespaceId
+    operation_id: str
+    effect_id: str
+    admission_ref: str
+    admission_digest: str
+    outbox_ref: str
+    request_digest: str
+    payload_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class NaturalReplyDispatchResultV3:
     status: str
     reason: str
-    original: OriginalNaturalReplyDispatchV2 | None = None
+    original_summary: NaturalReplyDispatchOriginalSummaryV3 | None = None
+
+
+def _dispatch_result_v3(status, reason, original=None):
+    summary = None if original is None else NaturalReplyDispatchOriginalSummaryV3(
+        original.namespace, original.operation_id, original.effect_id,
+        original.admission_ref, original.admission_digest, original.outbox_ref,
+        canonical_digest(original.request), original.request.payload_digest)
+    return NaturalReplyDispatchResultV3(status, reason, summary)
 
 
 def _read_original(graph, authority, lease, operation_id: str) -> OriginalNaturalReplyDispatchV2:
@@ -63,6 +84,22 @@ def _read_original(graph, authority, lease, operation_id: str) -> OriginalNatura
     if not callable(read):
         raise NaturalReplyDispatchHold("committed natural V2 read is unavailable")
     result = read(authority, lease, operation_id)
+    from ..graph_worker import GraphStorageWorkV3
+    if type(result) is GraphStorageWorkV3:
+        def ready(actual):
+            from ..runtime.natural_dispatch_initial_read_v1 import _NaturalInitialResultV1
+            if type(actual) is not _NaturalInitialResultV1:
+                raise NaturalReplyDispatchHold("actual initial Natural READ terminal required")
+            value, _, _ = actual.require_value_v1()
+            return _original_from_committed_read_v3(graph, authority, lease, operation_id,
+                value, prepared_result=actual)
+        def failed(error):
+            raise error
+        return result.map_terminal_v3("service", ready, failed)
+    return _original_from_committed_read_v3(graph, authority, lease, operation_id, result)
+
+
+def _original_from_committed_read_v3(graph, authority, lease, operation_id, result, *, prepared_result=None):
     if (type(result) is not tuple or len(result) != 4
             or type(result[0]) is not DispatchAdmissionReceiptV1
             or type(result[1]) is not DispatchRequest
@@ -92,7 +129,12 @@ def _read_original(graph, authority, lease, operation_id: str) -> OriginalNatura
             or request.proactive_contact
             or not _is_private_route(frozen.account_ref, frozen.destination_ref)):
         raise NaturalReplyDispatchHold("natural original admission or private route differs")
-    payload = NaturalGraphTextPayloadResolver(graph, authority, lease).resolve(request)
+    if prepared_result is None:
+        payload = NaturalGraphTextPayloadResolver(graph, authority, lease).resolve(request)
+    else:
+        from .astrbot_dispatch import resolved_natural_text_payload_v3
+        _, segment, retained_operation = prepared_result.require_value_v1()
+        payload = resolved_natural_text_payload_v3(request, segment, operation=retained_operation)
     return OriginalNaturalReplyDispatchV2(
         namespace, operation_id, request.effect_id, frozen.admission_ref,
         frozen.digest, operation.outbox_refs[0], request, admission,
@@ -174,11 +216,6 @@ class InstalledNaturalReplyContinuationV2:
                 or await asyncio.to_thread(lambda: self._port.installation_grant)
                    != self._grant):
             raise NaturalReplyDispatchHold("installed natural Authority grant differs")
-        payload = await self._worker.call(lambda graph:
-            NaturalGraphTextPayloadResolver(graph, self._authority, self._lease)
-            .resolve(request))
-        if type(payload) is not ResolvedTextPayload or payload != original.payload:
-            raise NaturalReplyDispatchHold("natural original text changed before P2")
         clock = await asyncio.to_thread(self._port.read_ingress_clock,
                                         self._clock_policy)
         now_utc = trusted_upper(clock)
@@ -208,47 +245,67 @@ class InstalledNaturalReplyContinuationV2:
         async with prepare_dispatch_inventory_on_worker_v3(self._worker,self._authority,self._lease,
                 binding=binding,admission=original.admission,request=request,permit=permit,
                 now_utc=now_utc,dispatch_family="natural_reply") as prepared_inventory:
-            prepared, _ = await asyncio.to_thread(
-                self._port.execution_prepare,
-                namespace=namespace, authority_namespace=authority_namespace,
-                permit=permit, mutation_id="dispatch:" + identity,
-                footprint=footprint)
-            claimed, _ = await asyncio.to_thread(
-                self._port.execution_claim_v2,
-                namespace=namespace, authority_namespace=authority_namespace,
-                prepared_receipt=prepared, binding=binding)
-            handoff_id = "handoff:" + identity
-            claim_writer = await self._worker.call(lambda graph:
-                self._claim_writer.prepare_natural_for_handoff(
-                    graph, claimed, handoff_id, original.operation_id, prepared_inventory=prepared_inventory))
-            if not callable(claim_writer):
-                raise NaturalReplyDispatchHold("natural final graph claim unavailable")
-            handoff = await asyncio.to_thread(
-                InstalledCurrentDispatchHandoffPort,
-                fence_port=self._port, policy=self._policy, grant=self._grant,
-                claimed_receipt=claimed)
-            sender = AstrBotV2TextSender(
-                context=self._context, candidates=self._candidates,
-                resolver=_FrozenNaturalTextResolver(request, payload),
-                authority=handoff, clock_policy=self._clock_policy,
-                record_observation=handoff.record_observation, local_module_admission=self._local_module_admission)
+            def read_prepared_payload(graph):
+                from ..runtime_storage_v3 import bind_runtime_storage_operation_v3
+                if prepared_inventory is None:
+                    return NaturalGraphTextPayloadResolver(
+                        graph, self._authority, self._lease).resolve(request)
+                with bind_runtime_storage_operation_v3(
+                        prepared_inventory.operation, prepared_inventory.db):
+                    return NaturalGraphTextPayloadResolver(
+                        graph, self._authority, self._lease,
+                        prepared_inventory=prepared_inventory).resolve(request)
 
-            async def begin(receipt, handoff_id):
-                return await asyncio.to_thread(
-                    self._port.execution_begin_handoff_v2,
+            payload = sender = None
+            try:
+                payload = await self._worker.call(read_prepared_payload)
+                if type(payload) is not ResolvedTextPayload or payload != original.payload:
+                    raise NaturalReplyDispatchHold("natural original text changed before P2")
+                prepared, _ = await asyncio.to_thread(
+                    self._port.execution_prepare,
                     namespace=namespace, authority_namespace=authority_namespace,
-                    claimed_receipt=receipt, handoff_id=handoff_id)
+                    permit=permit, mutation_id="dispatch:" + identity,
+                    footprint=footprint)
+                claimed, _ = await asyncio.to_thread(
+                    self._port.execution_claim_v2,
+                    namespace=namespace, authority_namespace=authority_namespace,
+                    prepared_receipt=prepared, binding=binding)
+                handoff_id = "handoff:" + identity
+                claim_writer = await self._worker.call(lambda graph:
+                    self._claim_writer.prepare_natural_for_handoff(
+                        graph, claimed, handoff_id, original.operation_id, prepared_inventory=prepared_inventory))
+                if not callable(claim_writer):
+                    raise NaturalReplyDispatchHold("natural final graph claim unavailable")
+                handoff = await asyncio.to_thread(
+                    InstalledCurrentDispatchHandoffPort,
+                    fence_port=self._port, policy=self._policy, grant=self._grant,
+                    claimed_receipt=claimed)
+                sender = AstrBotV2TextSender(
+                    context=self._context, candidates=self._candidates,
+                    resolver=_FrozenNaturalTextResolver(request, payload),
+                    authority=handoff, clock_policy=self._clock_policy,
+                    record_observation=handoff.record_observation, local_module_admission=self._local_module_admission)
 
-            async with begin_handoff_with_reverse_claim(
-                worker=self._worker, server=self._server, claimed=claimed,
-                handoff_id=handoff_id, claim_writer=claim_writer, begin=begin,
-            ) as decision:
-                if decision.replay:
-                    return "replay"
-                observation = await sender.send(
-                    decision=decision, binding=binding,
-                    claimed_receipt=claimed, request=request)
-            return observation.outcome
+                async def begin(receipt, handoff_id):
+                    return await asyncio.to_thread(
+                        self._port.execution_begin_handoff_v2,
+                        namespace=namespace, authority_namespace=authority_namespace,
+                        claimed_receipt=receipt, handoff_id=handoff_id)
+
+                async with begin_handoff_with_reverse_claim(
+                    worker=self._worker, server=self._server, claimed=claimed,
+                    handoff_id=handoff_id, claim_writer=claim_writer, begin=begin,
+                ) as decision:
+                    if decision.replay:
+                        return "replay"
+                    observation = await sender.send(
+                        decision=decision, binding=binding,
+                        claimed_receipt=claimed, request=request)
+                return observation.outcome
+            finally:
+                # Drop the sender resolver and its outgoing Body before the
+                # enclosing actual inventory Owned lease is released.
+                sender = payload = None
 
 
 class NaturalReplyDispatchDriverV2:
@@ -268,48 +325,57 @@ class NaturalReplyDispatchDriverV2:
         self._continuation = continuation
 
     async def run_once(self, *, operation_id: str,
-                       fresh_dispatch: bool = False) -> NaturalReplyDispatchResultV2:
-        if type(operation_id) is not str or not operation_id:
-            return NaturalReplyDispatchResultV2("hold", "original operation required")
-        try:
-            original = await self._worker.call(
-                _read_original, self._authority, self._lease, operation_id)
-        except (NaturalReplyDispatchHold, DispatchBlocked, UnavailableGuard, EventConflict,
-                StaleRead, ValueError, TypeError) as exc:
-            return NaturalReplyDispatchResultV2("hold", str(exc))
-        if self._continuation is None:
-            return NaturalReplyDispatchResultV2(
-                "hold", "installed natural final graph claim unavailable", original)
-        try:
-            effect = await self._continuation.read_recovery_state(original)
-            if effect.state == "observed":
-                return NaturalReplyDispatchResultV2(
-                    "hold", "original effect already observed; no platform retry", original)
-            if effect.state == "unresolved":
-                return NaturalReplyDispatchResultV2(
-                    "unknown", "original effect unresolved; independent observation authorization required", original)
-            if not fresh_dispatch:
-                return NaturalReplyDispatchResultV2(
-                    "hold", "recovery read only; no automatic send of an absent original effect", original)
-            outcome = await self._continuation.dispatch(original)
-        except asyncio.CancelledError:
-            return NaturalReplyDispatchResultV2(
-                "unknown", "local interruption cannot prove platform cancellation; original effect retained", original)
-        except (HandoffUncertain, V2FenceOutcomeUnknown) as exc:
-            return NaturalReplyDispatchResultV2("unknown", str(exc), original)
-        except Exception as exc:
-            return NaturalReplyDispatchResultV2("hold", str(exc), original)
-        if outcome == "replay":
-            return NaturalReplyDispatchResultV2(
-                "hold", "durable handoff replay; no platform retry", original)
-        return NaturalReplyDispatchResultV2(
-            outcome, ("OneBot adapter accepted; delivery unobserved"
-                      if outcome == "accepted" else
-                      "platform outcome unknown after durable start"), original)
+                       fresh_dispatch: bool = False) -> NaturalReplyDispatchResultV3:
+        from ..graph_worker import retained_graph_calls_v3
+        with retained_graph_calls_v3(self._worker) as graph_call:
+            original = None
+            try:
+                if type(operation_id) is not str or not operation_id:
+                    return _dispatch_result_v3("hold", "original operation required")
+                try:
+                    original = await graph_call(
+                        lambda graph: _read_original(graph, self._authority, self._lease, operation_id),
+                        slot="original_natural_dispatch")
+                except (NaturalReplyDispatchHold, DispatchBlocked, AuthorityUnavailable, UnavailableGuard, EventConflict,
+                        StaleRead, ValueError, TypeError) as exc:
+                    return _dispatch_result_v3("hold", str(exc))
+                if self._continuation is None:
+                    return _dispatch_result_v3(
+                        "hold", "installed natural final graph claim unavailable", original)
+                try:
+                    effect = await self._continuation.read_recovery_state(original)
+                    if effect.state == "observed":
+                        return _dispatch_result_v3(
+                            "hold", "original effect already observed; no platform retry", original)
+                    if effect.state == "unresolved":
+                        return _dispatch_result_v3(
+                            "unknown", "original effect unresolved; independent observation authorization required", original)
+                    if not fresh_dispatch:
+                        return _dispatch_result_v3(
+                            "hold", "recovery read only; no automatic send of an absent original effect", original)
+                    outcome = await self._continuation.dispatch(original)
+                except asyncio.CancelledError:
+                    return _dispatch_result_v3(
+                        "unknown", "local interruption cannot prove platform cancellation; original effect retained", original)
+                except (HandoffUncertain, V2FenceOutcomeUnknown) as exc:
+                    return _dispatch_result_v3("unknown", str(exc), original)
+                except Exception as exc:
+                    return _dispatch_result_v3("hold", str(exc), original)
+                if outcome == "replay":
+                    return _dispatch_result_v3(
+                        "hold", "durable handoff replay; no platform retry", original)
+                return _dispatch_result_v3(
+                    outcome, ("OneBot adapter accepted; delivery unobserved"
+                              if outcome == "accepted" else
+                              "platform outcome unknown after durable start"), original)
+            finally:
+                # Drop the business DTO before releasing its same Owned lease.
+                original = None
 
 
 __all__ = (
     "InstalledNaturalReplyContinuationV2", "NaturalReplyDispatchDriverV2",
-    "NaturalReplyDispatchHold", "NaturalReplyDispatchResultV2",
+    "NaturalReplyDispatchHold", "NaturalReplyDispatchResultV3",
+    "NaturalReplyDispatchOriginalSummaryV3",
     "OriginalNaturalReplyDispatchV2",
 )

@@ -64,11 +64,11 @@ def test_admin_mutation_and_reader_current_are_separate_mtls_capabilities(tmp_pa
     wire = _wire()
 
     def paired(peer, channel):
-        return server._dispatch_for_test(
+        return server.dispatch(
             "handshake", wire, peer, channel)["channel_binding_sha256"]
 
     def call(method, peer, channel, binding, command):
-        return server._dispatch_for_test(
+        return server.dispatch(
             method, wire, peer, channel,
             handshake_binding=binding, command=command)
 

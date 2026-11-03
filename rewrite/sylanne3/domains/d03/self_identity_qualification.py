@@ -11,11 +11,11 @@ from typing import Protocol
 from ...authority_service.v2_contract import FencePermitV2
 from ...authority_service.v2_owner_contract import OwnerAuthorizationGuardV1
 from ...authority_service.v2_self_identity_contract import AuthorityCurrentSelfIdentityV1
-from ...domains.d01 import ActiveRoleQualification
+from ...domains.d01 import ActiveRoleQualification, ActiveRoleHeadControlV3
 from ...graph_types import AtomKey, GraphAtom, Owner
 from ...installation_policy import AdminInstallationPolicy
 from ...runtime_contracts import InstallationGrantV2, NamespaceId, canonical_digest
-from .self_perspective import SelfIdentityMapping
+from .self_perspective import SelfIdentityMapping, _self_role_plan_identity_v3
 
 
 class AuthorityCurrentSelfIdentityPort(Protocol):
@@ -70,7 +70,7 @@ def self_identity_mapping_from_current(
 
 def qualify_authority_current_self_identity(
     *,
-    role: ActiveRoleQualification,
+    role: ActiveRoleQualification | ActiveRoleHeadControlV3,
     activation_atom: GraphAtom,
     policy: AdminInstallationPolicy,
     installation_grant: InstallationGrantV2,
@@ -91,20 +91,21 @@ def qualify_authority_current_self_identity(
     """
     if port is None or not callable(getattr(port, "current_self_identity", None)):
         raise ValueError("current Authority self identity port is unavailable")
-    if (type(role) is not ActiveRoleQualification or type(activation_atom) is not GraphAtom
+    if (type(role) not in (ActiveRoleQualification, ActiveRoleHeadControlV3) or type(activation_atom) is not GraphAtom
             or type(policy) is not AdminInstallationPolicy
             or type(installation_grant) is not InstallationGrantV2
             or type(owner_guard) is not OwnerAuthorizationGuardV1
             or type(permit) is not FencePermitV2
             or type(request_operation_id) is not str or not request_operation_id):
         raise TypeError("current D01, installation, Authority, Owner, and fence proofs are required")
+    plan_namespace,plan_head=_self_role_plan_identity_v3(role)
     namespace = role.namespace
     activation_key = AtomKey(Owner("persona", *namespace.as_tuple),
                              "d01.persona_activation.v1", "current")
     versions = {item.key: item.revision for item in role.read_versions}
     activation = activation_atom.value
-    if (policy.namespace != namespace or role.plan.namespace != namespace
-            or role.head_id != role.plan.head_id
+    if (policy.namespace != namespace or plan_namespace != namespace
+            or role.head_id != plan_head
             or activation_atom.key != activation_key or not activation_atom.valid
             or versions.get(activation_key) != activation_atom.revision
             or activation.get("head_id") != role.head_id
@@ -124,6 +125,10 @@ def qualify_authority_current_self_identity(
             or owner_guard.pending_revoke_operation_id is not None
             or owner_guard.minimum_revocation_revision >= owner_guard.authorization_revision):
         raise ValueError("current installed persona or Owner proof differs")
+    if type(role)is ActiveRoleHeadControlV3 and (activation.get('plan_id')!=role.plan_key.name
+            or activation.get('plan_version')!=role.plan_version
+            or activation.get('authorization_revision')!=role.authorization_revision):
+        raise ValueError('current D01 head control differs from actual activation plan/version')
     try:
         current = port.current_self_identity(
             namespace=namespace, authority_namespace=policy.authority_namespace,

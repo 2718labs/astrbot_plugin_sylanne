@@ -51,6 +51,9 @@ class InstalledD13DerivedPaidBlockVerifierV2(InstalledD13PaidBlockVerifierV1):
         handled,row=read_bound_authority_graph_attachment_v3(self._db,table='graph_atoms',columns=('value','valid'),
             key_columns=('token',),key=(key.token,))
         if not handled:
+            from ..runtime.graph_d13_cache_use_collection_v2 import read_bound_graph_d13_metadata_v2
+            handled,row=read_bound_graph_d13_metadata_v2(self._db,candidate.block_ref)
+        if not handled:
             row = self._db.execute('SELECT value,valid FROM graph_atoms WHERE token=?',(key.token,)).fetchone()
         if row is None or row[1]!=1:
             return None

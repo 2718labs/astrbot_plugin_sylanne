@@ -318,3 +318,48 @@ def test_deleted_original_quote_is_hold_even_with_accounting_grant(tmp_path):
         assert len(accounting.started) == len(accounting.finished) == 1
     finally:
         store.close()
+
+
+def test_natural_reported_usage_reaches_real_cost_and_foreground_consumers_once(tmp_path):
+    from sylanne3.graph_coordinator import EventConflict
+    from sylanne3.runtime.foreground_cycle_v1 import _read_reply_model_cost_closed_v1
+    from sylanne3.runtime.jobs import PersistentJob
+
+    store, coordinator, bootstrap, namespace, intent, accounting = _case(
+        tmp_path, work_kind="natural_generation")
+    try:
+        record, permit, admission, terminal = accounting.fact
+        record = replace(record, usage=(("cached_input_tokens", 10), ("input_tokens", 50), ("output_tokens", 90)))
+        original_fact = (record, permit, admission, terminal)
+        accounting.fact = original_fact
+        coordinator._GraphCoordinator__model_terminal_cost_port = lambda _intent: original_fact
+        result = coordinator.commit_natural_generation_model_cost_v2(
+            bootstrap, namespace, intent, quote_id="quote", quote_version=1)
+        assert result.status == "committed"
+        row = store._db.execute("SELECT receipt_json FROM graph_bundle_operations WHERE operation_id=?",
+            (result.operation_id,)).fetchone()
+        raw = json.loads(row[0])
+        usage = raw["model_reported_usage_v1"]
+        assert (usage["input_tokens"], usage["cached_input_tokens"], usage["output_tokens"]) == (50, 10, 90)
+        assert usage["budget_receipt_digest"] == result.budget_receipt_digest
+        assert usage["total_billed_microusd"] is None
+        job = PersistentJob("job", "original", "activity", None, "bot", "persona", "snapshot", "completed",
+            "natural_generation", {}, None, "1970-01-01T00:01:40Z", "lease", "resource", {}, None, None, 1, 0, {}, "result")
+        assert _read_reply_model_cost_closed_v1(store._db, namespace=namespace, job=job,
+            call_id=intent.call_id, quote_id="quote", reservation_digest=intent.budget_reservation_digest,
+            terminal_digest=canonical_digest(asdict(terminal))) is True
+        spent = get_budget_lease(store._db, "lease")
+        duplicate = coordinator.commit_natural_generation_model_cost_v2(
+            bootstrap, namespace, intent, quote_id="quote", quote_version=1)
+        assert duplicate.status == "duplicate"
+        assert get_budget_lease(store._db, "lease") == spent
+        coordinator._GraphCoordinator__model_terminal_cost_port = lambda _intent: (
+            replace(record, usage=(("input_tokens", 51), ("output_tokens", 90))), permit, admission, terminal)
+        with pytest.raises(EventConflict, match="original reported usage differs"):
+            coordinator.commit_natural_generation_model_cost_v2(
+                bootstrap, namespace, intent, quote_id="quote", quote_version=1)
+        assert get_budget_lease(store._db, "lease") == spent
+        assert store._db.execute("SELECT COUNT(*) FROM graph_atoms WHERE type_name='runtime.cost_settlement'").fetchone() == (1,)
+        assert len(accounting.started) == 1
+    finally:
+        store.close()

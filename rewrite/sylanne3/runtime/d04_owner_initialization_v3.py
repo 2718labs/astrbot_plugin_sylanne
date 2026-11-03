@@ -14,7 +14,7 @@ from uuid import UUID
 from ..contracts import Event, Scope, canonical_json
 from ..graph_store import GraphStore, ProductionGraphStore
 from ..graph_types import AtomKey, GraphCandidate, GraphVersion, GraphWrite, owner_grant_key
-from ..runtime_contracts import AuthorityContext, canonical_digest, canonical_serialize
+from ..runtime_contracts import AuthorityContext, NamespaceId, canonical_digest, canonical_serialize
 from ..domains.d12.types import (
     ActiveSchemeHeadV1, CharacterDraft, active_scheme_head_key, character_draft_key,
 )
@@ -61,19 +61,6 @@ def _installation(c, authority):
     return assembly, preset
 
 
-def _row(db, store, key, *, optional=False):
-    row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (key.token,)).fetchone()
-    if row is None and optional:
-        return None
-    if row is None or row[0] < 1 or row[2] != 1:
-        raise ValueError("current Owner root prerequisite is absent or invalid")
-    value = json.loads(row[1])
-    if canonical_json(value) != row[1]:
-        raise ValueError("Owner root prerequisite is not canonical")
-    store._registry.validate(key, value)
-    return row[0], value
-
-
 def _commit_graph(c, db, metadata, epoch, now, operation_id, activity, request_digest, reads, writes):
     store, cap = c._GraphCoordinator__store, c._GraphCoordinator__graph_capability
     candidate = GraphCandidate(Event(Scope(*metadata.requirements.namespace.as_tuple, activity),
@@ -91,6 +78,27 @@ def _commit_graph(c, db, metadata, epoch, now, operation_id, activity, request_d
         "invalidated": [], "epoch": asdict(receipt.epoch)}
 
 
+def _prepare_creator_root_write_v3(c,authority,lease,*,operation_id,request_digest,command_kind,
+        domains,capability,allow_missing,commit):
+    from .d12_creator_draft_read_v3 import(prepare_current_creator_draft_read_v3,
+        consume_current_creator_draft_read_v3)
+    work=prepare_current_creator_draft_read_v3(c,authority,lease,consumer='d04_root_initialization',
+        draft_ref=character_draft_key(authority.namespace).token,required_capability=capability,
+        allow_missing=allow_missing,command_kind=command_kind,command_operation_id=operation_id,
+        command_input_digest=request_digest)
+    def complete(value):
+        prepared=consume_current_creator_draft_read_v3(value,graph=c,work=work,
+            consumer='d04_root_initialization',command_operation_id=operation_id,command_input_digest=request_digest)
+        def write(db,metadata,epoch,now,owner,scope):
+            return commit(prepared,db,metadata,epoch,now,owner,scope)
+        from ..runtime_storage_v3 import bind_runtime_storage_operation_v3
+        with bind_runtime_storage_operation_v3(prepared.reader.operation,prepared.reader.db):
+            return c._owner_domain_write_v3(authority,lease,operation_id=operation_id,request_digest=request_digest,
+                domains=domains,capability=capability,commit=write,creator_draft_prepare=prepared,creator_command_kind=command_kind)
+    def failed(error):raise error
+    return work.map_terminal_v3('issuer',complete,failed)
+
+
 def initialize_current_d04_root_draft_v3(c, authority, lease, *, operation_id, root_field: dict):
     """Add one installed root choice without discarding existing D12 fields.
 
@@ -106,24 +114,25 @@ def initialize_current_d04_root_draft_v3(c, authority, lease, *, operation_id, r
     namespace, store = authority.namespace, c._GraphCoordinator__store
     request_digest = canonical_digest((DRAFT_SCHEMA, namespace, operation_id, field))
 
-    def commit(db, metadata, epoch, now, owner, scope):
+    def commit(creator,db,metadata,epoch,now,owner,scope):
         from ..domains.d04.authored_lineage_v3 import AuthoredRootInputV3, compile_authored_root_candidate_v3
         _assembly, preset = _installation(c, authority)
         draft_key, head_key = character_draft_key(namespace), active_scheme_head_key(namespace)
-        previous = _row(db, store, draft_key, optional=True)
-        previous_head = _row(db, store, head_key, optional=True)
-        if (previous is None) != (previous_head is None):
-            raise ValueError("D12 current draft/head is only partly initialized")
+        from .d12_creator_draft_read_v3 import require_current_creator_draft_write_v3
+        creator=require_current_creator_draft_write_v3(creator,c,authority,lease,consumer='d04_root_initialization',
+            command_operation_id=operation_id,command_input_digest=request_digest,db=db,scope=scope,current_owner=owner)
+        draft_atom,head_atom=creator.draft_atom,creator.head_atom
+        previous=None if draft_atom.revision==0 else(draft_atom.revision,draft_atom.value)
+        previous_head=None if head_atom.revision==0 else(head_atom.revision,head_atom.value)
         if previous is None:
             draft = CharacterDraft(namespace.persona_id, 1, {ROOT_FIELD: field}, {ROOT_FIELD: "owner"})
         else:
             raw = dict(previous[1]); raw.pop("schema")
             prior = CharacterDraft(**raw)
-            head_raw = dict(previous_head[1]); head_raw.pop("schema")
-            head = ActiveSchemeHeadV1(**head_raw)
+            head=creator.head
             if (prior.scope != namespace.persona_id or prior.revision != previous[0]
-                    or head.scope != namespace.persona_id or head.generation != previous_head[0]
-                    or head.draft_ref != draft_key.token):
+                    or head is not None and(head.scope != namespace.persona_id
+                        or head.generation != previous_head[0]or head.draft_ref != draft_key.token)):
                 raise ValueError("D12 current draft/head identity differs")
             if ROOT_FIELD in prior.fields:
                 raise ValueError("authored root draft is already initialized")
@@ -135,13 +144,18 @@ def initialize_current_d04_root_draft_v3(c, authority, lease, *, operation_id, r
             field["cursor"], field["preset_digest"], field["asset_digest"],
             _authored_root_blocks_v3(field)))
         owner_key = owner_grant_key(*namespace.as_tuple)
-        owner_row = _row(db, store, owner_key)
+        from ..runtime_storage_v3 import runtime_storage_quantum_v3
+        with runtime_storage_quantum_v3(db)as meter:
+            owner_row=meter.read_fixed_row(db,'graph_atoms',('revision','valid'),
+                'bot=? AND persona=? AND token=?',(*namespace.as_tuple,owner_key.token))
+        if owner_row is None or owner_row[0]<1 or owner_row[1]!=1:
+            raise ValueError('current Owner root grant fixed head is absent or invalid')
         reads = [GraphVersion(draft_key, previous[0] if previous else 0),
                  GraphVersion(head_key, previous_head[0] if previous_head else 0),
                  GraphVersion(owner_key, owner_row[0])]
         writes = [GraphWrite(draft_key, {"schema": draft_key.type_name, **asdict(draft)})]
-        head_revision = previous_head[0] if previous_head else 1
-        if previous_head is None:
+        head_revision = previous_head[0]if previous_head else(1 if previous is None else 0)
+        if previous is None:
             head = ActiveSchemeHeadV1(namespace.persona_id, 1,
                 canonical_digest(("initial_d12_head", namespace)), draft_key.token, 1,
                 canonical_digest(draft), None, operation_id, "initial")
@@ -152,11 +166,11 @@ def initialize_current_d04_root_draft_v3(c, authority, lease, *, operation_id, r
             "draft_ref": draft_key.token, "draft_revision": draft.revision,
             "draft_digest": canonical_digest(draft), "head_ref": head_key.token,
             "head_revision": head_revision, "candidate_digest": candidate.digest,
+            "status":"not_adopted"if head_revision==0 else"draft_initialized",
             "graph_receipt": graph_receipt}
 
-    return c._owner_domain_write_v3(authority, lease, operation_id=operation_id,
-        request_digest=request_digest, domains=("d04", "d12"),
-        capability="workbench.create", commit=commit)
+    return _prepare_creator_root_write_v3(c,authority,lease,operation_id=operation_id,request_digest=request_digest,
+        command_kind='root_draft',domains=('d04','d12'),capability='workbench.create',allow_missing=True,commit=commit)
 
 
 def allocate_current_d04_root_budget_v3(c, authority, lease, *, operation_id,
@@ -317,9 +331,13 @@ def _root_and_current_members(db, namespace, root_operation_id, issuer, preset):
                 or frozen.freeze_read_digest != canonical_digest(json.loads(frozen.freeze_read_json))
                 or candidate.preset != preset or candidate.namespace != namespace.as_tuple):
             raise ValueError("authored topology root signed original or installed preset differs")
-        rows = db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
-            "AND type_name IN ('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2') ORDER BY token",
-            namespace.as_tuple).fetchall()
+        from .d04_source_work_v3 import read_bound_installed_d04_component_rows_v3,read_bound_installed_d04_component_atom_v3
+        source_rows,rows=read_bound_installed_d04_component_rows_v3(db,namespace,
+            types=('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2'),limit=4)
+        if not source_rows:
+            rows = db.execute("SELECT token,revision,value,valid FROM graph_atoms WHERE bot=? AND persona=? "
+                "AND type_name IN ('d04.numeric_checkpoint.v1','d04.numeric_checkpoint.v2') ORDER BY token",
+                namespace.as_tuple).fetchall()
         if len(rows) != 3:
             raise ValueError("authored topology requires the complete three-member root")
         current, members = [], {}
@@ -333,8 +351,9 @@ def _root_and_current_members(db, namespace, root_operation_id, issuer, preset):
             checkpoint = decode_authored_numeric_checkpoint_v2(value)
             if key.name != checkpoint.block.block_id or checkpoint.namespace != namespace.as_tuple:
                 raise ValueError("authored topology current member address differs")
-            state_row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-                (checkpoint.graph_state.ref,)).fetchone()
+            source_state,state_atom=read_bound_installed_d04_component_atom_v3(db,namespace,checkpoint.graph_state.ref)
+            state_row=((state_atom.revision,canonical_json(state_atom.value),int(state_atom.valid))if source_state else
+                db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",(checkpoint.graph_state.ref,)).fetchone())
             if state_row is None or state_row[0] != revision or state_row[2] != 1:
                 raise ValueError("authored topology current state is unavailable")
             state_value = json.loads(state_row[1])
@@ -378,8 +397,13 @@ def _topology_edges(policy, preset, members, source_ref, effective_from, effecti
 
 
 def _graph_rows(db, refs):
+    from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
     result = []
     for ref in sorted(set(refs)):
+        handled,atom=read_bound_installed_d04_component_atom_v3(db,NamespaceId.from_key(AtomKey.from_token(ref)),ref)
+        if handled:
+            result.append((ref,atom.revision,atom.value,atom.valid))
+            continue
         row = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?", (ref,)).fetchone()
         if row is None:
             result.append((ref, 0, {}, False))
@@ -515,13 +539,16 @@ def adopt_current_d04_root_coupling_v3(c, authority, lease, *, operation_id,
     namespace, store = authority.namespace, c._GraphCoordinator__store
     request_digest = canonical_digest((TOPOLOGY_SCHEMA, namespace, operation_id, root_operation_id, effective_until))
 
-    def commit(db, metadata, epoch, now, owner, scope):
+    def commit(prepared,db,metadata,epoch,now,owner,scope):
         assembly, _ = _installation(c, authority)
         preset, policy = _installed_topology_policy(assembly.package_root,
             assembly.installation_policy.manifest_digest, assembly.available_cpu_features)
         install_d04_root_topology_originals_v3(db)
-        root, candidate, members, member_rows = _root_and_current_members(
-            db, namespace, root_operation_id, c._GraphCoordinator__d11_issuer, preset)
+        from .d04_root_topology_read_v1 import require_current_d04_root_topology_write_v1
+        qualified=require_current_d04_root_topology_write_v1(prepared,c,authority,lease,db=db,scope=scope,current_owner=owner)
+        root,candidate,members=qualified.root,qualified.candidate,qualified.members
+        member_rows=[(ref,revision,value,True)for ref,revision,value in qualified.member_rows]
+        if candidate.preset!=preset:raise ValueError('RootTopology READ preset differs from actual installed WRITE')
         if (any(row[1] != 1 for row in member_rows) or effective_until <= candidate.cursor):
             raise ValueError("authored topology must be adopted on the unadvanced root with a positive interval")
         existing = db.execute("SELECT token FROM graph_atoms WHERE bot=? AND persona=? "
@@ -530,14 +557,14 @@ def adopt_current_d04_root_coupling_v3(c, authority, lease, *, operation_id,
             raise ValueError("authored root topology is already initialized or has foreign edges")
         marker_key = authored_topology_key_v3(namespace, operation_id)
         head_key, draft_key = active_scheme_head_key(namespace), character_draft_key(namespace)
-        head_row = _row(db, store, head_key)
+        head_row=(qualified.headers[head_key.token][0][0],qualified.values['head'])
         raw_head = dict(head_row[1]); raw_head.pop("schema")
         head = ActiveSchemeHeadV1(**raw_head)
-        draft_row = _row(db, store, draft_key)
+        draft_row=(qualified.headers[draft_key.token][0][0],qualified.values['draft'])
         activation_key = AtomKey(Owner("persona", *namespace.as_tuple), "d01.persona_activation.v1", "current")
-        activation_row = _row(db, store, activation_key)
+        activation_row=(qualified.headers[activation_key.token][0][0],qualified.values['activation'])
         owner_key = owner_grant_key(*namespace.as_tuple)
-        owner_row = _row(db, store, owner_key)
+        owner_row=(qualified.headers[owner_key.token][0][0],qualified.owner_value)
         if (head.adopted_operation_id != root_operation_id or head.generation != head_row[0]
                 or head.draft_revision != draft_row[0] or head.draft_ref != draft_key.token
                 or head.draft_digest != canonical_digest(CharacterDraft(**{k: v for k, v in draft_row[1].items() if k != "schema"}))):
@@ -585,9 +612,20 @@ def adopt_current_d04_root_coupling_v3(c, authority, lease, *, operation_id,
             "coefficient": marker.coefficient, "effective_from": marker.effective_from,
             "effective_until": marker.effective_until, "graph_receipt": receipt}
 
-    return c._owner_domain_write_v3(authority, lease, operation_id=operation_id,
-        request_digest=request_digest, domains=("d04", "d11", "d12"),
-        capability="workbench.activate", commit=commit)
+    from .d04_root_topology_read_v1 import(prepare_current_d04_root_topology_read_v1,
+        consume_current_d04_root_topology_read_v1)
+    work=prepare_current_d04_root_topology_read_v1(c,authority,lease,operation_id=operation_id,
+        root_operation_id=root_operation_id,effective_until=effective_until,request_digest=request_digest)
+    def completed(value):
+        prepared=consume_current_d04_root_topology_read_v1(value,graph=c,work=work)
+        def write(db,metadata,epoch,now,owner,scope):
+            return commit(prepared,db,metadata,epoch,now,owner,scope)
+        from ..runtime_storage_v3 import bind_runtime_storage_operation_v3
+        with bind_runtime_storage_operation_v3(prepared.reader.operation,prepared.reader.db):
+            return c._owner_domain_write_v3(authority,lease,operation_id=operation_id,request_digest=request_digest,
+                domains=('d04','d11','d12'),capability='workbench.activate',commit=write,root_topology_prepare=prepared)
+    def failed(error):raise error
+    return work.map_terminal_v3('issuer',completed,failed)
 
 
 class InstalledD04AuthoredTopologyVerifierV3:
@@ -738,8 +776,11 @@ class InstalledD04AuthoredTopologyVerifierV3:
             raise ValueError("authored topology current target location proof is absent")
         requirements = metadata.requirements
         imported = _read_import_receipt_locked(db, namespace, target.transfer_id)
-        current_grant = db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
-            (owner_grant_key(*namespace.as_tuple).token,)).fetchone()
+        from .d04_source_work_v3 import read_bound_installed_d04_component_atom_v3
+        source_owner,owner_atom=read_bound_installed_d04_component_atom_v3(db,namespace,owner_grant_key(*namespace.as_tuple).token)
+        current_grant=((owner_atom.revision,canonical_json(owner_atom.value),int(owner_atom.valid))if source_owner else
+            db.execute("SELECT revision,value,valid FROM graph_atoms WHERE token=?",
+                (owner_grant_key(*namespace.as_tuple).token,)).fetchone())
         current_epoch = db.execute("SELECT revision FROM graph_epochs WHERE bot=? AND persona=?",
             namespace.as_tuple).fetchone()
         if (scope.namespace != namespace or scope.authority_namespace != requirements.authority_namespace
@@ -805,6 +846,9 @@ class InstalledD04AuthoredTopologyVerifierV3:
                 or any(AtomKey.from_token(ref).type_name != "d04.numeric_checkpoint.v2"
                        for ref in (edge.left_ref, edge.right_ref))):
             raise ValueError("authored topology source or endpoint lineage differs")
+        from .d04_root_topology_read_v1 import read_bound_source_topology_v1
+        handled,current=read_bound_source_topology_v1(self,db,namespace,edge)
+        if handled:return current
         preset, policy = _installed_topology_policy(self.package_root,
             self.trusted_manifest_sha256, self.available_cpu_features)
         row = db.execute(f"SELECT original_json,original_digest FROM {TOPOLOGY_TABLE} "

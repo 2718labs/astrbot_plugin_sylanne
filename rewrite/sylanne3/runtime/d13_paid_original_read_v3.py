@@ -17,7 +17,7 @@ from ..runtime_contracts import NamespaceId
 from ..runtime_storage_v3 import (begin_runtime_storage_operation_v3, bind_runtime_storage_operation_v3,
     finish_runtime_storage_operation_v3, runtime_storage_quantum_v3, runtime_storage_v3, begin_runtime_cell_read_v3)
 from .c09_canonical_json_stream_v2 import C09CanonicalJSONStreamV2
-from .c09_graph_row_codec_v2 import C09MemorySourceJSONStreamV3, C09MemoryAccessJSONStreamV3
+from .c09_graph_row_codec_v2 import C09MemoryAccessJSONStreamV3
 from .c09_paged_sql_v2 import read_legacy_sql_cell_fragment_v2
 from .d13_paid_identity_stream_v3 import _D13PaidIdentityStreamV3
 from .dispatch_current_inventory_v3 import _heap
@@ -117,7 +117,9 @@ class _ScheduleMetadataV3(C09CanonicalJSONStreamV2):
         if event.path[:1]==("frozen",):
             self.frozen.emit(replace(event,path=event.path[1:]))
             return
-        if event.path[:1]!=("binding",):return
+        job_fields = {"job_id", "operation_id", "bot_id", "persona_id", "budget_ref", "deadline_utc", "work_kind"}
+        selected_job = len(event.path) == 2 and event.path[0] == "job" and event.path[1] in job_fields
+        if event.path[:1] != ("binding",) and not selected_job: return
         if event.kind=="scalar_start":self.buffers[event.path]=bytearray()
         elif event.kind=="scalar_chunk":
             target=self.buffers[event.path]
@@ -128,11 +130,11 @@ class _ScheduleMetadataV3(C09CanonicalJSONStreamV2):
 
 class _ColumnV3:
     """One selected physical JSON column, with one bounded read/parse step."""
-    def __init__(self,reader,*,table,column,key_columns,key,cell_id=None,metadata=False,source=False,access=False):
+    def __init__(self,reader,*,table,column,key_columns,key,cell_id=None,metadata=False,access=False):
         reader.require_current_v3()
-        if not metadata and not source and not access and not reader.qualified:
+        if not metadata and not access and not reader.qualified:
             raise AuthorityUnavailable("D13 protected column requires every actual current Source ancestor")
-        if table=="graph_atoms" and not metadata and not source and not access:
+        if table=="graph_atoms" and not metadata and not access:
             atom_key=AtomKey.from_token(key[0])
             if NamespaceId.from_key(atom_key)!=reader.namespace:
                 raise AuthorityUnavailable("D13 selected Graph body crossed its actual namespace")
@@ -150,14 +152,13 @@ class _ColumnV3:
         codec=None if self.cell is None else self.cell.header[0]
         if codec not in {None,"canonical-json.ascii.v1","canonical-json.utf8.v1"}:
             raise AuthorityUnavailable("D13 original has another actual JSON cell codec")
-        self.metadata,self.source,self.access=metadata,source,access
+        self.metadata,self.access=metadata,access
         self.parser=(_ScheduleMetadataV3() if metadata=="schedule" else _IntentMetadataV3() if metadata else
-            C09MemorySourceJSONStreamV3(ensure_ascii=codec!="canonical-json.utf8.v1") if source else
             C09MemoryAccessJSONStreamV3(ensure_ascii=codec!="canonical-json.utf8.v1") if access else
             C09CanonicalJSONStreamV2(ensure_ascii=codec!="canonical-json.utf8.v1"))
         self.total=None if self.cell is None else self.cell.header[3]
         self.offset,self.fragment=0,b""
-        self.body=None if metadata or source or access else bytearray()
+        self.body=None if metadata or access else bytearray()
         self.complete,self.sha256,self.value=False,None,None
     def advance(self,meter):
         r=self.owner;r.require_current_v3(meter=meter)
@@ -192,18 +193,32 @@ class _ColumnV3:
                 raise AuthorityUnavailable("D13 original canonical EOF differs from sealed cell")
         elif result.byte_count!=self.total:raise AuthorityUnavailable("D13 original selected TEXT EOF differs")
         self.sha256=result.sha256
-        if self.source:
-            r.reserve_v3(_heap(self.parser._source_metadata)*2+65536)
-            self.value=MappingProxyType({name:tuple(value) if type(value)is list else value
-                for name,value in self.parser._source_metadata.items()})
-        elif self.access:
+        if self.access:
             r.reserve_v3(_heap(self.parser.metadata)*2+65536)
             self.value=dict(self.parser.metadata)
         elif not self.metadata:
             r.reserve_v3(len(self.body)*10+65536)
             self.value=bytes(self.body).decode("utf8")
+            if self.table=='graph_atoms' and AtomKey.from_token(self.key[0]).type_name=='memory.source':
+                from ..memory_types import SourceRecord
+                from ..domains.d06.inspection_metadata_v1 import SOURCE_FIELDS
+                from ..runtime_contracts import canonical_digest
+                task=r.source_inspection_tasks[self.key[0]]
+                original=task.result.require_v3(task.owner,meter)
+                record=SourceRecord.from_dict(json.loads(self.value))
+                data=record.to_dict()
+                metadata={name:tuple(data[name])if type(data[name])is list else data[name] for name in SOURCE_FIELDS}
+                if (self.sha256!=original.payload_sha256 or tuple(self.cell.header)!=original.header
+                        or metadata!=dict(original.metadata) or canonical_digest(data)!=original.semantic_digest):
+                    raise AuthorityUnavailable('qualified D13 Source Body differs from its inspection original')
             self.body=None
         self.complete=True;r.reserve_v3()
+
+
+def release_d13_paid_source_inspection_v3(reader):
+    for task in reader.source_inspection_tasks.values():
+        task.release_v3()
+    reader.source_inspection_tasks.clear()
 
 
 @dataclass(frozen=True)
@@ -226,6 +241,8 @@ class D13PaidOriginalReadWorkV3:
         self.window_policy=(graph._GraphCoordinator__d13_precompression_policy or graph._GraphCoordinator__d13_paid_precompression_policy
             if method=="read_current_d13_conversation_window_v1" else graph._GraphCoordinator__d13_paid_precompression_policy)
         self.current_window=self.window_metadata=self.window_body=None
+        self.deterministic_applicability_task=None
+        self.deterministic_no_reduction_decision=None
         self.pending_schedule_head=self.pending_schedule_sha=self.paid_cost_atom=self.paid_cost_head=None
         self.initial_now,self.now_utc,self.deadline=now,now,operation.deadline_utc
         self.graph_stamp=(fence.metadata,fence.epoch)
@@ -237,8 +254,10 @@ class D13PaidOriginalReadWorkV3:
         self.intent_digest_task=self.intent_projection=None
         self.completed_read=None
         self.original_deadline=None
+        self.technical_job_id = self.technical_job_header = None
         self.frozen_versions,self.sources,self.source_heads,self.access_atoms={},{},{},{}
         self.pending_sources=[];self.qualified=False
+        self.source_inspection_tasks={}
         self.rows,self.row_headers,self.body_columns={},{},{}
         self.table_index,self.pending_table,self.pending_header=0,None,None
         self.complete,self.proof,self.read_finished=False,None,False
@@ -246,7 +265,7 @@ class D13PaidOriginalReadWorkV3:
         _READERS.add(self);self.reserve_v3(65536)
     def reserve_v3(self,extra=0):
         values=(self.intent_metadata,self.frozen_metadata,self.frozen_versions,self.sources,
-            self.source_heads,self.access_atoms,self.pending_sources,self.rows,self.row_headers,self.body_columns)
+            self.source_heads,self.access_atoms,self.pending_sources,self.rows,self.row_headers,self.body_columns,self.technical_job_header)
         if self.window_metadata is not None:values+= (vars(self.window_metadata),)
         if self.window_body is not None:values+= (vars(self.window_body),)
         size=_heap(values)+extra+65536
@@ -264,8 +283,7 @@ class D13PaidOriginalReadWorkV3:
         if self.column is not None:
             c=self.column;size+=_heap((c.key,c.fragment,c.body,c.value))
             if isinstance(c.value,MappingProxyType):size+=_heap(tuple(c.value.items()))
-            if isinstance(c.parser,C09MemorySourceJSONStreamV3):size+=c.parser._source_heap_bytes()
-            elif isinstance(c.parser,C09MemoryAccessJSONStreamV3):size+=c.parser._source_heap_bytes()
+            if isinstance(c.parser,C09MemoryAccessJSONStreamV3):size+=c.parser._source_heap_bytes()
             elif isinstance(c.parser,(_IntentMetadataV3,_ScheduleMetadataV3)):
                 size+=_heap((c.parser.scalars,c.parser.buffers,c.parser.frozen.values,c.parser.frozen.buffers,
                     getattr(getattr(c.parser,"decoder",None),"pending",None)))
@@ -283,6 +301,10 @@ class D13PaidOriginalReadWorkV3:
         if now>=min(self.deadline,self.original_deadline or self.deadline):
             raise AuthorityUnavailable("D13 paid READ original TTL/worker lease expired")
         with runtime_storage_quantum_v3(self.db) as current:
+            if self.technical_job_header is not None:
+                actual = current.read_fixed_row(self.db, "runtime_jobs", _JOB_COLUMNS, "job_id=?", (self.technical_job_id,))
+                if actual != self.technical_job_header:
+                    raise AuthorityUnavailable("D13 technical original job changed during its actual Source READ")
             if meter is not None and current is not meter:raise AuthorityUnavailable("D13 paid reader changed its actual quantum")
             epochs=current.read_fixed_row(self.db,"graph_authority_epochs",("access_epoch","delete_epoch"),
                 "bot=? AND persona=?",self.namespace.as_tuple)
@@ -307,6 +329,8 @@ class D13PaidOriginalReadWorkV3:
             if self.method=="schedule_d13_paid_precompression_v1":
                 jobs=tuple(ref for ref,row in self.parent.ledger_rows.items() if row[2] in {"queued","running"})
                 if len(jobs)>1:raise AuthorityUnavailable("D13 scene metadata has multiple original pending jobs")
+                if (self.parent.expected_pending is not None or self.parent.expected_decision is not None) and jobs:
+                    raise AuthorityUnavailable("D13 pending recovery cannot select another existing paid job before Source")
                 if jobs:self.job_id=jobs[0]
             if self.job_id is None:
                 if self.method=="schedule_d13_paid_precompression_v1":
@@ -314,6 +338,11 @@ class D13PaidOriginalReadWorkV3:
                         row=meter.read_fixed_row(self.db,"graph_d13_paid_schedule_inputs_v1",
                             ("job_ref","payload_digest"),"bot=? AND persona=? AND scene_ref=? AND pending=1",
                             (*ns.as_tuple,self.scene_ref))
+                        if self.parent.expected_decision is not None and row is not None:
+                            raise AuthorityUnavailable("D13 new paid decision cannot replace another pending schedule before Source")
+                        expected = self.parent.expected_pending
+                        if expected is not None and row != (expected.job_ref, expected.original_digest):
+                            raise AuthorityUnavailable("D13 pending original metadata changed before Source")
                         if row is not None:
                             self.pending_schedule_head=tuple(row)
                             self.column=_ColumnV3(self,table="graph_d13_paid_schedule_inputs_v1",column="payload_json",
@@ -416,25 +445,44 @@ class D13PaidOriginalReadWorkV3:
         roots=tuple(ref for ref in self.frozen_versions if AtomKey.from_token(ref).type_name=="memory.source")
         if not roots or (values[("window","access_epoch")],values[("window","delete_epoch")])!=self.epochs:
             raise AuthorityUnavailable("D13 pending schedule actual Source/rights closure differs")
-        self.original_deadline=min(self.deadline,values[("plan","expires_at_utc")])
+        from .d13_priority_metadata_v1 import _finite_time_v1, _job_deadline_v1
+        outer = self.column.parser.scalars
+        policy = self.graph._GraphCoordinator__d13_paid_precompression_policy
+        if ((outer.get(("job", "bot_id")), outer.get(("job", "persona_id"))) != self.namespace.as_tuple
+                or outer.get(("job", "job_id")) != self.pending_schedule_head[0]
+                or outer.get(("job", "operation_id")) != outer.get(("binding", "original_operation_id"))
+                or outer.get(("job", "budget_ref")) != policy.lease_id
+                or outer.get(("job", "work_kind")) != "d13.precompress.paid.v1"):
+            raise AuthorityUnavailable("D13 pending original job/lease identity differs before Source")
+        self.original_deadline=min(self.deadline, _finite_time_v1(values[("plan","expires_at_utc")]),
+            _finite_time_v1(outer[("binding", "expires_at_utc")]), _job_deadline_v1(outer[("job", "deadline_utc")]))
         self.pending_schedule_sha=self.column.sha256;self.column=None
         self.pending_sources=list(roots);self.phase="window_metadata"
 
     def _sources(self,meter):
         from ..domains.d06 import source_correction_head_key
+        from .source_inspection_metadata_read_v3 import InspectionMetadataReadV3
         ns=self.namespace
-        if self.column is not None:
-            self.column.advance(meter)
-            if not self.column.complete:return
-            ref=self.pending_sources[-1];key=AtomKey.from_token(ref);head=self.source_heads[ref]
-            source=_SourceLeafV3(key,head[0],bool(head[1]),self.column.value)
-            if source.metadata["source_id"]!=key.owner.subject:
-                raise AuthorityUnavailable("D13 actual Source metadata identity differs")
+        self.require_current_v3(meter=meter)
+        if (self.pending_sources and self.pending_sources[-1] not in self.sources
+                and self.pending_sources[-1] in self.source_inspection_tasks):
+            ref=self.pending_sources[-1]
+            task=self.source_inspection_tasks[ref]
+            task.advance(meter)
+            if not task.complete:return
+            original=task.result.require_v3(task.owner,meter)
+            key=AtomKey.from_token(ref);head=self.source_heads[ref]
+            if (original.key,original.revision,int(original.valid),original.cell_id)!=(key,*head):
+                raise AuthorityUnavailable('D13 Source inspection differs from actual selected head')
+            source=_SourceLeafV3(key,head[0],bool(head[1]),original.metadata)
             self.sources[ref]=source
+            from .natural_outbound_receipt_adoption_read_v3 import NaturalOutboundReceiptAdoptionReadV3
+            if type(self)is NaturalOutboundReceiptAdoptionReadV3:
+                self.source_payload_sha256[ref]=original.semantic_digest
             akey=access_key(*ns.as_tuple,key.owner.subject);ahead=self.source_heads[akey.token]
-            self.column=_ColumnV3(self,table="graph_atoms",column="value",
-                key_columns=("token",),key=(akey.token,),cell_id=ahead[2],access=True)
-            self.phase="access";return
+            self.column=_ColumnV3(self,table='graph_atoms',column='value',
+                key_columns=('token',),key=(akey.token,),cell_id=ahead[2],access=True)
+            self.phase='access';return
         if self.pending_sources:
             ref=self.pending_sources[-1]
             if ref in self.sources:self.pending_sources.pop();return
@@ -453,8 +501,20 @@ class D13PaidOriginalReadWorkV3:
             for exact,actual in ((ref,head[0]),(akey.token,ahead[0])):
                 if exact in self.frozen_versions and self.frozen_versions[exact]!=actual:
                     raise AuthorityUnavailable("D13 current Source/access differs from its exact frozen version")
-            self.column=_ColumnV3(self,table="graph_atoms",column="value",key_columns=("token",),key=(ref,),
-                cell_id=head[2],source=True)
+            from ..authority_service.d13_authority_model_source_v3 import AuthorityD13PaidSourceV3
+            from .graph_d13_cache_use_collection_v2 import GraphFullReadD13CollectionV2
+            from .natural_outbound_receipt_adoption_read_v3 import NaturalOutboundReceiptAdoptionReadV3
+            from .artifact_outbound_receipt_adoption_read_v3 import ArtifactOutboundReceiptAdoptionReadV3
+            if type(self)is D13PaidOriginalReadWorkV3:
+                inspection_owner=self if self.parent is None else self.parent
+            elif type(self)is AuthorityD13PaidSourceV3:
+                inspection_owner=self.work
+            elif type(self)is GraphFullReadD13CollectionV2:
+                inspection_owner=self.full
+            elif type(self)in(NaturalOutboundReceiptAdoptionReadV3,ArtifactOutboundReceiptAdoptionReadV3):
+                inspection_owner=self
+            else:raise AuthorityUnavailable('D13 Source inspection requires its actual installed caller type')
+            self.source_inspection_tasks[ref]=InspectionMetadataReadV3(inspection_owner,key)
             return
         active,done=set(),set()
         def visit(ref):
@@ -464,6 +524,8 @@ class D13PaidOriginalReadWorkV3:
             for parent in self.sources[ref].metadata["parent_source_ids"]:visit(source_key(*ns.as_tuple,parent).token)
             active.remove(ref);done.add(ref)
         for ref in self.sources:visit(ref)
+        for task in self.source_inspection_tasks.values():
+            task.require_current_v3(meter)
         self.qualified,self.phase=True,"originals"
     def _access(self,meter):
         from ..domains.d07.qualified_attention_read import _qualify_source_rights_values_v3
@@ -579,9 +641,29 @@ class D13PaidOriginalReadWorkV3:
         if self.completed_read is not None:
             self.phase="completed_body"
         else:
-            self.complete=True;self.proof=PreparedD13PaidOriginalReadV3(_ISSUER,self)
+            from .d13_deterministic_applicability_v3 import has_d13_deterministic_applicability_v3
+            if has_d13_deterministic_applicability_v3(self):
+                self.phase="deterministic_applicability"
+            else:
+                self.complete=True;self.proof=PreparedD13PaidOriginalReadV3(_ISSUER,self)
 
     def advance_v3(self,meter):
+        if self.technical_job_id is not None and self.technical_job_header is None:
+            from .d13_priority_metadata_v1 import _job_deadline_v1
+            policy = self.graph._GraphCoordinator__d13_precompression_policy
+            row = meter.read_fixed_row(self.db, "runtime_jobs", _JOB_COLUMNS, "job_id=?", (self.technical_job_id,))
+            if (row is None or row[3:5] != self.namespace.as_tuple or row[6] != "d13.precompress"
+                    or row[8] != policy.lease_id or row[12] != 0 or row[5] not in {"queued", "running"}
+                    or row[5] == "running" and (row[9] != self.authority.actor or row[10] is None)):
+                raise AuthorityUnavailable("D13 technical Source READ lost its exact original job/lease")
+            deadline = _job_deadline_v1(row[7])
+            if row[5] == "running": deadline = min(deadline, _job_deadline_v1(row[10]))
+            if self.now_utc >= deadline:
+                raise AuthorityUnavailable("D13 technical original job/worker lease expired before Source")
+            self.technical_job_header = tuple(row)
+            self.original_deadline = min(self.deadline, deadline)
+            self.deadline = self.operation.deadline_utc = self.work.deadline_utc = self.original_deadline
+            return
         if self.epochs is None:
             self.epochs=meter.read_fixed_row(self.db,"graph_authority_epochs",("access_epoch","delete_epoch"),
                 "bot=? AND persona=?",self.namespace.as_tuple)
@@ -596,6 +678,10 @@ class D13PaidOriginalReadWorkV3:
         elif self.phase=="originals":self._originals(meter)
         elif self.phase=="window_metadata":self._window_metadata(meter)
         elif self.phase=="window_body":self._window_body(meter)
+        elif self.phase=="deterministic_applicability":
+            from .d13_deterministic_applicability_v3 import advance_d13_deterministic_applicability_v3
+            if advance_d13_deterministic_applicability_v3(self,meter) is not None:
+                self.complete=True;self.proof=PreparedD13PaidOriginalReadV3(_ISSUER,self)
         elif self.phase=="paid_cost":self._paid_cost(meter)
         elif self.phase=="completed_metadata":
             self.completed_read.metadata_advance_v3(meter)
@@ -633,10 +719,13 @@ class PreparedD13PaidOriginalReadV3:
         return r
     def release_payload_v3(self):
         _PROOFS.pop(self,None)
+        release_d13_paid_source_inspection_v3(self.reader)
         r=self.reader;_READERS.discard(r)
         r.rows.clear();r.body_columns.clear();r.sources.clear();r.source_heads.clear();r.access_atoms.clear()
         r.column=r.intent_metadata=r.frozen_metadata=r.intent_digest_task=r.intent_projection=r.proof=None
         r.completed_read=None
+        from .d13_deterministic_applicability_v3 import release_d13_deterministic_applicability_v3
+        release_d13_deterministic_applicability_v3(r)
 
 
 @contextmanager
@@ -677,9 +766,11 @@ def d13_paid_original_point_v3(db,*,table,columns,key_columns,key):
     return True,tuple(values[name] for name in columns)
 
 
-def prepare_d13_paid_original_read_v3(graph,authority,lease,*,job_id,method,args):
+def prepare_d13_paid_original_read_v3(graph,authority,lease,*,job_id,method,args,technical_job_id=None):
     from .d13_paid_product_v1 import _authorize
     from .first_ingress_v2 import trusted_upper
+    if technical_job_id is not None and (method != "read_current_d13_conversation_window_v1" or job_id is not None):
+        raise AuthorityUnavailable("D13 technical job Source READ cannot mix paid originals")
     require_graph_storage_work_admission_v3(graph)
     if method=="read_current_d13_conversation_window_v1":
         graph._authorize(lease,authority,frozenset({"d11"}))
@@ -700,12 +791,19 @@ def prepare_d13_paid_original_read_v3(graph,authority,lease,*,job_id,method,args
             fence=graph._begin_read_fence_v3(authority,operation_id=operation.operation_id,
                 fence_observer=lambda scope: observe_d13_paid_owner_guard_v3(graph,authority,scope))
             reader=D13PaidOriginalReadWorkV3(_ISSUER,graph,authority,lease,operation,fence,job_id,method,args,now)
+            if technical_job_id is not None:
+                reader.technical_job_id = technical_job_id
         work=create_graph_storage_work_v3(graph,kind=KIND,operation_id=operation.operation_id,
             selection_digest=operation.selection_digest,deadline_utc=operation.deadline_utc,
             state=reader,operation=operation)
         reader.work=work
         def completed(proof):
             with bind_runtime_storage_operation_v3(operation,store._db),bind_prepared_d13_paid_original_v3(proof):
+                if method == "complete_d13_paid_precompression_v1":
+                    from .d13_derived_cache_maintenance_v2 import issue_current_d13_pending_maintenance_v2
+                    pending = issue_current_d13_pending_maintenance_v2(graph, proof)
+                    if pending is not None:
+                        return pending
                 return getattr(graph,method)(authority,lease,**args)
         return work.map_terminal_v3("issuer",completed,lambda error:(_ for _ in ()).throw(error))
     except BaseException:
@@ -740,7 +838,11 @@ def finish_d13_paid_original_read_v3(graph,work,error):
         if error is None:work.result_lease=work.operation
     finally:
         if error is not None or work.result_lease is None:
+            release_d13_paid_source_inspection_v3(r)
             if r.proof is not None:r.proof.release_payload_v3()
+            else:
+                from .d13_deterministic_applicability_v3 import release_d13_deterministic_applicability_v3
+                release_d13_deterministic_applicability_v3(r)
             _READERS.discard(r);finish_runtime_storage_operation_v3(work.operation)
 
 
@@ -748,7 +850,9 @@ def finish_d13_paid_original_read_v3(graph,work,error):
 def bind_d13_paid_window_reader_v3(reader):
     from ..authority_service.d13_authority_model_source_v3 import require_d13_authority_window_reader_v3
     authority=require_d13_authority_window_reader_v3(reader)
-    if not authority and (type(reader)is not D13PaidOriginalReadWorkV3 or reader not in _READERS
+    from .graph_d13_cache_use_collection_v2 import require_graph_d13_window_reader_v2
+    graph_collection=require_graph_d13_window_reader_v2(reader)
+    if not authority and not graph_collection and (type(reader)is not D13PaidOriginalReadWorkV3 or reader not in _READERS
             or not reader.qualified or reader.phase!="window_body" or reader.window_body is None):
         raise AuthorityUnavailable("D13 window preparation needs its actual all-Source gated Work")
     reader.require_current_v3()
@@ -773,6 +877,9 @@ def begin_d13_paid_original_reader_in_work_v3(parent,*,job_id,method,args):
         parent.fence,job_id,method,args,now)
     reader.parent,parent.paid_original_read=parent,reader
     reader.work=parent.work
+    if parent.expected_decision is not None:
+        from .d13_deterministic_applicability_v3 import configure_d13_paid_fallback_applicability_v3
+        configure_d13_paid_fallback_applicability_v3(reader, parent.expected_decision)
     return reader
 
 
@@ -860,3 +967,23 @@ class _IntentDigestMetadataV3:
             raise AuthorityUnavailable("D13 typed canonical metadata range lost its actual original TEXT")
         r.reserve_v3(len(raw)*2+65536);meter.charge_encode(len(raw))
         self.hash.update(raw);self.offset+=len(raw)
+
+
+def continue_d13_technical_job_read_v3(work, graph, authority, lease, *, method, job_id, arguments):
+    """Continue the exact original acquire/complete after its own actual Source READ."""
+    from ..graph_worker import GraphStorageWorkV3
+    if (type(work) is not GraphStorageWorkV3 or work.kind != KIND or work.coordinator is not graph
+            or method not in {"acquire_d13_deterministic_precompression_job_v2", "complete_d13_deterministic_precompression_job_v2"}
+            or work.state.technical_job_id != job_id):
+        raise AuthorityUnavailable("D13 technical continuation differs from its actual Work/job")
+    def completed(window):
+        r = work.state
+        if (type(r.proof) is not PreparedD13PaidOriginalReadV3 or r.current_window is not window
+                or r.authority != authority or r.lease is not lease or r.technical_job_id != job_id
+                or r.technical_job_header is None or r.method != "read_current_d13_conversation_window_v1"):
+            raise AuthorityUnavailable("D13 technical completion lacks its actual Source EOF")
+        with bind_runtime_storage_operation_v3(r.operation, r.db), bind_prepared_d13_paid_original_v3(r.proof):
+            return getattr(graph, method)(authority, lease, job_id, **arguments)
+    def failed(error):
+        raise error
+    return work.map_terminal_v3("service", completed, failed)

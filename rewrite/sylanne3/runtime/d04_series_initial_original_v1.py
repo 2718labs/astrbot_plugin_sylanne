@@ -117,3 +117,31 @@ def require_d04_series_initial_original_v1(db, root):
         visiting.discard(identity)
         if token is not None:
             _ANCESTRY.reset(token)
+
+
+def require_historical_d04_series_initial_binding_v1(root,model):
+    """Check the same numeric initial binding without constructing a Graph snapshot."""
+    from .d04_numeric_artifact_v3 import HistoricalNumericModelMetadataV1
+    if type(model)is not HistoricalNumericModelMetadataV1 or root.binding!=model.binding:
+        raise TypeError('historical series requires its actual numeric model metadata')
+    current,members,frozen=model.current,model.predecessors.members,root.frozen
+    checkpoints=tuple(member.checkpoint for member in members)
+    lower=tuple(low for checkpoint in checkpoints for low,_ in checkpoint.certified_box)
+    upper=tuple(high for checkpoint in checkpoints for _,high in checkpoint.certified_box)
+    centers=tuple(value for checkpoint in checkpoints for value in checkpoint.latent_state)
+    if(frozen.component_digest!=current.component.candidate_digest or frozen.member_refs!=current.component.checkpoint_refs
+            or tuple(member.checkpoint_ref for member in members)!=frozen.member_refs
+            or checkpoints!=current.checkpoints or frozen.plan.role_start!=current.component.role_start
+            or frozen.plan.role_end!=current.component.role_end
+            or any(member.checkpoint.cursor!=frozen.plan.role_start or member.state.cursor!=frozen.plan.role_start for member in members)
+            or not _same_float_bits(frozen.full_step.previous,centers)
+            or not _same_float_bits(frozen.initial_lower,lower)or not _same_float_bits(frozen.initial_upper,upper)):
+        raise ValueError('historical series initial numeric model differs from actual frozen predecessors')
+    rows={row.ref:row for row in model.read_rows}
+    for member in members:
+        for ref,revision,value in((member.checkpoint_ref,member.checkpoint_revision,joint_checkpoint_payload_v1(member.checkpoint)),
+                (member.state_ref,member.state_revision,joint_state_payload_v1(member.state))):
+            row=rows.get(ref)
+            if row is None or(row.revision,row.valid,row.value_digest)!=(revision,True,canonical_digest(value)):
+                raise ValueError('historical series initial member loses its complete frozen read commitment')
+    return model

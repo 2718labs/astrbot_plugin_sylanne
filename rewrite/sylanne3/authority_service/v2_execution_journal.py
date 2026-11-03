@@ -112,7 +112,7 @@ class ExpectedAppendInspectionV2:
 class AuthorityV2ExecutionJournal:
     def __init__(self, path, *, namespace: str, journal_id: str, create: bool = False,
                  _redaction_core=None, _redaction_credential=None,
-                 installed_storage_reader=None, selected_storage=None, storage_context=None, maintenance_basis=None):
+                 installed_storage_reader=None, selected_storage=None, storage_context=None, maintenance_basis=None,initial_storage=None,initial_maintenance=None):
         identifier(namespace, "namespace")
         identifier(journal_id, "journal_id")
         self._maintenance_seal_digest: str | None = None
@@ -123,7 +123,7 @@ class AuthorityV2ExecutionJournal:
             from .c09_storage_control_v1 import InstalledC09StorageReaderV1
             if not isinstance(installed_storage_reader, InstalledC09StorageReaderV1) or create:
                 raise AuthorityUnavailable("installed C09 journal reader required")
-            context = (storage_context if selected_storage is not None or maintenance_basis is not None
+            context = (storage_context if selected_storage is not None or maintenance_basis is not None or initial_storage is not None or initial_maintenance is not None
                 else installed_storage_reader.read_verified_current_storage_v1())
             member = next(m for m in context.manifest["members"] if m["role"] == "execution")
             if (member["resolved_path"], member["incarnation_or_journal_id"], member["namespace"]) != (str(Path(path).resolve()), journal_id, namespace):
@@ -170,8 +170,18 @@ class AuthorityV2ExecutionJournal:
                     or self._db.execute("PRAGMA synchronous").fetchone()[0] < 2):
                 raise AuthorityUnavailable("v2 execution journal lacks FULL WAL durability")
             self._runtime_storage_v3 = None
-            if selected_storage is not None and maintenance_basis is not None:
-                raise AuthorityUnavailable("business selection and maintenance basis are mutually exclusive")
+            if sum(value is not None for value in (selected_storage,maintenance_basis,initial_storage,initial_maintenance))>1:
+                raise AuthorityUnavailable("one exact runtime storage origin required")
+            if initial_maintenance is not None:
+                from ..runtime_storage_v3 import install_initial_maintenance_runtime_storage_v4
+                self._runtime_storage_v3=install_initial_maintenance_runtime_storage_v4(
+                    self._db,role='execution',composition=initial_maintenance,context=storage_context)
+                return
+            elif initial_storage is not None:
+                from ..runtime_storage_v3 import install_initial_runtime_storage_v4
+                self._runtime_storage_v3=install_initial_runtime_storage_v4(
+                    self._db,role='execution',initial=initial_storage,context=storage_context)
+                return
             if maintenance_basis is not None:
                 from ..runtime_storage_v3 import install_selected_maintenance_storage_v3
                 from .daemon import _bootstrap_control_quantum_v3
@@ -216,6 +226,9 @@ class AuthorityV2ExecutionJournal:
             _redaction_core=core, _redaction_credential=credential)
 
     def _objects(self) -> dict[tuple[str, str], str]:
+        if self._runtime_storage_v3 is not None and self._runtime_storage_v3.source_kind=="initial_segmented_v4":
+            from .c09_initial_segmented_genesis_v4 import initial_journal_schema_objects_v4
+            return initial_journal_schema_objects_v4(self,"execution")
         return {(kind, name): ddl for kind, name, ddl in self._db.execute(
             "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'")}
 
@@ -708,6 +721,29 @@ class AuthorityV2ExecutionJournal:
             pending.expected_append_id, pending.expected_append_digest,
         )
 
+    def append_observation_fact_once_guarded_v3(self,pending):
+        from .observation_refinement_contract_v3 import (
+            PlatformObservationRefinementPendingV3,encode_fact_entry_v3,expected_fact_digest_v3)
+        from .observation_refinement_v3 import inspect_fact_append_locked_v3
+        if type(pending) is not PlatformObservationRefinementPendingV3 or self._guard_owner!=threading.get_ident():
+            raise AuthorityUnavailable('actual frozen observation fact pending required')
+        self._check_schema()
+        if self._schema_version not in ('2','4') or pending.fact_write_permit.namespace!=self.namespace or pending.expected_execution_journal_id!=self.journal_id or expected_fact_digest_v3(pending)!=pending.expected_append_digest:
+            raise AuthorityUnavailable('observation fact mixed journal identity differs')
+        if self._installed_storage_reader is not None:
+            self._require_current_storage_v1(action='recovery')
+            self._installed_storage_reader.require_unconsumed_identity_v1(namespace=self.namespace,
+                identities=(('platform_observation_fact_v3',pending.fact_write_permit.operation_id),
+                    ('fence',pending.fact_write_permit.operation_id),('journal_mutation',pending.mutation_id),('journal_append',pending.expected_append_id)))
+        count,head,rows=inspect_fact_append_locked_v3(self,pending)
+        if count>1:raise AuthorityUnavailable('extra append quarantines observation fact')
+        if count==1:return self._append_from_row(rows[pending.before_anchor.execution_seq],self.journal_id,self.namespace)
+        self._db.execute('INSERT INTO authority_v2_execution_entries(seq,mutation_id,request_digest,append_id,pending,previous_digest,chain_digest) VALUES(?,?,?,?,?,?,?)',
+            (pending.expected_execution_seq,pending.mutation_id,pending.request_digest,pending.expected_append_id,
+             encode_fact_entry_v3(pending),head.digest,pending.expected_append_digest))
+        return VerifiedAppendV2(self.journal_id,self.namespace,pending.expected_execution_seq,pending.mutation_id,
+            pending.request_digest,pending.expected_append_id,pending.expected_append_digest)
+
     def append_once_guarded(self, pending: PendingMutationV2) -> VerifiedAppendV2:
         """Service-internal append after Authority pending check under freeze_writes."""
         if self._guard_owner != threading.get_ident():
@@ -851,6 +887,16 @@ def scan_execution_original_rows_v1(reader):
             else:
                 terminals.add(key)
             previous = digest
+            continue
+        from .observation_refinement_contract_v3 import ENTRY_PREFIX as FACT_PREFIX,decode_fact_row_v3
+        if reader._schema_version in ('2','4') and encoded.startswith(FACT_PREFIX):
+            if seq!=expected_seq or prev!=previous:
+                raise AuthorityUnavailable('observation fact execution chain is discontinuous')
+            try:
+                decode_fact_row_v3(reader,row)
+            except (KeyError,TypeError,ValueError,UnicodeError) as exc:
+                raise AuthorityUnavailable('malformed observation fact execution entry') from exc
+            previous=digest
             continue
         try:
             pending = decode_bytes(encoded)

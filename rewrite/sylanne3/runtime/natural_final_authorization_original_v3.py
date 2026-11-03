@@ -16,8 +16,20 @@ class _NaturalFinalAuthorizationWitnessV3:
         self.coordinator=coordinator;self.db=db;self.bundle=bundle;self.evidence=evidence
         self.graph_receipt=graph_receipt;self.scope=scope;self.admission=admission;self.request=request
         self.schema=payload['schema']
+        self._locator_metadata=tuple((name,payload[name])for name in (
+            'bundle_digest','admission_digest','admission_receipt_digest','candidate_digest',
+            'request_digest','graph_receipt_commitment'))
         self.raw=canonical_serialize(payload);self.digest=canonical_digest(payload);self.used=False
         _WITNESSES.add(self)
+    def locator_commitments_v1(self,coordinator,db,bundle,evidence,graph_receipt,scope,admission,request):
+        if (type(self)is not _NaturalFinalAuthorizationWitnessV3 or self not in _WITNESSES or self.used
+                or self.schema!=SCHEMA_V4 or self.coordinator is not coordinator or self.db is not db
+                or not db.in_transaction or self.bundle is not bundle or self.evidence is not evidence
+                or self.graph_receipt is not graph_receipt or self.scope is not scope
+                or self.admission!=admission or self.request!=request):
+            raise ValueError('actual successful Natural authorization original required for locator')
+        return dict(self._locator_metadata)
+
     def consume_for(self,coordinator,db,bundle,evidence,graph_receipt,v2_write,admission,request):
         from ..authority_service.v2_contract import to_wire
         if (self not in _WITNESSES or self.used or self.coordinator is not coordinator or self.db is not db

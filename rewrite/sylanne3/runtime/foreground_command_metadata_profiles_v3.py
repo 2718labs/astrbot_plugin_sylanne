@@ -30,7 +30,7 @@ _FAMILIES_V3 = {
     'create_source_note_foreground_cycle_v1': (),
     'derive_artifact_completion_receipt_v1': (),
     'derive_ingress_artifact_task_scope_v1': (),
-    'evaluate_values': ('d01.growth_contribution.v1', 'd01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd01.persona_revision.v1', 'd02.settlement.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'runtime.cost_settlement'),
+    'evaluate_values': ('d01.method_scoped_trial.v1', 'd01.persona_activation.v1', 'd01.persona_plan.v1', 'd02.settlement.v1', 'd07.current_interpretation.v1', 'd08.action_intent.v1', 'runtime.cost_settlement'),
     'finish_artifact_receipt_cycle_v1': (),
     'initialize_artifact_task_project_checkpoint_v1': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),
     'initialize_project_checkpoint': ('d10.project_checkpoint.v1', 'd10.project_work_version.v1', 'runtime.job'),

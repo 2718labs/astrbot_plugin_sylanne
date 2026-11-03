@@ -1444,7 +1444,10 @@ class GoalExecutionProvider:
         from .contact_plan_v3 import contact_plan_type_specs_v3
         from .personal_plan_v1 import personal_plan_type_specs_v1
         from .long_term_plan_v1 import long_term_type_specs_v1
-        return (*specs, *contact_plan_type_specs_v2(), *contact_plan_type_specs_v3(), *personal_plan_type_specs_v1(), *long_term_type_specs_v1())
+        from ...runtime.persona_growth_review_contract_v1 import growth_review_type_specs_v1
+        from .commitment_communication_v1 import communication_type_specs_v1
+        from .commitment_fulfillment_v1 import fulfillment_type_specs_v1
+        return (*fulfillment_type_specs_v1(), *communication_type_specs_v1(), *growth_review_type_specs_v1("d08"), *specs, *contact_plan_type_specs_v2(), *contact_plan_type_specs_v3(), *personal_plan_type_specs_v1(), *long_term_type_specs_v1())
 
     def validate(self, proposal: DomainProposal, snapshot: object = None) -> DomainProposal:
         if not isinstance(proposal, DomainProposal):
@@ -1453,7 +1456,16 @@ class GoalExecutionProvider:
             raise ValueError("D08 provider cannot validate this proposal")
         if proposal.proposal_schema_hash != self.descriptor.request_schema_hash:
             raise ValueError("D08 proposal schema hash is not recognized")
+        if any(write.key.type_name == "d08.persona_growth_review.v1" for write in proposal.typed_writes):
+            from ...runtime.persona_growth_review_v1 import validate_growth_review_proposal_v1
+            return validate_growth_review_proposal_v1(proposal)
         specs = {spec.name: spec for spec in self.register_types()}
+        from .commitment_fulfillment_v1 import TERMS_TYPE,ACCEPTANCE_TYPE,EVIDENCE_TYPE
+        from .commitment_communication_v1 import TERMS_SCOPE_TYPE
+        if any(write.key.type_name in {TERMS_TYPE,ACCEPTANCE_TYPE,EVIDENCE_TYPE,TERMS_SCOPE_TYPE}
+                or write.key.type_name=="d08.commitment.v1"and write.value.get("fulfillment_state")=="fulfilled"
+                for write in proposal.typed_writes):
+            raise ValueError("objective commitment terms/transitions require their actual registered SourceWork producer")
         for write in proposal.typed_writes:
             try:
                 spec = specs[write.key.type_name]

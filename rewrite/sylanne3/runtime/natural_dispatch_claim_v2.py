@@ -7,7 +7,11 @@ use ``_commit_dispatch_claim_atom_in_transaction`` before its outer COMMIT.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from hashlib import sha256
+from time import monotonic_ns
+from weakref import WeakKeyDictionary
+import sys
 import json
 import math
 
@@ -48,23 +52,28 @@ from .reply_entity_route_v2 import (
     read_current_reply_entity_route_binding_v2,
 )
 from .reply_model_job import CurrentReplyRouteManifestV2
+from .runtime_canonical_stream_v3 import RuntimeCanonicalStreamV3
 
 
 class NaturalDispatchClaimHold(RuntimeError):
     """One final natural predicate is unavailable or changed."""
 
 
-def require_natural_action_uncancelled_v3(db, namespace, evidence, cancel_epoch: int) -> None:
+def require_natural_action_uncancelled_v3(db, namespace, evidence, cancel_epoch: int, *, prepared_inventory=None) -> None:
     """Read the existing durable D08 cancellation head in the held snapshot."""
     action_key = AtomKey.from_token(evidence.action_ref)
     key = AtomKey(action_key.owner, "d08.action_cancellation.v1", action_key.name)
-    row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
-                     (key.token, *namespace.as_tuple)).fetchone()
+    if prepared_inventory is None:
+        row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=? AND bot=? AND persona=?",
+                         (key.token, *namespace.as_tuple)).fetchone()
+    else:
+        atom=_current_natural_atom_v3(prepared_inventory,db,namespace,key)
+        row=None if atom is None else (atom.value,int(atom.valid))
     if row is None or row[1] != 1:
         raise NaturalDispatchClaimHold("natural cancellation head is unavailable")
     validator = next(spec.validator for spec in GoalExecutionProvider().register_types()
                      if spec.name == key.type_name)
-    state = validator(json.loads(row[0]))
+    state = validator(json.loads(row[0]) if prepared_inventory is None else row[0])
     if (state.action_id != action_key.name or state.action_digest != evidence.action_digest
             or state.activity_id != action_key.owner.subject
             or state.effect_id != evidence.effect_id or state.state != "active"
@@ -72,10 +81,160 @@ def require_natural_action_uncancelled_v3(db, namespace, evidence, cancel_epoch:
         raise NaturalDispatchClaimHold("natural reply was durably cancelled")
 
 
+def _current_natural_atom_v3(inventory,db,namespace,key):
+    from .dispatch_current_inventory_v3 import PreparedCurrentDispatchInventoryV3
+    if type(inventory)is PreparedCurrentDispatchInventoryV3:
+        if inventory.family!='natural_reply':
+            raise NaturalDispatchClaimHold("actual current Natural inventory required")
+        projection=inventory.require_current(db,namespace,inventory.query)
+    else:
+        from .natural_dispatch_initial_read_v1 import _PreparedNaturalInitialReadV1
+        if type(inventory)is not _PreparedNaturalInitialReadV1:
+            raise NaturalDispatchClaimHold("actual independent Natural readonly atom proof required")
+        projection=inventory.require_current(db,namespace,inventory.query)
+    return projection.get(key)
+
+
 @dataclass(frozen=True, slots=True)
 class NaturalDispatchClaimPreparedV2:
     value: DispatchGraphClaimValueV1
     write: GraphWrite
+
+
+
+_EVIDENCE_ISSUER_V3=object()
+_EVIDENCE_ORIGINALS_V3=WeakKeyDictionary()
+_STATIC_EVIDENCE_KEYS_V3=('admission','batch_digest','candidate','natural_v2','operation','paid_review','route','scoped_proof')
+
+
+
+
+
+class _NaturalEvidenceCanonicalReadV3:
+    """Encode actual verified originals before the reverse handoff begins."""
+    def __init__(self,owner):
+        from .dispatch_current_inventory_v3 import _DispatchInventoryReadV3,PreparedCurrentDispatchInventoryV3
+        from .natural_dispatch_current_read_v2 import recover_natural_dispatch_candidate_in_transaction_v2
+        if (type(owner)is not _DispatchInventoryReadV3 or owner.family!='natural_reply'
+                or type(owner.result)is not PreparedCurrentDispatchInventoryV3 or not owner.auxiliary.complete):
+            raise NaturalDispatchClaimHold('actual completed Natural inventory originals required')
+        self.owner,self.inventory=owner,owner.result
+        from .natural_dispatch_read_locator_current_v1 import require_natural_dispatch_read_locator_v1
+        require_natural_dispatch_read_locator_v1(self.inventory,owner.db)
+        inventory=self.inventory;db=owner.db;namespace=owner.namespace
+        inventory.require_current(db,namespace,inventory.query)
+        recovered=recover_natural_dispatch_candidate_in_transaction_v2(db,namespace,owner.binding.operation_id,
+            prepared_history=inventory.natural_history)
+        if recovered is None:raise NaturalDispatchClaimHold('actual Natural candidate original absent')
+        evidence=recovered.evidence
+        ref,revision=recovered.write_versions[3]
+        batch,valid=inventory.natural_history.read_history_json_v3(db,namespace,ref,revision,
+            owner.request.activity_id,owner.binding.operation_id)
+        if valid!=1:raise NaturalDispatchClaimHold('actual Natural batch original is invalid')
+        operation=owner.graph._get_operation_locked(namespace,owner.binding.operation_id,
+            prepared_history=inventory.natural_history)
+        generation=owner.auxiliary.natural
+        scope=inventory.natural_scope_original.read_v3(db,generation)
+        current_admission=inventory.admission_originals.receipt_v3()
+        admitted=current_admission.admission
+        # Select the route from actual EOF-qualified originals. The current
+        # route reader independently joins ingress/C02/Source/D03; this manifest
+        # is a selector and grants no access or dispatch permission.
+        manifest=CurrentReplyRouteManifestV2(namespace,generation.seal.c02_operation_id,
+            generation.seal.source_ref,admitted.account_ref,admitted.destination_ref,
+            admitted.scene_ref,canonical_digest({'account_ref':admitted.account_ref,
+                'destination_ref':admitted.destination_ref,'scene_ref':admitted.scene_ref}))
+        route=read_current_reply_entity_route_binding_v2(db,namespace,manifest,inventory.query,
+            now_utc=owner.now_utc,prepared_inventory=inventory)
+        self.values={'admission':current_admission,'batch_digest':batch['batch_digest'],
+            'candidate':evidence,'natural_v2':True,'operation':operation,
+            'paid_review':dict(batch['paid_review']),'route':route,'scoped_proof':scope,
+            'footprint':owner.binding.origin.footprint}
+        self.keys=(*_STATIC_EVIDENCE_KEYS_V3,'footprint');self.index=0
+        self.stream=None;self.parts={};self.complete=False;self.result=None
+        owner.operation.retain(4096)
+
+    def advance(self,meter):
+        self.inventory.require_current(self.owner.db,self.owner.namespace,self.inventory.query)
+        if self.stream is None:
+            key=self.keys[self.index];value=self.values[key]
+            self.owner.operation.retain(65536)
+            self.stream=RuntimeCanonicalStreamV3(value,self.owner.operation)
+            self.parts[key]=[]
+            return False
+        part=self.stream.read_fragment(meter)
+        if part:
+            self.owner.operation.retain(sys.getsizeof(part)+32)
+            self.parts[self.keys[self.index]].append(part)
+        if self.stream.complete:
+            key=self.keys[self.index]
+            self.owner.operation.retain(64+len(self.parts[key])*16)
+            self.parts[key]=tuple(self.parts[key]);self.stream=None;self.index+=1
+            if self.index==len(self.keys):
+                self.result=_PreparedNaturalEvidenceCanonicalV3(_EVIDENCE_ISSUER_V3,self)
+                self.complete=True
+        return self.complete
+
+
+class _PreparedNaturalEvidenceCanonicalV3:
+    """Private retained bytes; current authorization is still checked by final claim."""
+    def __init__(self,issuer,reader):
+        if issuer is not _EVIDENCE_ISSUER_V3 or reader.index!=len(reader.keys):
+            raise NaturalDispatchClaimHold('actual complete canonical preparation required')
+        self.inventory,self.values,self.parts=reader.inventory,reader.values,reader.parts
+        _EVIDENCE_ORIGINALS_V3[self]=(self.inventory,self.values,self.parts)
+
+    def release_payload_v3(self):
+        _EVIDENCE_ORIGINALS_V3.pop(self,None)
+        self.inventory=self.values=self.parts=None
+
+    def digest_v3(self,inventory,values,authority_snapshot,witness):
+        from ..runtime_contracts import canonical_serialize
+        from ..runtime_storage_v3 import runtime_storage_quantum_v3
+        if (_EVIDENCE_ORIGINALS_V3.get(self)!=(self.inventory,self.values,self.parts)
+                or inventory is not self.inventory or inventory.operation.closed
+                or values!={key:self.values[key]for key in _STATIC_EVIDENCE_KEYS_V3}):
+            raise NaturalDispatchClaimHold('current Natural evidence differs from its actual canonical originals')
+        own=authority_snapshot.unresolved_effects
+        if (len(own)!=1 or own[0].effect_id!=inventory.request.effect_id
+                or own[0].footprint!=self.values['footprint']):
+            raise NaturalDispatchClaimHold('current Authority effect differs from the actual admitted footprint')
+        digest=sha256()
+        with runtime_storage_quantum_v3(inventory.db) as meter:
+            def emit(part):
+                meter.charge_encode(len(part));digest.update(part)
+            def scalar(value):
+                # This is the actual live shell. It is never an expected snapshot.
+                # canonical_serialize already charges the active meter.
+                wire=canonical_serialize(value).encode('ascii');digest.update(wire)
+            def object_parts(value,overrides):
+                emit(b'{')
+                names=sorted(('$type',*(field.name for field in fields(value))))
+                for index,name in enumerate(names):
+                    if index:emit(b',')
+                    scalar(name);emit(b':')
+                    if name in overrides:overrides[name]()
+                    else:scalar(type(value).__module__+'.'+type(value).__qualname__ if name=='$type' else getattr(value,name))
+                emit(b'}')
+            def footprint():
+                for part in self.parts['footprint']:emit(part)
+            def unresolved():
+                emit(b'[');object_parts(own[0],{'footprint':footprint});emit(b']')
+            emit(b'{')
+            keys=sorted((*_STATIC_EVIDENCE_KEYS_V3,'authority_snapshot','owner_witness'))
+            for index,key in enumerate(keys):
+                if index:emit(b',')
+                scalar(key);emit(b':')
+                if key=='authority_snapshot':object_parts(authority_snapshot,{'unresolved_effects':unresolved})
+                elif key=='owner_witness':scalar(witness)
+                else:
+                    for part in self.parts[key]:emit(part)
+            emit(b'}')
+            # A nested quantum shares its original meter. Fail before W01 writes,
+            # even when its enclosing context would otherwise exit after COMMIT.
+            if monotonic_ns()-meter.started_ns>meter.budget.max_local_ns:
+                raise NaturalDispatchClaimHold('Natural final evidence exceeded its original local quantum')
+        return 'sha256:'+digest.hexdigest()
 
 
 def prepare_natural_dispatch_claim_v2(
@@ -87,7 +246,7 @@ def prepare_natural_dispatch_claim_v2(
     context: DispatchHandoffContextV1, binding: ExecutionBindingV2,
     claimed: MutationReceiptV2, witness: OwnerDispatchWitnessV1,
     authority_snapshot: AuthorityDispatchSnapshotV1,
-    now_utc: float,
+    now_utc: float, prepared_inventory=None,
 ) -> NaturalDispatchClaimPreparedV2:
     """Recheck one original paid natural effect and prepare its unique P2 atom.
 
@@ -111,8 +270,11 @@ def prepare_natural_dispatch_claim_v2(
             or type(authority_snapshot) is not AuthorityDispatchSnapshotV1
             or type(now_utc) not in (int, float) or not math.isfinite(now_utc)):
         raise NaturalDispatchClaimHold("typed final natural transaction required")
+    from .natural_dispatch_read_locator_current_v1 import require_natural_dispatch_read_locator_v1
+    require_natural_dispatch_read_locator_v1(prepared_inventory,db)
     admission = admission_receipt.admission
-    if load_admission(db, namespace, admission.admission_ref) != admission_receipt:
+    if load_admission(db, namespace, admission.admission_ref, prepared_admission=(
+            None if prepared_inventory is None else prepared_inventory.admission_originals)) != admission_receipt:
         raise NaturalDispatchClaimHold("committed natural admission differs")
     try:
         validate_natural_verified_batch_value(batch)
@@ -163,15 +325,20 @@ def prepare_natural_dispatch_claim_v2(
             or request.proactive_contact):
         raise NaturalDispatchClaimHold("committed natural admission or effect differs")
     paid, segment = batch["paid_review"], batch["segment"]
-    require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch)
-    history = db.execute(
-        "SELECT value,valid FROM graph_history WHERE token=? AND event_bot=? "
-        "AND event_persona=? AND event_session=? AND event_id=?",
-        (evidence.batch_ref,) + namespace.as_tuple + (
-            request.activity_id, request.operation_id),
-    ).fetchall()
+    require_natural_action_uncancelled_v3(db, namespace, evidence, request.cancel_epoch,prepared_inventory=prepared_inventory)
+    if prepared_inventory is None:
+        history = db.execute(
+            "SELECT value,valid FROM graph_history WHERE token=? AND event_bot=? "
+            "AND event_persona=? AND event_session=? AND event_id=?",
+            (evidence.batch_ref,) + namespace.as_tuple + (request.activity_id, request.operation_id),
+        ).fetchall()
+    else:
+        original=prepared_inventory.natural_history
+        matches=[key for key in original.cells if key[0]==evidence.batch_ref]
+        history=[] if len(matches)!=1 else [original.read_history_json_v3(db,namespace,
+            *matches[0],request.activity_id,request.operation_id)]
     if (len(history) != 1 or history[0][1] != 1
-            or json.loads(history[0][0]) != batch):
+            or (json.loads(history[0][0]) if prepared_inventory is None else history[0][0]) != batch):
         raise NaturalDispatchClaimHold("committed natural V2 batch differs")
     if (batch["operation_id"] != request.operation_id
             or batch["effect_id"] != request.effect_id
@@ -201,8 +368,10 @@ def prepare_natural_dispatch_claim_v2(
     ).fetchall()
     if len(parents) != 1:
         raise NaturalDispatchClaimHold("paid generation original is absent")
-    generation = read_original_preparation(db, namespace, parents[0][0], "generation")
-    review = read_original_preparation(db, namespace, parents[0][0], "review")
+    generation = read_original_preparation(db, namespace, parents[0][0], "generation",
+        prepared_originals=None if prepared_inventory is None else prepared_inventory.natural_originals)
+    review = read_original_preparation(db, namespace, parents[0][0], "review",
+        prepared_originals=None if prepared_inventory is None else prepared_inventory.natural_review_originals)
     if (generation is None or review is None
             or generation.state != "terminal" or review.state != "terminal"
             or generation.seal.original_operation_id
@@ -242,7 +411,8 @@ def prepare_natural_dispatch_claim_v2(
                != paid["generation_output_digest"]
             or review.terminal_output_digest
                != paid["review_output_digest"]
-            or read_original_scoped_query_proof_v2(db, generation)
+            or read_original_scoped_query_proof_v2(db, generation,prepared_scope=(
+                None if prepared_inventory is None else prepared_inventory.natural_scope_original))
                != original_scope_proof):
         raise NaturalDispatchClaimHold("sealed dual paid originals or scoped proof differ")
     epochs = db.execute(
@@ -275,7 +445,7 @@ def prepare_natural_dispatch_claim_v2(
         raise NaturalDispatchClaimHold("current natural private route differs")
     try:
         current_proof = assert_natural_scoped_query_current_v2(
-            db, original_scope_proof, now_utc=float(now_utc))
+            db, original_scope_proof, now_utc=float(now_utc),prepared_inventory=prepared_inventory)
     except (ValueError, RuntimeError) as exc:
         raise NaturalDispatchClaimHold("current D03/D05/D06 scoped query changed") from exc
     if current_proof != original_scope_proof:
@@ -291,7 +461,7 @@ def prepare_natural_dispatch_claim_v2(
     )
     try:
         fresh_route = read_current_reply_entity_route_binding_v2(
-            db, namespace, route_manifest, current_route.query, now_utc=now_utc)
+            db, namespace, route_manifest, current_route.query, now_utc=now_utc,prepared_inventory=prepared_inventory)
     except (ReplyEntityRouteHold, ValueError) as exc:
         raise NaturalDispatchClaimHold("natural private route query changed") from exc
     if fresh_route != current_route:
@@ -306,14 +476,16 @@ def prepare_natural_dispatch_claim_v2(
                           (version.key.token,)).fetchone()
         if head != (version.revision, 1):
             raise NaturalDispatchClaimHold("natural current route head changed")
-    action_row = db.execute(
-        "SELECT value,valid FROM graph_atoms WHERE token=?", (evidence.action_ref,),
-    ).fetchone()
-    schema_row = db.execute(
-        "SELECT value,valid FROM graph_atoms WHERE token=?", (evidence.schema_ref,),
-    ).fetchone()
     action_key = AtomKey.from_token(evidence.action_ref)
     schema_key = AtomKey.from_token(evidence.schema_ref)
+    if prepared_inventory is None:
+        action_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (evidence.action_ref,)).fetchone()
+        schema_row = db.execute("SELECT value,valid FROM graph_atoms WHERE token=?", (evidence.schema_ref,)).fetchone()
+    else:
+        action_atom=_current_natural_atom_v3(prepared_inventory,db,namespace,action_key)
+        schema_atom=_current_natural_atom_v3(prepared_inventory,db,namespace,schema_key)
+        action_row=None if action_atom is None else (action_atom.value,int(action_atom.valid))
+        schema_row=None if schema_atom is None else (schema_atom.value,int(schema_atom.valid))
     if (action_row is None or schema_row is None
             or action_row[1] != 1 or schema_row[1] != 1
             or (action_key.owner.bot, action_key.owner.persona)
@@ -329,9 +501,9 @@ def prepare_natural_dispatch_claim_v2(
     validators = {spec.name: spec.validator
                   for spec in GoalExecutionProvider().register_types()}
     try:
-        action = validators["d08.action_intent.v1"](json.loads(action_row[0]))
+        action = validators["d08.action_intent.v1"](json.loads(action_row[0]) if prepared_inventory is None else action_row[0])
         schema_record = validators["d08.action_schema.v1"](
-            json.loads(schema_row[0]))
+            json.loads(schema_row[0]) if prepared_inventory is None else schema_row[0])
         schema = ActionSchema(schema_record.schema_id, schema_record.action_kind,
                               schema_record.proactive,
                               schema_record.required_checks)
@@ -351,13 +523,20 @@ def prepare_natural_dispatch_claim_v2(
             or tuple(batch["required_check_refs"])
                != request.required_check_refs):
         raise NaturalDispatchClaimHold("current natural communication checks differ")
-    evidence_digest = "sha256:" + canonical_digest({
+    evidence_values = {
         "natural_v2": True, "admission": admission_receipt,
         "operation": operation, "candidate": evidence,
         "paid_review": paid, "batch_digest": batch["batch_digest"],
         "scoped_proof": current_proof, "route": current_route,
-        "authority_snapshot": authority_snapshot, "owner_witness": witness,
-    })
+    }
+    if prepared_inventory is None:
+        evidence_digest = "sha256:" + canonical_digest(dict(evidence_values,
+            authority_snapshot=authority_snapshot,owner_witness=witness))
+    else:
+        canonical=prepared_inventory.natural_evidence_canonical
+        if type(canonical)is not _PreparedNaturalEvidenceCanonicalV3:
+            raise NaturalDispatchClaimHold('actual Natural evidence canonical EOF preparation required')
+        evidence_digest=canonical.digest_v3(prepared_inventory,evidence_values,authority_snapshot,witness)
     value = DispatchGraphClaimValueV1(
         namespace.bot_id, namespace.persona_id, binding.graph_incarnation,
         request.activity_id, request.effect_id, request.operation_id,

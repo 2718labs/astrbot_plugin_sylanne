@@ -7,7 +7,7 @@ import json
 import time
 
 from ..contracts import Event, Scope
-from ..domains.d01 import PersonaDomain, _activation_key
+from ..domains.d01 import _activation_key
 from ..domains.d03.context import WorldEvent
 from ..domains.d06 import source_correction_head_key
 from ..domains.d07 import CurrentInterpretationCandidate, Stance, EvidenceStatus
@@ -74,12 +74,12 @@ def _freeze(graph, db, bundle, c02_id, source_ref, role, current):
             interpretations.append(BoundInterpretationV1(VersionedRef(atom.key.token, atom.revision), CurrentInterpretationCandidate(**values)))
     if not 1 <= len(interpretations) <= 4:
         raise ValueError("D04 current competing interpretations require bounded complete coverage")
-    seal = db.execute("SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?",
-        (*namespace.as_tuple, c02_id)).fetchone()
-    if seal is None:
-        raise ValueError("D04 actual C02 source original absent")
-    qualification = c02_bundle_from_wire(seal[0]).envelope.source_qualification
-    view = PersonaDomain().project(role.plan, context_tags=(), role_binding_complete=role_read.status == "complete")
+    from .d04_ordinary_readout_v3 import require_bound_d04_role_readout_v3
+    prepared_role = require_bound_d04_role_readout_v3(db,namespace)
+    qualification = prepared_role.owner.source_qualification
+    if role is not prepared_role.control:
+        raise ValueError('D04 appraisal role is not its actual selected readout control')
+    view = prepared_role.project_selected_v4(role_binding_complete=role_read.status == 'complete')
     role_atom = snapshot.get(_activation_key(namespace))
     frozen = freeze_appraisal_request_v1(AppraisalInputV1(namespace, (qualified,), qualification,
         VersionedRef(event_atom.key.token, event_atom.revision), event, VersionedRef(role_atom.key.token, role_atom.revision),
@@ -87,10 +87,16 @@ def _freeze(graph, db, bundle, c02_id, source_ref, role, current):
         AppraisalInstallationV1(bundle.installation_policy.installation_id, workflow.provider_id, workflow.model_id,
             workflow.provider_config_ref, workflow.provider_config_digest, workflow.max_output_tokens))
     # Full source closure is independently derived by the staging validator.
-    keys = {v.key for v in role.read_versions} | {event_atom.key, binding.binding_version.key}
+    from .selected_persona_readout_v4 import require_selected_persona_control_header_v4
+    for version in role.read_versions:
+        require_selected_persona_control_header_v4(prepared_role.selected_readout,version.key,version.revision)
+    keys = {event_atom.key, binding.binding_version.key}
     keys.update(AtomKey.from_token(item.ref.ref) for item in interpretations)
-    versions = tuple(GraphVersion(atom.key, atom.revision) for atom in snapshot.atoms if atom.key in keys)
-    return frozen, snapshot, versions, route.conversation_ref
+    versions = (*role.read_versions,*(GraphVersion(atom.key, atom.revision) for atom in snapshot.atoms if atom.key in keys))
+    from .d04_ordinary_readout_v3 import d04_role_manifest_wire_v3,d04_role_manifest_versions_v3
+    support = d04_role_manifest_versions_v3(d04_role_manifest_wire_v3(prepared_role.manifest),namespace)
+    merged = {v.key:v for v in (*versions,*support)}
+    return frozen, snapshot, tuple(merged.values()), route.conversation_ref
 
 
 def _commit(graph, db, metadata, epoch, operation_id, activity_id, now, writes, reads, kind):
@@ -129,17 +135,17 @@ def prepare_current_c02_interpretation_v1(graph, bootstrap, bundle, *, c02_opera
         if existing:
             return {"status": "existing_interpretation", "refs": [atom.key.token for atom in existing]}
         record = inputs.source.source
-        sealed = db.execute("SELECT bundle_json FROM graph_first_ingress_c02_committed_seals_v2 WHERE bot=? AND persona=? AND operation_id=?",
-            (*namespace.as_tuple, c02_operation_id)).fetchone()
-        if sealed is None:
-            raise ValueError("D07 input presence lacks actual C02 original")
-        qualification = c02_bundle_from_wire(sealed[0]).envelope.source_qualification
+        from .d04_source_work_v3 import require_bound_installed_d04_source_v3
+        actual_source=require_bound_installed_d04_source_v3(graph,db,namespace,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,epoch=epoch,now_utc=now)
+        qualification=actual_source.source_qualification
         refs = (source_ref, scene.ref)
         rights = graph._deletion_epochs_locked(db, namespace)
         keys = (AtomKey.from_token(source_ref), access_key(*namespace.as_tuple, record.source_id),
             source_correction_head_key(namespace, record.source_id), AtomKey.from_token(scene.ref))
         reads = tuple(GraphVersion(key, snapshot.get(key).revision) for key in keys)
         policy = bundle.installation_policy
+        deadline=min(now+30.0,actual_source.operation.deadline_utc)
         envelope = CommandEnvelope(RUNTIME_SCHEMA, OperationIdentity(inputs.c02_receipt.activity_id, None,
             operation_id, "interpret", operation_id, canonical_digest({"input_refs": list(refs)})),
             AuthorityContext(graph._GraphCoordinator__content_fence_v2.installation_grant.subject,
@@ -149,7 +155,8 @@ def prepare_current_c02_interpretation_v1(graph, bootstrap, bundle, *, c02_opera
             VersionGuard(reads, (QueryEpoch(namespace, "all", epoch.revision),), rights[0], rights[1],
                 graph._GraphCoordinator__store._registry.catalogue_hash, policy.scheme_version,
                 policy.operator_version, policy.policy_version, (), (), ()),
-            qualification, refs, policy.root_grant.lease_id, now + 30.0, time.monotonic() + 30.0,
+            qualification, refs, policy.root_grant.lease_id, deadline,
+            min(time.monotonic()+deadline-now,actual_source.initial_monotonic_deadline),
             "c02-presence:" + c02_operation_id, (c02_operation_id,))
         proposal, provenance = issue_current_c02_presence_v1(envelope=envelope, snapshot=snapshot,
             source=inputs.source, c02_receipt=inputs.c02_receipt, perspective_ref=scene.ref)
@@ -165,12 +172,55 @@ def prepare_current_c02_interpretation_v1(graph, bootstrap, bundle, *, c02_opera
 
 def prepare_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, source_ref):
     namespace, policy = bundle.installation_policy.namespace, bundle.installation_policy
-    identity = ids(namespace, c02_operation_id)
     workflow = bundle.model_workflows.appraisal
     if workflow is None:
         return {"status": "not_configured", "missing_inputs": ["appraisal_workflow"]}
-    prepare_current_c02_interpretation_v1(graph, bootstrap, bundle,
+    interpretation = prepare_current_c02_interpretation_v1(graph, bootstrap, bundle,
         c02_operation_id=c02_operation_id, source_ref=source_ref)
+    from ..graph_worker import GraphStorageWorkV3
+    if type(interpretation) is GraphStorageWorkV3:
+        def after_interpretation(result):
+            if type(result) is not dict or result.get("status") not in {"meaning_unassessed", "existing_interpretation"}:
+                raise ValueError("D04 preparation requires the actual completed interpretation stage")
+            from ..graph_storage_handoff_v3 import issue_graph_storage_handoff_v3
+            from .first_ingress_v2 import trusted_upper
+            now = trusted_upper(graph._GraphCoordinator__content_fence_v2.read_ingress_clock(bundle.ingress_clock))
+            command = canonical_serialize({"schema": "d04.appraisal-after-interpretation.v3",
+                "namespace": namespace.as_tuple, "installation_id": policy.installation_id,
+                "manifest_digest": policy.manifest_digest, "c02_operation_id": c02_operation_id,
+                "source_ref": source_ref, "deadline_utc": interpretation.deadline_utc}).encode("utf-8")
+            return issue_graph_storage_handoff_v3(interpretation,
+                factory=_start_appraisal_after_interpretation_v3, command=command,
+                deadline_utc=interpretation.deadline_utc, observed_utc=now)
+        def failed_interpretation(error):
+            raise error
+        return interpretation.map_terminal_v3("service", after_interpretation, failed_interpretation)
+    return _prepare_appraisal_after_interpretation_v3(graph, bootstrap, bundle,
+        c02_operation_id=c02_operation_id, source_ref=source_ref)
+
+
+def _start_appraisal_after_interpretation_v3(graph, command):
+    """Only detached locators cross the terminal; the child opens fresh Source."""
+    data = json.loads(command)
+    bundle = graph._GraphCoordinator__d04_installed_joint_assembly.admin_bundle
+    policy = bundle.installation_policy
+    if (type(data) is not dict or set(data) != {"schema", "namespace", "installation_id",
+            "manifest_digest", "c02_operation_id", "source_ref", "deadline_utc"}
+            or data["schema"] != "d04.appraisal-after-interpretation.v3"
+            or data["namespace"] != list(policy.namespace.as_tuple)
+            or data["installation_id"] != policy.installation_id or data["manifest_digest"] != policy.manifest_digest):
+        raise ValueError("D04 child changed its actual installed interpretation lineage")
+    # The child can only tighten its installed Root and actual C02 deadline.
+    # A known completed receipt may return synchronously; it grants no Source.
+    return _prepare_appraisal_after_interpretation_v3(graph, graph._GraphCoordinator__bootstrap, bundle,
+        c02_operation_id=data["c02_operation_id"], source_ref=data["source_ref"],
+        original_deadline_utc=data["deadline_utc"])
+
+
+def _prepare_appraisal_after_interpretation_v3(graph, bootstrap, bundle, *, c02_operation_id, source_ref, original_deadline_utc=None):
+    namespace, policy = bundle.installation_policy.namespace, bundle.installation_policy
+    identity = ids(namespace, c02_operation_id)
+    workflow = bundle.model_workflows.appraisal
     request_digest = canonical_digest(("d04.prepare.v3", namespace, c02_operation_id, source_ref, policy.installation_id,
         {name: dict(workflow.quote_ceiling) if name == "quote_ceiling" else getattr(workflow, name)
          for name in workflow.__dataclass_fields__}))
@@ -185,7 +235,11 @@ def prepare_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id,
         require_budget_family_admissible(db, grant.lease_id)
         if any(amount > grant.max_ceiling.get(key, 0) for key, amount in workflow.quote_ceiling.items()):
             raise ValueError("D04 appraisal quote exceeds current signed grant")
-        deadline = min(grant.valid_until_utc, now + bundle.ingress_encoding.deadline_after_seconds)
+        from .d04_source_work_v3 import require_bound_installed_d04_source_v3
+        prepared_source=require_bound_installed_d04_source_v3(graph,db,namespace,
+            c02_operation_id=c02_operation_id,source_ref=source_ref,epoch=epoch,now_utc=now)
+        deadline = min(grant.valid_until_utc, now + bundle.ingress_encoding.deadline_after_seconds,
+            prepared_source.operation.deadline_utc)
         snapshot_ref = "d04-appraisal-snapshot:" + frozen.frozen_input_digest[:48]
         job = PersistentJob(identity["job"], identity["operation"], identity["activity"], None, *namespace.as_tuple,
             snapshot_ref, "queued", "d04.appraisal", {"schema": "d04.post-c02-appraisal.v3", "c02_operation_id": c02_operation_id,
@@ -196,17 +250,20 @@ def prepare_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id,
             grant.lease_id, "d04.appraisal", snapshot_ref, deadline, workflow.provider_config_ref,
             job_graph_write(job).key.token, (), (), dict(workflow.quote_ceiling), None, deadline)
         rights = graph._deletion_epochs_locked(db, namespace)
+        from .d04_ordinary_readout_v3 import require_bound_d04_role_readout_v3
+        prepared_role = require_bound_d04_role_readout_v3(db,namespace,frozen=frozen)
         stage = stage_current_d04_appraisal_in_transaction_v3(db, frozen=frozen, current_frozen=frozen,
             snapshot=snapshot, read_versions=reads, job=job, call_id=identity["call"], quote=quote,
             resource_issuer=graph._GraphCoordinator__d02_issuer, model_request_digest=frozen.model_request_digest,
             audience=(conversation,), purpose="expression", activation_generation=metadata.requirements.activation_generation,
-            access_epoch=rights[0], delete_epoch=rights[1])
+            access_epoch=rights[0], delete_epoch=rights[1],ordinary_readout=prepared_role)
         record_d04_original_in_transaction_v3(db, namespace, "appraisal_scope", job.job_id, {"scope_digest": scope_rows(db, namespace)})
         _commit(graph, db, metadata, epoch, identity["operation"], identity["activity"], now, stage.writes,
             (*stage.read_versions, GraphVersion(job_graph_write(job).key, 0)), "d04.appraisal_prepared.v3")
         return {"status": "queued", "job_id": job.job_id, "operation_id": identity["operation"], "original_digest": stage.original.digest}
     return run_installed_d04_stage_v3(graph, bootstrap, bundle, c02_operation_id=c02_operation_id, source_ref=source_ref,
-        operation_id=identity["operation"], stage="prepare", request_digest=request_digest, commit=commit)
+        operation_id=identity["operation"], stage="prepare", request_digest=request_digest, commit=commit,
+        original_deadline_utc=original_deadline_utc)
 
 
 def acquire_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, source_ref):
@@ -230,7 +287,10 @@ def acquire_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id,
         deadline = min(datetime.fromisoformat(job.deadline_utc.replace("Z", "+00:00")).timestamp(),
             datetime.fromisoformat(job.lease_expires_utc.replace("Z", "+00:00")).timestamp())
         job_write = job_graph_write(job)
+        from .d04_ordinary_readout_v3 import d04_role_manifest_versions_v3,require_bound_d04_role_readout_v3
+        require_bound_d04_role_readout_v3(db,namespace,frozen=frozen,manifest=original.role_support_manifest)
         actual_reads = tuple(GraphVersion(AtomKey.from_token(row.ref), row.revision) for row in original.read_rows)
+        actual_reads = (*actual_reads,*d04_role_manifest_versions_v3(original.role_support_manifest,namespace))
         version_guard = VersionGuard((*actual_reads, GraphVersion(job_write.key, 2)), (QueryEpoch(namespace, "all", epoch.revision + 1),),
             original.access_epoch, original.delete_epoch, graph._GraphCoordinator__store._registry.catalogue_hash,
             policy.scheme_version, policy.operator_version, policy.policy_version, (), (), ())
@@ -288,6 +348,14 @@ def read_acquired_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, so
                 raise ValueError("D04 original qualified input changed")
             call = read_original_d04_request_v3(db, original)
             job = get_job(db, original.job_id)
+            if job.phase == "completed":
+                from .d04_appraisal_driver_v3 import D04SettledAppraisalLocatorV3
+                paid = read_d04_original_v3(db, namespace, "appraisal_cost", original.job_id)
+                if (paid is None or paid[0].get("paid") is not True
+                        or paid[0]["prepared_digest"] != original.digest
+                        or paid[0]["result_original_ref"] != job.result_ref):
+                    raise ValueError("D04 completed worker lacks its original paid result")
+                return D04SettledAppraisalLocatorV3(job.job_id, original.digest, job.result_ref)
             if job.phase != "running" or job.lease_holder != call.envelope.authority.actor or job.fence != call.envelope.authority.worker_fence:
                 raise ValueError("D04 original worker is not running")
             quote = graph._GraphCoordinator__d02_issuer.original_signed_quote(db, original.quote_id, original.quote_version)
@@ -312,7 +380,8 @@ def read_acquired_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, so
     from .first_ingress_v2 import trusted_upper
     sample_now = [trusted_upper(port.read_ingress_clock(bundle.ingress_clock))]
     result, anchor, _metadata, _epoch = graph._read_v2(authority, read, fence_observer=observe, return_recovery_context=True)
-    return (*result[:4], anchor, result[4])
+    from .d04_appraisal_driver_v3 import D04SettledAppraisalLocatorV3
+    return result if type(result) is D04SettledAppraisalLocatorV3 else (*result[:4], anchor, result[4])
 
 
 def seal_appraisal_egress_v3(graph, bootstrap, namespace, *, intent, permit):
@@ -356,6 +425,7 @@ def settle_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, 
     from ..authority_service.v2_model_egress_wire import from_wire as model_from_wire
     from ..authority_service.v2_model_egress_contract import ModelEgressIntentV1
     from .model_cost_settlement import read_original_model_cost
+    from .d04_appraisal_driver_v3 import read_d04_appraisal_accounting_locator_v3
     graph._admin(bootstrap)
     namespace, policy = bundle.installation_policy.namespace, bundle.installation_policy
     identity = ids(namespace, c02_operation_id)
@@ -364,7 +434,7 @@ def settle_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, 
     if result_port is None:
         raise ValueError("D04 independently installed result reader unavailable")
     with store._lock:
-        original = read_current_d04_appraisal_original_v3(store._db, namespace, identity["job"])
+        original = read_d04_appraisal_accounting_locator_v3(store._db, namespace, identity["job"])
         completed = read_d04_original_v3(store._db, namespace, "appraisal_cost", identity["job"])
         if completed is not None:
             return {"status": "settled", "job_id": identity["job"], "paid": True}
@@ -372,6 +442,9 @@ def settle_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, 
         if original is None or call_row is None:
             raise ValueError("D04 actual original call absent")
         intent = model_from_wire(call_row[0], ModelEgressIntentV1)
+        if ((original.job_id,original.call_id,original.operation_id,original.digest)!=
+                (intent.job_id,intent.call_id,intent.budget_reservation_operation_id,intent.binding_digest)):
+            raise ValueError('D04 accounting metadata differs from actual original sealed call')
         attempts = store._db.execute("SELECT payload_json FROM graph_d04_originals_v3 WHERE bot=? AND persona=? "
             "AND kind='appraisal_result_attempt' AND json_extract(payload_json,'$.job_id')=? ORDER BY rowid",
             (*namespace.as_tuple, identity["job"])).fetchall()
@@ -403,7 +476,7 @@ def settle_post_c02_appraisal_v3(graph, bootstrap, bundle, *, c02_operation_id, 
         raise
     operation_id = "d04-settle:" + identity["operation"]
     def commit(db, metadata, epoch, now, guard, role, current):
-        original_now = read_current_d04_appraisal_original_v3(db, namespace, original.job_id)
+        original_now = read_d04_appraisal_accounting_locator_v3(db, namespace, original.job_id)
         if original_now != original:
             raise ValueError("D04 paid original changed")
         job = get_job(db, original.job_id)
