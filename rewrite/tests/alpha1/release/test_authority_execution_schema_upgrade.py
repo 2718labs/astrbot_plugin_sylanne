@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 from dataclasses import replace
 import json
-import msvcrt
 from pathlib import Path
 import sqlite3
 import sys
 
 import pytest
+
+msvcrt = pytest.importorskip(
+    'msvcrt', reason='Windows-only execution schema upgrade acceptance')
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "rewrite"))

@@ -303,6 +303,11 @@ class InstalledC09StorageReaderV1:
         from .c09_paged_capture_control_v2 import InstalledC09CaptureProfileV2
         self._resource_profile_v3 = InstalledC09CaptureProfileV2()
         self._applied_reader = None
+        # Current control-chain proof/reader are lazily advanced; initialize the
+        # attributes so read paths that inspect them before the first advance see
+        # the documented absent state instead of raising AttributeError.
+        self._c09_control_chain_proof_v2 = None
+        self._c09_control_chain_reader_v2 = None
 
     def install_selected_producer_config_v3(self,config):
         from .deployment_config import AuthorityDeploymentConfig
