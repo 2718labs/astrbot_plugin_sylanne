@@ -205,7 +205,8 @@ def _fresh_installed_factory(state, *, extra_specs=()):
         reverse_handoff_profiles={}, reverse_handoff_issuers={}, core_authorizer=_authorize,
         local_administrator_credential=lambda action, namespace: ADMIN,
         administrator_authorizer=lambda credential, action, namespace, holder: credential == PEER,
-        publisher_manifest_verifier=lambda profile, name, version, pin: pin == installation.manifest_digest)
+        publisher_manifest_verifier=lambda profile, name, version, pin: pin == installation.manifest_digest,
+        d13_counter_assets_v1={}, natural_model_authorities_v2={})
     registry = _registry()
     lease = InstalledC09InstanceLeaseV1(config.instance_lock)
     identities = initialize_fresh_authority_v1(config, registry, instance_lease=lease)
