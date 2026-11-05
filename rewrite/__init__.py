@@ -8,4 +8,7 @@ from pathlib import Path as _Path
 
 _IMPL_ROOT = str(_Path(__file__).resolve().parent)
 if _IMPL_ROOT not in _sys.path:
-    _sys.path.insert(0, _IMPL_ROOT)
+    # Append rather than prepend: an embedder or test process that already has
+    # the installed package's rewrite directory first must keep that precedence
+    # over this source checkout when both expose the same implementation tree.
+    _sys.path.append(_IMPL_ROOT)

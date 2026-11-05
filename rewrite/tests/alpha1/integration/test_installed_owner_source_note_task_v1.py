@@ -19,7 +19,7 @@ from m1_artifact_draft_acceptance_support_v1 import (
     cold_originals_v1, compose_actual_m1_services_v1, install_m1_owner_body_and_catalogue_v1)
 from test_current_domain_production_v1 import command, domain_owner
 from test_d04_owner_semantic_initialization_v3 import (
-    real_owner_case, initialize_owner_root_v3, adopt_mapping_and_clock)
+    installed_d04_root, real_owner_case, initialize_owner_root_v3, adopt_mapping_and_clock)
 from sylanne3.domains.d01.production_operations_v1 import plain_v1
 from sylanne3.domains.d10 import LifeProject, ActivityRecipe
 from sylanne3.graph_types import AtomKey, Owner, GraphVersion
